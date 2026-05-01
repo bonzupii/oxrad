@@ -1,0 +1,12 @@
+[package]
+name = "oxrad"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = { version = "0.34.1", features = ["wgpu"] }
+nexrad-data = { version = "0.2.0", features = ["nexrad-decode", "nexrad-model", "reqwest", "tokio", "bzip2"] }
+nexrad-decode = "0.1.2"
+nexrad-model = "0.1.0"
+thiserror = "2.0.18"
+tokio = { version = "1.52.1", features = ["rt-multi-thread"] }
