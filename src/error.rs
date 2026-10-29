@@ -15,44 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 use thiserror::Error;
 
-#[derive(Error, Debug)]
-pub enum RadarError {
-    #[error("Network error occurred while fetching radar data for site {site}: {source}")]
-    NetworkFetch {
-        site: String,
-        source: nexrad_data::result::Error,
-    },
-
-    #[error("The latest volume for site {site} was not found; no volume index was returned.")]
-    LatestVolumeNotFound { site: String },
-
-    #[error("Chunk {chunk_id} for site {site} failed to download: {source}")]
-    ChunkDownload {
-        site: String,
-        chunk_id: String,
-        source: nexrad_data::result::Error,
-    },
-
-    #[error("Radar data failed to decode: {source}")]
-    Decode { source: nexrad_data::result::Error },
-
-    #[error("No reflectivity data was found in the sweep.")]
-    NoReflectivityData,
-
-    #[error("No volume data block was found in any radial; site coordinates unavailable.")]
-    MissingVolumeDataBlock,
-
-    #[error("The tokio runtime failed to initialize: {source}")]
-    RuntimeCreation { source: std::io::Error },
-
-    #[error("Failed to send radar data to the UI thread: {0}")]
-    SendFailure(String),
-
-    #[error("S3 chunk list was truncated after {pages} pagination attempts for site {site}")]
-    ChunkListTruncated { site: String, pages: usize },
-}
-
-#[derive(Error, Debug)]
+#[derive(Debug, Error)]
 pub enum CoordinateError {
     #[error("Latitude {lat} is invalid; it must be in the range -90 to 90.")]
     Latitude { lat: f64 },
@@ -67,27 +30,58 @@ pub enum CoordinateError {
     Azimuth { azimuth_deg: f64 },
 }
 
-#[derive(Error, Debug)]
+#[derive(Debug, Error)]
 pub enum ColorMapError {
     #[error("Value {value} is out of range for product {product}.")]
     OutOfRange { product: &'static str, value: f32 },
+
+    #[error("Value {value} did not match any palette interval for product {product}.")]
+    Unmapped { product: &'static str, value: f32 },
 }
 
-#[derive(Error, Debug)]
-pub enum RenderError {
-    #[error("Colormap rejected dbz={dbz}: {source}")]
-    ColorMap { dbz: f32, source: ColorMapError },
-
-    #[error("Forward projection failed for bin corner {corner}: {source}")]
-    BinCorner {
-        corner: &'static str,
-        source: CoordinateError,
+#[derive(Debug, Error)]
+pub enum RadarError {
+    #[error("HTTP request to {url} failed: {source}")]
+    Http {
+        url: String,
+        #[source]
+        source: ureq::Error,
     },
 
-    #[error("Forward projection failed for range ring at {range_km} km, az {az_deg}: {source}")]
-    RangeRing {
-        range_km: f64,
-        az_deg: f64,
-        source: CoordinateError,
+    #[error("S3 listing response for prefix {prefix} could not be parsed.")]
+    Listing { prefix: String },
+
+    #[error("No volume was listed for site {site} in the last three days.")]
+    NoVolume { site: String },
+
+    #[error("Archive record at byte {offset} of {key} has no four-byte length prefix.")]
+    RecordHeader { key: String, offset: usize },
+
+    #[error("Archive record at byte {offset} of {key} extends past the end of the file.")]
+    RecordBounds { key: String, offset: usize },
+
+    #[error("Archive record at byte {offset} of {key} failed to decompress: {source}")]
+    Decompress {
+        key: String,
+        offset: usize,
+        #[source]
+        source: std::io::Error,
     },
+
+    #[error("Archive record at byte {offset} of {key} failed to decode: {source}")]
+    Decode {
+        key: String,
+        offset: usize,
+        #[source]
+        source: nexrad_decode::result::Error,
+    },
+
+    #[error("No volume data block was found in any radial; site coordinates are unavailable.")]
+    MissingSiteCoordinates,
+
+    #[error("No reflectivity data was found in the selected sweep for site {site}.")]
+    NoReflectivityData { site: String },
+
+    #[error("The clock is before the Unix epoch or outside the supported date range: {detail}")]
+    Clock { detail: String },
 }

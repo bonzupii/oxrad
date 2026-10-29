@@ -19,26 +19,23 @@ mod error;
 mod projection;
 mod radar;
 
-use eframe::egui;
-
 use app::OxradApp;
 use radar::start_fetch_thread;
 
 const DEFAULT_SITE: &str = "KPAH";
 
 fn main() -> eframe::Result<()> {
-    let site = match std::env::args().nth(1) {
-        Some(arg) => arg,
-        None => String::from(DEFAULT_SITE),
-    };
-    let (rx, fetch_handle) = start_fetch_thread(site);
+    let site = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| String::from(DEFAULT_SITE));
+    let receiver = start_fetch_thread(site);
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([800.0, 800.0]),
+        viewport: eframe::egui::ViewportBuilder::default().with_inner_size([900.0, 900.0]),
         ..Default::default()
     };
     eframe::run_native(
         "oxrad",
         options,
-        Box::new(|_cc| Ok(Box::new(OxradApp::new(rx, fetch_handle)))),
+        Box::new(|_creation| Ok(Box::new(OxradApp::new(receiver)))),
     )
 }
