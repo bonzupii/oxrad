@@ -12,9 +12,10 @@ bzip2-rs = "0.1.2"
 eframe = { version = "0.34.1", features = ["wgpu"] }
 geographiclib-rs = "0.2.7"
 nexrad-decode = "0.1.2"
-nexrad-model = "0.1.0"
-thiserror = "2.0.18"
 ureq = "3.5.0"
+
+[dev-dependencies]
+sha2 = "0.11.1"
 
 [lints.rust]
 dead_code = "deny"

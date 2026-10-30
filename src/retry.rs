@@ -1,4 +1,4 @@
-// oxrad: A storm-chaser-grade NEXRAD weather radar viewer
+// oxrad — A storm-chaser-grade NEXRAD weather radar viewer
 // Copyright (C) 2026 Micah Ostrow <bonzupii@protonmail.com>
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,6 +13,8 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//! Retry scheduling: exponential backoff, jitter, and `Retry-After`.
+
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::time::Duration;
@@ -20,6 +22,9 @@ use std::time::Duration;
 use crate::error::RadarError;
 use crate::pipeline::{FetchFailure, FetchUpdate};
 use crate::time::{civil_from_days, now_unix_ms};
+
+pub const BASE_DELAY: Duration = Duration::from_secs(2);
+pub const MAX_DELAY: Duration = Duration::from_secs(60);
 
 pub fn error_update(
     failure: FetchFailure,
@@ -31,24 +36,22 @@ pub fn error_update(
     let FetchFailure { operation, error } = failure;
     let wait = if is_decode_failure(&error) && failures >= 2 {
         None
-    } else {
-        match retry_delay(&error) {
-            Ok(Some(wait)) => Some(wait),
-            Ok(None) => Some(jittered(delay, attempt, jitter)),
-            Err(source) => {
+    } else if let Some(value) = retry_after(&error) {
+        match retry_after_delay(value) {
+            Ok(requested) => Some(requested),
+            Err(invalid) => {
                 return FetchUpdate {
                     result: Err(FetchFailure {
                         operation,
-                        error: RadarError::RetryAfter {
-                            request: Box::new(error),
-                            source: Box::new(source),
-                        },
+                        error: invalid,
                     }),
                     retry_in: Some(jittered(delay, attempt, jitter)),
                     waiting_for_next_volume: false,
                 };
             }
         }
+    } else {
+        Some(jittered(delay, attempt, jitter))
     };
     FetchUpdate {
         result: Err(FetchFailure { operation, error }),
@@ -69,30 +72,32 @@ pub const fn is_decode_failure(error: &RadarError) -> bool {
             | RadarError::Decompress { .. }
             | RadarError::Decode { .. }
             | RadarError::MessageStructure { .. }
-            | RadarError::MissingSiteCoordinates
             | RadarError::SiteMismatch { .. }
             | RadarError::SiteCoordinates { .. }
             | RadarError::GateRange { .. }
-            | RadarError::NoReflectivityData { .. }
-            | RadarError::IncompleteSweep { .. }
             | RadarError::IncompleteVolume { .. }
             | RadarError::DecoderPanic { .. }
     )
 }
 
-fn retry_delay(error: &RadarError) -> Result<Option<Duration>, RadarError> {
-    if let RadarError::HttpStatus {
-        status: 429 | 503,
-        retry_after: Some(value),
-        ..
-    } = error
-    {
-        if let Ok(seconds) = value.trim().parse::<u64>() {
-            return Ok(Some(Duration::from_secs(seconds)));
-        }
-        return http_date_delay(value).map(Some);
+/// The `Retry-After` value of a throttled response, if it carries one.
+fn retry_after(error: &RadarError) -> Option<&str> {
+    match error {
+        RadarError::HttpStatus {
+            status: 429 | 503,
+            retry_after: Some(value),
+            ..
+        } => Some(value),
+        _ => None,
     }
-    Ok(None)
+}
+
+/// The wait a `Retry-After` value asks for, in seconds or as an HTTP date.
+fn retry_after_delay(value: &str) -> Result<Duration, RadarError> {
+    if let Ok(seconds) = value.trim().parse::<u64>() {
+        return Ok(Duration::from_secs(seconds));
+    }
+    http_date_delay(value)
 }
 
 fn http_date_delay(value: &str) -> Result<Duration, RadarError> {
@@ -177,13 +182,35 @@ fn parse_decimal(value: &str) -> Option<u32> {
 
 fn jittered(delay: Duration, attempt: u32, state: &RandomState) -> Duration {
     let millis = state.hash_one(attempt) % 500;
-    (delay + Duration::from_millis(millis)).min(Duration::from_secs(60))
+    (delay + Duration::from_millis(millis)).min(MAX_DELAY)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::VolumeDefect;
     use crate::pipeline::Operation;
+
+    fn incomplete() -> RadarError {
+        RadarError::IncompleteVolume {
+            site: String::from("KPAH"),
+            defect: VolumeDefect::MissingEnd,
+        }
+    }
+
+    #[test]
+    fn backoff_starts_at_two_seconds_and_caps_at_one_minute() {
+        let random = RandomState::new();
+        assert_eq!(BASE_DELAY, Duration::from_secs(2));
+        for attempt in 0..10 {
+            assert_eq!(jittered(MAX_DELAY, attempt, &random), MAX_DELAY);
+            let short = jittered(BASE_DELAY, attempt, &random);
+            assert!(
+                (BASE_DELAY..Duration::from_millis(2500)).contains(&short),
+                "unexpected jitter {short:?}"
+            );
+        }
+    }
 
     #[test]
     fn retry_after_seconds_is_honored_for_throttling() {
@@ -192,15 +219,17 @@ mod tests {
             status: 429,
             retry_after: Some(String::from("120")),
         };
-        assert!(
-            matches!(retry_delay(&error), Ok(Some(value)) if value == Duration::from_secs(120))
-        );
+        assert_eq!(retry_after(&error), Some("120"));
+        assert!(matches!(
+            retry_after_delay("120"),
+            Ok(value) if value == Duration::from_secs(120)
+        ));
         let error = RadarError::HttpStatus {
             url: String::from("https://example.invalid"),
             status: 404,
             retry_after: Some(String::from("120")),
         };
-        assert!(matches!(retry_delay(&error), Ok(None)));
+        assert_eq!(retry_after(&error), None, "only 429 and 503 ask for a wait");
     }
 
     #[test]
@@ -211,67 +240,15 @@ mod tests {
         );
         assert_eq!(parse_http_date("Mon, 06 Nov 1994 08:49:37 GMT"), None);
         assert_eq!(parse_http_date("Thu, 31 Feb 2000 00:00:00 GMT"), None);
-        let error = RadarError::HttpStatus {
-            url: String::from("https://example.invalid"),
-            status: 503,
-            retry_after: Some(String::from("invalid")),
-        };
-        assert!(
-            matches!(retry_delay(&error), Err(RadarError::InvalidRetryAfter { ref value }) if value == "invalid")
+        assert_eq!(
+            parse_http_date("Sun, 06 Nov 1994 08:49:37"),
+            None,
+            "a date without a zone is rejected"
         );
     }
 
     #[test]
-    fn decode_failure_stops_after_one_retry() {
-        let state = RandomState::new();
-        let first = error_update(
-            FetchFailure {
-                operation: Operation::Decoding,
-                error: RadarError::IncompleteVolume {
-                    site: String::from("KPAH"),
-                    defect: crate::error::VolumeDefect::MissingEnd,
-                },
-            },
-            1,
-            Duration::from_secs(2),
-            0,
-            &state,
-        );
-        assert!(matches!(
-            first.result,
-            Err(FetchFailure {
-                error: RadarError::IncompleteVolume { ref site, .. },
-                ..
-            }) if site == "KPAH"
-        ));
-        assert!(first.retry_in.is_some());
-        assert!(!first.waiting_for_next_volume);
-        let second = error_update(
-            FetchFailure {
-                operation: Operation::Decoding,
-                error: RadarError::IncompleteVolume {
-                    site: String::from("KPAH"),
-                    defect: crate::error::VolumeDefect::MissingEnd,
-                },
-            },
-            2,
-            Duration::from_secs(4),
-            1,
-            &state,
-        );
-        assert!(matches!(
-            second.result,
-            Err(FetchFailure {
-                error: RadarError::IncompleteVolume { ref site, .. },
-                ..
-            }) if site == "KPAH"
-        ));
-        assert!(second.retry_in.is_none());
-        assert!(second.waiting_for_next_volume);
-    }
-
-    #[test]
-    fn invalid_retry_after_keeps_http_failure() {
+    fn an_invalid_retry_after_falls_back_to_the_backoff_schedule() {
         let state = RandomState::new();
         let error = RadarError::HttpStatus {
             url: String::from("https://example.invalid"),
@@ -284,34 +261,51 @@ mod tests {
                 error,
             },
             0,
-            Duration::from_secs(2),
+            BASE_DELAY,
             0,
             &state,
         );
         assert!(matches!(
             update.result,
             Err(FetchFailure {
-                error: RadarError::RetryAfter { request, source },
+                error: RadarError::InvalidRetryAfter { ref value },
                 ..
-            }) if matches!(*request, RadarError::HttpStatus { status: 503, .. })
-                && matches!(*source, RadarError::InvalidRetryAfter { ref value } if value == "invalid")
+            }) if value == "invalid"
         ));
-        assert!(update.retry_in.is_some());
+        assert!(update.retry_in.is_some(), "the retry still happens");
+        assert!(!update.waiting_for_next_volume);
     }
 
     #[test]
-    fn retry_delay_is_bounded() {
-        let random = RandomState::new();
-        for attempt in 0..10 {
-            assert_eq!(
-                jittered(Duration::from_secs(60), attempt, &random),
-                Duration::from_secs(60)
-            );
-            let short = jittered(Duration::from_secs(2), attempt, &random);
-            assert!(
-                (Duration::from_secs(2)..Duration::from_millis(2500)).contains(&short),
-                "unexpected jitter {short:?}"
-            );
-        }
+    fn a_decode_failure_waits_for_the_next_volume_after_one_retry() {
+        let state = RandomState::new();
+        let first = error_update(
+            FetchFailure {
+                operation: Operation::Decoding,
+                error: incomplete(),
+            },
+            1,
+            BASE_DELAY,
+            0,
+            &state,
+        );
+        assert!(first.retry_in.is_some());
+        assert!(!first.waiting_for_next_volume);
+        let second = error_update(
+            FetchFailure {
+                operation: Operation::Decoding,
+                error: incomplete(),
+            },
+            2,
+            Duration::from_secs(4),
+            1,
+            &state,
+        );
+        assert!(second.retry_in.is_none());
+        assert!(second.waiting_for_next_volume);
+        assert!(is_decode_failure(&incomplete()));
+        assert!(!is_decode_failure(&RadarError::VolumeGone {
+            key: String::from("2026/10/30/KPAH/KPAH20261030_023529_V06"),
+        }));
     }
 }

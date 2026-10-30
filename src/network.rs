@@ -1,4 +1,4 @@
-// oxrad: A storm-chaser-grade NEXRAD weather radar viewer
+// oxrad — A storm-chaser-grade NEXRAD weather radar viewer
 // Copyright (C) 2026 Micah Ostrow <bonzupii@protonmail.com>
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,16 +13,20 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//! The AWS NEXRAD Level II source: listing, ordering, and retrieval.
+
 use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::error::RadarError;
+use crate::stations::SiteId;
 use crate::time::{MS_PER_DAY, civil_from_days, now_unix_ms};
 
 const BUCKET_URL: &str = "https://unidata-nexrad-level2.s3.amazonaws.com";
 const LOOKBACK_DAYS: i64 = 3;
 const MAX_BODY_BYTES: u64 = 64 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_LIST_PAGES: usize = 10_000;
 const USER_AGENT: &str = concat!(
     "oxrad/",
     env!("CARGO_PKG_VERSION"),
@@ -109,11 +113,11 @@ fn tag_values<'a>(text: &'a str, tag: &str) -> Vec<&'a str> {
     values
 }
 
+/// Paginates a bucket listing prefix to exhaustion.
 fn list_keys(prefix: &str) -> Result<Vec<String>, RadarError> {
     let mut keys = Vec::new();
     let mut token: Option<String> = None;
     let mut seen_tokens = HashSet::new();
-    const MAX_LIST_PAGES: usize = 10_000;
     loop {
         if seen_tokens.len() >= MAX_LIST_PAGES {
             return Err(RadarError::Listing {
@@ -129,7 +133,7 @@ fn list_keys(prefix: &str) -> Result<Vec<String>, RadarError> {
             url.push_str(&encode_query_value(current));
         }
         let body = http_get(&url)?;
-        let xml = String::from_utf8(body).map_err(|_| RadarError::Listing {
+        let xml = String::from_utf8(body).map_err(|_| RadarError::ListingBody {
             prefix: String::from(prefix),
         })?;
         keys.extend(tag_values(&xml, "Key").into_iter().map(String::from));
@@ -172,7 +176,8 @@ fn is_volume_key(key: &str) -> bool {
     version.len() == 2 && version.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-pub fn latest_volume_key(site: &str) -> Result<String, RadarError> {
+/// The newest volume the feed lists for a site, ordered by its UTC timestamp.
+pub fn latest_volume_key(site: &SiteId) -> Result<String, RadarError> {
     for days_ago in 0..LOOKBACK_DAYS {
         let (year, month, day) = utc_day(days_ago)?;
         let prefix = format!("{year:04}/{month:02}/{day:02}/{site}/");
@@ -182,17 +187,28 @@ pub fn latest_volume_key(site: &str) -> Result<String, RadarError> {
         }
     }
     Err(RadarError::NoVolume {
-        site: String::from(site),
+        site: String::from(site.as_str()),
     })
 }
 
+/// Retrieves one Archive II volume. A 404 means the listing went stale.
 pub fn fetch_archive(key: &str) -> Result<Vec<u8>, RadarError> {
-    http_get(&format!("{BUCKET_URL}/{key}"))
+    match http_get(&format!("{BUCKET_URL}/{key}")) {
+        Ok(bytes) => Ok(bytes),
+        Err(RadarError::HttpStatus { status: 404, .. }) => Err(RadarError::VolumeGone {
+            key: String::from(key),
+        }),
+        Err(other) => Err(other),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::is_volume_key;
+    use super::*;
+
+    fn site() -> Result<SiteId, String> {
+        SiteId::parse("KPAH").map_err(|error| error.to_string())
+    }
 
     #[test]
     fn volume_listing_excludes_metadata() {
@@ -201,5 +217,82 @@ mod tests {
         assert!(!is_volume_key(
             "2026/10/29/KPAH/KPAH20261029_000115_V06_MDM"
         ));
+    }
+
+    #[test]
+    fn listing_xml_fields_are_extracted() {
+        let xml = "<ListBucketResult><IsTruncated>true</IsTruncated>\
+                   <Contents><Key>2026/10/30/KPAH/KPAH20261030_023529_V06</Key></Contents>\
+                   <Contents><Key>2026/10/30/KPAH/KPAH20261030_024005_V06</Key></Contents>\
+                   <NextContinuationToken>abc</NextContinuationToken></ListBucketResult>";
+        assert_eq!(
+            tag_values(xml, "Key"),
+            vec![
+                "2026/10/30/KPAH/KPAH20261030_023529_V06",
+                "2026/10/30/KPAH/KPAH20261030_024005_V06"
+            ]
+        );
+        assert_eq!(tag_values(xml, "IsTruncated"), vec!["true"]);
+        assert_eq!(tag_values(xml, "NextContinuationToken"), vec!["abc"]);
+    }
+
+    #[test]
+    fn query_values_keep_path_separators() {
+        assert_eq!(encode_query_value("2026/10/30/KPAH/"), "2026/10/30/KPAH/");
+        assert_eq!(encode_query_value("a b+c"), "a%20b%2Bc");
+    }
+
+    /// Exercises the live source: listing, ordering, retrieval, and the
+    /// completeness sentinels inside the decoded volume. A network failure
+    /// fails this test; it is not replaced with synthetic data.
+    #[test]
+    fn live_listing_retrieves_a_complete_current_volume() -> Result<(), String> {
+        let site = site()?;
+        let key = latest_volume_key(&site).map_err(|error| error.to_string())?;
+        assert!(is_volume_key(&key), "listed key {key}");
+        let name = key
+            .rsplit('/')
+            .next()
+            .ok_or("listed key has no file name")?;
+        assert!(name.starts_with("KPAH"), "listed key {key}");
+        assert_eq!(
+            name.len(),
+            "KPAH20261030_023529_V06".len(),
+            "volume file name {name}"
+        );
+        assert!(name.ends_with("_V06"), "volume file name {name}");
+        let stamp = name
+            .get(4..19)
+            .ok_or_else(|| format!("volume file name {name} has no timestamp"))?;
+        let digits = stamp
+            .chars()
+            .filter(|character| *character != '_')
+            .all(|character| character.is_ascii_digit());
+        assert!(digits, "volume timestamp {stamp}");
+        let bytes = fetch_archive(&key).map_err(|error| error.to_string())?;
+        assert!(bytes.len() > 1_000_000, "archive size {}", bytes.len());
+        let volume =
+            crate::radar::decode_volume(&site, &key, &bytes).map_err(|error| error.to_string())?;
+        assert!(
+            volume.sweep.radials.len() >= 360,
+            "radial count {}",
+            volume.sweep.radials.len()
+        );
+        assert_eq!(volume.skipped_radials, 0, "skipped radials");
+        let now = now_unix_ms().map_err(|error| error.to_string())?;
+        let age_ms = now.saturating_sub(volume.scan_unix_ms);
+        assert!(age_ms < 3 * 3_600_000, "live volume age {age_ms} ms");
+        Ok(())
+    }
+
+    #[test]
+    fn a_missing_volume_is_reported_as_a_stale_listing() -> Result<(), String> {
+        match fetch_archive("2026/10/30/KPAH/KPAH20261030_999999_V06") {
+            Err(RadarError::VolumeGone { key }) => {
+                assert_eq!(key, "2026/10/30/KPAH/KPAH20261030_999999_V06");
+                Ok(())
+            }
+            other => Err(format!("expected VolumeGone, got {other:?}")),
+        }
     }
 }

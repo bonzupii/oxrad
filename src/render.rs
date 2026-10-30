@@ -13,105 +13,171 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//! Radar gate geometry, overlay geometry, and the screen transform.
+//!
+//! Every gate corner is placed with the WGS84 geodesic direct solution from the
+//! site after its slant range is converted to ground range, then projected to
+//! Web Mercator. Vertices carry kilometre offsets from the site, which the GPU
+//! scales into the viewport, so one mesh serves every window size. The pointer
+//! lookup inverts the same model.
+
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{self, Receiver, Sender};
 
-use eframe::egui::{Color32, Mesh, Pos2, Rect, Shape, Vec2};
+use eframe::egui::{Color32, Pos2, Rect, Vec2};
 
 use crate::colormap::{color_for_reflectivity, range_folded_color};
 use crate::error::{CoordinateError, RenderError};
-use crate::gpu::RadarGpu;
 use crate::projection;
-use crate::radar::{GateCorner, GateValue, RadarBin, RadarVolume};
+use crate::radar::{GateValue, RadarVolume, RadialBins};
 
-const HOVER_CELL_PX: f32 = 8.0;
 const RADAR_ALPHA: u8 = 255;
-const CANONICAL_SIZE: f32 = 1080.0;
+const VERTEX_BYTES: usize = 12;
+/// Half-width of the radar disc as a fraction of the viewport side.
+const VIEW_MARGIN: f64 = 0.48;
+const RING_STEP_KM: f64 = 50.0;
+const RING_SAMPLES: u32 = 128;
+const GRID_SAMPLES: u32 = 64;
+const GRID_DEGREES_EACH_SIDE: i32 = 3;
 
-pub fn canonical_rect() -> Rect {
-    Rect::from_min_size(Pos2::ZERO, Vec2::splat(CANONICAL_SIZE))
+pub struct RangeRing {
+    pub range_km: f64,
+    pub points: Vec<Pos2>,
 }
 
-pub fn radar_viewport(rect: Rect) -> Rect {
-    Rect::from_center_size(rect.center(), Vec2::splat(rect.width().min(rect.height())))
+/// The gate under a map point.
+#[derive(Debug, Clone, Copy)]
+pub struct GateHit {
+    pub value: GateValue,
+    pub elevation_deg: f64,
 }
 
-pub struct RenderRequest {
-    pub volume: RadarVolume,
-    pub rect: Rect,
-    pub generation: u64,
+struct RadialLookup {
+    left: f64,
+    span: f64,
+    elevation_deg: f64,
+    first_gate_km: f64,
+    gate_width_km: f64,
+    gate_count: usize,
 }
 
-pub struct RenderResult {
-    pub volume: RadarVolume,
-    pub cache: Result<(RenderCache, Shape), RenderError>,
-    pub generation: u64,
+impl RadialLookup {
+    fn gate_at(&self, range_km: f64) -> Option<usize> {
+        let mut low = 0_usize;
+        let mut high = self.gate_count;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let centre = self.first_gate_km + middle as f64 * self.gate_width_km;
+            let near =
+                projection::ground_range(centre - self.gate_width_km / 2.0, self.elevation_deg)
+                    .ok()?;
+            if near <= range_km {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        let gate = low.checked_sub(1)?;
+        let centre = self.first_gate_km + gate as f64 * self.gate_width_km;
+        let far =
+            projection::ground_range(centre + self.gate_width_km / 2.0, self.elevation_deg).ok()?;
+        if range_km < far { Some(gate) } else { None }
+    }
 }
 
-pub struct RenderCache {
-    pub rect: Rect,
-    pub transform: ViewTransform,
+/// Azimuth and gate lookup over the sweep that was drawn.
+pub struct SweepLookup {
+    radials: Vec<RadialLookup>,
+}
+
+impl SweepLookup {
+    fn new(volume: &RadarVolume) -> Self {
+        let mut radials: Vec<RadialLookup> = Vec::with_capacity(volume.sweep.radials.len());
+        let mut previous: Option<f64> = None;
+        for radial in &volume.sweep.radials {
+            let span = (radial.azimuth_right_deg - radial.azimuth_left_deg).rem_euclid(360.0);
+            let left = previous.map_or(radial.azimuth_left_deg, |value| {
+                value + (radial.azimuth_left_deg - value).rem_euclid(360.0)
+            });
+            radials.push(RadialLookup {
+                left,
+                span,
+                elevation_deg: radial.elevation_deg,
+                first_gate_km: radial.first_gate_km,
+                gate_width_km: radial.gate_width_km,
+                gate_count: radial.values.len(),
+            });
+            previous = Some(left);
+        }
+        Self { radials }
+    }
+
+    fn radial_at(&self, azimuth_deg: f64) -> Option<usize> {
+        for turn in [-360.0, 0.0, 360.0] {
+            let target = azimuth_deg + turn;
+            let after = self.radials.partition_point(|radial| radial.left <= target);
+            if let Some(index) = after.checked_sub(1)
+                && let Some(radial) = self.radials.get(index)
+                && target < radial.left + radial.span
+            {
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    /// The gate whose drawn quad covers this ground range and azimuth.
+    pub fn gate(&self, volume: &RadarVolume, range_km: f64, azimuth_deg: f64) -> Option<GateHit> {
+        let index = self.radial_at(azimuth_deg)?;
+        let lookup = self.radials.get(index)?;
+        let gate = lookup.gate_at(range_km)?;
+        let radial = volume.sweep.radials.get(index)?;
+        let value = radial.values.get(gate).copied()?;
+        Some(GateHit {
+            value,
+            elevation_deg: radial.elevation_deg,
+        })
+    }
+}
+
+/// Everything a frame draws, built once per volume off the UI thread.
+pub struct RadarGeometry {
+    pub extent_km: f64,
     pub vertices: Vec<u8>,
     pub indices: Vec<u8>,
     pub index_count: u32,
-    pub hover: HoverIndex,
-    pub rings: Vec<(f64, Vec<Pos2>)>,
+    pub rings: Vec<RangeRing>,
     pub grid: Vec<Vec<Pos2>>,
+    pub lookup: SweepLookup,
+    pub site_lat: f64,
+    pub site_lon: f64,
+    pub site_x: f64,
+    pub site_y: f64,
 }
 
-#[derive(Clone, Copy)]
-pub struct ViewTransform {
-    center: Pos2,
-    pixels_per_km: f64,
-    site_lat: f64,
-    site_lon: f64,
-    site_x: f64,
-    site_y: f64,
+pub struct BuildRequest {
+    pub volume: RadarVolume,
+    pub generation: u64,
 }
 
-pub struct PointerInfo {
-    pub lat: f64,
-    pub lon: f64,
-    pub range_km: f64,
-    pub azimuth_deg: f64,
+pub struct BuildResult {
+    pub volume: RadarVolume,
+    pub geometry: Result<RadarGeometry, RenderError>,
+    pub generation: u64,
 }
 
-pub struct HoverIndex {
-    origin: Pos2,
-    cell: f32,
-    cols: usize,
-    rows: usize,
-    cells: Vec<Vec<usize>>,
-    entries: Vec<HoverEntry>,
-}
-
-struct HoverEntry {
-    points: [Pos2; 4],
-    value: GateValue,
-    bounds: Rect,
-}
-
-pub fn start_render_thread(
-    gpu: Option<RadarGpu>,
-    errors: Sender<u64>,
-) -> (Sender<RenderRequest>, Receiver<RenderResult>) {
-    let (request_sender, request_receiver) = mpsc::channel::<RenderRequest>();
-    let (result_sender, result_receiver) = mpsc::channel::<RenderResult>();
+/// Runs geometry construction on its own thread; a panic is reported, not fatal.
+pub fn start_build_thread() -> (Sender<BuildRequest>, Receiver<BuildResult>) {
+    let (request_sender, request_receiver) = mpsc::channel::<BuildRequest>();
+    let (result_sender, result_receiver) = mpsc::channel::<BuildResult>();
     std::thread::spawn(move || {
         while let Ok(request) = request_receiver.recv() {
-            let cache = catch_unwind(AssertUnwindSafe(|| {
-                let mut cache = build_render(&request.volume, request.rect)?;
-                let gpu = gpu.as_ref().ok_or(RenderError::GpuUnavailable)?;
-                let shape = gpu.upload(&cache, errors.clone(), request.generation)?;
-                cache.vertices = Vec::new();
-                cache.indices = Vec::new();
-                Ok((cache, shape))
-            }))
-            .map_err(|_| RenderError::Panic)
-            .and_then(std::convert::identity);
-            let result = RenderResult {
+            let geometry = catch_unwind(AssertUnwindSafe(|| build_geometry(&request.volume)))
+                .map_err(|_| RenderError::Panic)
+                .and_then(std::convert::identity);
+            let result = BuildResult {
                 volume: request.volume,
-                cache,
+                geometry,
                 generation: request.generation,
             };
             if result_sender.send(result).is_err() {
@@ -122,172 +188,325 @@ pub fn start_render_thread(
     (request_sender, result_receiver)
 }
 
-pub fn build_render(volume: &RadarVolume, rect: Rect) -> Result<RenderCache, RenderError> {
-    let transform =
-        ViewTransform::new(rect, volume).map_err(|source| RenderError::Coordinate { source })?;
-    let mut mesh = Mesh::default();
-    let mut hover = HoverIndex::new(rect);
-    let mut previous = None;
-    let mut paths = None;
-
-    for bin in &volume.bins {
-        let points = screen_quad(bin, &transform, &mut previous, &mut paths)?;
-        let bounds = quad_bounds(&points);
-        if !rect.intersects(bounds) {
-            continue;
-        }
-        if !matches!(bin.value, GateValue::BelowThreshold) {
-            let color = bin_color(bin.value)?;
-            add_quad(&mut mesh, &points, color)?;
-        }
-        hover.insert(points, bin.value, bounds);
-    }
-
-    let index_count = u32::try_from(mesh.indices.len()).map_err(|_| RenderError::MeshSize {
-        vertices: mesh.vertices.len(),
-    })?;
-    let mut vertices = Vec::with_capacity(mesh.vertices.len() * 12);
-    for vertex in &mesh.vertices {
-        let x = 2.0 * (vertex.pos.x - rect.left()) / rect.width() - 1.0;
-        let y = 1.0 - 2.0 * (vertex.pos.y - rect.top()) / rect.height();
-        vertices.extend_from_slice(&x.to_le_bytes());
-        vertices.extend_from_slice(&y.to_le_bytes());
-        vertices.extend_from_slice(&vertex.color.to_array());
-    }
-    let mut indices = Vec::with_capacity(mesh.indices.len() * 4);
-    for index in &mesh.indices {
-        indices.extend_from_slice(&index.to_le_bytes());
-    }
-    Ok(RenderCache {
-        rect,
-        transform,
-        vertices,
-        indices,
-        index_count,
-        hover,
-        rings: build_rings(&transform, volume.max_range_km)?,
-        grid: build_grid(&transform)?,
-    })
+fn place_geo(lat: f64, lon: f64, site_x: f64, site_y: f64) -> Result<Pos2, CoordinateError> {
+    let (x, y) = projection::mercator(lat, lon)?;
+    Ok(Pos2::new(
+        projection::mercator_wrap_delta(x - site_x) as f32,
+        (y - site_y) as f32,
+    ))
 }
 
-fn build_grid(transform: &ViewTransform) -> Result<Vec<Vec<Pos2>>, RenderError> {
-    let mut lines = Vec::new();
-    for step in -2..=2 {
-        for meridian in [true, false] {
-            let mut line = Vec::new();
-            for sample in 0..=32 {
-                let delta = -2.5 + 5.0 * f64::from(sample) / 32.0;
-                let (lat, lon) = if meridian {
-                    (
-                        transform.site_lat + delta,
-                        transform.site_lon + f64::from(step),
-                    )
-                } else {
-                    (
-                        transform.site_lat + f64::from(step),
-                        transform.site_lon + delta,
-                    )
-                };
-                let lon = (lon + 180.0).rem_euclid(360.0) - 180.0;
-                if (-85.051_128_779_806_6..=85.051_128_779_806_6).contains(&lat) {
-                    line.push(
-                        transform
-                            .screen_geo(lat, lon)
-                            .map_err(|source| RenderError::Coordinate { source })?,
-                    );
-                }
-            }
-            lines.push(line);
-        }
+fn place_corner(
+    path: &projection::GeodesicPath,
+    range_km: f64,
+    site_x: f64,
+    site_y: f64,
+) -> Result<Pos2, RenderError> {
+    let (lat, lon) = path
+        .position(range_km)
+        .map_err(|source| RenderError::Coordinate { source })?;
+    place_geo(lat, lon, site_x, site_y).map_err(|source| RenderError::Coordinate { source })
+}
+
+fn bin_color(value: GateValue) -> Result<Option<Color32>, RenderError> {
+    let rgba = match value {
+        GateValue::Measured(dbz) => color_for_reflectivity(dbz),
+        GateValue::BelowThreshold => return Ok(None),
+        GateValue::RangeFolded => Ok(range_folded_color()),
     }
-    Ok(lines)
+    .map_err(|source| RenderError::Color { source })?;
+    Ok(Some(Color32::from_rgba_unmultiplied(
+        rgba[0],
+        rgba[1],
+        rgba[2],
+        RADAR_ALPHA,
+    )))
+}
+
+fn push_quad(
+    vertices: &mut Vec<u8>,
+    indices: &mut Vec<u8>,
+    corners: [Pos2; 4],
+    color: Color32,
+) -> Result<(), RenderError> {
+    let count = vertices.len() / VERTEX_BYTES;
+    let base = u32::try_from(count).map_err(|_| RenderError::MeshSize { vertices: count })?;
+    if base.checked_add(4).is_none() {
+        return Err(RenderError::MeshSize { vertices: count });
+    }
+    let channels = color.to_array();
+    for corner in corners {
+        vertices.extend_from_slice(&corner.x.to_le_bytes());
+        vertices.extend_from_slice(&corner.y.to_le_bytes());
+        vertices.extend_from_slice(&channels);
+    }
+    for index in [base, base + 1, base + 2, base, base + 2, base + 3] {
+        indices.extend_from_slice(&index.to_le_bytes());
+    }
+    Ok(())
+}
+
+struct BuildState {
+    vertices: Vec<u8>,
+    indices: Vec<u8>,
+    extent_km: f64,
+    site_x: f64,
+    site_y: f64,
+    near: [Pos2; 2],
+    near_slant: Option<f64>,
+}
+
+impl BuildState {
+    fn corners_at(
+        &mut self,
+        slant_km: f64,
+        elevation_deg: f64,
+        left: &projection::GeodesicPath,
+        right: &projection::GeodesicPath,
+    ) -> Result<[Pos2; 2], RenderError> {
+        let ground = projection::ground_range(slant_km, elevation_deg)
+            .map_err(|source| RenderError::Coordinate { source })?;
+        let left_corner = place_corner(left, ground, self.site_x, self.site_y)?;
+        let right_corner = place_corner(right, ground, self.site_x, self.site_y)?;
+        self.extent_km = self
+            .extent_km
+            .max(f64::from(left_corner.x.hypot(left_corner.y)))
+            .max(f64::from(right_corner.x.hypot(right_corner.y)));
+        Ok([left_corner, right_corner])
+    }
+}
+
+fn radial_quads(
+    radial: &RadialBins,
+    left_path: &projection::GeodesicPath,
+    right_path: &projection::GeodesicPath,
+    build: &mut BuildState,
+) -> Result<(), RenderError> {
+    let width = radial.gate_width_km;
+    for (gate, value) in radial.values.iter().enumerate() {
+        let centre = radial.first_gate_km + gate as f64 * width;
+        let near_slant = centre - width / 2.0;
+        let far_slant = centre + width / 2.0;
+        let colour = bin_color(*value)?;
+        if build.near_slant != Some(near_slant) {
+            build.near =
+                build.corners_at(near_slant, radial.elevation_deg, left_path, right_path)?;
+        }
+        let far = build.corners_at(far_slant, radial.elevation_deg, left_path, right_path)?;
+        if let Some(colour) = colour {
+            push_quad(
+                &mut build.vertices,
+                &mut build.indices,
+                [build.near[0], build.near[1], far[1], far[0]],
+                colour,
+            )?;
+        }
+        build.near = far;
+        build.near_slant = Some(far_slant);
+    }
+    Ok(())
 }
 
 fn build_rings(
-    transform: &ViewTransform,
-    max_range_km: f64,
-) -> Result<Vec<(f64, Vec<Pos2>)>, RenderError> {
+    volume: &RadarVolume,
+    site_x: f64,
+    site_y: f64,
+) -> Result<Vec<RangeRing>, RenderError> {
     let mut rings = Vec::new();
-    let mut range_km = 50.0;
-    while range_km <= max_range_km {
-        let mut points = Vec::with_capacity(129);
-        for step in 0..=128 {
-            let corner = GateCorner {
-                range_km,
-                azimuth_deg: f64::from(step) * 360.0 / 128.0,
-            };
+    let mut range_km = RING_STEP_KM;
+    while range_km <= volume.sweep.max_ground_range_km {
+        let mut points = Vec::with_capacity(RING_SAMPLES as usize + 1);
+        for step in 0..=RING_SAMPLES {
+            let azimuth_deg = f64::from(step) * 360.0 / f64::from(RING_SAMPLES);
+            let (lat, lon) =
+                projection::forward(range_km, azimuth_deg, volume.site_lat, volume.site_lon)
+                    .map_err(|source| RenderError::Coordinate { source })?;
             points.push(
-                transform
-                    .screen_corner(corner)
+                place_geo(lat, lon, site_x, site_y)
                     .map_err(|source| RenderError::Coordinate { source })?,
             );
         }
-        rings.push((range_km, points));
-        range_km += 50.0;
+        rings.push(RangeRing { range_km, points });
+        range_km += RING_STEP_KM;
     }
     Ok(rings)
 }
 
-impl ViewTransform {
-    pub fn new(rect: Rect, volume: &RadarVolume) -> Result<Self, CoordinateError> {
-        let (site_x, site_y) = projection::mercator(volume.site_lat, volume.site_lon)?;
-        let range_km = volume.max_range_km;
-        if !range_km.is_finite() || range_km <= 0.0 {
-            return Err(CoordinateError::ViewRange { range_km });
+fn grid_line(
+    start: (f64, f64),
+    step: (f64, f64),
+    site_x: f64,
+    site_y: f64,
+) -> Result<Vec<Pos2>, RenderError> {
+    let mut points = Vec::with_capacity(GRID_SAMPLES as usize + 1);
+    for sample in 0..=GRID_SAMPLES {
+        let fraction = f64::from(sample) / f64::from(GRID_SAMPLES);
+        let lat = start.0 + step.0 * fraction;
+        let lon = start.1 + step.1 * fraction;
+        if (-85.051_128_779_806_6..=85.051_128_779_806_6).contains(&lat) {
+            points.push(
+                place_geo(lat, lon, site_x, site_y)
+                    .map_err(|source| RenderError::Coordinate { source })?,
+            );
         }
-        let scale = volume
-            .site_lat
-            .clamp(-85.051_128_779_806_6, 85.051_128_779_806_6)
-            .to_radians()
-            .cos();
-        let pixels_per_km = f64::from(rect.width().min(rect.height())) * 0.48 * scale / range_km;
-        Ok(Self {
-            center: rect.center(),
-            pixels_per_km,
-            site_lat: volume.site_lat,
-            site_lon: volume.site_lon,
+    }
+    Ok(points)
+}
+
+fn build_grid(
+    volume: &RadarVolume,
+    site_x: f64,
+    site_y: f64,
+) -> Result<Vec<Vec<Pos2>>, RenderError> {
+    let mut lines = Vec::new();
+    let span = f64::from(GRID_DEGREES_EACH_SIDE) + 0.5;
+    let first_latitude = volume.site_lat.floor() as i32 - GRID_DEGREES_EACH_SIDE;
+    let last_latitude = volume.site_lat.ceil() as i32 + GRID_DEGREES_EACH_SIDE;
+    let first_longitude = volume.site_lon.floor() as i32 - GRID_DEGREES_EACH_SIDE;
+    let last_longitude = volume.site_lon.ceil() as i32 + GRID_DEGREES_EACH_SIDE;
+    for latitude in first_latitude..=last_latitude {
+        lines.push(grid_line(
+            (f64::from(latitude), volume.site_lon - span),
+            (0.0, 2.0 * span),
             site_x,
             site_y,
+        )?);
+    }
+    for longitude in first_longitude..=last_longitude {
+        lines.push(grid_line(
+            (volume.site_lat - span, f64::from(longitude)),
+            (2.0 * span, 0.0),
+            site_x,
+            site_y,
+        )?);
+    }
+    Ok(lines)
+}
+
+/// Builds the mesh, overlays, and pointer lookup for one volume.
+pub fn build_geometry(volume: &RadarVolume) -> Result<RadarGeometry, RenderError> {
+    let (site_x, site_y) = projection::mercator(volume.site_lat, volume.site_lon)
+        .map_err(|source| RenderError::Coordinate { source })?;
+    let mut build = BuildState {
+        vertices: Vec::new(),
+        indices: Vec::new(),
+        extent_km: 0.0,
+        site_x,
+        site_y,
+        near: [Pos2::ZERO; 2],
+        near_slant: None,
+    };
+    for radial in &volume.sweep.radials {
+        let left_path = projection::GeodesicPath::new(
+            volume.site_lat,
+            volume.site_lon,
+            radial.azimuth_left_deg,
+        )
+        .map_err(|source| RenderError::Coordinate { source })?;
+        let right_path = projection::GeodesicPath::new(
+            volume.site_lat,
+            volume.site_lon,
+            radial.azimuth_right_deg,
+        )
+        .map_err(|source| RenderError::Coordinate { source })?;
+        build.near_slant = None;
+        radial_quads(radial, &left_path, &right_path, &mut build)?;
+    }
+    let index_count =
+        u32::try_from(build.indices.len() / 4).map_err(|_| RenderError::MeshSize {
+            vertices: build.vertices.len() / VERTEX_BYTES,
+        })?;
+    Ok(RadarGeometry {
+        extent_km: build.extent_km,
+        vertices: build.vertices,
+        indices: build.indices,
+        index_count,
+        rings: build_rings(volume, site_x, site_y)?,
+        grid: build_grid(volume, site_x, site_y)?,
+        lookup: SweepLookup::new(volume),
+        site_lat: volume.site_lat,
+        site_lon: volume.site_lon,
+        site_x,
+        site_y,
+    })
+}
+
+/// Clip-space units per kilometre of offset, shared by the mesh shader and the
+/// screen transform so both place a gate in the same spot.
+pub fn projection_scale(extent_km: f64) -> Result<f64, CoordinateError> {
+    if !(extent_km.is_finite() && extent_km > 0.0) {
+        return Err(CoordinateError::ViewExtent { extent_km });
+    }
+    Ok(2.0 * VIEW_MARGIN / extent_km)
+}
+
+/// The square of the window the radar disc is drawn into.
+pub fn radar_viewport(rect: Rect) -> Rect {
+    Rect::from_center_size(rect.center(), Vec2::splat(rect.width().min(rect.height())))
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PointerInfo {
+    pub lat: f64,
+    pub lon: f64,
+    pub range_km: f64,
+    pub azimuth_deg: f64,
+}
+
+/// Screen placement for one geometry at the current viewport size.
+#[derive(Debug, Clone, Copy)]
+pub struct ViewTransform {
+    center: Pos2,
+    pixels_per_km: f64,
+    site_lat: f64,
+    site_lon: f64,
+    site_x: f64,
+    site_y: f64,
+}
+
+impl ViewTransform {
+    pub fn new(viewport: Rect, geometry: &RadarGeometry) -> Result<Self, CoordinateError> {
+        let side = f64::from(viewport.width().min(viewport.height()));
+        if !(side.is_finite() && side > 0.0) {
+            return Err(CoordinateError::Viewport {
+                width: viewport.width(),
+                height: viewport.height(),
+            });
+        }
+        let scale = projection_scale(geometry.extent_km)?;
+        Ok(Self {
+            center: viewport.center(),
+            pixels_per_km: 0.5 * side * scale,
+            site_lat: geometry.site_lat,
+            site_lon: geometry.site_lon,
+            site_x: geometry.site_x,
+            site_y: geometry.site_y,
         })
     }
 
-    pub fn for_viewport(&self, viewport: Rect) -> Self {
-        Self {
-            center: viewport.center(),
-            pixels_per_km: self.pixels_per_km * f64::from(viewport.width() / CANONICAL_SIZE),
-            site_lat: self.site_lat,
-            site_lon: self.site_lon,
-            site_x: self.site_x,
-            site_y: self.site_y,
-        }
-    }
-
-    pub fn screen_local(&self, east_km: f64, north_km: f64) -> Pos2 {
+    /// Places a site-relative kilometre offset in the window.
+    pub fn screen(&self, offset: Pos2) -> Pos2 {
         self.center
             + Vec2::new(
-                (east_km * self.pixels_per_km) as f32,
-                (-north_km * self.pixels_per_km) as f32,
+                (f64::from(offset.x) * self.pixels_per_km) as f32,
+                (-f64::from(offset.y) * self.pixels_per_km) as f32,
             )
     }
 
-    pub fn local_at(&self, position: Pos2) -> (f64, f64) {
-        let east_km = f64::from(position.x - self.center.x) / self.pixels_per_km;
-        let north_km = -f64::from(position.y - self.center.y) / self.pixels_per_km;
-        (east_km, north_km)
-    }
-
-    pub fn screen_geo(&self, lat: f64, lon: f64) -> Result<Pos2, CoordinateError> {
-        let (x, y) = projection::mercator(lat, lon)?;
-        Ok(self.screen_local(
-            projection::mercator_wrap_delta(x - self.site_x),
-            y - self.site_y,
-        ))
+    /// The site-relative kilometre offset under a window position.
+    pub fn offset_at(&self, position: Pos2) -> Pos2 {
+        Pos2::new(
+            (f64::from(position.x - self.center.x) / self.pixels_per_km) as f32,
+            (-f64::from(position.y - self.center.y) / self.pixels_per_km) as f32,
+        )
     }
 
     pub fn pointer_info(&self, position: Pos2) -> Result<PointerInfo, CoordinateError> {
-        let (east_km, north_km) = self.local_at(position);
-        let (lat, lon) =
-            projection::mercator_inverse(self.site_x + east_km, self.site_y + north_km)?;
+        let offset = self.offset_at(position);
+        let (lat, lon) = projection::mercator_inverse(
+            self.site_x + f64::from(offset.x),
+            self.site_y + f64::from(offset.y),
+        )?;
         let (range_km, azimuth_deg) = projection::inverse(lat, lon, self.site_lat, self.site_lon)?;
         Ok(PointerInfo {
             lat,
@@ -296,596 +515,269 @@ impl ViewTransform {
             azimuth_deg,
         })
     }
-
-    fn screen_corner(&self, corner: GateCorner) -> Result<Pos2, CoordinateError> {
-        let (lat, lon) = projection::forward(
-            corner.range_km,
-            corner.azimuth_deg,
-            self.site_lat,
-            self.site_lon,
-        )?;
-        self.screen_geo(lat, lon)
-    }
-}
-
-impl HoverIndex {
-    fn new(rect: Rect) -> Self {
-        let cols = (rect.width() / HOVER_CELL_PX).ceil().max(1.0) as usize + 1;
-        let rows = (rect.height() / HOVER_CELL_PX).ceil().max(1.0) as usize + 1;
-        Self {
-            origin: rect.min,
-            cell: HOVER_CELL_PX,
-            cols,
-            rows,
-            cells: vec![Vec::new(); cols * rows],
-            entries: Vec::new(),
-        }
-    }
-
-    fn insert(&mut self, points: [Pos2; 4], value: GateValue, bounds: Rect) {
-        let (min_row, min_col, max_row, max_col) = self.cell_range(bounds);
-        let entry_index = self.entries.len();
-        self.entries.push(HoverEntry {
-            points,
-            value,
-            bounds,
-        });
-        for row in min_row..=max_row {
-            for col in min_col..=max_col {
-                let Some(index) = row
-                    .checked_mul(self.cols)
-                    .and_then(|value| value.checked_add(col))
-                else {
-                    continue;
-                };
-                if let Some(cell) = self.cells.get_mut(index) {
-                    cell.push(entry_index);
-                }
-            }
-        }
-    }
-
-    fn cell_range(&self, bounds: Rect) -> (usize, usize, usize, usize) {
-        let min_col = self.col_clamped(bounds.min.x);
-        let max_col = self.col_clamped(bounds.max.x);
-        let min_row = self.row_clamped(bounds.min.y);
-        let max_row = self.row_clamped(bounds.max.y);
-        (min_row, min_col, max_row, max_col)
-    }
-
-    fn col_clamped(&self, x: f32) -> usize {
-        let value = ((x - self.origin.x) / self.cell).floor();
-        value.clamp(0.0, (self.cols - 1) as f32) as usize
-    }
-
-    fn row_clamped(&self, y: f32) -> usize {
-        let value = ((y - self.origin.y) / self.cell).floor();
-        value.clamp(0.0, (self.rows - 1) as f32) as usize
-    }
-
-    fn col(&self, x: f32) -> Option<usize> {
-        let value = ((x - self.origin.x) / self.cell).floor();
-        if value < 0.0 {
-            return None;
-        }
-        let index = value as usize;
-        if index >= self.cols {
-            return None;
-        }
-        Some(index)
-    }
-
-    fn row(&self, y: f32) -> Option<usize> {
-        let value = ((y - self.origin.y) / self.cell).floor();
-        if value < 0.0 {
-            return None;
-        }
-        let index = value as usize;
-        if index >= self.rows {
-            return None;
-        }
-        Some(index)
-    }
-
-    pub fn find(&self, position: Pos2) -> Option<GateValue> {
-        let col = self.col(position.x)?;
-        let row = self.row(position.y)?;
-        let cell_index = row.checked_mul(self.cols)?.checked_add(col)?;
-        let cell = self.cells.get(cell_index)?;
-        let mut best: Option<&HoverEntry> = None;
-        for index in cell {
-            let Some(entry) = self.entries.get(*index) else {
-                continue;
-            };
-            if !entry.bounds.contains(position) {
-                continue;
-            }
-            if !quad_contains(position, entry.points) {
-                continue;
-            }
-            let better = best.is_none_or(|current| {
-                entry.bounds.width() * entry.bounds.height()
-                    < current.bounds.width() * current.bounds.height()
-            });
-            if better {
-                best = Some(entry);
-            }
-        }
-        best.map(|entry| entry.value)
-    }
-}
-
-struct PreviousEdge {
-    left: GateCorner,
-    right: GateCorner,
-    left_screen: Pos2,
-    right_screen: Pos2,
-}
-
-const fn same_corner(a: GateCorner, b: GateCorner) -> bool {
-    a.range_km.to_bits() == b.range_km.to_bits()
-        && a.azimuth_deg.to_bits() == b.azimuth_deg.to_bits()
-}
-
-struct RadialPaths {
-    left_azimuth: u64,
-    right_azimuth: u64,
-    left: projection::GeodesicPath,
-    right: projection::GeodesicPath,
-}
-
-impl RadialPaths {
-    fn new(
-        transform: &ViewTransform,
-        left: GateCorner,
-        right: GateCorner,
-    ) -> Result<Self, RenderError> {
-        let path = |azimuth| {
-            projection::GeodesicPath::new(transform.site_lat, transform.site_lon, azimuth)
-                .map_err(|source| RenderError::Coordinate { source })
-        };
-        Ok(Self {
-            left_azimuth: left.azimuth_deg.to_bits(),
-            right_azimuth: right.azimuth_deg.to_bits(),
-            left: path(left.azimuth_deg)?,
-            right: path(right.azimuth_deg)?,
-        })
-    }
-
-    const fn matches(&self, left: GateCorner, right: GateCorner) -> bool {
-        self.left_azimuth == left.azimuth_deg.to_bits()
-            && self.right_azimuth == right.azimuth_deg.to_bits()
-    }
-}
-
-fn project_path(
-    transform: &ViewTransform,
-    path: &projection::GeodesicPath,
-    range: f64,
-) -> Result<Pos2, RenderError> {
-    let (lat, lon) = path
-        .position(range)
-        .map_err(|source| RenderError::Coordinate { source })?;
-    transform
-        .screen_geo(lat, lon)
-        .map_err(|source| RenderError::Coordinate { source })
-}
-
-fn screen_quad(
-    bin: &RadarBin,
-    transform: &ViewTransform,
-    previous: &mut Option<PreviousEdge>,
-    paths: &mut Option<RadialPaths>,
-) -> Result<[Pos2; 4], RenderError> {
-    let [near_left, near_right, far_right, far_left] = bin.corners;
-    if paths
-        .as_ref()
-        .is_none_or(|paths| !paths.matches(near_left, near_right))
-    {
-        *paths = Some(RadialPaths::new(transform, near_left, near_right)?);
-    }
-    let Some(paths) = paths else {
-        return Err(RenderError::MissingGeodesicPaths);
-    };
-    let (left, right) = match previous.as_ref() {
-        Some(edge) if same_corner(edge.left, near_left) && same_corner(edge.right, near_right) => {
-            (edge.left_screen, edge.right_screen)
-        }
-        Some(_) | None => (
-            project_path(transform, &paths.left, near_left.range_km)?,
-            project_path(transform, &paths.right, near_right.range_km)?,
-        ),
-    };
-    let far_left_screen = project_path(transform, &paths.left, far_left.range_km)?;
-    let far_right_screen = project_path(transform, &paths.right, far_right.range_km)?;
-    *previous = Some(PreviousEdge {
-        left: far_left,
-        right: far_right,
-        left_screen: far_left_screen,
-        right_screen: far_right_screen,
-    });
-    Ok([left, right, far_right_screen, far_left_screen])
-}
-
-const fn quad_bounds(points: &[Pos2; 4]) -> Rect {
-    let [p0, p1, p2, p3] = *points;
-    let min_x = p0.x.min(p1.x).min(p2.x).min(p3.x);
-    let max_x = p0.x.max(p1.x).max(p2.x).max(p3.x);
-    let min_y = p0.y.min(p1.y).min(p2.y).min(p3.y);
-    let max_y = p0.y.max(p1.y).max(p2.y).max(p3.y);
-    Rect::from_min_max(Pos2::new(min_x, min_y), Pos2::new(max_x, max_y))
-}
-
-fn add_quad(mesh: &mut Mesh, points: &[Pos2; 4], color: Color32) -> Result<(), RenderError> {
-    let vertices = mesh.vertices.len();
-    let start = u32::try_from(vertices).map_err(|_| RenderError::MeshSize { vertices })?;
-    if start.checked_add(3).is_none() {
-        return Err(RenderError::MeshSize { vertices });
-    }
-    for point in points {
-        mesh.colored_vertex(*point, color);
-    }
-    mesh.add_triangle(start, start + 1, start + 2);
-    mesh.add_triangle(start, start + 2, start + 3);
-    Ok(())
-}
-
-fn bin_color(value: GateValue) -> Result<Color32, RenderError> {
-    let rgba = match value {
-        GateValue::Measured(dbz) => color_for_reflectivity(dbz),
-        GateValue::BelowThreshold => color_for_reflectivity(crate::colormap::MIN_REFLECTIVITY_DBZ),
-        GateValue::RangeFolded => Ok(range_folded_color()),
-    }
-    .map_err(|source| RenderError::Color { source })?;
-    Ok(Color32::from_rgba_unmultiplied(
-        rgba[0],
-        rgba[1],
-        rgba[2],
-        RADAR_ALPHA,
-    ))
-}
-
-fn quad_contains(position: Pos2, points: [Pos2; 4]) -> bool {
-    let [p0, p1, p2, p3] = points;
-    point_in_triangle(position, p0, p1, p2) || point_in_triangle(position, p0, p2, p3)
-}
-
-fn point_in_triangle(p: Pos2, a: Pos2, b: Pos2, c: Pos2) -> bool {
-    if edge(a, b, c).abs() <= f32::MIN_POSITIVE {
-        return false;
-    }
-    let d1 = edge(p, a, b);
-    let d2 = edge(p, b, c);
-    let d3 = edge(p, c, a);
-    let has_negative = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
-    let has_positive = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
-    !(has_negative && has_positive)
-}
-
-fn edge(p1: Pos2, p2: Pos2, p3: Pos2) -> f32 {
-    (p1.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (p1.y - p3.y)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eframe::egui::{Pos2, Rect, Vec2};
+    use crate::error::ColorMapError;
+    use crate::radar::RadarSweep;
+    use crate::stations::SiteId;
 
-    #[derive(Debug)]
-    enum TestFailure {
-        Coordinate(CoordinateError),
-        Render(RenderError),
-        Value {
-            label: &'static str,
-            expected: f64,
-            actual: f64,
-            tolerance: f64,
-        },
-        Missing {
-            label: &'static str,
-            expected: &'static str,
-        },
-        Count {
-            label: &'static str,
-            expected: usize,
-            actual: usize,
-        },
+    const SITE_LAT: f64 = 37.068_33;
+    const SITE_LON: f64 = -88.771_94;
+
+    fn site() -> Result<SiteId, String> {
+        SiteId::parse("KPAH").map_err(|error| error.to_string())
     }
 
-    impl From<CoordinateError> for TestFailure {
-        fn from(source: CoordinateError) -> Self {
-            Self::Coordinate(source)
+    fn radial(left: f64, right: f64, elevation_deg: f64, values: Vec<GateValue>) -> RadialBins {
+        RadialBins {
+            azimuth_number: 1,
+            azimuth_left_deg: left,
+            azimuth_right_deg: right,
+            elevation_deg,
+            first_gate_km: 74.75,
+            gate_width_km: 0.5,
+            values,
         }
     }
 
-    impl From<RenderError> for TestFailure {
-        fn from(source: RenderError) -> Self {
-            Self::Render(source)
-        }
-    }
-
-    impl std::fmt::Display for TestFailure {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                Self::Coordinate(error) => write!(formatter, "{error}"),
-                Self::Render(error) => write!(formatter, "{error}"),
-                Self::Value {
-                    label,
-                    expected,
-                    actual,
-                    tolerance,
-                } => write!(
-                    formatter,
-                    "{label}: expected {expected}, got {actual}, tolerance {tolerance}"
-                ),
-                Self::Missing { label, expected } => {
-                    write!(formatter, "{label}: expected {expected}")
-                }
-                Self::Count {
-                    label,
-                    expected,
-                    actual,
-                } => write!(formatter, "{label}: expected {expected}, got {actual}"),
-            }
-        }
-    }
-
-    /// Screen coordinates are `f32`, so a position round trip through
-    /// [`ViewTransform::screen_local`] and [`ViewTransform::local_at`] resolves to
-    /// about one `f32` unit at 800 px, roughly 0.1 m at this scale.
-    const SCREEN_ROUND_TRIP_KM: f64 = 1e-4;
-
-    fn expect_within(
-        label: &'static str,
-        expected: f64,
-        actual: f64,
-        tolerance: f64,
-    ) -> Result<(), TestFailure> {
-        if (actual - expected).abs() <= tolerance {
-            Ok(())
-        } else {
-            Err(TestFailure::Value {
-                label,
-                expected,
-                actual,
-                tolerance,
-            })
-        }
-    }
-
-    fn empty_volume() -> RadarVolume {
-        RadarVolume {
-            site_lat: 37.0,
-            site_lon: -88.0,
-            bins: Vec::new(),
-            max_range_km: 100.0,
-            scan_unix_ms: 0,
-            below_threshold_bins: 0,
-            range_folded_bins: 0,
+    fn volume(radials: Vec<RadialBins>, max_ground_range_km: f64) -> Result<RadarVolume, String> {
+        Ok(RadarVolume {
+            site: site()?,
+            site_lat: SITE_LAT,
+            site_lon: SITE_LON,
+            scan_unix_ms: 1_793_327_729_000,
+            sweep: RadarSweep {
+                elevation_deg: 0.0,
+                elevation_number: 1,
+                radials,
+                below_threshold: 0,
+                range_folded: 0,
+                max_ground_range_km,
+            },
             skipped_radials: 0,
             skipped_non_data: 0,
             moment_error: None,
-        }
+        })
     }
 
+    fn build(
+        radials: Vec<RadialBins>,
+        max_ground_range_km: f64,
+    ) -> Result<(RadarVolume, RadarGeometry), String> {
+        let volume = volume(radials, max_ground_range_km)?;
+        let geometry = build_geometry(&volume).map_err(|error| error.to_string())?;
+        Ok((volume, geometry))
+    }
+
+    fn vertex(geometry: &RadarGeometry, index: usize) -> Result<Pos2, String> {
+        let start = index * VERTEX_BYTES;
+        let x: [u8; 4] = geometry
+            .vertices
+            .get(start..start + 4)
+            .ok_or("vertex x")?
+            .try_into()
+            .map_err(|_| String::from("vertex x"))?;
+        let y: [u8; 4] = geometry
+            .vertices
+            .get(start + 4..start + 8)
+            .ok_or("vertex y")?
+            .try_into()
+            .map_err(|_| String::from("vertex y"))?;
+        Ok(Pos2::new(f32::from_le_bytes(x), f32::from_le_bytes(y)))
+    }
+
+    /// At zero elevation the 75 km slant range converts to 74.998 km of ground
+    /// range, so the corner sits 2 m inside the roadmap's 75 km reference point;
+    /// 5e-5 degrees is 4.4 m at this latitude.
     #[test]
-    fn screen_and_local_round_trip() -> Result<(), TestFailure> {
-        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 800.0));
-        let transform = ViewTransform::new(rect, &empty_volume())?;
-        let point = transform.screen_local(50.0, -25.0);
-        let (east_km, north_km) = transform.local_at(point);
-        expect_within("east km", 50.0, east_km, SCREEN_ROUND_TRIP_KM)?;
-        expect_within("north km", -25.0, north_km, SCREEN_ROUND_TRIP_KM)?;
+    fn rendered_corner_lands_on_the_reference_geodesic_point() -> Result<(), String> {
+        let (_, geometry) = build(
+            vec![radial(90.0, 90.0, 0.0, vec![GateValue::Measured(30.0)])],
+            75.0,
+        )?;
+        let corner = vertex(&geometry, 2)?;
+        let (lat, lon) = projection::mercator_inverse(
+            geometry.site_x + f64::from(corner.x),
+            geometry.site_y + f64::from(corner.y),
+        )
+        .map_err(|error| error.to_string())?;
+        assert!(
+            (lat - 37.065_332).abs() < 5e-5,
+            "rendered corner latitude {lat}"
+        );
+        assert!(
+            (lon + 87.928_621).abs() < 5e-5,
+            "rendered corner longitude {lon}"
+        );
         Ok(())
     }
 
     #[test]
-    fn viewport_resize_preserves_gate_location_and_pointer_mapping() -> Result<(), TestFailure> {
-        let canonical = ViewTransform::new(canonical_rect(), &empty_volume())?;
+    fn lookup_returns_the_gate_under_a_reference_point() -> Result<(), String> {
+        let (volume, geometry) = build(
+            vec![radial(89.5, 90.5, 0.0, vec![GateValue::Measured(41.0)])],
+            75.0,
+        )?;
+        let ground = projection::ground_range(74.75, 0.0).map_err(|error| error.to_string())?;
+        match geometry.lookup.gate(&volume, ground, 90.0) {
+            Some(GateHit {
+                value: GateValue::Measured(dbz),
+                elevation_deg,
+            }) => {
+                assert!((dbz - 41.0).abs() < 1e-6, "gate value {dbz}");
+                assert!(elevation_deg.abs() < 1e-9, "elevation {elevation_deg}");
+                Ok(())
+            }
+            other => Err(format!("expected the measured gate, got {other:?}")),
+        }
+    }
+
+    #[test]
+    fn lookup_reports_no_data_outside_the_drawn_sweep() -> Result<(), String> {
+        let (volume, geometry) = build(
+            vec![radial(89.5, 90.5, 0.0, vec![GateValue::Measured(41.0)])],
+            75.0,
+        )?;
+        assert!(
+            geometry.lookup.gate(&volume, 10.0, 90.0).is_none(),
+            "a point nearer than the first gate reports no data"
+        );
+        assert!(
+            geometry.lookup.gate(&volume, 75.0, 180.0).is_none(),
+            "a point outside the drawn azimuth sector reports no data"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn below_threshold_gates_are_identifiable_and_not_drawn() -> Result<(), String> {
+        let (volume, geometry) = build(
+            vec![radial(89.5, 90.5, 0.0, vec![GateValue::BelowThreshold])],
+            75.0,
+        )?;
+        assert_eq!(
+            geometry.index_count, 0,
+            "below-threshold gates are excluded from the mesh"
+        );
+        let ground = projection::ground_range(74.75, 0.0).map_err(|error| error.to_string())?;
+        match geometry.lookup.gate(&volume, ground, 90.0) {
+            Some(GateHit {
+                value: GateValue::BelowThreshold,
+                ..
+            }) => Ok(()),
+            other => Err(format!("expected below threshold, got {other:?}")),
+        }
+    }
+
+    #[test]
+    fn range_folded_gates_are_drawn_in_the_sentinel_colour() -> Result<(), String> {
+        let (_, geometry) = build(
+            vec![radial(89.5, 90.5, 0.0, vec![GateValue::RangeFolded])],
+            75.0,
+        )?;
+        let colour: [u8; 4] = geometry
+            .vertices
+            .get(8..12)
+            .ok_or("vertex colour")?
+            .try_into()
+            .map_err(|_| String::from("vertex colour"))?;
+        assert_eq!(colour, range_folded_color(), "range folded colour");
+        Ok(())
+    }
+
+    #[test]
+    fn an_unmappable_reflectivity_value_is_an_error() -> Result<(), String> {
+        let volume = volume(
+            vec![radial(89.5, 90.5, 0.0, vec![GateValue::Measured(95.0)])],
+            75.0,
+        )?;
+        match build_geometry(&volume) {
+            Err(RenderError::Color {
+                source: ColorMapError::OutOfRange { value, .. },
+            }) => {
+                assert!((value - 95.0).abs() < f32::EPSILON, "carried value {value}");
+                Ok(())
+            }
+            Err(error) => Err(format!("expected a colour error, got {error}")),
+            Ok(_) => Err(String::from("expected a colour error, got a geometry")),
+        }
+    }
+
+    #[test]
+    fn viewport_transform_maps_offsets_and_pointer_positions() -> Result<(), String> {
+        let (_, geometry) = build(
+            vec![radial(89.5, 90.5, 0.0, vec![GateValue::Measured(30.0)])],
+            75.0,
+        )?;
         let viewport = radar_viewport(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 900.0)));
-        let resized = canonical.for_viewport(viewport);
-        let (lat, lon) = projection::forward(50.0, 90.0, 37.0, -88.0)?;
-        let point = resized.screen_geo(lat, lon)?;
-        expect_within("screen x", 1016.0, f64::from(point.x), 1.0)?;
-        expect_within("screen y", 450.0, f64::from(point.y), 1.0)?;
-        let info = resized.pointer_info(point)?;
-        expect_within("pointer range km", 50.0, info.range_km, 0.001)?;
-        expect_within("pointer azimuth deg", 90.0, info.azimuth_deg, 0.001)?;
+        let transform =
+            ViewTransform::new(viewport, &geometry).map_err(|error| error.to_string())?;
+        let offset = Pos2::new(40.0, -25.0);
+        let screen = transform.screen(offset);
+        let recovered = transform.offset_at(screen);
+        assert!(
+            (recovered.x - offset.x).abs() < 1e-2 && (recovered.y - offset.y).abs() < 1e-2,
+            "offset round trip {recovered:?}"
+        );
+        let info = transform
+            .pointer_info(screen)
+            .map_err(|error| error.to_string())?;
+        let (expected_lat, expected_lon) =
+            projection::mercator_inverse(geometry.site_x + 40.0, geometry.site_y - 25.0)
+                .map_err(|error| error.to_string())?;
+        assert!(
+            (info.lat - expected_lat).abs() < 1e-6,
+            "latitude {}",
+            info.lat
+        );
+        assert!(
+            (info.lon - expected_lon).abs() < 1e-6,
+            "longitude {}",
+            info.lon
+        );
         Ok(())
     }
 
     #[test]
-    fn zero_range_is_rejected_instead_of_fabricating_a_view() {
-        let mut volume = empty_volume();
-        volume.max_range_km = 0.0;
-        assert!(
-            matches!(ViewTransform::new(canonical_rect(), &volume), Err(CoordinateError::ViewRange { range_km }) if range_km.abs() < f64::EPSILON)
-        );
-    }
-
-    #[test]
-    fn gate_corner_uses_wgs84_geodesic_on_map() -> Result<(), TestFailure> {
-        let mut volume = empty_volume();
-        volume.site_lat = 37.06833;
-        volume.site_lon = -88.77194;
-        let transform = ViewTransform::new(canonical_rect(), &volume)?;
-        let corner = GateCorner {
-            range_km: 75.0,
-            azimuth_deg: 45.0,
-        };
-        let actual = transform.screen_corner(corner)?;
-        let expected = transform.screen_geo(37.544662, -88.171837)?;
-        expect_within(
-            "gate corner x",
-            f64::from(expected.x),
-            f64::from(actual.x),
-            0.001,
+    fn a_viewport_without_pixels_is_rejected() -> Result<(), String> {
+        let (_, geometry) = build(
+            vec![radial(89.5, 90.5, 0.0, vec![GateValue::Measured(30.0)])],
+            75.0,
         )?;
-        expect_within(
-            "gate corner y",
-            f64::from(expected.y),
-            f64::from(actual.y),
-            0.001,
+        let empty = Rect::from_min_size(Pos2::ZERO, Vec2::ZERO);
+        match ViewTransform::new(empty, &geometry) {
+            Err(CoordinateError::Viewport { width, height }) => {
+                assert!(width.abs() < f32::EPSILON && height.abs() < f32::EPSILON);
+                Ok(())
+            }
+            other => Err(format!("expected a viewport error, got {other:?}")),
+        }
+    }
+
+    #[test]
+    fn range_rings_are_geodesic_circles_at_fifty_kilometre_intervals() -> Result<(), String> {
+        let (_, geometry) = build(
+            vec![radial(89.5, 90.5, 0.0, vec![GateValue::Measured(30.0)])],
+            75.0,
         )?;
-        let pointer = transform.pointer_info(actual)?;
-        expect_within("gate corner range km", 75.0, pointer.range_km, 0.001)?;
-        expect_within("gate corner azimuth deg", 45.0, pointer.azimuth_deg, 0.001)?;
+        assert_eq!(geometry.rings.len(), 1, "one ring inside a 75 km extent");
+        let ring = geometry.rings.first().ok_or("no ring")?;
+        assert!((ring.range_km - 50.0).abs() < 1e-9, "ring radius");
+        let first = ring.points.first().ok_or("no ring point")?;
+        let (lat, lon) = projection::mercator_inverse(
+            geometry.site_x + f64::from(first.x),
+            geometry.site_y + f64::from(first.y),
+        )
+        .map_err(|error| error.to_string())?;
+        let (range_km, _) =
+            projection::inverse(lat, lon, SITE_LAT, SITE_LON).map_err(|error| error.to_string())?;
+        assert!(
+            (range_km - 50.0).abs() < 1e-3,
+            "ring point range {range_km}"
+        );
         Ok(())
-    }
-
-    #[test]
-    fn render_reports_unmapped_color_instead_of_dropping_gate() {
-        let mut volume = empty_volume();
-        volume.bins.push(RadarBin {
-            corners: [
-                GateCorner {
-                    range_km: 9.0,
-                    azimuth_deg: 0.0,
-                },
-                GateCorner {
-                    range_km: 9.0,
-                    azimuth_deg: 1.0,
-                },
-                GateCorner {
-                    range_km: 10.0,
-                    azimuth_deg: 1.0,
-                },
-                GateCorner {
-                    range_km: 10.0,
-                    azimuth_deg: 0.0,
-                },
-            ],
-            value: GateValue::Measured(95.0),
-        });
-        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 800.0));
-        let result = build_render(&volume, rect);
-        assert!(
-            matches!(result, Err(RenderError::Color { source: crate::error::ColorMapError::OutOfRange { value, .. } }) if value == 95.0)
-        );
-    }
-
-    #[test]
-    fn hover_returns_the_value_at_a_rendered_gate() -> Result<(), TestFailure> {
-        let mut volume = empty_volume();
-        volume.bins.push(RadarBin {
-            corners: [
-                GateCorner {
-                    range_km: 49.0,
-                    azimuth_deg: 44.0,
-                },
-                GateCorner {
-                    range_km: 49.0,
-                    azimuth_deg: 46.0,
-                },
-                GateCorner {
-                    range_km: 51.0,
-                    azimuth_deg: 46.0,
-                },
-                GateCorner {
-                    range_km: 51.0,
-                    azimuth_deg: 44.0,
-                },
-            ],
-            value: GateValue::Measured(35.0),
-        });
-        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 800.0));
-        let cache = build_render(&volume, rect)?;
-        let (lat, lon) = projection::forward(50.0, 45.0, 37.0, -88.0)?;
-        let position = cache.transform.screen_geo(lat, lon)?;
-        match cache.hover.find(position) {
-            Some(GateValue::Measured(value)) => {
-                expect_within("hover value", 35.0, f64::from(value), f64::EPSILON)?;
-            }
-            _ => {
-                return Err(TestFailure::Missing {
-                    label: "hover value inside the gate",
-                    expected: "a measured gate value",
-                });
-            }
-        }
-        let (outside_lat, outside_lon) = projection::forward(60.0, 45.0, 37.0, -88.0)?;
-        let outside = cache.transform.screen_geo(outside_lat, outside_lon)?;
-        if cache.hover.find(outside).is_some() {
-            return Err(TestFailure::Missing {
-                label: "hover outside every gate",
-                expected: "no gate value",
-            });
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn below_threshold_is_not_drawn_but_remains_identifiable() -> Result<(), TestFailure> {
-        let mut volume = empty_volume();
-        volume.bins.push(RadarBin {
-            corners: [
-                GateCorner {
-                    range_km: 49.0,
-                    azimuth_deg: 44.0,
-                },
-                GateCorner {
-                    range_km: 49.0,
-                    azimuth_deg: 46.0,
-                },
-                GateCorner {
-                    range_km: 51.0,
-                    azimuth_deg: 46.0,
-                },
-                GateCorner {
-                    range_km: 51.0,
-                    azimuth_deg: 44.0,
-                },
-            ],
-            value: GateValue::BelowThreshold,
-        });
-        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 800.0));
-        let cache = build_render(&volume, rect)?;
-        let (lat, lon) = projection::forward(50.0, 45.0, 37.0, -88.0)?;
-        let point = cache.transform.screen_geo(lat, lon)?;
-        match cache.hover.find(point) {
-            Some(GateValue::BelowThreshold) => {}
-            _ => {
-                return Err(TestFailure::Missing {
-                    label: "below-threshold gate",
-                    expected: "below-threshold in the hover index",
-                });
-            }
-        }
-        if !cache.vertices.is_empty() {
-            return Err(TestFailure::Count {
-                label: "drawn vertices for a below-threshold gate",
-                expected: 0,
-                actual: cache.vertices.len(),
-            });
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn degenerate_triangle_does_not_claim_outside_points() {
-        let a = Pos2::new(0.0, 0.0);
-        let b = Pos2::new(10.0, 10.0);
-        assert!(
-            !point_in_triangle(Pos2::new(5.0, 6.0), a, a, b),
-            "a collapsed triangle must not contain an outside point"
-        );
-    }
-
-    #[test]
-    fn quad_contains_center_and_rejects_outside() {
-        let points = [
-            Pos2::new(0.0, 0.0),
-            Pos2::new(10.0, 0.0),
-            Pos2::new(10.0, 10.0),
-            Pos2::new(0.0, 10.0),
-        ];
-        assert!(
-            quad_contains(Pos2::new(5.0, 5.0), points),
-            "center must be inside"
-        );
-        assert!(
-            !quad_contains(Pos2::new(15.0, 5.0), points),
-            "outside point must be rejected"
-        );
     }
 }

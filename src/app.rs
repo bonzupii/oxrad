@@ -1,4 +1,4 @@
-// oxrad: A storm-chaser-grade NEXRAD weather radar viewer
+// oxrad — A storm-chaser-grade NEXRAD weather radar viewer
 // Copyright (C) 2026 Micah Ostrow <bonzupii@protonmail.com>
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,261 +13,436 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//! The application window: site selection, map, readout, and status.
+
 use std::time::Duration;
 
-use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Shape, Stroke, Vec2};
+use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Stroke, Vec2};
 
+use crate::config::{self, Config, Loaded};
 use crate::display::{Display, DisplayState, Frame};
 use crate::gpu::RadarGpu;
 use crate::overlay;
-use crate::pipeline::{Operation, Pipeline, PipelineState};
+use crate::pipeline::{Pipeline, PipelineState};
 use crate::radar::GateValue;
 use crate::render::{self, ViewTransform};
+use crate::stations::{self, SiteId, Station};
 use crate::time;
 
 const BACKGROUND: Color32 = Color32::from_rgb(8, 10, 14);
 const TEXT: Color32 = Color32::from_rgb(206, 214, 226);
+const MUTED: Color32 = Color32::from_rgb(150, 160, 175);
 const ERROR: Color32 = Color32::from_rgb(255, 122, 122);
 const STALE: Color32 = Color32::from_rgb(255, 196, 64);
+const HIGHLIGHT: Color32 = Color32::from_rgb(38, 60, 90);
 const STALE_AFTER_MS: u64 = 15 * 60 * 1000;
+const PICKER_WIDTH: f32 = 620.0;
+const PICKER_ROW_HEIGHT: f32 = 30.0;
+const PICKER_LIST_HEIGHT: f32 = 330.0;
+const BUSY_REPAINT_MS: u64 = 100;
+const IDLE_REPAINT_MS: u64 = 1000;
 
 pub struct OxradApp {
-    site: String,
-    pipeline: Pipeline,
+    stations: Result<Vec<Station>, String>,
+    config: Config,
+    config_writable: bool,
+    notice: Option<String>,
+    query: String,
+    picker_index: usize,
+    picker_focused: bool,
+    site: Option<SiteId>,
+    pipeline: Option<Pipeline>,
     display: Display,
 }
 
+struct PickerChoice {
+    index: usize,
+    chosen: Option<SiteId>,
+}
+
 impl OxradApp {
-    pub fn new(site: String, gpu: Option<RadarGpu>) -> Self {
-        Self {
-            pipeline: Pipeline::start(site.clone()),
+    pub fn new(gpu: Option<RadarGpu>, initial: Option<SiteId>) -> Self {
+        let stations = stations::catalog().map_err(|error| error.to_string());
+        let mut config = Config::default();
+        let mut config_writable = true;
+        let mut notice = None;
+        match config::load_default() {
+            Ok(Loaded::Missing) => {}
+            Ok(Loaded::Present(loaded)) => config = loaded,
+            Err(error) => {
+                config_writable = false;
+                notice = Some(format!("Configuration ignored: {error}"));
+            }
+        }
+        let restored = initial.or_else(|| config.site.clone());
+        let mut app = Self {
+            stations,
+            config,
+            config_writable,
+            notice,
+            query: String::new(),
+            picker_index: 0,
+            picker_focused: false,
+            site: None,
+            pipeline: None,
             display: Display::new(gpu),
-            site,
+        };
+        if let Some(id) = restored {
+            match &app.stations {
+                Ok(list) if stations::find(list, &id).is_some() => app.open_site(id, false),
+                Ok(_) => {
+                    app.notice = Some(format!(
+                        "Site {id} is not in the radar site catalog; choose a site."
+                    ));
+                }
+                Err(_) => {}
+            }
+        }
+        app
+    }
+
+    fn open_site(&mut self, id: SiteId, persist: bool) {
+        self.display.reset();
+        self.pipeline = Some(Pipeline::start(id.clone()));
+        self.site = Some(id.clone());
+        self.picker_focused = false;
+        if !persist {
+            return;
+        }
+        self.config.site = Some(id);
+        if !self.config_writable {
+            return;
+        }
+        match config::save_default(&self.config) {
+            Ok(()) => self.notice = None,
+            Err(error) => self.notice = Some(format!("Could not save the selected site: {error}")),
         }
     }
 
     fn update_workers(&mut self) {
-        if let Some(volume) = self.pipeline.poll() {
+        if let Some(pipeline) = self.pipeline.as_mut()
+            && let Some(volume) = pipeline.poll()
+        {
             self.display.submit(volume);
         }
         self.display.poll();
     }
 
+    fn site_name(&self) -> &str {
+        self.site.as_ref().map_or("no site", |site| site.as_str())
+    }
+
+    fn placeholder_text(&self) -> String {
+        match (&self.site, &self.pipeline) {
+            (None, _) => String::from("No site selected. Choose a radar on the left to begin."),
+            (Some(site), Some(pipeline)) => match &pipeline.state {
+                PipelineState::Failed(failure) => format!(
+                    "Radar unavailable. {} failed for {}: {}",
+                    failure.operation.description(),
+                    site,
+                    failure.error
+                ),
+                PipelineState::Working { operation, .. } => {
+                    format!("{} the latest volume for {site}…", operation.description())
+                }
+                PipelineState::Ready => match &self.display.state {
+                    DisplayState::Unavailable(_) | DisplayState::Failed { .. } => String::from(
+                        "The radar image could not be prepared; the status bar has the reason.",
+                    ),
+                    DisplayState::Waiting | DisplayState::Building | DisplayState::Ready => {
+                        String::from("Preparing the radar image…")
+                    }
+                },
+            },
+            (Some(site), None) => format!("Starting the radar pipeline for {site}…"),
+        }
+    }
+
+    const fn phase(&self) -> &'static str {
+        match &self.pipeline {
+            None => "No site selected",
+            Some(pipeline) => match &pipeline.state {
+                PipelineState::Failed(_) => "Error",
+                PipelineState::Working { .. } => {
+                    if self.display.frame.is_some() {
+                        "Refreshing"
+                    } else {
+                        pipeline.state.label()
+                    }
+                }
+                PipelineState::Ready => match &self.display.state {
+                    DisplayState::Ready => "Ready",
+                    DisplayState::Unavailable(_) | DisplayState::Failed { .. } => "Render error",
+                    DisplayState::Waiting | DisplayState::Building => "Preparing frame",
+                },
+            },
+        }
+    }
+
+    fn failed(&self) -> bool {
+        self.pipeline
+            .as_ref()
+            .is_some_and(|pipeline| pipeline.state.failure().is_some())
+            || self.display.state.error().is_some()
+    }
+
+    fn busy(&self) -> bool {
+        if self.failed() {
+            return false;
+        }
+        self.site.is_some()
+            && (self.display.state.is_busy()
+                || self
+                    .pipeline
+                    .as_ref()
+                    .is_some_and(|pipeline| pipeline.state.is_working())
+                || self.display.frame.is_none())
+    }
+
     fn status(&mut self, ui: &mut egui::Ui) {
+        let mut retry_pipeline = false;
+        let mut retry_display = false;
+        let failed = self.failed();
         egui::Panel::bottom("status").show_inside(ui, |ui| {
             ui.vertical(|ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.strong(format!("{} · Level II · Base reflectivity", self.site));
+                    match &self.site {
+                        Some(site) => {
+                            ui.strong(format!("{site} · Level II · Base reflectivity"));
+                        }
+                        None => {
+                            ui.strong("No site selected");
+                        }
+                    }
                     ui.separator();
-                    ui.label(phase_label(
-                        &self.pipeline.state,
-                        &self.display.state,
-                        self.display.frame.is_some(),
-                        self.display.gpu_error.is_some(),
-                    ));
+                    ui.label(self.phase());
                     if let Some(frame) = &self.display.frame {
-                        draw_frame_status(
-                            ui,
-                            frame,
-                            self.pipeline.state.failure().is_some()
-                                || matches!(self.pipeline.state, PipelineState::Stopped(_))
-                                || self.display.gpu_error.is_some()
-                                || matches!(
-                                    self.display.state,
-                                    DisplayState::Failed { .. } | DisplayState::Unavailable(_)
-                                ),
-                        );
+                        scan_status(ui, frame, failed);
                     }
                 });
-                let mut retry_fetch = false;
-                if let Some(failure) = self.pipeline.state.failure() {
+                if let Some(notice) = &self.notice {
+                    ui.colored_label(STALE, notice);
+                }
+                if let Err(error) = &self.stations {
+                    ui.colored_label(ERROR, format!("Radar site catalog unavailable: {error}"));
+                }
+                if let Some(failure) = self
+                    .pipeline
+                    .as_ref()
+                    .and_then(|pipeline| pipeline.state.failure())
+                {
                     ui.horizontal_wrapped(|ui| {
                         ui.colored_label(
                             ERROR,
                             format!(
                                 "{} failed for {}: {}",
                                 failure.operation.description(),
-                                self.site,
+                                self.site_name(),
                                 failure.error
                             ),
                         );
                         if let Some(wait) = failure.retry_in {
-                            ui.label(format!("Retry scheduled after {} s", wait.as_secs()));
+                            ui.label(format!("Retry in {} s", wait.as_secs()));
                         }
                         if failure.waiting_for_next_volume {
-                            ui.label("Waiting for a new volume or manual retry.");
+                            ui.label("Waiting for a new volume or a manual retry.");
                         }
-                        retry_fetch = ui.button("Retry").clicked();
+                        retry_pipeline = ui.button("Retry now").clicked();
                     });
                 }
-                if retry_fetch && let Err(error) = self.pipeline.retry() {
-                    self.pipeline.state = PipelineState::Stopped(error);
-                }
-                if let PipelineState::Stopped(error) = &self.pipeline.state {
-                    ui.colored_label(ERROR, format!("{}: {error}", self.site));
-                }
-                if let Some(error) = &self.display.gpu_error {
-                    ui.colored_label(ERROR, format!("{}: {error}", self.site));
-                }
-                let mut retry_render = false;
-                match &self.display.state {
-                    DisplayState::Failed { error, .. } => {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.colored_label(ERROR, format!("{}: {error}", self.site));
-                            retry_render = ui.button("Retry render").clicked();
-                        });
-                    }
-                    DisplayState::Unavailable(error) => {
-                        ui.colored_label(ERROR, format!("{}: {error}", self.site));
-                    }
-                    DisplayState::Waiting | DisplayState::Preparing(_) | DisplayState::Ready => {}
-                }
-                if retry_render {
-                    self.display.retry();
+                if let Some(error) = self.display.state.error() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.colored_label(ERROR, format!("{}: {error}", self.site_name()));
+                        retry_display = ui.button("Retry render").clicked();
+                    });
                 }
                 if let Some(frame) = &self.display.frame {
-                    draw_diagnostics(ui, frame);
+                    diagnostics(ui, frame);
                 }
             });
         });
+        if retry_pipeline
+            && let Some(pipeline) = self.pipeline.as_mut()
+            && let Err(error) = pipeline.retry()
+        {
+            self.notice = Some(format!("Retry unavailable: {error}"));
+        }
+        if retry_display {
+            self.display.retry();
+        }
     }
 
-    fn scene(&self, ui: &mut egui::Ui) {
+    fn scene(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
-        let painter = ui.painter();
-        painter.rect_filled(rect, CornerRadius::ZERO, BACKGROUND);
-        let Some(frame) = &self.display.frame else {
-            let message = if self.pipeline.state.failure().is_some()
-                || matches!(self.pipeline.state, PipelineState::Stopped(_))
-                || self.display.gpu_error.is_some()
-                || matches!(
-                    self.display.state,
-                    DisplayState::Failed { .. } | DisplayState::Unavailable(_)
-                ) {
-                "Radar image unavailable"
-            } else {
-                "Waiting for radar data"
-            };
-            painter.text(
-                rect.center(),
-                Align2::CENTER_CENTER,
-                message,
-                FontId::proportional(16.0),
-                TEXT,
-            );
+        ui.painter()
+            .rect_filled(rect, CornerRadius::ZERO, BACKGROUND);
+        if self.site.is_none() {
+            self.picker(ui);
+            return;
+        }
+        if self.display.frame.is_none() {
+            self.placeholder(ui);
+            return;
+        }
+        let Some(frame) = self.display.frame.as_ref() else {
             return;
         };
         if rect.width() <= 0.0 || rect.height() <= 0.0 {
             return;
         }
         let viewport = render::radar_viewport(rect);
-        let transform = frame.cache.transform.for_viewport(viewport);
-        let mut shape = frame.shape.clone();
-        if let Shape::Callback(callback) = &mut shape {
-            callback.rect = viewport;
+        let transform = match ViewTransform::new(viewport, &frame.geometry) {
+            Ok(transform) => transform,
+            Err(error) => {
+                ui.painter().text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    format!("Radar view unavailable: {error}"),
+                    FontId::proportional(15.0),
+                    ERROR,
+                );
+                return;
+            }
+        };
+        if let Some(shape) = frame.shape(viewport) {
+            ui.painter().add(shape);
         }
-        painter.add(shape);
-        if frame.volume.bins.len()
-            == frame.volume.below_threshold_bins + frame.volume.range_folded_bins
-        {
-            painter.text(
+        if frame.mesh.is_none() {
+            ui.painter().text(
                 rect.center(),
                 Align2::CENTER_CENTER,
                 "No measured echo in this sweep; this does not establish clear weather.",
-                FontId::proportional(16.0),
+                FontId::proportional(15.0),
                 TEXT,
             );
         }
-        overlay::draw_grid(painter, &frame.cache, viewport);
-        overlay::draw_rings(painter, &frame.cache, viewport);
-        overlay::draw_legend(painter, rect);
-        draw_cursor(ui, frame, &transform, viewport, rect);
+        overlay::draw_grid(ui.painter(), &frame.geometry, &transform);
+        overlay::draw_rings(ui.painter(), &frame.geometry, &transform);
+        overlay::draw_legend(ui.painter(), rect);
+        readout(ui, frame, &transform, viewport, rect);
     }
-}
 
-impl eframe::App for OxradApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.update_workers();
-        self.status(ui);
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(BACKGROUND))
-            .show_inside(ui, |ui| self.scene(ui));
-        let interval = if matches!(self.display.state, DisplayState::Preparing(_))
-            || self.display.frame.is_none()
-        {
-            100
-        } else {
-            1000
-        };
-        ui.ctx()
-            .request_repaint_after(Duration::from_millis(interval));
+    fn placeholder(&self, ui: &egui::Ui) {
+        ui.painter().text(
+            ui.max_rect().center(),
+            Align2::CENTER_CENTER,
+            self.placeholder_text(),
+            FontId::proportional(16.0),
+            TEXT,
+        );
     }
-}
 
-const fn phase_label(
-    pipeline: &PipelineState,
-    display: &DisplayState,
-    has_frame: bool,
-    gpu_failed: bool,
-) -> &'static str {
-    if matches!(
-        pipeline,
-        PipelineState::Failed(_) | PipelineState::Stopped(_)
-    ) || pipeline.failure().is_some()
-    {
-        return "Error";
-    }
-    if gpu_failed
-        || matches!(
-            display,
-            DisplayState::Failed { .. } | DisplayState::Unavailable(_)
-        )
-    {
-        return "Render error";
-    }
-    match (pipeline, display, has_frame) {
-        (
-            PipelineState::Working {
-                operation: Operation::Fetching,
-                ..
-            },
-            _,
-            true,
-        ) => "Refreshing · fetching",
-        (
-            PipelineState::Working {
-                operation: Operation::Decoding,
-                ..
-            },
-            _,
-            true,
-        ) => "Refreshing · decoding",
-        (
-            PipelineState::Working {
-                operation: Operation::Fetching,
-                ..
-            },
-            _,
-            false,
-        ) => "Fetching",
-        (
-            PipelineState::Working {
-                operation: Operation::Decoding,
-                ..
-            },
-            _,
-            false,
-        ) => "Decoding",
-        (PipelineState::Ready, DisplayState::Preparing(_), true) => "Refreshing · preparing frame",
-        (PipelineState::Ready, DisplayState::Preparing(_) | DisplayState::Waiting, false) => {
-            "Preparing frame"
+    fn picker(&mut self, ui: &mut egui::Ui) {
+        let mut query = std::mem::take(&mut self.query);
+        let mut index = self.picker_index;
+        let mut chosen = None;
+        let width = (ui.available_width() - 32.0).clamp(240.0, PICKER_WIDTH);
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            let indent = ((ui.available_width() - width) / 2.0).max(0.0);
+            ui.horizontal(|ui| {
+                ui.add_space(indent);
+                ui.vertical(|ui| {
+                    ui.set_width(width);
+                    ui.add_space(20.0);
+                    ui.heading("Choose a radar");
+                    ui.colored_label(
+                        MUTED,
+                        "Live Level II base reflectivity from a National Weather Service radar.",
+                    );
+                    ui.colored_label(
+                        MUTED,
+                        "Type a site identifier or place name, then press Enter.",
+                    );
+                    ui.add_space(12.0);
+                    let response = ui.add_sized(
+                        [width, 30.0],
+                        egui::TextEdit::singleline(&mut query)
+                            .hint_text("Search sites, for example Paducah or KPAH"),
+                    );
+                    if !self.picker_focused && !response.has_focus() {
+                        response.request_focus();
+                        self.picker_focused = true;
+                    }
+                    ui.add_space(8.0);
+                    match &self.stations {
+                        Err(error) => {
+                            ui.colored_label(
+                                ERROR,
+                                format!("Radar site catalog unavailable: {error}"),
+                            );
+                        }
+                        Ok(stations) => {
+                            let choice = picker_list(ui, stations, &query, index, width);
+                            index = choice.index;
+                            chosen = choice.chosen;
+                        }
+                    }
+                    if let Some(notice) = &self.notice {
+                        ui.add_space(8.0);
+                        ui.colored_label(STALE, notice);
+                    }
+                });
+            });
+        });
+        self.query = query;
+        self.picker_index = index;
+        if let Some(id) = chosen {
+            self.open_site(id, true);
         }
-        (PipelineState::Ready, DisplayState::Ready, true) => "Ready",
-        _ => "Radar unavailable",
     }
 }
 
-fn draw_frame_status(ui: &mut egui::Ui, frame: &Frame, failed: bool) {
+fn picker_list(
+    ui: &mut egui::Ui,
+    stations: &[Station],
+    query: &str,
+    index: usize,
+    width: f32,
+) -> PickerChoice {
+    let filtered: Vec<&Station> = stations
+        .iter()
+        .filter(|station| stations::matches(station, query))
+        .collect();
+    if filtered.is_empty() {
+        ui.colored_label(STALE, "No radar site matches that search.");
+        return PickerChoice {
+            index: 0,
+            chosen: None,
+        };
+    }
+    let count = filtered.len();
+    let mut index = index.min(count.saturating_sub(1));
+    let down = ui.input(|input| input.key_pressed(egui::Key::ArrowDown));
+    let up = ui.input(|input| input.key_pressed(egui::Key::ArrowUp));
+    if down {
+        index = (index + 1) % count;
+    }
+    if up {
+        index = index
+            .checked_sub(1)
+            .unwrap_or_else(|| count.saturating_sub(1));
+    }
+    let mut chosen = None;
+    egui::ScrollArea::vertical()
+        .max_height(PICKER_LIST_HEIGHT)
+        .show(ui, |ui| {
+            for (position, station) in filtered.iter().enumerate() {
+                let selected = position == index;
+                let button = egui::Button::new(station.label())
+                    .min_size(Vec2::new(width - 20.0, PICKER_ROW_HEIGHT))
+                    .fill(if selected { HIGHLIGHT } else { BACKGROUND });
+                if ui.add(button).clicked() {
+                    chosen = Some(station.id.clone());
+                }
+            }
+        });
+    if chosen.is_none() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+        chosen = filtered.get(index).map(|station| station.id.clone());
+    }
+    PickerChoice { index, chosen }
+}
+
+fn scan_status(ui: &mut egui::Ui, frame: &Frame, failed: bool) {
     let scan = frame.volume.scan_unix_ms;
     match time::format_utc(scan) {
         Ok(text) => {
@@ -296,18 +471,22 @@ fn draw_frame_status(ui: &mut egui::Ui, frame: &Frame, failed: bool) {
     }
 }
 
-fn draw_diagnostics(ui: &mut egui::Ui, frame: &Frame) {
+fn diagnostics(ui: &mut egui::Ui, frame: &Frame) {
     let volume = &frame.volume;
     let text = format!(
-        "{} gates · {} below threshold · {} range folded · {:.0} km · Skipped radials: {} · Other messages: {}",
-        volume.bins.len(),
-        volume.below_threshold_bins,
-        volume.range_folded_bins,
-        volume.max_range_km,
+        "{} · {} radials · {} gates · {} below threshold · {} range folded · {:.0} km · tilt {} at {:.2}° · Skipped radials: {} · Other messages: {}",
+        volume.site,
+        volume.sweep.radials.len(),
+        volume.sweep.gate_count(),
+        volume.sweep.below_threshold,
+        volume.sweep.range_folded,
+        volume.sweep.max_ground_range_km,
+        volume.sweep.elevation_number,
+        volume.sweep.elevation_deg,
         volume.skipped_radials,
         volume.skipped_non_data
     );
-    if volume.skipped_radials > 0 {
+    if volume.skipped_radials > 0 || volume.sweep.below_threshold > 0 {
         ui.colored_label(STALE, text);
     } else {
         ui.label(text);
@@ -317,13 +496,16 @@ fn draw_diagnostics(ui: &mut egui::Ui, frame: &Frame) {
     }
 }
 
-fn draw_cursor(
-    ui: &egui::Ui,
-    frame: &Frame,
-    transform: &ViewTransform,
-    viewport: Rect,
-    bounds: Rect,
-) {
+fn gate_label(value: Option<GateValue>) -> String {
+    match value {
+        Some(GateValue::Measured(dbz)) => format!("{dbz:.1} dBZ"),
+        Some(GateValue::BelowThreshold) => String::from("below threshold"),
+        Some(GateValue::RangeFolded) => String::from("range folded"),
+        None => String::from("no data"),
+    }
+}
+
+fn readout(ui: &egui::Ui, frame: &Frame, transform: &ViewTransform, viewport: Rect, bounds: Rect) {
     let Some(position) = ui.input(|input| input.pointer.hover_pos()) else {
         return;
     };
@@ -344,17 +526,26 @@ fn draw_cursor(
             return;
         }
     };
-    let canonical = frame.cache.rect.center()
-        + (position - viewport.center()) * (frame.cache.rect.width() / viewport.width());
-    let value = match frame.cache.hover.find(canonical) {
-        Some(GateValue::Measured(dbz)) => format!("{dbz:.1} dBZ"),
-        Some(GateValue::BelowThreshold) => String::from("below threshold"),
-        Some(GateValue::RangeFolded) => String::from("range folded"),
-        None => String::from("no data"),
+    let (value, beam) = if viewport.contains(position) {
+        let hit = frame
+            .geometry
+            .lookup
+            .gate(&frame.volume, info.range_km, info.azimuth_deg);
+        hit.map_or_else(
+            || (gate_label(None), String::new()),
+            |hit| {
+                (
+                    gate_label(Some(hit.value)),
+                    format!("\n{:.2}° beam", hit.elevation_deg),
+                )
+            },
+        )
+    } else {
+        (String::from("no data"), String::new())
     };
     let label = format!(
-        "{:.4}, {:.4}\n{:.1} km  {:.0}°\n{}",
-        info.lat, info.lon, info.range_km, info.azimuth_deg, value
+        "{:.4}, {:.4}\n{:.1} km  {:.0}°\n{value}{beam}",
+        info.lat, info.lon, info.range_km, info.azimuth_deg
     );
     let stroke = Stroke::new(1.0_f32, TEXT);
     painter.line_segment(
@@ -383,4 +574,21 @@ fn draw_cursor(
         Color32::from_black_alpha(220),
     );
     painter.galley(origin + padding, galley, TEXT);
+}
+
+impl eframe::App for OxradApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.update_workers();
+        self.status(ui);
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(BACKGROUND))
+            .show_inside(ui, |ui| self.scene(ui));
+        let interval = if self.busy() {
+            BUSY_REPAINT_MS
+        } else {
+            IDLE_REPAINT_MS
+        };
+        ui.ctx()
+            .request_repaint_after(Duration::from_millis(interval));
+    }
 }

@@ -13,6 +13,8 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//! The reflectivity palette.
+
 use crate::error::ColorMapError;
 
 const KEYPOINTS: [(f32, [u8; 3]); 20] = [
@@ -68,35 +70,32 @@ fn reflectivity_color(dbz: f32) -> Result<[u8; 4], ColorMapError> {
             value: dbz,
         });
     }
-
-    let lowest = KEYPOINTS.first().ok_or(ColorMapError::Unmapped {
-        product: PRODUCT,
-        value: dbz,
-    })?;
-    let highest = KEYPOINTS.last().ok_or(ColorMapError::Unmapped {
-        product: PRODUCT,
-        value: dbz,
-    })?;
-
-    if dbz < lowest.0 {
-        return Ok(with_alpha(lowest.1));
-    }
-    if dbz >= highest.0 {
-        return Ok(with_alpha(highest.1));
-    }
-
-    for pair in KEYPOINTS.windows(2) {
-        let [low, high] = pair else { continue };
-        if dbz >= low.0 && dbz < high.0 {
-            let fraction = (dbz - low.0) / (high.0 - low.0);
-            return Ok(interpolate(low.1, high.1, fraction));
+    let mut previous: Option<(f32, [u8; 3])> = None;
+    for (value, rgb) in KEYPOINTS {
+        match previous {
+            None => {
+                if dbz < value {
+                    return Ok(with_alpha(rgb));
+                }
+            }
+            Some((low, low_rgb)) => {
+                if dbz < value {
+                    let fraction = (dbz - low) / (value - low);
+                    return Ok(interpolate(low_rgb, rgb, fraction));
+                }
+            }
         }
+        previous = Some((value, rgb));
     }
-
-    Err(ColorMapError::Unmapped {
-        product: PRODUCT,
-        value: dbz,
-    })
+    previous.map_or_else(
+        || {
+            Err(ColorMapError::OutOfRange {
+                product: PRODUCT,
+                value: dbz,
+            })
+        },
+        |(_, rgb)| Ok(with_alpha(rgb)),
+    )
 }
 
 pub fn color_for_reflectivity(dbz: f32) -> Result<[u8; 4], ColorMapError> {
@@ -158,14 +157,13 @@ mod tests {
 
     #[test]
     fn keypoints_map_to_palette_values() -> Result<(), TestFailure> {
-        let cases = [
+        for (dbz, expected) in [
             (-15.0, [102, 139, 139, 255]),
             (0.0, [187, 255, 255, 255]),
             (20.0, [0, 255, 0, 255]),
             (40.0, [231, 192, 0, 255]),
             (55.0, [214, 0, 0, 255]),
-        ];
-        for (dbz, expected) in cases {
+        ] {
             expect_color(dbz, expected)?;
         }
         Ok(())
@@ -177,24 +175,26 @@ mod tests {
     }
 
     #[test]
-    fn below_palette_clamps_to_lowest_keypoint() -> Result<(), TestFailure> {
-        expect_color(-31.0, [50, 79, 79, 255])
+    fn values_outside_the_keypoints_take_the_end_colours() -> Result<(), TestFailure> {
+        expect_color(-31.0, [50, 79, 79, 255])?;
+        expect_color(80.0, [235, 235, 235, 255])
     }
 
     #[test]
-    fn range_folded_maps_to_sentinel_color() {
+    fn range_folded_maps_to_its_sentinel_colour() {
         assert_eq!(range_folded_color(), RANGE_FOLDED);
     }
 
     #[test]
-    fn invalid_measured_nan_is_not_range_folded() {
-        assert!(
-            matches!(reflectivity_color(f32::NAN), Err(ColorMapError::OutOfRange { product, value }) if product == PRODUCT && value.is_nan())
-        );
+    fn a_nan_measurement_is_out_of_range_not_range_folded() {
+        assert!(matches!(
+            reflectivity_color(f32::NAN),
+            Err(ColorMapError::OutOfRange { product, value }) if product == PRODUCT && value.is_nan()
+        ));
     }
 
     #[test]
-    fn out_of_range_carries_value() {
+    fn an_out_of_range_value_carries_itself() {
         let result = reflectivity_color(95.0);
         assert!(
             matches!(result, Err(ColorMapError::OutOfRange { product, value }) if product == PRODUCT && value == 95.0),

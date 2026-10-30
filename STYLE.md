@@ -50,9 +50,9 @@ Signatures express borrowing, ownership, and fallibility accurately. If a body c
 
 ### Error types
 
-Library modules expose typed errors, normally with `thiserror`. Variants identify failure modes and retain relevant structured context, including invalid values when useful and safe to report. Do not collapse distinct failures into `Msg(String)`, `Box<dyn Error>` on public APIs, or `.map_err(|e| e.to_string())`.
+Library modules expose typed error enums. Variants identify the failure mode and retain the structured context that produced it, including the invalid value where reporting it is useful and safe. Implement `Display` and `Error` directly: the message is written for the user, and `source()` carries the cause. Do not collapse distinct failures into `Msg(String)`, `Box<dyn Error>` on public APIs, or `.map_err(|e| e.to_string())`.
 
-Use `anyhow` only at the application boundary where heterogeneous errors are presented to the user. Preserve the error chain and structured source information until that boundary. User-visible errors are human-readable and actionable; logging alone is not error handling.
+Preserve the error chain and structured source information until the point where the error is presented. User-visible errors are human-readable and actionable; logging alone is not error handling.
 
 The architecture document defines application-level failure states, recovery, retry, isolation, and user-visible behavior. This guide defines the Rust representation and propagation of errors. They are complementary responsibilities.
 
@@ -138,7 +138,7 @@ Establish expected behavior from the architecture and source-format contracts be
 
 Coverage includes:
 - Coordinate transforms against the architecture document's reference values.
-- Direct/inverse round trips at eight azimuths and 75 km from the KPAH fixture origin.
+- Direct/inverse round trips at eight azimuths and 75 km from the KPAH origin.
 - Every error variant and its relevant carried context.
 - Tile transforms at two zoom levels.
 - Colormap keypoints and out-of-range paths.

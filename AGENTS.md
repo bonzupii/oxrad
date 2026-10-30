@@ -50,8 +50,8 @@ Ownership resolution order: `&T` → `&mut T` → move `T`. `clone()` to satisfy
 ## Error Handling
 
 - Every fallible call must be handled: `?`, `match`, or typed conversion. Discarding a `Result` in any form is forbidden.
-- Library code uses `thiserror` enums. Variants carry the invalid value as a field wherever possible.
-- `anyhow` is permitted at the UI boundary only. Never `Box<dyn Error>`, never `map_err(|e| e.to_string())`.
+- Failures use typed enums whose variants carry the invalid value. `Display` and `Error` are written by hand so every message reads as a sentence for the user.
+- Preserve the underlying cause with `source()`. Never `Box<dyn Error>`, never `map_err(|e| e.to_string())`.
 - Every error must appear in the UI as a human-readable message. Errors written only to stderr or logs are invisible to the user, and an invisible error is a silent failure.
 - Error messages use sentence case: `"Failed to fetch radar data for site {site}: {source}"`.
 

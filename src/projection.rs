@@ -39,10 +39,13 @@ pub fn ground_range(slant_km: f64, elevation_deg: f64) -> Result<f64, Coordinate
     .sqrt()
         - EFFECTIVE_RADIUS_KM;
     let ratio = slant_km * elevation.cos() / (EFFECTIVE_RADIUS_KM + height);
-    if !ratio.is_finite() {
-        return Err(CoordinateError::Range { range_km: slant_km });
+    if !(-1.0..=1.0).contains(&ratio) {
+        return Err(CoordinateError::GroundRange {
+            slant_km,
+            elevation_deg,
+        });
     }
-    Ok(EFFECTIVE_RADIUS_KM * ratio.clamp(-1.0, 1.0).asin())
+    Ok(EFFECTIVE_RADIUS_KM * ratio.asin())
 }
 
 fn validate_lat(lat: f64) -> Result<(), CoordinateError> {
@@ -64,9 +67,10 @@ fn validate_lon(lon: f64) -> Result<(), CoordinateError> {
 pub fn mercator(lat: f64, lon: f64) -> Result<(f64, f64), CoordinateError> {
     validate_lat(lat)?;
     validate_lon(lon)?;
-    let lat = lat
-        .clamp(-MERCATOR_LIMIT_DEG, MERCATOR_LIMIT_DEG)
-        .to_radians();
+    if !(-MERCATOR_LIMIT_DEG..=MERCATOR_LIMIT_DEG).contains(&lat) {
+        return Err(CoordinateError::MercatorLatitude { lat });
+    }
+    let lat = lat.to_radians();
     Ok((
         MERCATOR_RADIUS_KM * lon.to_radians(),
         MERCATOR_RADIUS_KM * (std::f64::consts::FRAC_PI_4 + lat / 2.0).tan().ln(),

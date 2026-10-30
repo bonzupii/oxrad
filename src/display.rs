@@ -1,4 +1,4 @@
-// oxrad: A storm-chaser-grade NEXRAD weather radar viewer
+// oxrad — A storm-chaser-grade NEXRAD weather radar viewer
 // Copyright (C) 2026 Micah Ostrow <bonzupii@protonmail.com>
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,150 +13,178 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+//! The displayed frame and the render worker that prepares it.
 
-use eframe::egui::Shape;
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+
+use eframe::egui::{Rect, Shape};
 
 use crate::error::RenderError;
-use crate::gpu::RadarGpu;
+use crate::gpu::{self, RadarGpu, RadarMesh};
 use crate::radar::RadarVolume;
-use crate::render::{self, RenderCache, RenderRequest, RenderResult};
+use crate::render::{self, RadarGeometry};
 
 pub struct Frame {
     pub volume: RadarVolume,
-    pub cache: RenderCache,
-    pub shape: Shape,
-    generation: u64,
+    pub geometry: RadarGeometry,
+    pub mesh: Option<RadarMesh>,
+}
+
+impl Frame {
+    /// The draw callback for this frame at the current viewport.
+    pub fn shape(&self, viewport: Rect) -> Option<Shape> {
+        self.mesh.as_ref().map(|mesh| gpu::shape(mesh, viewport))
+    }
 }
 
 pub enum DisplayState {
     Waiting,
-    Preparing(u64),
+    Building,
     Ready,
+    Unavailable(RenderError),
     Failed {
         error: RenderError,
         volume: RadarVolume,
     },
-    Unavailable(RenderError),
+}
+
+impl DisplayState {
+    pub const fn error(&self) -> Option<&RenderError> {
+        match self {
+            Self::Unavailable(error) => Some(error),
+            Self::Failed { error, .. } => Some(error),
+            Self::Waiting | Self::Building | Self::Ready => None,
+        }
+    }
+
+    pub const fn is_busy(&self) -> bool {
+        matches!(self, Self::Waiting | Self::Building)
+    }
 }
 
 pub struct Display {
-    sender: Sender<RenderRequest>,
-    receiver: Receiver<RenderResult>,
-    gpu_errors: Receiver<u64>,
+    gpu: Option<RadarGpu>,
+    sender: Sender<render::BuildRequest>,
+    receiver: Receiver<render::BuildResult>,
     pub state: DisplayState,
     pub frame: Option<Frame>,
-    pub gpu_error: Option<RenderError>,
     queued: Option<(u64, RadarVolume)>,
     generation: u64,
 }
 
 impl Display {
     pub fn new(gpu: Option<RadarGpu>) -> Self {
-        let available = gpu.is_some();
-        let (gpu_sender, gpu_errors) = mpsc::channel();
-        let (sender, receiver) = render::start_render_thread(gpu, gpu_sender);
-        let state = if available {
+        let (sender, receiver) = render::start_build_thread();
+        let state = if gpu.is_some() {
             DisplayState::Waiting
         } else {
             DisplayState::Unavailable(RenderError::GpuUnavailable)
         };
         Self {
+            gpu,
             sender,
             receiver,
-            gpu_errors,
             state,
             frame: None,
-            gpu_error: None,
             queued: None,
             generation: 0,
         }
     }
 
-    pub fn submit(&mut self, volume: RadarVolume) {
+    /// Drops the current frame and discards any result still in flight.
+    pub fn reset(&mut self) {
         self.generation = self.generation.wrapping_add(1);
-        if matches!(self.state, DisplayState::Preparing(_)) {
-            self.queued = Some((self.generation, volume));
-        } else if !matches!(self.state, DisplayState::Unavailable(_)) {
-            self.send(self.generation, volume);
+        self.frame = None;
+        self.queued = None;
+        self.state = if self.gpu.is_some() {
+            DisplayState::Waiting
+        } else {
+            DisplayState::Unavailable(RenderError::GpuUnavailable)
+        };
+    }
+
+    pub fn submit(&mut self, volume: RadarVolume) {
+        if self.gpu.is_none() {
+            return;
+        }
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        if matches!(self.state, DisplayState::Building) {
+            self.queued = Some((generation, volume));
+        } else {
+            self.send(generation, volume);
         }
     }
 
     fn send(&mut self, generation: u64, volume: RadarVolume) {
-        let request = RenderRequest {
-            volume,
-            rect: render::canonical_rect(),
-            generation,
-        };
-        self.state = match self.sender.send(request) {
-            Ok(()) => DisplayState::Preparing(generation),
-            Err(_) => DisplayState::Unavailable(RenderError::WorkerStopped),
-        };
-    }
-
-    pub fn retry(&mut self) {
-        let state = std::mem::replace(&mut self.state, DisplayState::Waiting);
-        match state {
-            DisplayState::Failed { volume, .. } => self.send(self.generation, volume),
-            other => self.state = other,
+        match self
+            .sender
+            .send(render::BuildRequest { volume, generation })
+        {
+            Ok(()) => self.state = DisplayState::Building,
+            Err(_) => self.state = DisplayState::Unavailable(RenderError::WorkerStopped),
         }
     }
 
+    pub fn retry(&mut self) {
+        let DisplayState::Failed { volume, .. } =
+            std::mem::replace(&mut self.state, DisplayState::Waiting)
+        else {
+            return;
+        };
+        self.send(self.generation, volume);
+    }
+
     pub fn poll(&mut self) {
-        self.poll_gpu();
         match self.receiver.try_recv() {
             Ok(result) => self.complete(result),
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
-                self.state = DisplayState::Unavailable(RenderError::WorkerStopped)
+                self.state = DisplayState::Unavailable(RenderError::WorkerStopped);
             }
         }
     }
 
-    fn poll_gpu(&mut self) {
-        while let Ok(generation) = self.gpu_errors.try_recv() {
-            if self
-                .frame
-                .as_ref()
-                .is_some_and(|frame| frame.generation == generation)
-                && let Some(frame) = self.frame.take()
-            {
-                if matches!(self.state, DisplayState::Ready) {
-                    self.state = DisplayState::Failed {
-                        error: RenderError::GpuDraw,
-                        volume: frame.volume,
-                    };
-                } else {
-                    self.gpu_error = Some(RenderError::GpuDraw);
-                }
-            }
-        }
-    }
-
-    fn complete(&mut self, result: RenderResult) {
-        if !matches!(self.state, DisplayState::Preparing(generation) if generation == result.generation)
-        {
-            return;
-        }
+    fn complete(&mut self, result: render::BuildResult) {
+        // A queued volume waits for the worker to finish whatever it was doing,
+        // including work that this frame has already superseded. Sending it here
+        // is what keeps the display from waiting on a build that never starts.
         if let Some((generation, volume)) = self.queued.take() {
             self.send(generation, volume);
             return;
         }
-        self.state = match result.cache {
-            Ok((cache, shape)) => {
-                self.gpu_error = None;
-                self.frame = Some(Frame {
+        if !matches!(self.state, DisplayState::Building) || result.generation != self.generation {
+            return;
+        }
+        self.state = match result.geometry {
+            Ok(geometry) => match self.upload(&geometry) {
+                Ok(mesh) => {
+                    self.frame = Some(Frame {
+                        volume: result.volume,
+                        geometry,
+                        mesh,
+                    });
+                    DisplayState::Ready
+                }
+                Err(error) => DisplayState::Failed {
+                    error,
                     volume: result.volume,
-                    cache,
-                    shape,
-                    generation: result.generation,
-                });
-                DisplayState::Ready
-            }
+                },
+            },
             Err(error) => DisplayState::Failed {
                 error,
                 volume: result.volume,
             },
         };
+    }
+
+    fn upload(&self, geometry: &RadarGeometry) -> Result<Option<RadarMesh>, RenderError> {
+        let Some(gpu) = self.gpu.as_ref() else {
+            return Err(RenderError::GpuUnavailable);
+        };
+        if geometry.index_count == 0 {
+            return Ok(None);
+        }
+        gpu.upload(geometry).map(Some)
     }
 }

@@ -75,7 +75,7 @@ All coordinate math is locked to verified implementations. Every value cited her
 
 ### Reference Values
 
-The KPAH test origin below is a test input declared in the test fixtures. It does not appear in any rendering path. All values were computed independently of the implementation with GeographicLib (geodesics) and PROJ (Mercator), and cross-checked against closed-form expressions.
+The KPAH origin below is the site's published coordinate, used as a test input only; no rendering path depends on it. All values were computed independently of the implementation with GeographicLib (geodesics) and PROJ (Mercator), and cross-checked against closed-form expressions.
 
 **Geodesic direct, WGS84, KPAH test origin 37.06833°N 88.77194°W, ground range 75 km**
 
@@ -586,7 +586,9 @@ Passing the gates is necessary, not sufficient. The milestone's acceptance crite
 
 ### Milestone 1: Core render loop
 
-Window opens on the latest complete live KPAH Level II volume. Discovery, fetching, completeness validation, Archive II decompression, decoding, and refresh are implemented in this milestone. A checked-in, provenance-recorded KPAH fixture exercises the same decode-to-render path in tests and is never presented as live radar. Base reflectivity draws on a plain background with a lat/lon grid and 50 km range rings. For reflectivity, only gates that carry echo are drawn: `BelowThreshold` gates are excluded from the default view and counted in diagnostics, and `RangeFolded` gates use the distinct sentinel color. The color legend shows the reflectivity scale and dBZ. The scan time is visible. A pointer readout shows the gate value with units, ground range, and azimuth, and tracks the pointer within the interaction budget. Render geometry is built once per volume and reused across frames.
+The application starts with `cargo run` and no arguments. It restores the last selected site from `~/.oxrad/config.toml`; with no saved site it shows the site picker with the pipeline Idle and the reason "No site selected", and acquisition begins only for a site the user selects. The site list is the bundled National Weather Service catalog, and selecting a site cancels the previous site's work before the new fetch starts.
+
+Window opens on the latest complete live KPAH Level II volume. Discovery, fetching, completeness validation, Archive II decompression, decoding, and refresh are implemented in this milestone. Two real-data tests cover the source: a pinned, provenance-recorded KPAH archive is retrieved from the AWS feed at test time after its size and SHA-256 are verified, and the current live listing is paginated and decoded. Neither is presented as live radar. Base reflectivity draws on a plain background with a lat/lon grid and 50 km range rings. For reflectivity, only gates that carry echo are drawn: `BelowThreshold` gates are excluded from the default view and counted in diagnostics, and `RangeFolded` gates use the distinct sentinel color. The color legend shows the reflectivity scale and dBZ. The scan time is visible. A pointer readout shows the gate value with units, ground range, and azimuth, and tracks the pointer within the interaction budget. Render geometry is built once per volume and reused across frames.
 
 Gate geometry and elevation are read from radial headers and site coordinates from the volume header. Each gate's slant-range edges are converted to ground range before display, and the geographic placement follows the WGS84 geodesic. Coordinate math is unit-tested against the independently verified reference values. Every fetch and decode error surfaces as a message naming the operation, the site, and the cause. A failed fetch leaves the last good volume visible with its age and retries on the schedule in Retry Policy.
 

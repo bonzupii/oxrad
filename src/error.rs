@@ -13,308 +13,807 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
-use thiserror::Error;
+//! Every failure the application can report, with its carried values.
 
-#[derive(Debug, Error)]
+use std::error::Error;
+use std::fmt::{self, Display, Formatter};
+use std::io;
+use std::path::PathBuf;
+
+/// A value that cannot be placed on the ellipsoid or in the view.
+#[derive(Debug)]
 pub enum CoordinateError {
-    #[error("Latitude {lat} is invalid; it must be in the range -90 to 90.")]
     Latitude { lat: f64 },
-
-    #[error("Longitude {lon} is invalid; it must be in the range -180 to 180.")]
     Longitude { lon: f64 },
-
-    #[error("Range {range_km} is invalid; it must be non-negative.")]
+    MercatorLatitude { lat: f64 },
     Range { range_km: f64 },
-
-    #[error("Radar view range {range_km} is invalid; it must be finite and greater than zero.")]
-    ViewRange { range_km: f64 },
-
-    #[error("Azimuth {azimuth_deg} is invalid; it must be in the range 0 to 360.")]
+    GroundRange { slant_km: f64, elevation_deg: f64 },
+    ViewExtent { extent_km: f64 },
+    Viewport { width: f32, height: f32 },
     Azimuth { azimuth_deg: f64 },
-
-    #[error("Elevation {elevation_deg} is invalid; it must be in the range -90 to 90 degrees.")]
     Elevation { elevation_deg: f64 },
 }
 
-#[derive(Debug, Error)]
-pub enum ColorMapError {
-    #[error("Value {value} is out of range for product {product}.")]
-    OutOfRange { product: &'static str, value: f32 },
-
-    #[error("Value {value} did not match any palette interval for product {product}.")]
-    Unmapped { product: &'static str, value: f32 },
+impl CoordinateError {
+    fn message(&self) -> String {
+        match self {
+            Self::Latitude { lat } => format!("Latitude {lat} is outside -90 to 90."),
+            Self::Longitude { lon } => format!("Longitude {lon} is outside -180 to 180."),
+            Self::MercatorLatitude { lat } => {
+                format!("Latitude {lat} is outside the range Web Mercator can project.")
+            }
+            Self::Range { range_km } => format!("Range {range_km} km is not a valid distance."),
+            Self::GroundRange {
+                slant_km,
+                elevation_deg,
+            } => format!(
+                "Slant range {slant_km} km at {elevation_deg} degrees of elevation has no ground range."
+            ),
+            Self::ViewExtent { extent_km } => {
+                format!("Radar extent {extent_km} km is not positive and finite.")
+            }
+            Self::Viewport { width, height } => {
+                format!("The viewport is {width} by {height} pixels, too small to draw radar.")
+            }
+            Self::Azimuth { azimuth_deg } => {
+                format!("Azimuth {azimuth_deg} is outside 0 to 360.")
+            }
+            Self::Elevation { elevation_deg } => {
+                format!("Elevation {elevation_deg} is outside -90 to 90 degrees.")
+            }
+        }
+    }
 }
 
-#[derive(Debug, Error)]
+impl Display for CoordinateError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message())
+    }
+}
+
+impl Error for CoordinateError {}
+
+/// A value that is not a four-character radar site identifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SiteIdError {
+    Length { value: String, length: usize },
+    Character { value: String, byte: u8 },
+}
+
+impl SiteIdError {
+    fn message(&self) -> String {
+        match self {
+            Self::Length { value, length } => {
+                format!("Site identifier {value:?} has {length} characters; four are required.")
+            }
+            Self::Character { value, byte } => format!(
+                "Site identifier {value:?} contains {byte}; only A to Z and 0 to 9 are allowed."
+            ),
+        }
+    }
+}
+
+impl Display for SiteIdError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message())
+    }
+}
+
+impl Error for SiteIdError {}
+
+/// A defect in the bundled site catalog, which is fixed at build time.
+#[derive(Debug)]
+pub enum CatalogError {
+    Empty,
+    Fields { line: usize },
+    Identifier { line: usize, source: SiteIdError },
+    Name { line: usize },
+    Number { line: usize },
+    Latitude { line: usize, lat: f64 },
+    Longitude { line: usize, lon: f64 },
+    Duplicate { line: usize, id: String },
+}
+
+impl CatalogError {
+    fn message(&self) -> String {
+        match self {
+            Self::Empty => String::from("The radar site catalog is empty."),
+            Self::Fields { line } => {
+                format!("Catalog line {line} does not hold four tab-separated fields.")
+            }
+            Self::Identifier { line, source } => {
+                format!("Catalog line {line} has an invalid identifier: {source}")
+            }
+            Self::Name { line } => format!("Catalog line {line} has an empty name."),
+            Self::Number { line } => {
+                format!("Catalog line {line} has a coordinate that is not a number.")
+            }
+            Self::Latitude { line, lat } => {
+                format!("Catalog line {line} has latitude {lat}, outside -90 to 90.")
+            }
+            Self::Longitude { line, lon } => {
+                format!("Catalog line {line} has longitude {lon}, outside -180 to 180.")
+            }
+            Self::Duplicate { line, id } => format!("Catalog line {line} repeats site {id}."),
+        }
+    }
+}
+
+impl Display for CatalogError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message())
+    }
+}
+
+impl Error for CatalogError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Identifier { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+/// A failure reading or writing the application directory.
+#[derive(Debug)]
+pub enum PathError {
+    HomeUnavailable,
+}
+
+impl Display for PathError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HomeUnavailable => write!(
+                formatter,
+                "No home directory is set, so the oxrad configuration cannot be stored."
+            ),
+        }
+    }
+}
+
+impl Error for PathError {}
+
+/// A failure reading or writing the user configuration file.
+#[derive(Debug)]
+pub enum ConfigError {
+    Read {
+        path: PathBuf,
+        source: io::Error,
+    },
+    Write {
+        path: PathBuf,
+        source: io::Error,
+    },
+    Syntax {
+        path: PathBuf,
+        line: usize,
+    },
+    UnknownKey {
+        path: PathBuf,
+        line: usize,
+        key: String,
+    },
+    Site {
+        path: PathBuf,
+        line: usize,
+        source: SiteIdError,
+    },
+    Path {
+        source: PathError,
+    },
+}
+
+impl ConfigError {
+    fn message(&self) -> String {
+        match self {
+            Self::Read { path, source } => {
+                format!("Failed to read {}: {source}", path.display())
+            }
+            Self::Write { path, source } => {
+                format!("Failed to write {}: {source}", path.display())
+            }
+            Self::Syntax { path, line } => {
+                format!("{} line {line} is not a key and a value.", path.display())
+            }
+            Self::UnknownKey { path, line, key } => format!(
+                "{} line {line} sets the unrecognized key {key}.",
+                path.display()
+            ),
+            Self::Site { path, line, source } => {
+                format!(
+                    "{} line {line} has an invalid site: {source}",
+                    path.display()
+                )
+            }
+            Self::Path { source } => source.to_string(),
+        }
+    }
+}
+
+impl Display for ConfigError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message())
+    }
+}
+
+impl Error for ConfigError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Read { source, .. } | Self::Write { source, .. } => Some(source),
+            Self::Site { source, .. } => Some(source),
+            Self::Path { source } => Some(source),
+            Self::Syntax { .. } | Self::UnknownKey { .. } => None,
+        }
+    }
+}
+
+/// A reflectivity moment that cannot be decoded into gate values.
+#[derive(Debug)]
 pub enum MomentError {
-    #[error("Moment scale {scale} must be finite and positive.")]
     Scale { scale: f32 },
-    #[error("Moment offset {offset} must be finite.")]
     Offset { offset: f32 },
-    #[error("Moment word size {word_size} is unsupported.")]
     WordSize { word_size: u8 },
-    #[error("Moment has {actual} bytes; expected {expected}.")]
     Length { expected: usize, actual: usize },
-    #[error("Moment decodes to {value}, outside the representable reflectivity range.")]
     Value { value: f32 },
 }
 
+impl MomentError {
+    fn message(&self) -> String {
+        match self {
+            Self::Scale { scale } => format!("Moment scale {scale} is not positive and finite."),
+            Self::Offset { offset } => format!("Moment offset {offset} is not finite."),
+            Self::WordSize { word_size } => format!("Moment word size {word_size} is unsupported."),
+            Self::Length { expected, actual } => {
+                format!("Moment has {actual} bytes; expected {expected}.")
+            }
+            Self::Value { value } => {
+                format!("Moment decodes to {value}, outside the representable reflectivity range.")
+            }
+        }
+    }
+}
+
+impl Display for MomentError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message())
+    }
+}
+
+impl Error for MomentError {}
+
 /// The specific structural violation found in a type 31 message.
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum MessageDefect {
-    #[error("Message header is truncated: {available} bytes remain, 28 are required.")]
-    TruncatedHeader { available: usize },
-    #[error("Message declares {declared} bytes, less than its {minimum} byte header.")]
-    DeclaredSize { declared: usize, minimum: usize },
-    #[error("Message declares {declared} bytes but only {available} remain in its record.")]
-    Bounds { declared: usize, available: usize },
-    #[error("Type 31 message is segmented: segment {segment_number} of {segment_count}.")]
+    TruncatedHeader {
+        available: usize,
+    },
+    DeclaredSize {
+        declared: usize,
+        minimum: usize,
+    },
+    Bounds {
+        declared: usize,
+        available: usize,
+    },
     Segmented {
         segment_count: u16,
         segment_number: u16,
     },
-    #[error("Radial header is truncated: {available} bytes remain, 32 are required.")]
-    TruncatedRadialHeader { available: usize },
-    #[error("Radial is compressed, which type 31 decoding does not define.")]
+    TruncatedRadialHeader {
+        available: usize,
+    },
     CompressedRadial,
-    #[error("Radial declares {declared} bytes but {available} remain in its message.")]
-    RadialLength { declared: u16, available: usize },
-    #[error(
-        "Radial declares {blocks} data blocks that do not fit within its {radial_length} bytes."
-    )]
-    PointerTable { blocks: u16, radial_length: usize },
-    #[error(
-        "Data block {index} points to {pointer}, inside the pointer table ending at {table_end}."
-    )]
+    RadialLength {
+        declared: u16,
+        available: usize,
+    },
+    PointerTable {
+        blocks: u16,
+        radial_length: usize,
+    },
     PointerInsideTable {
         index: u16,
         pointer: usize,
         table_end: usize,
     },
-    #[error("Data block {index} has offset {pointer}, which this machine cannot address.")]
-    PointerUnrepresentable { index: u16, pointer: u32 },
-    #[error("Data block {index} at {pointer} has no four-byte identifier inside its radial.")]
-    BlockIdentifier { index: u16, pointer: usize },
-    #[error("Data block {id:?} at {pointer} cannot hold its {length} bytes.")]
+    PointerUnrepresentable {
+        index: u16,
+        pointer: u32,
+    },
+    BlockIdentifier {
+        index: u16,
+        pointer: usize,
+    },
     BlockEnd {
         id: [u8; 4],
         pointer: usize,
         length: usize,
     },
-    #[error("Data block {id:?} at {pointer} is not defined by the ICD.")]
-    UnknownBlock { pointer: usize, id: [u8; 4] },
-    #[error(
-        "Constant block {id:?} declares {declared} bytes, below the {minimum} the decoder reads."
-    )]
+    UnknownBlock {
+        pointer: usize,
+        id: [u8; 4],
+    },
     BlockLength {
         id: [u8; 4],
         declared: u16,
         minimum: u16,
     },
-    #[error(
-        "Data block {id:?} at {pointer} ends at {end}, beyond its {radial_length} byte radial."
-    )]
     BlockBounds {
         id: [u8; 4],
         pointer: usize,
         end: usize,
         radial_length: usize,
     },
-    #[error("Data block {id:?} at {pointer} overlaps another data block.")]
-    BlockOverlap { id: [u8; 4], pointer: usize },
-    #[error("Moment block {id:?} declares a {word_size} bit word.")]
-    WordSize { id: [u8; 4], word_size: u8 },
-    #[error("Moment block {id:?} declares {gates} gates whose byte length overflows.")]
-    GateLength { id: [u8; 4], gates: u16 },
+    BlockOverlap {
+        id: [u8; 4],
+        pointer: usize,
+    },
+    WordSize {
+        id: [u8; 4],
+        word_size: u8,
+    },
+    GateLength {
+        id: [u8; 4],
+        gates: u16,
+    },
 }
+
+impl MessageDefect {
+    fn message(&self) -> String {
+        match self {
+            Self::TruncatedHeader { available } => {
+                format!("The message header is truncated at {available} bytes of 28.")
+            }
+            Self::DeclaredSize { declared, minimum } => {
+                format!("The message declares {declared} bytes, below {minimum}.")
+            }
+            Self::Bounds {
+                declared,
+                available,
+            } => {
+                format!("The message declares {declared} bytes with {available} left.")
+            }
+            Self::Segmented {
+                segment_count,
+                segment_number,
+            } => {
+                format!("The type 31 message is segment {segment_number} of {segment_count}.")
+            }
+            Self::TruncatedRadialHeader { available } => {
+                format!("The radial header is truncated at {available} bytes of 32.")
+            }
+            Self::CompressedRadial => {
+                String::from("The radial is compressed, which type 31 does not define.")
+            }
+            Self::RadialLength {
+                declared,
+                available,
+            } => {
+                format!("The radial declares {declared} bytes with {available} left.")
+            }
+            Self::PointerTable {
+                blocks,
+                radial_length,
+            } => format!(
+                "The radial declares {blocks} data blocks that do not fit its {radial_length} bytes."
+            ),
+            Self::PointerInsideTable {
+                index,
+                pointer,
+                table_end,
+            } => format!(
+                "Data block {index} points to {pointer}, inside the table ending at {table_end}."
+            ),
+            Self::PointerUnrepresentable { index, pointer } => format!(
+                "Data block {index} has offset {pointer}, which this machine cannot address."
+            ),
+            Self::BlockIdentifier { index, pointer } => {
+                format!("Data block {index} at {pointer} has no four-byte identifier.")
+            }
+            Self::BlockEnd {
+                id,
+                pointer,
+                length,
+            } => {
+                format!("Data block {id:?} at {pointer} cannot hold {length} bytes.")
+            }
+            Self::UnknownBlock { pointer, id } => {
+                format!("Data block {id:?} at {pointer} is not defined by the ICD.")
+            }
+            Self::BlockLength {
+                id,
+                declared,
+                minimum,
+            } => format!(
+                "Block {id:?} declares {declared} bytes, below the {minimum} the decoder reads."
+            ),
+            Self::BlockBounds {
+                id,
+                pointer,
+                end,
+                radial_length,
+            } => format!(
+                "Block {id:?} at {pointer} ends at {end}, past its {radial_length} byte radial."
+            ),
+            Self::BlockOverlap { id, pointer } => {
+                format!("Data block {id:?} at {pointer} overlaps another block.")
+            }
+            Self::WordSize { id, word_size } => {
+                format!("Moment block {id:?} declares a {word_size} bit word.")
+            }
+            Self::GateLength { id, gates } => {
+                format!("Moment block {id:?} declares {gates} gates with an overflow.")
+            }
+        }
+    }
+}
+
+impl Display for MessageDefect {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message())
+    }
+}
+
+impl Error for MessageDefect {}
 
 /// Why a decoded archive does not form a complete volume.
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum VolumeDefect {
-    #[error("no radial declares the start of the volume")]
     MissingStart,
-    #[error("no radial declares the end of the volume")]
     MissingEnd,
-    #[error("radials appear outside any elevation sweep")]
     SweepBoundaries,
+    NoCompleteSweep,
+    NoReflectivity,
+    MissingSiteCoordinates,
+    AzimuthGeometry { radials: usize },
 }
 
-#[derive(Debug, Error)]
+impl VolumeDefect {
+    fn message(&self) -> String {
+        match self {
+            Self::MissingStart => String::from("no radial declares the volume start"),
+            Self::MissingEnd => String::from("no radial declares the volume end"),
+            Self::SweepBoundaries => String::from("a radial appears outside any elevation sweep"),
+            Self::NoCompleteSweep => String::from("no sweep has both a first and a last radial"),
+            Self::NoReflectivity => String::from("the lowest sweep carries no reflectivity gates"),
+            Self::MissingSiteCoordinates => {
+                String::from("no radial carries the site coordinate block")
+            }
+            Self::AzimuthGeometry { radials } => {
+                format!("{radials} radials do not define a usable azimuth sequence")
+            }
+        }
+    }
+}
+
+impl Display for VolumeDefect {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message())
+    }
+}
+
+impl Error for VolumeDefect {}
+
+/// A failure acquiring, decoding, or assembling a radar volume.
+#[derive(Debug)]
 pub enum RadarError {
-    #[error("HTTP request to {url} failed: {source}")]
     Http {
         url: String,
-        #[source]
         source: ureq::Error,
     },
-
-    #[error("HTTP request to {url} returned status {status}; Retry-After: {retry_after:?}.")]
     HttpStatus {
         url: String,
         status: u16,
         retry_after: Option<String>,
     },
-
-    #[error("Invalid Retry-After value {value:?}.")]
-    InvalidRetryAfter { value: String },
-
-    #[error("{request} Retry-After could not be applied: {source}")]
-    RetryAfter {
-        request: Box<RadarError>,
-        #[source]
-        source: Box<RadarError>,
+    VolumeGone {
+        key: String,
     },
-
-    #[error("S3 listing response for prefix {prefix} could not be parsed.")]
-    Listing { prefix: String },
-
-    #[error("No volume was listed for site {site} in the last three days.")]
-    NoVolume { site: String },
-
-    #[error(
-        "Archive {key} declares version {version:?}, which is not AR2V with a numeric volume and version."
-    )]
-    ArchiveVersion { key: String, version: [u8; 12] },
-
-    #[error("Archive {key} is for site {actual:?}; site {expected:?} was requested.")]
+    InvalidRetryAfter {
+        value: String,
+    },
+    Listing {
+        prefix: String,
+    },
+    ListingBody {
+        prefix: String,
+    },
+    NoVolume {
+        site: String,
+    },
+    ArchiveVersion {
+        key: String,
+        version: [u8; 12],
+    },
     ArchiveSite {
         key: String,
         expected: String,
         actual: [u8; 4],
     },
-
-    #[error(
-        "Archive {key} declares date {date} and time {time} ms, which are not a valid scan time."
-    )]
-    ArchiveTime { key: String, date: u32, time: u32 },
-
-    #[error("Archive record at byte {offset} of {key} has no four-byte length prefix.")]
-    RecordHeader { key: String, offset: usize },
-
-    #[error("Archive record at byte {offset} of {key} extends past the end of the file.")]
-    RecordBounds { key: String, offset: usize },
-
-    #[error(
-        "Archive record at byte {offset} of {key} exceeds the decompressed limit of {limit} bytes."
-    )]
+    ArchiveTime {
+        key: String,
+        date: u32,
+        time: u32,
+    },
+    RecordHeader {
+        key: String,
+        offset: usize,
+    },
+    RecordBounds {
+        key: String,
+        offset: usize,
+    },
     RecordTooLarge {
         key: String,
         offset: usize,
         limit: u64,
     },
-
-    #[error("Archive record at byte {offset} of {key} failed to decompress: {source}")]
     Decompress {
         key: String,
         offset: usize,
-        #[source]
-        source: std::io::Error,
+        source: io::Error,
     },
-
-    #[error("Archive record at byte {offset} of {key} failed to decode: {source}")]
     Decode {
         key: String,
         offset: usize,
-        #[source]
         source: nexrad_decode::result::Error,
     },
-
-    #[error(
-        "Message at byte {message_offset} of record {record_offset} in {key} is invalid: {defect}"
-    )]
     MessageStructure {
         key: String,
         record_offset: usize,
         message_offset: usize,
-        #[source]
         defect: MessageDefect,
     },
-
-    #[error("No volume data block was found in any radial; site coordinates are unavailable.")]
-    MissingSiteCoordinates,
-
-    #[error("Requested site {requested}, but a radar radial identifies site {actual:?}.")]
-    SiteMismatch { requested: String, actual: [u8; 4] },
-
-    #[error("Invalid radar site coordinates: {source}")]
+    SiteMismatch {
+        requested: String,
+        actual: [u8; 4],
+    },
     SiteCoordinates {
-        #[source]
         source: CoordinateError,
     },
-
-    #[error("Radial {azimuth_number} of site {site} has an invalid gate range: {source}")]
     GateRange {
         site: String,
         azimuth_number: u16,
-        #[source]
         source: CoordinateError,
     },
-
-    #[error("No reflectivity data was found in the selected sweep for site {site}.")]
-    NoReflectivityData { site: String },
-
-    #[error(
-        "The selected sweep for site {site} ended before the elevation-end radial; the volume is incomplete."
-    )]
-    IncompleteSweep { site: String },
-
-    #[error("The archive for site {site} is incomplete: {defect}.")]
-    IncompleteVolume { site: String, defect: VolumeDefect },
-
-    #[error("The decoder worker for site {site} stopped before producing a volume.")]
-    DecoderStopped { site: String },
-
-    #[error("The decoder worker for site {site} panicked; no volume was produced.")]
-    DecoderPanic { site: String },
-
-    #[error("The fetch worker for site {site} stopped; radar updates are unavailable.")]
-    WorkerStopped { site: String },
-
-    #[error("The fetch worker for site {site} panicked; no volume was produced.")]
-    WorkerPanic { site: String },
-
-    #[error("The clock is before the Unix epoch: {source}")]
+    IncompleteVolume {
+        site: String,
+        defect: VolumeDefect,
+    },
+    DecoderStopped {
+        site: String,
+    },
+    DecoderPanic {
+        site: String,
+    },
+    WorkerStopped {
+        site: String,
+    },
+    WorkerPanic {
+        site: String,
+    },
     Clock {
-        #[source]
         source: std::time::SystemTimeError,
     },
-
-    #[error("The current date cannot be represented: {source}")]
     DateRange {
-        #[source]
         source: std::num::TryFromIntError,
     },
 }
 
-#[derive(Debug, Error)]
+impl RadarError {
+    fn message(&self) -> String {
+        match self {
+            Self::Http { url, source } => format!("The request to {url} failed: {source}"),
+            Self::HttpStatus {
+                url,
+                status,
+                retry_after,
+            } => {
+                format!("{url} returned {status}; Retry-After {retry_after:?}.")
+            }
+            Self::VolumeGone { key } => {
+                format!("Volume {key} left the feed; the listing is refreshed.")
+            }
+            Self::InvalidRetryAfter { value } => format!("Retry-After {value:?} is not a time."),
+            Self::Listing { prefix } => {
+                format!("The listing for {prefix} could not be read.")
+            }
+            Self::ListingBody { prefix } => {
+                format!("The listing for {prefix} is not UTF-8 text.")
+            }
+            Self::NoVolume { site } => {
+                format!("No volume was listed for {site} in the last three days.")
+            }
+            Self::ArchiveVersion { key, version } => {
+                format!("{key} declares {version:?}, which is not AR2V.")
+            }
+            Self::ArchiveSite {
+                key,
+                expected,
+                actual,
+            } => {
+                format!("{key} is site {actual:?}; {expected} was requested.")
+            }
+            Self::ArchiveTime { key, date, time } => {
+                format!("{key} has date {date} and time {time} ms, not a valid time.")
+            }
+            Self::RecordHeader { key, offset } => {
+                format!("{key} at byte {offset} has no record length.")
+            }
+            Self::RecordBounds { key, offset } => {
+                format!("{key} at byte {offset} ends past the file.")
+            }
+            Self::RecordTooLarge { key, offset, limit } => {
+                format!("{key} at byte {offset} exceeds {limit} decompressed bytes.")
+            }
+            Self::Decompress {
+                key,
+                offset,
+                source,
+            } => {
+                format!("Decompressing {key} at {offset} failed: {source}")
+            }
+            Self::Decode {
+                key,
+                offset,
+                source,
+            } => {
+                format!("Decoding {key} at {offset} failed: {source}")
+            }
+            Self::MessageStructure {
+                key,
+                record_offset,
+                message_offset,
+                defect,
+            } => {
+                format!("{key} record {record_offset} message {message_offset}: {defect}")
+            }
+            Self::SiteMismatch { requested, actual } => {
+                format!("Site {requested} was requested; radials say {actual:?}.")
+            }
+            Self::SiteCoordinates { source } => {
+                format!("Invalid radar site coordinates: {source}")
+            }
+            Self::GateRange {
+                site,
+                azimuth_number,
+                source,
+            } => {
+                format!("{site} radial {azimuth_number} gate range: {source}")
+            }
+            Self::IncompleteVolume { site, defect } => {
+                format!("The {site} archive is incomplete: {defect}.")
+            }
+            Self::DecoderStopped { site } => {
+                format!("The {site} decoder stopped; no volume arrived.")
+            }
+            Self::DecoderPanic { site } => {
+                format!("The {site} decoder panicked; no volume arrived.")
+            }
+            Self::WorkerStopped { site } => {
+                format!("The {site} fetch worker stopped; updates stopped.")
+            }
+            Self::WorkerPanic { site } => {
+                format!("The {site} fetch worker panicked; no volume arrived.")
+            }
+            Self::Clock { source } => format!("The clock is before the Unix epoch: {source}"),
+            Self::DateRange { source } => {
+                format!("The date cannot be represented: {source}")
+            }
+        }
+    }
+}
+
+impl Display for RadarError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message())
+    }
+}
+
+impl Error for RadarError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Http { source, .. } => Some(source),
+            Self::Decompress { source, .. } => Some(source),
+            Self::Decode { source, .. } => Some(source),
+            Self::MessageStructure { defect, .. } => Some(defect),
+            Self::SiteCoordinates { source } => Some(source),
+            Self::GateRange { source, .. } => Some(source),
+            Self::IncompleteVolume { defect, .. } => Some(defect),
+            Self::Clock { source } => Some(source),
+            Self::DateRange { source } => Some(source),
+            Self::HttpStatus { .. }
+            | Self::VolumeGone { .. }
+            | Self::InvalidRetryAfter { .. }
+            | Self::Listing { .. }
+            | Self::ListingBody { .. }
+            | Self::NoVolume { .. }
+            | Self::ArchiveVersion { .. }
+            | Self::ArchiveSite { .. }
+            | Self::ArchiveTime { .. }
+            | Self::RecordHeader { .. }
+            | Self::RecordBounds { .. }
+            | Self::RecordTooLarge { .. }
+            | Self::SiteMismatch { .. }
+            | Self::DecoderStopped { .. }
+            | Self::DecoderPanic { .. }
+            | Self::WorkerStopped { .. }
+            | Self::WorkerPanic { .. } => None,
+        }
+    }
+}
+
+/// A failure mapping a reflectivity value to a palette entry.
+#[derive(Debug)]
+pub enum ColorMapError {
+    OutOfRange { product: &'static str, value: f32 },
+}
+
+impl Display for ColorMapError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OutOfRange { product, value } => {
+                write!(
+                    formatter,
+                    "Value {value} is out of range for product {product}."
+                )
+            }
+        }
+    }
+}
+
+impl Error for ColorMapError {}
+
+/// A failure preparing or drawing the radar frame.
+#[derive(Debug)]
 pub enum RenderError {
-    #[error("The render worker stopped before producing a frame.")]
     WorkerStopped,
-
-    #[error("The GPU radar draw failed.")]
-    GpuDraw,
-
-    #[error("The WGPU renderer is unavailable; radar cannot be displayed.")]
     GpuUnavailable,
-
-    #[error("The render worker panicked while preparing the radar frame.")]
     Panic,
-
-    #[error("The radar geometry has no geodesic paths for a gate.")]
-    MissingGeodesicPaths,
-
-    #[error("Radar geographic placement failed: {source}")]
-    Coordinate {
-        #[source]
-        source: CoordinateError,
-    },
-
-    #[error("Failed to map radar value to a color: {source}")]
-    Color {
-        #[source]
-        source: ColorMapError,
-    },
-
-    #[error("Radar mesh has too many vertices: {vertices}.")]
+    Coordinate { source: CoordinateError },
+    Color { source: ColorMapError },
     MeshSize { vertices: usize },
+}
+
+impl RenderError {
+    fn message(&self) -> String {
+        match self {
+            Self::WorkerStopped => {
+                String::from("The render worker stopped before producing a frame.")
+            }
+            Self::GpuUnavailable => {
+                String::from("The WGPU renderer is unavailable; radar cannot be displayed.")
+            }
+            Self::Panic => {
+                String::from("The render worker panicked while preparing the radar frame.")
+            }
+            Self::Coordinate { source } => {
+                format!("Radar geographic placement failed: {source}")
+            }
+            Self::Color { source } => {
+                format!("Failed to map radar value to a color: {source}")
+            }
+            Self::MeshSize { vertices } => {
+                format!("The radar mesh has {vertices} vertices, too many to draw.")
+            }
+        }
+    }
+}
+
+impl Display for RenderError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message())
+    }
+}
+
+impl Error for RenderError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Coordinate { source } => Some(source),
+            Self::Color { source } => Some(source),
+            Self::WorkerStopped | Self::GpuUnavailable | Self::Panic | Self::MeshSize { .. } => {
+                None
+            }
+        }
+    }
 }

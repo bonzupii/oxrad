@@ -1,4 +1,4 @@
-// oxrad: A storm-chaser-grade NEXRAD weather radar viewer
+// oxrad — A storm-chaser-grade NEXRAD weather radar viewer
 // Copyright (C) 2026 Micah Ostrow <bonzupii@protonmail.com>
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,6 +13,8 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//! The fetch and decode workers for one site, and the state they report.
+
 use std::collections::hash_map::RandomState;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -21,9 +23,10 @@ use std::time::Duration;
 use crate::error::RadarError;
 use crate::network;
 use crate::radar::{self, RadarVolume};
-use crate::retry::{self, error_update};
+use crate::retry::{self, BASE_DELAY, MAX_DELAY, error_update};
+use crate::stations::SiteId;
 
-const FETCH_INTERVAL: Duration = Duration::from_secs(30);
+const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 /// A failed pipeline step and the stage it failed in.
 #[derive(Debug)]
@@ -68,7 +71,6 @@ pub enum PipelineState {
     },
     Ready,
     Failed(Failure),
-    Stopped(RadarError),
 }
 
 impl PipelineState {
@@ -76,7 +78,34 @@ impl PipelineState {
         match self {
             Self::Working { last_failure, .. } => last_failure.as_ref(),
             Self::Failed(failure) => Some(failure),
-            Self::Ready | Self::Stopped(_) => None,
+            Self::Ready => None,
+        }
+    }
+
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Working {
+                operation: Operation::Fetching,
+                ..
+            } => "Fetching",
+            Self::Working {
+                operation: Operation::Decoding,
+                ..
+            } => "Decoding",
+            Self::Failed(_) => "Error",
+            Self::Ready => "Ready",
+        }
+    }
+
+    pub const fn is_working(&self) -> bool {
+        matches!(self, Self::Working { .. })
+    }
+
+    const fn operation(&self) -> Operation {
+        match self {
+            Self::Working { operation, .. } => *operation,
+            Self::Failed(failure) => failure.operation,
+            Self::Ready => Operation::Fetching,
         }
     }
 
@@ -84,7 +113,7 @@ impl PipelineState {
         match self {
             Self::Working { last_failure, .. } => last_failure,
             Self::Failed(failure) => Some(failure),
-            Self::Ready | Self::Stopped(_) => None,
+            Self::Ready => None,
         }
     }
 }
@@ -100,14 +129,14 @@ struct Archive {
 }
 
 pub struct Pipeline {
-    site: String,
+    site: SiteId,
     events: Receiver<Event>,
     retry: Sender<()>,
     pub state: PipelineState,
 }
 
 impl Pipeline {
-    pub fn start(site: String) -> Self {
+    pub fn start(site: SiteId) -> Self {
         let (events, event_receiver) = mpsc::channel();
         let (retry, retries) = mpsc::channel();
         let (jobs, decode_jobs) = mpsc::channel();
@@ -149,8 +178,12 @@ impl Pipeline {
             Ok(event) => self.apply(event),
             Err(TryRecvError::Empty) => None,
             Err(TryRecvError::Disconnected) => {
-                self.state = PipelineState::Stopped(RadarError::WorkerStopped {
-                    site: self.site.clone(),
+                let site = String::from(self.site.as_str());
+                self.state = PipelineState::Failed(Failure {
+                    operation: self.state.operation(),
+                    error: RadarError::WorkerStopped { site },
+                    retry_in: None,
+                    waiting_for_next_volume: false,
                 });
                 None
             }
@@ -192,15 +225,16 @@ impl Pipeline {
         }
     }
 
+    /// Asks the fetch worker to try again now.
     pub fn retry(&mut self) -> Result<(), RadarError> {
         self.retry.send(()).map_err(|_| RadarError::WorkerStopped {
-            site: self.site.clone(),
+            site: String::from(self.site.as_str()),
         })
     }
 }
 
 struct Decoder {
-    site: String,
+    site: SiteId,
     jobs: Receiver<Archive>,
     results: Sender<Result<RadarVolume, RadarError>>,
 }
@@ -213,7 +247,7 @@ impl Decoder {
             }))
             .unwrap_or_else(|_| {
                 Err(RadarError::DecoderPanic {
-                    site: self.site.clone(),
+                    site: String::from(self.site.as_str()),
                 })
             });
             if self.results.send(result).is_err() {
@@ -238,7 +272,7 @@ impl FetchState {
             last_key: None,
             failed_key: None,
             decode_failures: 0,
-            delay: Duration::from_secs(2),
+            delay: BASE_DELAY,
             attempt: 0,
             jitter: RandomState::new(),
         }
@@ -247,23 +281,35 @@ impl FetchState {
     fn reset_retry(&mut self) {
         self.failed_key = None;
         self.decode_failures = 0;
-        self.delay = Duration::from_secs(2);
+        self.delay = BASE_DELAY;
         self.attempt = 0;
     }
 }
 
-fn decode_failure(site: &str) -> FetchFailure {
+fn worker_failure(site: &SiteId, operation: Operation, error: RadarError) -> FetchFailure {
+    FetchFailure {
+        operation,
+        error: match error {
+            RadarError::WorkerStopped { .. } => RadarError::WorkerStopped {
+                site: String::from(site.as_str()),
+            },
+            other => other,
+        },
+    }
+}
+
+fn decode_failure(site: &SiteId) -> FetchFailure {
     FetchFailure {
         operation: Operation::Decoding,
         error: RadarError::DecoderStopped {
-            site: String::from(site),
+            site: String::from(site.as_str()),
         },
     }
 }
 
 fn fetch(
     state: &mut FetchState,
-    site: &str,
+    site: &SiteId,
     events: &Sender<Event>,
     jobs: &Sender<Archive>,
     results: &Receiver<Result<RadarVolume, RadarError>>,
@@ -281,17 +327,23 @@ fn fetch(
         state.failed_key = None;
         state.decode_failures = 0;
     }
-    let bytes = network::fetch_archive(&key).map_err(|error| FetchFailure {
-        operation: Operation::Fetching,
-        error,
+    let bytes = network::fetch_archive(&key).map_err(|error| {
+        if matches!(error, RadarError::VolumeGone { .. }) {
+            state.last_key = None;
+        }
+        FetchFailure {
+            operation: Operation::Fetching,
+            error,
+        }
     })?;
     if events.send(Event::Working(Operation::Decoding)).is_err() {
-        return Err(FetchFailure {
-            operation: Operation::Fetching,
-            error: RadarError::WorkerStopped {
-                site: String::from(site),
+        return Err(worker_failure(
+            site,
+            Operation::Fetching,
+            RadarError::WorkerStopped {
+                site: String::from(site.as_str()),
             },
-        });
+        ));
     }
     jobs.send(Archive {
         key: key.clone(),
@@ -314,7 +366,7 @@ fn fetch(
 }
 
 struct Fetcher {
-    site: String,
+    site: SiteId,
     events: Sender<Event>,
     retries: Receiver<()>,
     jobs: Sender<Archive>,
@@ -350,7 +402,7 @@ impl Fetcher {
                     }
                 }
                 Ok(Ok(None)) => {
-                    state.delay = Duration::from_secs(2);
+                    state.delay = BASE_DELAY;
                     state.attempt = 0;
                     FetchUpdate {
                         result: Ok(None),
@@ -368,9 +420,11 @@ impl Fetcher {
                 Err(_) => FetchUpdate {
                     result: Err(FetchFailure {
                         operation: Operation::Fetching,
-                        error: RadarError::WorkerPanic { site: site.clone() },
+                        error: RadarError::WorkerPanic {
+                            site: String::from(site.as_str()),
+                        },
                     }),
-                    retry_in: Some(FETCH_INTERVAL),
+                    retry_in: Some(POLL_INTERVAL),
                     waiting_for_next_volume: false,
                 },
             };
@@ -378,16 +432,45 @@ impl Fetcher {
             if events.send(Event::Update(update)).is_err() {
                 return;
             }
-            let timeout = wait.unwrap_or(FETCH_INTERVAL);
+            let timeout = wait.unwrap_or(POLL_INTERVAL);
             match retries.recv_timeout(timeout) {
                 Ok(()) => state.reset_retry(),
                 Err(mpsc::RecvTimeoutError::Timeout) if wait.is_some() => {
-                    state.delay = state.delay.saturating_mul(2).min(Duration::from_secs(60));
+                    state.delay = state.delay.saturating_mul(2).min(MAX_DELAY);
                     state.attempt = state.attempt.saturating_add(1);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn operation_names_read_as_actions() {
+        assert_eq!(Operation::Fetching.description(), "Fetch");
+        assert_eq!(Operation::Decoding.description(), "Decode");
+    }
+
+    #[test]
+    fn a_failed_step_keeps_its_operation_and_error() -> Result<(), String> {
+        let site = SiteId::parse("KPAH").map_err(|error| error.to_string())?;
+        let failed = worker_failure(
+            &site,
+            Operation::Fetching,
+            RadarError::WorkerStopped {
+                site: String::from("KPAH"),
+            },
+        );
+        assert_eq!(failed.operation, Operation::Fetching);
+        assert!(matches!(
+            failed.error,
+            RadarError::WorkerStopped { ref site } if site == "KPAH"
+        ));
+        Ok(())
     }
 }
