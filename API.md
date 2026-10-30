@@ -1,6 +1,8 @@
 # NEXRAD Rust Crate API Reference
 
-Sourced from `cargo doc` HTML output in `target/doc/`. Units: km unless noted. Error types use `thiserror` with complete-sentence messages.
+Reference notes for `nexrad-decode` and `nexrad-model`. Check signatures against the versions in `Cargo.lock` before use. Dependency-specific types stay inside the NEXRAD adapter. [ROADMAP.md](ROADMAP.md) specifies application data contracts; [STYLE.md](STYLE.md) specifies error and code conventions.
+
+The locked `nexrad-decode` version does not validate Archive II file framing or completeness. Its [`decode_messages`](https://docs.rs/crate/nexrad-decode/0.1.2/source/src/messages.rs) treats a failed next-header read as the end of the sequence, including a truncated header. The caller must validate record boundaries and decode until the exact end of the decompressed record, reporting an incomplete header as an error.
 
 ---
 
@@ -10,7 +12,7 @@ Sourced from `cargo doc` HTML output in `target/doc/`. Units: km unless noted. E
 
 #### `Message` (top-level wrapper)
 
-Decoded NEXRAD Level II message (any type). The one you get from `record.messages()`.
+Decoded NEXRAD Level II message (any type).
 
 ```rust
 pub struct Message { /* ... */ }
@@ -76,7 +78,7 @@ pub enum MessageContents {
 **Pattern to access digital radar data:**
 
 ```rust
-let msg: Message = /* from record.messages() */;
+let msg: Message = /* from the decoder */;
 // or via MessageContents:
 if let MessageContents::DigitalRadarData(inner) = msg.contents() {
     // inner is &digital_radar_data::Message
@@ -149,7 +151,7 @@ impl Header {
 }
 ```
 
-**RadialStatus values:** 0→ElevationStart, 1→IntermediateRadialData, 2→ElevationEnd, 3→VolumeScanStart, 4→VolumeScanEnd, other→ElevationStartVCPFinal.
+**RadialStatus values:** 0→ElevationStart, 1→IntermediateRadialData, 2→ElevationEnd, 3→VolumeScanStart, 4→VolumeScanEnd, 5→ElevationStartVCPFinal. Reject unknown codes rather than treating them as code 5. Azimuth resolution spacing is commanded spacing, not a guarantee of actual separation between adjacent measured azimuths.
 
 #### `VolumeDataBlock`
 
@@ -288,7 +290,7 @@ impl GenericDataBlockHeader {
   - For gate `i` (0-indexed): `range_i = data_moment_range / 1000.0 + i * data_moment_range_sample_interval / 1000.0`
 - `data_moment_range_sample_interval` is gate width in km × 1000.
   - To get km: `data_moment_range_sample_interval as f64 / 1000.0`
-- Scale/offset for dBZ: `dbz = raw * scale + offset`
+- The physical measurement is `(raw - offset) / scale`; raw values 0 and 1 represent below-threshold and range-folded, respectively. Validate the word size, finite positive scale, finite offset, and expected encoded length before decoding. Version 0.1.2's `decoded_values()` treats zero scale as unscaled measurements and iterates bytes rather than 16-bit words, so it must not be used unconditionally. Retain each gate's position and category. See the [locked crate source](https://docs.rs/crate/nexrad-decode/0.1.2/source/src/messages/digital_radar_data/generic_data_block.rs).
 
 #### `DataBlockId`
 
@@ -426,7 +428,7 @@ impl Site {
 
 Found on the first `DigitalRadarData` message where `header.radial_status == 0` (ElevationStart) or `header.radial_status == 3` (VolumeScanStart). Cast to f64 for projection calls: `volume_data_block.latitude as f64`, `volume_data_block.longitude as f64`.
 
-No external lookup or hardcoded constants needed.
+Rendering uses the volume header coordinates. The source catalog supplies coordinates for site selection and the catalog-versus-header diagnostic described in ROADMAP.md.
 
 ---
 

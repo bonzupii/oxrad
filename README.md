@@ -2,11 +2,13 @@
 
 Storm-chaser-grade weather radar viewer.
 
-![screenshot](screenshot.png)
+![Historical screenshot](screenshot.png)
 
-oxrad renders weather radar for storm chasers, emergency managers, and weather spotters. It currently fetches the latest Level II volume for KPAH (Paducah, KY) from the AWS public data feed and draws base reflectivity with the standard NWS color scale, a latitude/longitude grid, and 50 km range rings. Data and network errors appear in the status bar.
+The screenshot is historical and does not verify the current build.
 
-NEXRAD is the first source. [ROADMAP.md](ROADMAP.md) covers the source catalog, additional products, and the milestone plan.
+oxrad is a desktop weather and radar application for everyday use, storm chasers, emergency managers, and weather spotters. Milestone 1 targets live KPAH (Paducah, KY) Level II base reflectivity with a latitude/longitude grid, 50 km range rings, a legend, scan time, and pointer readout. The current display and live-data path have not completed runtime acceptance; do not rely on this build for weather or safety decisions.
+
+NEXRAD is the first radar source. [ROADMAP.md](ROADMAP.md) specifies worldwide weather and radar coverage, source catalogs, forecasts, and the milestone plan.
 
 ## Building
 

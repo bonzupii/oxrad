@@ -40,8 +40,8 @@ const KEYPOINTS: [(f32, [u8; 3]); 20] = [
 
 const RANGE_FOLDED: [u8; 4] = [128, 0, 255, 255];
 const PRODUCT: &str = "BaseReflectivity";
-const MIN_DBZ: f32 = -32.0;
-const MAX_DBZ: f32 = 94.5;
+pub const MIN_REFLECTIVITY_DBZ: f32 = -32.0;
+pub const MAX_REFLECTIVITY_DBZ: f32 = 94.5;
 
 const fn with_alpha(rgb: [u8; 3]) -> [u8; 4] {
     [rgb[0], rgb[1], rgb[2], 255]
@@ -49,8 +49,8 @@ const fn with_alpha(rgb: [u8; 3]) -> [u8; 4] {
 
 fn interpolate(low: [u8; 3], high: [u8; 3], fraction: f32) -> [u8; 4] {
     let channel = |low_channel: u8, high_channel: u8| {
-        let value = f32::from(low_channel)
-            + (f32::from(high_channel) - f32::from(low_channel)) * fraction;
+        let value =
+            f32::from(low_channel) + (f32::from(high_channel) - f32::from(low_channel)) * fraction;
         value.round().clamp(0.0, 255.0) as u8
     };
     [
@@ -62,28 +62,21 @@ fn interpolate(low: [u8; 3], high: [u8; 3], fraction: f32) -> [u8; 4] {
 }
 
 fn reflectivity_color(dbz: f32) -> Result<[u8; 4], ColorMapError> {
-    if dbz.is_nan() {
-        return Ok(RANGE_FOLDED);
-    }
-    if !(MIN_DBZ..=MAX_DBZ).contains(&dbz) {
+    if !(MIN_REFLECTIVITY_DBZ..=MAX_REFLECTIVITY_DBZ).contains(&dbz) {
         return Err(ColorMapError::OutOfRange {
             product: PRODUCT,
             value: dbz,
         });
     }
 
-    let lowest = KEYPOINTS
-        .first()
-        .ok_or(ColorMapError::Unmapped {
-            product: PRODUCT,
-            value: dbz,
-        })?;
-    let highest = KEYPOINTS
-        .last()
-        .ok_or(ColorMapError::Unmapped {
-            product: PRODUCT,
-            value: dbz,
-        })?;
+    let lowest = KEYPOINTS.first().ok_or(ColorMapError::Unmapped {
+        product: PRODUCT,
+        value: dbz,
+    })?;
+    let highest = KEYPOINTS.last().ok_or(ColorMapError::Unmapped {
+        product: PRODUCT,
+        value: dbz,
+    })?;
 
     if dbz < lowest.0 {
         return Ok(with_alpha(lowest.1));
@@ -110,6 +103,10 @@ pub fn color_for_reflectivity(dbz: f32) -> Result<[u8; 4], ColorMapError> {
     reflectivity_color(dbz)
 }
 
+pub const fn range_folded_color() -> [u8; 4] {
+    RANGE_FOLDED
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,7 +131,11 @@ mod tests {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
                 Self::ColorMap(error) => write!(formatter, "{error}"),
-                Self::Color { dbz, expected, actual } => write!(
+                Self::Color {
+                    dbz,
+                    expected,
+                    actual,
+                } => write!(
                     formatter,
                     "reflectivity {dbz} dBZ: expected {expected:?}, got {actual:?}"
                 ),
@@ -181,8 +182,15 @@ mod tests {
     }
 
     #[test]
-    fn range_folded_maps_to_sentinel_color() -> Result<(), TestFailure> {
-        expect_color(f32::NAN, RANGE_FOLDED)
+    fn range_folded_maps_to_sentinel_color() {
+        assert_eq!(range_folded_color(), RANGE_FOLDED);
+    }
+
+    #[test]
+    fn invalid_measured_nan_is_not_range_folded() {
+        assert!(
+            matches!(reflectivity_color(f32::NAN), Err(ColorMapError::OutOfRange { product, value }) if product == PRODUCT && value.is_nan())
+        );
     }
 
     #[test]

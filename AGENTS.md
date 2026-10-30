@@ -2,9 +2,11 @@
 
 This is safety-critical storm chasing software. People stand in open fields with tornadoes bearing down on them, making life-or-death decisions based on what this display shows. A misplaced bin puts a storm in the wrong location. A silently swallowed error shows stale data as current. A frozen screen looks like clear skies when a wedge tornado is two miles away.
 
-[ROADMAP.md](ROADMAP.md) is the specification. [STYLE.md](STYLE.md) is the code and prose style guide. Both bind every change.
+[ROADMAP.md](ROADMAP.md) owns product behavior, architecture, safety, and milestones. [STYLE.md](STYLE.md) owns code and prose style, including lint and test conventions. Both bind every change.
 
-Every rule here is absolute. If you believe a rule cannot be followed in a specific situation, stop, leave a comment at the exact location explaining the conflict, and ask for explicit permission before writing a single line that would violate it.
+Every rule here is absolute.
+
+No banned code pattern receives an exception. A banned pattern that appears required means the ownership or data model is wrong. Restructure the code.
 
 ## Gates
 
@@ -17,9 +19,13 @@ cargo test
 
 The lint set is the `[lints]` table in `Cargo.toml` and the thresholds in `clippy.toml`. `#[allow]` is not available.
 
+The gates are necessary, not sufficient. A milestone is complete only when its acceptance criteria in [ROADMAP.md](ROADMAP.md) are observed in the running binary and its interaction budgets are measured. A green gate over an unusable display is a failed milestone.
+
 ## Unconditional Bans
 
-**Panicking:** `unwrap()`, `panic!()`, `unreachable!()`, `todo!()`, `unimplemented!()`, `assert!(false, …)`, `debug_assert!()`, and indexing or slicing on a computed index without a proven bound. An `expect` is legitimate only where its message states the invariant it relies on.
+No argument makes these acceptable. No permission is available for any of them.
+
+**Panicking:** `unwrap()`, `expect()`, `panic!()`, `unreachable!()`, `todo!()`, `unimplemented!()`, `assert!(false, …)`, `debug_assert!()`, and indexing or slicing on a computed index without a proven bound.
 
 **Unsafe:** `unsafe { }`, `unsafe fn`, `unsafe trait`, `unsafe impl`.
 
@@ -27,7 +33,7 @@ The lint set is the `[lints]` table in `Cargo.toml` and the thresholds in `clipp
 
 **Other:** `#[allow(…)]`, `#![allow(…)]`, commented-out code of any kind.
 
-If the compiler requires handling a branch you believe is unreachable, handle it gracefully: return an error, surface a message to the user.
+If the compiler requires handling a branch you believe is unreachable, handle it gracefully: return an error, surface a message to the user. You may never assert that a branch is unreachable.
 
 ## Commit Messages
 
@@ -35,11 +41,11 @@ Commit messages contain the technical change and its reason. Trailers are prohib
 
 ## Ownership and Concurrency
 
-`Arc`, `Rc`, `RefCell`, `Mutex`, `RwLock`, `Cell`, `OnceCell`, `LazyLock`: banned by default. Permission required before use. When you believe you need one, stop, leave a comment explaining what you are trying to accomplish and why no approved pattern solves it, then ask.
+`Arc`, `Rc`, `RefCell`, `Mutex`, `RwLock`, `Cell`, `OnceCell`, `LazyLock`: banned.
 
-Ownership resolution order: `&T` → `&mut T` → move `T` → shared ownership (ask first). `clone()` to satisfy the borrow checker means the ownership model is wrong. Fix the model.
+Ownership resolution order: `&T` → `&mut T` → move `T`. `clone()` to satisfy the borrow checker means the ownership model is wrong. Fix the model.
 
-**Approved concurrency pattern:** worker thread owns its data exclusively → produces a completed owned value → sends it via `std::sync::mpsc` → UI thread owns all display state exclusively and never shares it. No other cross-thread pattern without explicit permission.
+**Approved concurrency pattern:** worker thread owns its data exclusively → produces a completed owned value → sends it via `std::sync::mpsc` → UI thread owns all display state exclusively and never shares it. No other cross-thread pattern is used.
 
 ## Error Handling
 
@@ -63,4 +69,4 @@ Formulas and reference values are in `ROADMAP.md`. Implement them exactly as spe
 
 ## Testing
 
-[STYLE.md](STYLE.md) governs test style. Required coverage floor: the coordinate reference values and round-trip tolerances in `ROADMAP.md`, every error variant with its carried value, Web Mercator forward and inverse at two zoom levels, and palette keypoint values and out-of-range paths.
+[STYLE.md](STYLE.md) defines test conventions and the coverage floor. [ROADMAP.md](ROADMAP.md) defines coordinate reference values, runtime acceptance, and interaction budgets.

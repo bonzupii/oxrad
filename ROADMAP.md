@@ -10,7 +10,25 @@ oxrad started because the viewers available are slow, crash-prone, and freeze th
 
 ## Scope
 
-A desktop viewer for Windows, macOS, and Linux that renders weather radar from any source whose data is openly published and whose format oxrad decodes, and carries that radar forward into nowcasting and forecasting. A source is a catalog entry (see Radar Sources). NEXRAD (United States) is the first source. ODIM_H5 volumes, the format used by European national services, are the second, with Germany's DWD as the first target. Adding a country is adding a catalog entry and, if the format is new, a decoder.
+A free, open-source desktop weather and radar application for Windows, macOS, and Linux. It shows current weather, hourly and daily forecasts, radar, and severe-weather information for locations the user chooses. It renders radar from sources whose data is openly published and whose format oxrad decodes, and carries that radar forward into nowcasting. A source is a catalog entry (see Radar Sources). NEXRAD (United States) is the first radar source. ODIM_H5 volumes, the format used by European national services, are the second, with Germany's DWD as the first target. Adding a country is adding a catalog entry and, if the format is new, a decoder. No subscription or paid feature is required; a source that requires one is outside scope.
+
+---
+
+## The Product
+
+The application answers both everyday and urgent weather questions: what it is like now, what is expected later, where weather is, and when it may arrive. Weather and radar are first-class views for the same selected location. The weather view gives a readable current summary and hourly and daily forecasts; the radar view gives a map, recent scans, and hazards. Switching views preserves the location. Forecasts and radar-derived nowcasts remain distinct, with their source and time visible.
+
+The radar view is a storm-spotter and meteorology-grade workspace, not a simplified backdrop for the weather view. It exposes full-resolution radar products and available elevation angles, precise measurements and units, scan age, warnings, geographic context, and the diagnostic information needed to interpret missing or degraded data. Product and tilt selection, animation, and radar inspection remain directly reachable during a live update. Ordinary weather summaries do not replace measured radar products or conceal their limitations. Severe-weather workflows and everyday forecasts are both part of the finished product.
+
+The application opens on the radar map at the home location or last site, showing the most recent volume. With no saved location, the site picker opens over the map. A weather-view control opens current conditions and the forecast for the selected location; search, home, location, and a map pin select that location. The map carries the radar layer, place labels, the color legend with units, the frame time, and the user's position when available. Stepping through recent scans and playing them is a first-class control. A glance answers what is falling, where it is relative to the user and named places, which way it is moving, and how old the picture is. A second step answers the value at a point, the product and tilt, and the forecast for a point.
+
+Every displayed measurement carries its place, time, and units. A transient failure names the operation, the site, and the cause, and offers a retry. The last good volume stays visible with its age labeled until a new one arrives. The application never presents stale data as current, an empty map as clear weather, or below-threshold gates as precipitation.
+
+The map fills the window. A left rail holds the site picker, product selector, tilt selector, and layer toggles. A bottom bar holds the time controls, the frame timestamp, and the status line. The legend sits in a map corner. The forecast panel docks to the right and collapses. A narrow window collapses the rails to icon buttons that open over the map. Every control has a keyboard path and a visible focus state.
+
+The application is used outdoors, one-handed, in sunlight, on a poor connection. Controls are reachable without a menu dive, targets are large enough for a gloved finger or a trackpad, text contrast is at least 4.5:1, and nothing blocks the map during a live update.
+
+A feature that exists but cannot be reached in that loop is not delivered.
 
 ---
 
@@ -135,13 +153,15 @@ A source is a catalog entry plus a decoder. Catalog entries are TOML files bundl
 
 Each crate is chosen per concern and confined behind the one module that uses it, so replacing a crate changes that module only. The NEXRAD crates decode a single country's format, so they sit inside the NEXRAD decoder module and their model types stop at its boundary. Every added dependency is recorded in `docs/DEPENDENCIES.md` with its license, whether it performs network I/O, and a census of its `unsafe` code.
 
+Versions live in `Cargo.toml` and `Cargo.lock` only. This document names the crate and the capability required.
+
 | Concern | Choice | Basis |
 |---|---|---|
 | NEXRAD Level II parsing | `nexrad-decode` | Parses decompressed Archive II records against NOAA ICD 2620002AA and performs no I/O. MIT. |
 | NEXRAD fetch | oxrad's fetch worker | `nexrad-data` bundles Archive II decompression with AWS S3 access. Its network client would sit outside the fetch worker and outside the Network Policy table. |
-| Archive II decompression | selected in Milestone 5 | Streaming, pure Rust, no C build step. |
+| Archive II decompression | selected in Milestone 1 | Streaming, pure Rust, no C build step. |
 | Image output | oxrad's GPU renderer | `nexrad-render` produces `image` buffers. oxrad draws bins from geometry. |
-| HDF5 container for ODIM_H5 and GLM | `hdf5-pure` | Pure Rust with no build script. Reads superblocks v0 to v3, object headers v1 and v2, contiguous, compact, and chunked storage, compound types, and variable-length strings. Version 0.x, MIT. Accepted on fixtures in Milestone 18. |
+| HDF5 container for ODIM_H5 and GLM | `hdf5-pure` | Pure Rust with no build script. Reads superblocks v0 to v3, object headers v1 and v2, contiguous, compact, and chunked storage, compound types, and variable-length strings. MIT. Accepted on fixtures in Milestone 18. |
 | ODIM_H5 radar decoding | oxrad module over `hdf5-pure` | No Rust ODIM_H5 radar decoder turned up in a crate search. |
 | Geodesics | `geographiclib-rs` | Direct and inverse geodesic solutions after Karney. The crate describes itself as a subset of GeographicLib, and direct and inverse are the subset in use. Accepted when it reproduces the Reference Values within tolerance. |
 | Vector tile decode and style evaluation | selected in Milestone 2 | Pure Rust, MVT decode, MapLibre style expressions, fractional zoom. |
@@ -155,7 +175,7 @@ Each crate is chosen per concern and confined behind the one module that uses it
 
 Level II is full-resolution dual-polarization volume scan data. It is the primary data source for storm chasing in the United States.
 
-**Volume assembly.** A real-time volume on the AWS feed consists of approximately 55 chunks delivered over several seconds. A complete volume requires paginating the chunk list to exhaustion, sorting chunks by sequence number where the API permits, and verifying the presence of start and end sentinel chunks before decoding. Decoding a partial volume and presenting it as complete is not permitted.
+**Volume assembly.** A real-time volume on the AWS feed consists of approximately 55 chunks delivered over several seconds. A complete volume requires paginating the chunk list to exhaustion, ordering chunks by the sequence numbers exposed by the feed, and verifying the presence of start and end sentinel chunks before decoding. If the feed does not expose enough ordering or boundary information to establish completeness, the volume is rejected as incomplete and the feed limitation is reported. A partial or ambiguously ordered volume is never presented as complete. Decoding a partial volume and presenting it as complete is not permitted.
 
 **Sweep selection.** A volume contains multiple elevation sweeps. The application selects sweeps by elevation number, not by list index. The lowest available elevation angle is the default. `first()` is not an acceptable sweep selector.
 
@@ -166,7 +186,9 @@ Level II is full-resolution dual-polarization volume scan data. It is the primar
 
 No fallback constants are permitted. If a radial does not supply valid geometry, it is skipped and counted in a diagnostic counter visible in the UI.
 
-**Gate value handling.** `BelowThreshold` gates are mapped to the minimum valid value for that moment (-32 dBZ for reflectivity). `RangeFolded` gates are mapped to a distinct NaN sentinel that renders as a visually distinct color. Both are kept in the bin array to preserve index-to-range alignment. A skipped gate shifts all subsequent gates inward, which is a safety defect.
+**Gate value handling.** `BelowThreshold` and `RangeFolded` are distinct from measured values. The decoded representation retains each gate's original range position and value category; omitting a gate from a display mesh must not shift subsequent gates inward. Range-folded gates use a distinct visible color. The show-below-threshold option displays those gates at the moment's minimum valid value (-32 dBZ for reflectivity), without treating them as measured echo.
+
+Below-threshold gates are hidden in the default view and are never drawn as echo. The `Show below-threshold bins` configuration field reveals them, and the hidden count is reported in diagnostics. Range-folded gates draw in the distinct sentinel color.
 
 **Site coordinates and height.** Radar site latitude, longitude, and antenna height are read from the volume header and stored in `RadarVolume`. No geographic constant is hardcoded in the rendering path.
 
@@ -212,7 +234,7 @@ All errors that are surfaced to the UI are also written to the error log with a 
 
 ### User configuration: `~/.oxrad/config.toml`
 
-User preferences persisted across sessions in TOML format. The configuration file is written only when settings change. If the file is absent, malformed, or contains unrecognized keys, the application starts with defaults and attempts to rewrite a clean config. The home location is stored as latitude and longitude in plain text. Defaults that depend on the operating system locale are derived once on first run and then written explicitly.
+User preferences persisted across sessions in TOML format. The configuration file is written only when settings change. If the file is absent, the application starts with the documented defaults and creates a config when settings are saved. If it is malformed or contains unrecognized keys, the application reports the issue and uses the documented defaults for affected settings for this session; it does not overwrite the existing file without the user's explicit action. The home location is stored as latitude and longitude in plain text. Defaults that depend on the operating system locale are derived once on first run and then written explicitly.
 
 | Field | Default |
 |---|---|
@@ -288,6 +310,29 @@ Pipeline state describes the application's work. Site health describes whether t
 
 A worker thread that panics is caught at the thread boundary, reported to the UI as an error state with a descriptive message, and does not crash the application. Worker panics are expected operating conditions, not unrecoverable failures. A panic in one site's workers affects only that site.
 
+### Retry Policy
+
+Transient failures retry with exponential backoff: a 2 s base, doubling to a 60 s cap, with jitter. A selected site retries indefinitely. A decode failure retries once, then stays in Error until the next volume or a manual retry, because the same bytes produce the same failure. HTTP 429 and 503 honor `Retry-After`. A 404 for a volume that has left the feed is a stale listing: the worker re-lists and fetches the current volume. The error message stays visible with the next retry time and is cleared only by a success.
+
+### Interaction Budgets
+
+Latency is part of correctness. A readout that lags the pointer describes a place the pointer has left. A frozen map presents an old frame as the current situation.
+
+Reference machine: four-core x86-64 at 2.5 GHz, integrated GPU, 1920×1080, release build.
+
+| Interaction | Budget |
+|---|---|
+| Pointer readout update | within one frame of the pointer event, at every zoom level |
+| Static radar frame | 60 fps at the reference resolution with the radar layer, grid, and rings drawn |
+| Pan and zoom | 60 fps with radar, labels, boundaries, roads, alerts, and lightning drawn |
+| Product, tilt, or frame change | 100 ms when the data is in memory, with no rebuild of per-volume geometry |
+| First radar frame from a cached volume | 500 ms after the UI receives the volume |
+| Window resize | 100 ms |
+
+Render geometry for a volume is built once, off the UI thread, and reused for every frame it is displayed. A frame draws cached GPU buffers. It does not rebuild the mesh, re-project bins, or allocate per-bin data.
+
+Each budget is measured in the milestone that introduces the interaction, with the layers that exist at that milestone, and again in Milestone 24 with the full stack. A milestone that misses a budget is not complete.
+
 ---
 
 ## Feature Specification
@@ -334,17 +379,27 @@ An attribution panel, reachable from the main window and shown in a corner of th
 
 County/parish boundaries and major highways draw above the radar and toggle individually. Everywhere they come from the boundary and transportation layers of the vector tiles. When a United States source is active, the Census TIGER/Line shapefiles under `~/.oxrad/shapefiles/` provide county/parish boundaries and highways at higher fidelity. Both overlays are enabled by default, and their visibility is persisted to `config.toml`. If a data source for an overlay is unavailable, that overlay's toggle is disabled with a visible reason and the application continues normally.
 
-### Hover Cursor
+### Hover Cursor and Measurement
 
-Displays at all times: latitude, longitude, ground range from the active site, azimuth from the active site, and the product value of the nearest bin with units. If the cursor is not over a bin, the product value shows "no data." If no volume is loaded, only lat/lon is shown. In mosaic mode the cursor also shows which site supplied the value and the age of that site's scan.
+The cursor reports latitude, longitude, ground range and azimuth from the active site, and the product value of the gate under it with units. If the cursor is not over a gate, the product value shows "no data." If no volume is loaded, only lat/lon is shown. In mosaic mode the cursor also shows which site supplied the value and the age of that site's scan. The selected sweep's elevation and calculated beam height above the antenna are available with the readout, labeled as an estimate rather than surface conditions.
+
+A measurement tool places two map points and shows their geodesic distance and initial bearing in the active units. The points remain visible until cleared; the tool works without a radar volume and has keyboard access.
+
+### Location and Follow Mode
+
+When location permission is granted, the map marks the user's reported position and its accuracy when the operating system supplies it. Follow mode keeps the position in view as it changes. Panning the map suspends follow mode visibly; the user can resume it. An unavailable or stale location has a visible reason and is not displayed as a current fix. Location updates stay on the device except when the user explicitly requests a forecast or search for that position.
 
 ### Sweep Elevation Selector
 
 Shows all available elevation angles in the current volume. The user steps through sweeps or selects by elevation number. The lowest elevation is the default. Each sweep entry shows its elevation angle in degrees and its scan time offset.
 
+### Comparison Views
+
+The radar workspace can show multiple synchronized panes so a user can compare available products or elevations for the selected site. Each pane identifies its site, product, elevation, scan time, and legend. Linked panes share map movement and time selection; a missing product or scan is labeled rather than replaced by a different one. Comparison controls work without a subscription.
+
 ### Animation
 
-Loops the last 2 to 3 complete volume scans for the active site and product. Controls: Play/Pause, step forward, step backward, configurable frame interval. The scan timestamp for the currently displayed frame is shown persistently. Controls are disabled with a visible reason when fewer than 2 complete scans are available. On startup, the volume cache under `~/.oxrad/volumes/` pre-populates the animation buffer while a fresh fetch runs in the background. The frame interval is persisted to `config.toml`. In mosaic mode animation is disabled with the visible reason "Mosaic holds the latest volume per site".
+Loops a user-selectable history of complete volume scans for the active site and product, subject to the available feed and cache. Controls: Play/Pause, step forward, step backward, history length, and frame interval. A historical time selector opens available archived scans, labels archive time separately from live data, and provides an explicit return-to-live control. Show the available time span and distinguish missing scans from clear weather. The scan timestamp for the currently displayed frame is shown persistently. Controls are disabled with a visible reason when fewer than 2 complete scans are available. On startup, the volume cache under `~/.oxrad/volumes/` pre-populates the animation buffer while a fresh fetch runs in the background. The frame interval is persisted to `config.toml`. In mosaic mode animation is disabled with the visible reason "Mosaic holds the latest volume per site".
 
 ### Color Scale Legend
 
@@ -362,11 +417,15 @@ Verification is a test in the repository. Each palette is simulated under deuter
 
 ### NWS Weather Alerts and Regional Alert Sources
 
-Active weather alerts from the NWS public API (`api.weather.gov`) are displayed as geographic overlays on the map. Alert polygons are drawn with color coding by alert type (tornado warning, severe thunderstorm warning, tornado watch, severe thunderstorm watch, special weather statement, etc.) following NWS standard alert colors. Alerts are polled on a configurable interval (default 60 seconds) while the application is running. Alert details (headline, effective time, expiration time, issuing office, and full description) are accessible by clicking an alert polygon. Expired alerts are removed from the display immediately. If the NWS API is unreachable, the overlay is disabled with a visible message and polling continues with exponential backoff while the rest of the application operates normally. Alert data is live or absent and is not cached to disk.
+Active weather alerts from the NWS public API (`api.weather.gov`) are displayed as geographic overlays on the map. Alert polygons are drawn with color coding by alert type (tornado warning, severe thunderstorm warning, tornado watch, severe thunderstorm watch, special weather statement, etc.) following NWS standard alert colors. Alerts are polled on a configurable interval (default 60 seconds) while the application is running. Alert details (headline, effective time, expiration time, issuing office, and full description) are accessible by clicking an alert polygon. Expired alerts are removed from the display immediately. If the NWS API is unreachable, the overlay reports the error, preserves any last good unexpired alerts with their age and stale state visible, and retries with exponential backoff while the rest of the application operates normally. Without a last good alert set, the overlay is unavailable with a visible reason. Alerts are not cached to disk; expired alerts are removed immediately.
 
 Many watches and some warnings arrive with null geometry and a list of affected zones. For these the alert worker fetches each affected zone's geometry, from `~/.oxrad/zones/` when cached, and the alert's area is the union of those zones. An alert whose zone geometry cannot be resolved appears in an alerts panel with the label "area unavailable" and counts in the alert count.
 
 Alert sources for other regions are catalog entries that point at a Common Alerting Protocol (CAP) feed, mapped onto the same alert type, color, and detail fields. A region without an alert source shows the alert overlay disabled with the reason "no alert source for this region".
+
+### Storm Reports and Tracks
+
+Where an openly accessible source supplies them, show local storm reports and official storm-track products as separately toggleable overlays. Each report identifies the event, location, observed time, source, and available details. Each track identifies its source and issue and valid times. A report or track is not an official warning, and a derived nowcast is labeled separately. When a source is unavailable, unsupported in the region, or stale, show that state rather than implying that no reports exist. User-submitted reports are optional, explicit actions and are sent only to a supported openly accessible destination with confirmation of the data being sent.
 
 ### Location Warnings
 
@@ -410,11 +469,15 @@ Nowcasting is disabled with a visible reason when fewer than three grids are ava
 
 ### Forecasting
 
-Point forecasts for a location the user chooses: the home location, a placed pin, or a clicked map point. The forecast panel shows the next hours and days of temperature, precipitation amount, precipitation probability where the service provides it, wind speed and direction, and cloud cover, in the user's unit and time preferences, with the issue time and the service name.
+The weather view and forecast panel serve a location the user chooses by search, home, current position, a placed pin, or a clicked map point. Show a plain-language condition and temperature together, such as "Sunny, 70 °F," when supplied. Identify observed current conditions by observation time and source; a forecast for the present hour is labeled as a forecast, never as an observation. Show hourly and daily forecasts with condition, temperature, precipitation probability and amount, wind speed and direction, and cloud cover when supplied. Daily rows identify the day, high and low where supplied, and the period to which each probability applies; for example, "Tomorrow: 70% chance of rain" only when the provider supplies that probability for that period. Show the forecast issue time, applicable time zone, and provider. Use the user's temperature, distance, wind, precipitation, and time preferences consistently. Missing values are labeled unavailable and never inferred as zero, clear sky, or a provider-supported probability.
 
 Forecast services are catalog entries. Inside the United States the service is `api.weather.gov`, and everywhere else it is MET Norway's `api.met.no` locationforecast, which covers the globe and needs no key. Each carries its attribution into the attribution panel. A request sends the forecast point's coordinates to the service, and the Network Policy table lists this. Responses are held in memory and honor the service's `Expires` and `Last-Modified` headers, and nothing is cached to disk.
 
-The panel is in one of five states: loading, ready (with the issue time), stale (issue time older than the service's own update interval, with its age), unavailable (with the specific error), and "no forecast service for this location". With nowcasting on, the panel shows the nowcast arrival range for the point next to the model forecast, in a separately labeled block.
+Requests time out after 10 s. A transient failure retries with exponential backoff up to 60 s while the panel is visible, and the panel shows the retry state. HTTP 429 and 503 honor `Retry-After`. A 4xx response other than 429 is not retried and appears as unavailable with its status. One request per point is in flight; moving the panel to a new point cancels the old request.
+
+The weather view presents current conditions first, then hourly rows for at least the next 24 hours and daily rows for at least the next 7 days when the source supplies them. The forecast panel presents the same data for its map point. If a source supplies a shorter horizon or no observation, show the available horizon or observation as unavailable; do not fabricate a forecast, probability, daily high, or low. Identify the selected location in both views and mark a map point on the map. The issue time and service name stay visible in every ready state. Available forecast map layers show the quantity, units, valid time, issue time, and source; an unavailable layer is disabled with a reason, and an observation, forecast, or nowcast is never labeled as another.
+
+The weather view and panel distinguish loading, ready (with issue time), stale (with age), unavailable (with the specific error), and "no forecast service for this location". The last good forecast remains visible and labeled stale on a refresh failure. Observation availability and age are independent of forecast availability and age. With nowcasting on, the panel shows the nowcast arrival range next to the model forecast in a separately labeled block.
 
 ### Localization
 
@@ -454,45 +517,64 @@ HDF5 files (ODIM_H5 radar volumes and GLM NetCDF-4 files) are read with `hdf5-pu
 
 Release binaries for Windows, macOS, and Linux are produced by `cargo build --release` in continuous integration.
 
-## Code Style
+## Specification Boundaries
 
-These rules bind all code in the project. Lints are a gate, and a green lint run says only that the mechanical surface is clean. Wrong-spec tests, unexercised generality, subsystem bypasses, safety arguments, and narrative comments need reading.
+This document owns product scope, externally observable behavior, system architecture, data contracts, runtime guarantees, source integration, operational failure behavior, and development milestones.
 
-**Types first.** Bad states are unrepresentable: enums for exclusive states, newtypes for validated values, typestate for protocol ordering. Runtime checks live at real boundaries: parsing, IO, FFI. A defensive check for an invariant the type already guarantees is a bodge.
+[STYLE.md](STYLE.md) owns code organization and implementation style: Rust idioms, ownership expression, naming, comments, tests, lint configuration, and prose style. The style guide does not redefine product behavior or grant exceptions to architectural requirements. This document does not duplicate stylistic rules. A change to a style convention belongs in the style guide; a change to a product guarantee or system behavior belongs here.
 
-**Safe Rust.** Edition 2024. New `unsafe` needs explicit approval first, with the location, the measured gain, the safety argument, and the cost of the safe alternative. Approved `unsafe` lives in minimal leaf functions that contain no safe logic, and every site carries its safety argument. Miri runs on `unsafe`-adjacent tests where feasible.
+The two documents are complementary. Their scopes are distinct, not hierarchical. Neither document grants permission to weaken a requirement owned by the other. If an implementation detail appears to conflict with a product or safety requirement, the implementation must satisfy the product or safety requirement. If the documents appear to conflict, identify the exact statements and resolve their meaning from the intended behavior; do not select the easier interpretation, silently omit functionality, or invent an exception.
 
-**Ownership.** Resolution order: shared borrow, mutable borrow, move, and shared ownership only with explicit permission. A clone added to satisfy the borrow checker means the ownership model is wrong, so the code is restructured until the clone disappears or its necessity is documented and load-bearing. `Arc<Mutex<T>>` and `Rc<RefCell<T>>` are not default architecture.
+## Product Coverage and Users
 
-**Errors.** Library code carries typed `thiserror` enums whose variants carry the invalid value as a field wherever possible. `anyhow` appears at the UI boundary only. `Box<dyn Error>` on a public API, a single `Msg(String)` variant, and `.map_err(|e| e.to_string())` erase the failure modes callers need to match on. Every error reaches the user as a human-readable message.
+oxrad is a full-featured desktop weather and radar application, not a United States-only NEXRAD viewer. It serves everyday users who want a clear desktop weather experience, weather enthusiasts, storm spotters, local meteorologists, regional and nationwide meteorological operations, emergency managers, and first responders involved in response and rescue.
 
-**Panics.** No `unwrap`, `expect`, `panic!`, `todo!`, `unimplemented!`, or `unreachable!` in production code, and no indexing or slicing on computed indices without a proven bound. An `expect` with a proof is legitimate, and its message states the invariant. Tests may fail loudly.
+The product includes the capabilities users reasonably expect from a desktop weather widget, a general-purpose weather application such as MyRadar, and a professional radar workstation such as RadarScope. These are capability references, not dependencies or permission to copy proprietary implementation or presentation.
 
-**Fallbacks.** No `unwrap_or_default`, no `unwrap_or(0)` or `unwrap_or("")`, no `let _ =` on fallible operations, no catch-all arms that swallow a case. A fallback names the condition it handles, is visible to the caller, and is pinned by a test. If the caller cannot tell from outside whether the main path or the fallback ran, the fallback is the defect.
+The finished application includes:
+- Current conditions, hourly forecasts, daily forecasts, severe-weather information, and forecast maps.
+- Interactive radar maps, full-resolution source products, elevation selection, animation, historical scans where public data permits, comparison views, measurements, overlays, and multi-site mosaics.
+- Radar-derived nowcasting, storm-cell identification and tracking, motion estimation, extrapolated precipitation fields, and estimated arrival information.
+- Alerts, watches, warning polygons, storm reports, lightning where a public feed exists, location-based warnings, and diagnostic status.
+- A usable everyday interface and a detailed operational interface. Complexity is progressively exposed; ordinary users are not forced to interpret professional diagnostics, and professional users are not deprived of the underlying data.
 
-**Abstraction.** Generality is exercised, not anticipated. One implementor is inlined or becomes an enum. Closed sets dispatch through `match` on an enum, never through `dyn Trait`. A struct literal replaces a builder, and generic parameters appear only where instantiated at more than one type.
+The application is usable worldwide. Radar, forecast, alert, and lightning coverage varies by public data availability, licensing, service policy, and implemented decoder/provider support. Regional coverage gaps must be represented explicitly. A missing provider or unsupported format is a coverage limitation, not evidence of clear weather and not a reason to narrow the product to the United States. Source adapters and catalogs are extensible across countries and regions. NEXRAD and ODIM_H5/DWD are initial radar integrations, not the final geographic boundary. Forecast integration begins with the United States and MET Norway providers and expands through provider adapters to public forecast services covering additional regions.
 
-**One computation per value.** Every value with more than one consumer has exactly one computation site. Duplicated derivations are fixed by extraction. A feature built beside a canonical capability, with its own storage, IO, or error surface, is routed through that capability, and the capability is extended where it lacks something.
+The product must run responsively on ordinary consumer desktop and laptop hardware, including older machines. Heavy numerical weather prediction, climate modelling, data assimilation, and simulation workloads requiring workstation-class hardware or large local compute resources are outside scope. Forecast presentation consumes provider forecasts; nowcasting performs bounded, efficient analysis of recent radar observations. Performance must degrade through explicit reduced capabilities, not an unresponsive interface or silent loss of correctness.
 
-**Small units.** Each new behavior gets a unit whose reason to change is that behavior. If the last five features all landed in the same unit for different reasons, the unit is factored. Functions past 100 lines, 7 or more arguments, and cognitive complexity past 15 are factoring tasks.
+## Runtime Error and Recovery Contract
 
-**Effects visible in types.** Mutation, IO, time, randomness, and global state stay out of code that presents as pure computation. `static` holds compiled-once values and atomics, each named at the site. Interior mutability serves genuinely single-threaded shared state with the sharing reason stated. Other state is threaded through parameters, returned, or held in a struct the caller can see.
+Failure handling is a system behavior, not merely an implementation convention.
 
-**Strings at system boundaries.** File contents, user input, display text, and serialized forms are text. Internal values get types at birth: paths are `PathBuf` or `&Path`, fixed key sets are enums, modes and commands are enums the dispatcher matches on, identifiers are newtypes. Values are parsed once and carried as their type.
+Every failure is represented, classified, surfaced, and accounted for. No network failure, decode failure, malformed record, missing field, cache failure, worker panic, provider outage, or data-quality anomaly may disappear silently. Logs supplement visible status; they never replace it.
 
-**Performance.** Borrows over allocations in hot paths, `&str` for borrowed data, `Cow` for conditional ownership, iterators end to end. Measure the hot path, remove the allocation, measure again.
+A failure must not terminate the whole application merely because one operation, source, site, layer, or worker failed. The application isolates independent work and continues unaffected functionality. A failed radar site must not stop other sites, forecasts, alerts, map tiles, or the UI. A failed optional overlay must not disable the radar display. A failed forecast provider must not stop radar or cached forecasts. A worker panic is contained at its worker boundary, reported, and isolated to the affected work unit.
 
-**Dead weight.** A stub is implemented, deleted, or documented as unimplemented in user-facing docs and unreachable from the UI. Dead code and unused public API are deleted. A feature counts as working when the binary has been exercised and the code path does what its name promises.
+An incorrect decoder, calculation, or data association is a correctness defect: reject affected results, diagnose and fix the cause, and verify against the source format and independent references. Error reporting and retry do not make incorrect results trustworthy. Format-defined sentinel categories remain distinct valid data. Recovery is attempted when it is safe and meaningful:
+- Transient network and service failures retry under the retry policy, honoring `Retry-After`, timeouts, cancellation, and bounded backoff.
+- A decode failure for identical immutable bytes is not retried indefinitely. The failed volume is quarantined or skipped, the error is surfaced, and the next available volume is attempted. A manual retry remains available where it can change the outcome.
+- Corrupt cache entries are identified, removed or quarantined, reported, and refetched when possible. Cache corruption must not prevent startup.
+- Malformed records are rejected individually when record boundaries and format semantics make isolation safe. Valid records and other independent products continue. If corruption invalidates the enclosing volume or makes geometry/data association unreliable, reject that volume rather than render misleading data.
+- Missing optional values disable only the dependent measurement or feature and state exactly what is unavailable. Required geometry is never fabricated.
+- A failed refresh preserves the last known-good result with its age and stale state visible. It is never relabeled current.
+- Worker restart is attempted only when worker state can be safely reconstructed. Repeated deterministic failures are surfaced and rate-limited rather than hidden in an endless restart loop.
+- Cancellation and supersession are normal outcomes when the user changes site, product, level, or forecast point. Superseded work is cancelled and cannot overwrite newer state.
 
-**Unnecessary complexity.** A layer with no client is deleted. Complexity that earns its place names its client in a mechanistic comment: the second implementor, the measured hot path, or the invariant it maintains.
+Errors have distinct states for loading, ready, stale, unavailable, failed, and not provided where applicable. The UI identifies the operation, source/site/location, affected feature, cause, and next retry or recovery action. Error messages are actionable and do not expose secrets or sensitive location/search content. Diagnostic counters include rejected records, skipped radials/bins, missing products, stale inputs, retries, provider failures, and worker restarts.
 
-**Comments.** One sentence, mechanistic, about the machine: memory layout, data flow, algorithm, or a verifiable invariant. The only other comments are permission requests.
+The UI thread remains responsive during failures and recovery. A fatal process exit is reserved for conditions in which continued execution cannot preserve memory safety or trustworthy application state. It is not a generic error-handling strategy. Since unsafe Rust is prohibited, memory-safety faults are not handled by introducing unsafe recovery mechanisms.
 
-**Structure and naming.** One module per concern, named files, no `mod.rs`. `main.rs` holds argument parsing and app construction only. Imports run `std`, then external crates, then internal modules, one blank line between groups. Types are named after what they are, with no `Manager`, `Service`, `Controller`, `Factory`, `Provider`, `Helper`, `Util`, or `Handler` in type names. Newtypes carry a validated constructor returning `Result`.
+No required feature may be removed, hidden, stubbed, or marked complete as a workaround for a build, lint, test, performance, or integration failure. A failing quality gate is a defect to fix while preserving the feature. Feature scope changes require an explicit product-scope decision; implementation difficulty is not such a decision.
 
-**Tests.** Tests return `Result` and propagate with `?`. Assertions state the expected value, the actual value, and the tolerance. Error-path tests match the specific variant and the value it carries. A test asserts the behavior the spec requires, and code and test are fixed as a pair. No exemption lists, skip filters, or `#[ignore]`d tests. A deliberate sabotage of the code must turn a test red. Round-trip tests accompany absolute reference value tests and never replace them. Coverage floor: coordinate transforms against the reference values in this document, round-trip at eight azimuths at 75 km from the KPAH test origin, every error variant with its carried value, tile transforms at two zoom levels, colormap keypoints and out-of-range paths.
+## Delivery and Completion Contract
 
-**Lints.** `#[allow]` is not used. The lint gate is `cargo clippy -- -D warnings` over the `[lints]` tables in `Cargo.toml` and the thresholds in `clippy.toml` (cognitive complexity 15, 7 arguments, 100 lines). Floating point is not denied: the math in this document is float math. Every float computation with a known answer carries absolute reference-value tests within a stated tolerance. No `==` or `!=` on computed floats. The NaN `RangeFolded` sentinel is detected with `is_nan()` only. Non-finite values are rejected or counted at decode boundaries, except the designed sentinel the `RangeFolded` mapping itself produces. Domain clamps where rounded inputs can leave a function's domain are stated and tested.
+A milestone is complete only when all of its specified behavior is implemented, reachable through the application, exercised in the running binary, and verified by its acceptance tests. Compilation, Clippy, and unit tests are necessary gates, not substitutes for feature completion.
+
+A required feature is never an acceptable stub. There are no placeholder implementations, empty handlers, fake data paths, TODO-based feature stand-ins, dead UI controls, or documentation-only substitutions for required behavior. If a feature is scheduled for a later milestone, it is not represented as an available feature in the current application. If its UI is present because the milestone requires it, the control must perform the specified behavior or expose a truthful unavailable state caused by a real dependency/coverage limitation, not an unfinished implementation.
+
+A build or lint failure never authorizes deleting the feature that exposed it. Fix the implementation, its types, tests, and integration while preserving the specified capability. A milestone cannot pass by reducing the acceptance criteria, removing a failing test, disabling a lint, hiding a control, replacing real data with fabricated data, or changing a required feature into a placeholder.
+
+Each milestone records the implemented behavior, tests run, runtime observations, and measured performance. Unimplemented acceptance criteria remain open work and block milestone completion.
 
 ---
 
@@ -500,9 +582,15 @@ These rules bind all code in the project. Lints are a gate, and a green lint run
 
 Each milestone must pass all gates before the next begins: `cargo clippy -- -D warnings` at zero warnings and `cargo test` fully passing. Each milestone's gate also covers the failure modes it introduces: the network failing, malformed input, and a panic in each worker it adds. No milestone is complete with failing tests or outstanding warnings.
 
-### Milestone 1: Core render loop ✓
+Passing the gates is necessary, not sufficient. The milestone's acceptance criteria are observed in the running binary, and its interaction budgets are measured. A display defect the tests cannot see is a failed milestone.
 
-Window opens. Single hardcoded site (KPAH). Base reflectivity rendered on a plain background with lat/lon grid and range rings. All errors surfaced as visible UI messages. Coordinate math unit-tested against independently verified reference values. Gate geometry read from radial headers. Site coordinates read from volume header. `BelowThreshold` and `RangeFolded` handled correctly.
+### Milestone 1: Core render loop
+
+Window opens on the latest complete live KPAH Level II volume. Discovery, fetching, completeness validation, Archive II decompression, decoding, and refresh are implemented in this milestone. A checked-in, provenance-recorded KPAH fixture exercises the same decode-to-render path in tests and is never presented as live radar. Base reflectivity draws on a plain background with a lat/lon grid and 50 km range rings. For reflectivity, only gates that carry echo are drawn: `BelowThreshold` gates are excluded from the default view and counted in diagnostics, and `RangeFolded` gates use the distinct sentinel color. The color legend shows the reflectivity scale and dBZ. The scan time is visible. A pointer readout shows the gate value with units, ground range, and azimuth, and tracks the pointer within the interaction budget. Render geometry is built once per volume and reused across frames.
+
+Gate geometry and elevation are read from radial headers and site coordinates from the volume header. Each gate's slant-range edges are converted to ground range before display, and the geographic placement follows the WGS84 geodesic. Coordinate math is unit-tested against the independently verified reference values. Every fetch and decode error surfaces as a message naming the operation, the site, and the cause. A failed fetch leaves the last good volume visible with its age and retries on the schedule in Retry Policy.
+
+The milestone is complete when `cargo clippy -- -D warnings` and `cargo test` pass, the binary has been run, every behavior above has been observed, and the pointer-readout and frame-time measurements are recorded. Tests and lints alone do not satisfy this milestone.
 
 ### Milestone 2: Vector tile pipeline and base map
 
@@ -510,7 +598,7 @@ Tile fetch from the tile host, MVT decode, and client-side rendering of fills an
 
 ### Milestone 3: Local storage and configuration
 
-Establish the `~/.oxrad` directory structure. Implement the `paths` module as the single source of all file paths. User configuration in `~/.oxrad/config.toml` with every field and default in the configuration table, including fields for features that land later. Persist and restore last site, product, map center and zoom, overlay visibility, animation frame interval, and window size as an initial-size hint. Window position is never persisted or set; placement is the window manager's job. Error log at `~/.oxrad/errors.log` with rotation. Cache size caps and eviction. `docs/DEPENDENCIES.md` created. Configuration load failures fall back to defaults and rewrite a clean file.
+Establish the `~/.oxrad` directory structure. Implement the `paths` module as the single source of all file paths. User configuration in `~/.oxrad/config.toml` with every field and default in the configuration table, including fields for features that land later. Persist and restore last site, product, map center and zoom, overlay visibility, animation frame interval, and window size as an initial-size hint. Window position is never persisted or set; placement is the window manager's job. Error log at `~/.oxrad/errors.log` with rotation. Cache size caps and eviction. `docs/DEPENDENCIES.md` created. Configuration load failures are visible; existing malformed or unrecognized configuration is not overwritten without the user's explicit action.
 
 ### Milestone 4: Radar source catalog and site selection
 
@@ -518,7 +606,7 @@ Catalog format and loader, and the NEXRAD catalog. Searchable site picker. First
 
 ### Milestone 5: Gate geometry and full data fidelity
 
-Geodesic placement on WGS84 through `geographiclib-rs`, and slant-to-ground conversion with the effective radius, both against the reference tables. All gate geometry (first gate center, gate interval, azimuth spacing) read from radial headers with no fallback constants. NEXRAD decoder module over `nexrad-decode`, with the Archive II decompression crate selected here. Volume assembly paginated to exhaustion. Start/end sentinel verification before decode. Sweep selector by elevation number, not list index. Skipped radial and bin counts verified in UI.
+Extend the Milestone 1 geodesic placement and slant-to-ground conversion to every available sweep and product, with the reference tables as the acceptance tests. All gate geometry (first gate center, gate interval, azimuth spacing) is read from radial headers with no fallback constants. Extend the NEXRAD decoder module over `nexrad-decode` and the Archive II decompression selected in Milestone 1. Apply the complete volume assembly contract, including pagination to exhaustion and start/end sentinel verification before decode, to all supported Level II retrieval paths. Sweep selector by elevation number, not list index. Skipped radial and bin counts verified in UI.
 
 ### Milestone 6: Products, legends, units, and palettes
 
@@ -526,15 +614,15 @@ Full dual-pol product suite: Z, V, SW, ZDR, CC, KDP. Product selector reflects a
 
 ### Milestone 7: Data level toggle (Level III)
 
-Level II / Level III toggle. Level III fetch pipeline. Product catalog enumerated from Level III data at runtime. Product selector reflects active level. Switching levels cancels in-progress fetch and reloads.
+Level II / Level III toggle. Level III fetch pipeline. Product catalog enumerated from Level III data at runtime. Product selector reflects active level. Switching levels cancels in-progress fetch and reloads. Synchronized comparison panes identify the product, elevation, scan time, and unavailable data for each pane.
 
 ### Milestone 8: NEXRAD volume cache and animation
 
-Volume cache under `~/.oxrad/volumes/` with 48-hour expiry, size cap, and startup purge. Animation buffer pre-populated from cache on startup while a fresh fetch runs in the background. Animation controls: play/pause, step forward, step backward, configurable frame interval. Scan timestamp display. Controls disabled with a visible reason when fewer than 2 scans are available. Frame interval persisted to config.
+Volume cache under `~/.oxrad/volumes/` with 48-hour expiry, size cap, and startup purge. Animation buffer pre-populated from cache on startup while a fresh fetch runs in the background. Animation controls: play/pause, step forward, step backward, selectable available history, and configurable frame interval. Historical scan selection and explicit return to live. Scan timestamp display. Controls disabled with a visible reason when fewer than 2 scans are available. Frame interval persisted to config.
 
 ### Milestone 9: Boundary and road overlays
 
-Boundary and road layers from the vector tiles. Census TIGER/Line overlays for United States sources, downloaded on first use of such a source with progress display and integrity verification, cached under `~/.oxrad/shapefiles/`. Per-overlay toggles. Overlay visibility persisted. Graceful degradation when a data source is unavailable.
+Boundary and road layers from the vector tiles. Census TIGER/Line overlays for United States sources, downloaded on first use of such a source with progress display and integrity verification, cached under `~/.oxrad/shapefiles/`. Per-overlay toggles. Overlay visibility persisted. When a data source is unavailable, the affected overlay reports its unavailable state and reason; all unrelated layers and application functions continue.
 
 ### Milestone 10: Hover cursor and diagnostics
 
@@ -546,7 +634,7 @@ Glyph range fetch and cache, label layout with collision placement, language-awa
 
 ### Milestone 12: NWS weather alerts
 
-Alert overlay from `api.weather.gov`. Alert polygons color-coded by alert type following NWS standard colors. Zone-geometry resolution and cache for alerts without polygons, with the "area unavailable" state. Configurable poll interval with exponential backoff on failure. Alert detail view on click: headline, times in the active time preference, issuing office, full description. Expired alerts removed immediately. Alert API failure disables the overlay with a visible message and leaves other functionality unaffected. Alert data is not cached to disk.
+Alert overlay from `api.weather.gov`. Alert polygons color-coded by alert type following NWS standard colors. Zone-geometry resolution and cache for alerts without polygons, with the "area unavailable" state. Configurable poll interval with exponential backoff on failure. Alert detail view on click: headline, times in the active time preference, issuing office, full description. Expired alerts removed immediately. Alert API failure marks alerts unavailable or stale with a visible message, preserves the last good alert set with its age, retries under the retry policy, and leaves other functionality unaffected. Alert data is not cached to disk. Separately toggleable local storm report and official track overlays show their source, observation or issue time, details, and unavailable or stale state. Optional report submission requires an explicit user action and confirmation.
 
 ### Milestone 13: Site health
 
@@ -554,7 +642,7 @@ Cadence from observed volume intervals. States Live, Silent, Cadence unknown, an
 
 ### Milestone 14: Place search and nearest site
 
-Geocoder worker with submit-only search, one request in flight, one request per second, session result cache, and identifying User-Agent. Local resolution of site ids, names, and `lat, lon`. Operating-system location control with map-pin fallback. Nearest-site selection with distance shown. First-run behavior from Site Selection. Query text excluded from the error log.
+Geocoder worker with submit-only search, one request in flight, one request per second, session result cache, and identifying User-Agent. Local resolution of site ids, names, and `lat, lon`. Operating-system location control with map-pin fallback, current-position accuracy and age, and follow mode with visible suspension on pan. A two-point geodesic distance and bearing tool works independently of radar availability. Nearest-site selection with distance shown. First-run behavior from Site Selection. Query text excluded from the error log.
 
 ### Milestone 15: Location warnings
 
@@ -586,7 +674,7 @@ Nowcast worker fed by the compositor with an in-memory history of four reflectiv
 
 ### Milestone 22: Forecasting
 
-Forecast worker and panel for home, pin, and clicked points. United States and MET Norway catalog entries with attribution and network-policy rows. Memory-only caching that honors response headers. Loading, ready, stale, unavailable, and no-service states. Nowcast arrival range shown beside the forecast in a separately labeled block. Forecast-point coordinates excluded from the error log.
+Weather view and forecast worker and panel for searched locations, home, current position, pins, and clicked points. United States and MET Norway are the initial provider catalog entries, with attribution and network-policy rows. The forecast-provider interface and catalog support additional public regional and national providers without changing the weather view or forecast model. Add providers to expand worldwide coverage; never treat the initial provider set as a geographic product limit. Show observed current conditions when available, or label the current-hour forecast as such; show plain-language condition, temperature, hourly forecasts for 24 hours, and daily forecasts for 7 days when supplied, with precipitation probability and amount, wind, cloud cover, units, source, valid periods, and issue or observation time. Label unavailable values and shorter horizons without inventing them. Weather and radar views share the selected location, and switching preserves it. Available forecast map layers identify quantity, units, source, issue time, and valid time; unavailable layers state why. Memory-only caching honors `Expires` and `Last-Modified`. Request timeout, retry with exponential backoff, `Retry-After` handling, and cancellation when the point changes. Loading, ready, stale, unavailable, and no-service states preserve and label the last good forecast on refresh failure. Nowcast arrival range appears beside the forecast in a separately labeled block. Forecast-point coordinates are excluded from the error log.
 
 ### Milestone 23: Localization
 
@@ -594,7 +682,7 @@ Translation catalogs for all strings. Locale-aware number, date, and time format
 
 ### Milestone 24: Resilience hardening and performance
 
-Comprehensive review of all failure modes across the full stack: worker panic recovery for every worker, all pipeline states and site-health states reachable and correctly labeled, all error paths confirmed to reach the UI. Malformed-input tests on every decoder. Performance profiling at 60 fps during pan and zoom with the full overlay stack, a mosaic at the concurrency limit, animation, alert polling, and lightning active. Cache integrity: corrupt entries in every cache are detected, deleted, and reported without preventing startup.
+Comprehensive review of all failure modes across the full stack: worker panic recovery for every worker, all pipeline states and site-health states reachable and correctly labeled, all error paths confirmed to reach the UI. Malformed-input tests on every decoder. Every interaction budget measured on the reference machine with the full overlay stack, a mosaic at the concurrency limit, animation, alert polling, and lightning active; the measurements are recorded with the method and hardware. A budget missed here sends the work back to the milestone that introduced the interaction. Cache integrity: corrupt entries in every cache are detected, deleted, and reported without preventing startup.
 
 ### Milestone 25: Release binaries
 
