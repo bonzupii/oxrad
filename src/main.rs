@@ -1,4 +1,4 @@
-// oxrad — A storm-chaser-grade NEXRAD weather radar viewer
+// oxrad - A storm-chaser-grade NEXRAD weather radar viewer
 // Copyright (C) 2026 Micah Ostrow <bonzupii@protonmail.com>
 //
 // This program is free software: you can redistribute it and/or modify
@@ -18,16 +18,21 @@ mod colormap;
 mod config;
 mod display;
 mod error;
+mod forecast;
 mod gpu;
 mod network;
 mod overlay;
 mod paths;
 mod pipeline;
+mod place;
 mod projection;
+mod provider;
 mod radar;
 mod render;
 mod retry;
 mod stations;
+#[cfg(test)]
+mod test_support;
 mod time;
 
 use std::process::ExitCode;
@@ -38,15 +43,11 @@ use stations::SiteId;
 const USAGE: &str = "\
 Usage: oxrad [--site IDENTIFIER]
 
-Runs the radar viewer. The last selected site is restored from
-~/.oxrad/config.toml; with no saved site the picker opens.
+Runs the radar viewer. The last selected site is restored from the
+configuration file; with no saved site the picker opens.
 
   --site IDENTIFIER   Start with this site instead of the saved one
   -h, --help          Show this message";
-
-fn parse_site(value: &str) -> Result<SiteId, String> {
-    SiteId::parse(value).map_err(|error| error.to_string())
-}
 
 fn main() -> ExitCode {
     let mut initial = None;
@@ -54,7 +55,7 @@ fn main() -> ExitCode {
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--site" => match arguments.next() {
-                Some(value) => match parse_site(&value) {
+                Some(value) => match SiteId::parse(&value) {
                     Ok(site) => initial = Some(site),
                     Err(error) => {
                         eprintln!("{error}");
@@ -77,7 +78,9 @@ fn main() -> ExitCode {
         }
     }
     let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default().with_inner_size([1280.0, 800.0]),
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size([1280.0, 800.0])
+            .with_min_inner_size([1040.0, 640.0]),
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };

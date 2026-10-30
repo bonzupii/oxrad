@@ -1,4 +1,4 @@
-// oxrad — A storm-chaser-grade NEXRAD weather radar viewer
+// oxrad - A storm-chaser-grade NEXRAD weather radar viewer
 // Copyright (C) 2026 Micah Ostrow <bonzupii@protonmail.com>
 //
 // This program is free software: you can redistribute it and/or modify
@@ -93,7 +93,7 @@ fn retry_after(error: &RadarError) -> Option<&str> {
 }
 
 /// The wait a `Retry-After` value asks for, in seconds or as an HTTP date.
-fn retry_after_delay(value: &str) -> Result<Duration, RadarError> {
+pub fn retry_after_delay(value: &str) -> Result<Duration, RadarError> {
     if let Ok(seconds) = value.trim().parse::<u64>() {
         return Ok(Duration::from_secs(seconds));
     }

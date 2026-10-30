@@ -1,2 +1,4 @@
 /target
 /shell.nix
+/.tools/
+/artifacts/

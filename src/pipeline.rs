@@ -1,4 +1,4 @@
-// oxrad — A storm-chaser-grade NEXRAD weather radar viewer
+// oxrad - A storm-chaser-grade NEXRAD weather radar viewer
 // Copyright (C) 2026 Micah Ostrow <bonzupii@protonmail.com>
 //
 // This program is free software: you can redistribute it and/or modify
@@ -450,6 +450,8 @@ impl Fetcher {
 mod tests {
     use super::*;
 
+    use crate::test_support::TestError;
+
     #[test]
     fn operation_names_read_as_actions() {
         assert_eq!(Operation::Fetching.description(), "Fetch");
@@ -457,8 +459,8 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_step_keeps_its_operation_and_error() -> Result<(), String> {
-        let site = SiteId::parse("KPAH").map_err(|error| error.to_string())?;
+    fn a_failed_step_keeps_its_operation_and_error() -> Result<(), TestError> {
+        let site = SiteId::parse("KPAH")?;
         let failed = worker_failure(
             &site,
             Operation::Fetching,

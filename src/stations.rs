@@ -1,4 +1,4 @@
-// oxrad — A storm-chaser-grade NEXRAD weather radar viewer
+// oxrad - A storm-chaser-grade NEXRAD weather radar viewer
 // Copyright (C) 2026 Micah Ostrow <bonzupii@protonmail.com>
 //
 // This program is free software: you can redistribute it and/or modify
@@ -67,15 +67,6 @@ pub struct Station {
     pub name: &'static str,
     pub lat: f64,
     pub lon: f64,
-}
-
-impl Station {
-    pub fn label(&self) -> String {
-        format!(
-            "{} · {} · {:.2}, {:.2}",
-            self.id, self.name, self.lat, self.lon
-        )
-    }
 }
 
 fn parse_coordinate(text: &str, line: usize, longitude: bool) -> Result<f64, CatalogError> {

@@ -1,4 +1,4 @@
-// oxrad — A storm-chaser-grade NEXRAD weather radar viewer
+// oxrad - A storm-chaser-grade NEXRAD weather radar viewer
 // Copyright (C) 2026 Micah Ostrow <bonzupii@protonmail.com>
 //
 // This program is free software: you can redistribute it and/or modify
@@ -62,26 +62,26 @@ struct RadialLookup {
 }
 
 impl RadialLookup {
-    fn gate_at(&self, range_km: f64) -> Option<usize> {
+    fn gate_at(&self, range_km: f64) -> Result<Option<usize>, CoordinateError> {
         let mut low = 0_usize;
         let mut high = self.gate_count;
         while low < high {
             let middle = low + (high - low) / 2;
             let centre = self.first_gate_km + middle as f64 * self.gate_width_km;
             let near =
-                projection::ground_range(centre - self.gate_width_km / 2.0, self.elevation_deg)
-                    .ok()?;
+                projection::ground_range(centre - self.gate_width_km / 2.0, self.elevation_deg)?;
             if near <= range_km {
                 low = middle + 1;
             } else {
                 high = middle;
             }
         }
-        let gate = low.checked_sub(1)?;
+        let Some(gate) = low.checked_sub(1) else {
+            return Ok(None);
+        };
         let centre = self.first_gate_km + gate as f64 * self.gate_width_km;
-        let far =
-            projection::ground_range(centre + self.gate_width_km / 2.0, self.elevation_deg).ok()?;
-        if range_km < far { Some(gate) } else { None }
+        let far = projection::ground_range(centre + self.gate_width_km / 2.0, self.elevation_deg)?;
+        Ok((range_km < far).then_some(gate))
     }
 }
 
@@ -127,16 +127,31 @@ impl SweepLookup {
     }
 
     /// The gate whose drawn quad covers this ground range and azimuth.
-    pub fn gate(&self, volume: &RadarVolume, range_km: f64, azimuth_deg: f64) -> Option<GateHit> {
-        let index = self.radial_at(azimuth_deg)?;
-        let lookup = self.radials.get(index)?;
-        let gate = lookup.gate_at(range_km)?;
-        let radial = volume.sweep.radials.get(index)?;
-        let value = radial.values.get(gate).copied()?;
-        Some(GateHit {
+    pub fn gate(
+        &self,
+        volume: &RadarVolume,
+        range_km: f64,
+        azimuth_deg: f64,
+    ) -> Result<Option<GateHit>, CoordinateError> {
+        let Some(index) = self.radial_at(azimuth_deg) else {
+            return Ok(None);
+        };
+        let Some(lookup) = self.radials.get(index) else {
+            return Ok(None);
+        };
+        let Some(gate) = lookup.gate_at(range_km)? else {
+            return Ok(None);
+        };
+        let Some(radial) = volume.sweep.radials.get(index) else {
+            return Ok(None);
+        };
+        let Some(value) = radial.values.get(gate).copied() else {
+            return Ok(None);
+        };
+        Ok(Some(GateHit {
             value,
             elevation_deg: radial.elevation_deg,
-        })
+        }))
     }
 }
 
@@ -188,7 +203,8 @@ pub fn start_build_thread() -> (Sender<BuildRequest>, Receiver<BuildResult>) {
     (request_sender, result_receiver)
 }
 
-fn place_geo(lat: f64, lon: f64, site_x: f64, site_y: f64) -> Result<Pos2, CoordinateError> {
+/// The site-relative kilometre offset of a place, in the mesh's frame.
+pub fn place_offset(lat: f64, lon: f64, site_x: f64, site_y: f64) -> Result<Pos2, CoordinateError> {
     let (x, y) = projection::mercator(lat, lon)?;
     Ok(Pos2::new(
         projection::mercator_wrap_delta(x - site_x) as f32,
@@ -205,7 +221,7 @@ fn place_corner(
     let (lat, lon) = path
         .position(range_km)
         .map_err(|source| RenderError::Coordinate { source })?;
-    place_geo(lat, lon, site_x, site_y).map_err(|source| RenderError::Coordinate { source })
+    place_offset(lat, lon, site_x, site_y).map_err(|source| RenderError::Coordinate { source })
 }
 
 fn bin_color(value: GateValue) -> Result<Option<Color32>, RenderError> {
@@ -322,7 +338,7 @@ fn build_rings(
                 projection::forward(range_km, azimuth_deg, volume.site_lat, volume.site_lon)
                     .map_err(|source| RenderError::Coordinate { source })?;
             points.push(
-                place_geo(lat, lon, site_x, site_y)
+                place_offset(lat, lon, site_x, site_y)
                     .map_err(|source| RenderError::Coordinate { source })?,
             );
         }
@@ -345,7 +361,7 @@ fn grid_line(
         let lon = start.1 + step.1 * fraction;
         if (-85.051_128_779_806_6..=85.051_128_779_806_6).contains(&lat) {
             points.push(
-                place_geo(lat, lon, site_x, site_y)
+                place_offset(lat, lon, site_x, site_y)
                     .map_err(|source| RenderError::Coordinate { source })?,
             );
         }
@@ -507,7 +523,7 @@ impl ViewTransform {
             self.site_x + f64::from(offset.x),
             self.site_y + f64::from(offset.y),
         )?;
-        let (range_km, azimuth_deg) = projection::inverse(lat, lon, self.site_lat, self.site_lon)?;
+        let (range_km, azimuth_deg) = projection::inverse(self.site_lat, self.site_lon, lat, lon)?;
         Ok(PointerInfo {
             lat,
             lon,
@@ -520,15 +536,17 @@ impl ViewTransform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::error::ColorMapError;
     use crate::radar::RadarSweep;
     use crate::stations::SiteId;
+    use crate::test_support::TestError;
 
     const SITE_LAT: f64 = 37.068_33;
     const SITE_LON: f64 = -88.771_94;
 
-    fn site() -> Result<SiteId, String> {
-        SiteId::parse("KPAH").map_err(|error| error.to_string())
+    fn site() -> Result<SiteId, TestError> {
+        Ok(SiteId::parse("KPAH")?)
     }
 
     fn radial(left: f64, right: f64, elevation_deg: f64, values: Vec<GateValue>) -> RadialBins {
@@ -543,7 +561,10 @@ mod tests {
         }
     }
 
-    fn volume(radials: Vec<RadialBins>, max_ground_range_km: f64) -> Result<RadarVolume, String> {
+    fn volume(
+        radials: Vec<RadialBins>,
+        max_ground_range_km: f64,
+    ) -> Result<RadarVolume, TestError> {
         Ok(RadarVolume {
             site: site()?,
             site_lat: SITE_LAT,
@@ -566,13 +587,13 @@ mod tests {
     fn build(
         radials: Vec<RadialBins>,
         max_ground_range_km: f64,
-    ) -> Result<(RadarVolume, RadarGeometry), String> {
+    ) -> Result<(RadarVolume, RadarGeometry), TestError> {
         let volume = volume(radials, max_ground_range_km)?;
-        let geometry = build_geometry(&volume).map_err(|error| error.to_string())?;
+        let geometry = build_geometry(&volume)?;
         Ok((volume, geometry))
     }
 
-    fn vertex(geometry: &RadarGeometry, index: usize) -> Result<Pos2, String> {
+    fn vertex(geometry: &RadarGeometry, index: usize) -> Result<Pos2, TestError> {
         let start = index * VERTEX_BYTES;
         let x: [u8; 4] = geometry
             .vertices
@@ -593,7 +614,7 @@ mod tests {
     /// range, so the corner sits 2 m inside the roadmap's 75 km reference point;
     /// 5e-5 degrees is 4.4 m at this latitude.
     #[test]
-    fn rendered_corner_lands_on_the_reference_geodesic_point() -> Result<(), String> {
+    fn rendered_corner_lands_on_the_reference_geodesic_point() -> Result<(), TestError> {
         let (_, geometry) = build(
             vec![radial(90.0, 90.0, 0.0, vec![GateValue::Measured(30.0)])],
             75.0,
@@ -602,8 +623,7 @@ mod tests {
         let (lat, lon) = projection::mercator_inverse(
             geometry.site_x + f64::from(corner.x),
             geometry.site_y + f64::from(corner.y),
-        )
-        .map_err(|error| error.to_string())?;
+        )?;
         assert!(
             (lat - 37.065_332).abs() < 5e-5,
             "rendered corner latitude {lat}"
@@ -616,13 +636,14 @@ mod tests {
     }
 
     #[test]
-    fn lookup_returns_the_gate_under_a_reference_point() -> Result<(), String> {
+    fn lookup_returns_the_gate_under_a_reference_point() -> Result<(), TestError> {
         let (volume, geometry) = build(
             vec![radial(89.5, 90.5, 0.0, vec![GateValue::Measured(41.0)])],
             75.0,
         )?;
-        let ground = projection::ground_range(74.75, 0.0).map_err(|error| error.to_string())?;
-        match geometry.lookup.gate(&volume, ground, 90.0) {
+        let ground = projection::ground_range(74.75, 0.0)?;
+        let hit = geometry.lookup.gate(&volume, ground, 90.0)?;
+        match hit {
             Some(GateHit {
                 value: GateValue::Measured(dbz),
                 elevation_deg,
@@ -631,29 +652,31 @@ mod tests {
                 assert!(elevation_deg.abs() < 1e-9, "elevation {elevation_deg}");
                 Ok(())
             }
-            other => Err(format!("expected the measured gate, got {other:?}")),
+            other => Err(TestError::from(format!(
+                "expected the measured gate, got {other:?}"
+            ))),
         }
     }
 
     #[test]
-    fn lookup_reports_no_data_outside_the_drawn_sweep() -> Result<(), String> {
+    fn lookup_reports_no_data_outside_the_drawn_sweep() -> Result<(), TestError> {
         let (volume, geometry) = build(
             vec![radial(89.5, 90.5, 0.0, vec![GateValue::Measured(41.0)])],
             75.0,
         )?;
         assert!(
-            geometry.lookup.gate(&volume, 10.0, 90.0).is_none(),
+            geometry.lookup.gate(&volume, 10.0, 90.0)?.is_none(),
             "a point nearer than the first gate reports no data"
         );
         assert!(
-            geometry.lookup.gate(&volume, 75.0, 180.0).is_none(),
+            geometry.lookup.gate(&volume, 75.0, 180.0)?.is_none(),
             "a point outside the drawn azimuth sector reports no data"
         );
         Ok(())
     }
 
     #[test]
-    fn below_threshold_gates_are_identifiable_and_not_drawn() -> Result<(), String> {
+    fn below_threshold_gates_are_identifiable_and_not_drawn() -> Result<(), TestError> {
         let (volume, geometry) = build(
             vec![radial(89.5, 90.5, 0.0, vec![GateValue::BelowThreshold])],
             75.0,
@@ -662,18 +685,21 @@ mod tests {
             geometry.index_count, 0,
             "below-threshold gates are excluded from the mesh"
         );
-        let ground = projection::ground_range(74.75, 0.0).map_err(|error| error.to_string())?;
-        match geometry.lookup.gate(&volume, ground, 90.0) {
+        let ground = projection::ground_range(74.75, 0.0)?;
+        let hit = geometry.lookup.gate(&volume, ground, 90.0)?;
+        match hit {
             Some(GateHit {
                 value: GateValue::BelowThreshold,
                 ..
             }) => Ok(()),
-            other => Err(format!("expected below threshold, got {other:?}")),
+            other => Err(TestError::from(format!(
+                "expected below threshold, got {other:?}"
+            ))),
         }
     }
 
     #[test]
-    fn range_folded_gates_are_drawn_in_the_sentinel_colour() -> Result<(), String> {
+    fn range_folded_gates_are_drawn_in_the_sentinel_colour() -> Result<(), TestError> {
         let (_, geometry) = build(
             vec![radial(89.5, 90.5, 0.0, vec![GateValue::RangeFolded])],
             75.0,
@@ -689,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unmappable_reflectivity_value_is_an_error() -> Result<(), String> {
+    fn an_unmappable_reflectivity_value_is_an_error() -> Result<(), TestError> {
         let volume = volume(
             vec![radial(89.5, 90.5, 0.0, vec![GateValue::Measured(95.0)])],
             75.0,
@@ -701,20 +727,23 @@ mod tests {
                 assert!((value - 95.0).abs() < f32::EPSILON, "carried value {value}");
                 Ok(())
             }
-            Err(error) => Err(format!("expected a colour error, got {error}")),
-            Ok(_) => Err(String::from("expected a colour error, got a geometry")),
+            Err(error) => Err(TestError::from(format!(
+                "expected a colour error, got {error}"
+            ))),
+            Ok(_) => Err(TestError::from(String::from(
+                "expected a colour error, got a geometry",
+            ))),
         }
     }
 
     #[test]
-    fn viewport_transform_maps_offsets_and_pointer_positions() -> Result<(), String> {
+    fn viewport_transform_maps_offsets_and_pointer_positions() -> Result<(), TestError> {
         let (_, geometry) = build(
             vec![radial(89.5, 90.5, 0.0, vec![GateValue::Measured(30.0)])],
             75.0,
         )?;
         let viewport = radar_viewport(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 900.0)));
-        let transform =
-            ViewTransform::new(viewport, &geometry).map_err(|error| error.to_string())?;
+        let transform = ViewTransform::new(viewport, &geometry)?;
         let offset = Pos2::new(40.0, -25.0);
         let screen = transform.screen(offset);
         let recovered = transform.offset_at(screen);
@@ -722,12 +751,9 @@ mod tests {
             (recovered.x - offset.x).abs() < 1e-2 && (recovered.y - offset.y).abs() < 1e-2,
             "offset round trip {recovered:?}"
         );
-        let info = transform
-            .pointer_info(screen)
-            .map_err(|error| error.to_string())?;
+        let info = transform.pointer_info(screen)?;
         let (expected_lat, expected_lon) =
-            projection::mercator_inverse(geometry.site_x + 40.0, geometry.site_y - 25.0)
-                .map_err(|error| error.to_string())?;
+            projection::mercator_inverse(geometry.site_x + 40.0, geometry.site_y - 25.0)?;
         assert!(
             (info.lat - expected_lat).abs() < 1e-6,
             "latitude {}",
@@ -742,7 +768,7 @@ mod tests {
     }
 
     #[test]
-    fn a_viewport_without_pixels_is_rejected() -> Result<(), String> {
+    fn a_viewport_without_pixels_is_rejected() -> Result<(), TestError> {
         let (_, geometry) = build(
             vec![radial(89.5, 90.5, 0.0, vec![GateValue::Measured(30.0)])],
             75.0,
@@ -753,12 +779,14 @@ mod tests {
                 assert!(width.abs() < f32::EPSILON && height.abs() < f32::EPSILON);
                 Ok(())
             }
-            other => Err(format!("expected a viewport error, got {other:?}")),
+            other => Err(TestError::from(format!(
+                "expected a viewport error, got {other:?}"
+            ))),
         }
     }
 
     #[test]
-    fn range_rings_are_geodesic_circles_at_fifty_kilometre_intervals() -> Result<(), String> {
+    fn range_rings_are_geodesic_circles_at_fifty_kilometre_intervals() -> Result<(), TestError> {
         let (_, geometry) = build(
             vec![radial(89.5, 90.5, 0.0, vec![GateValue::Measured(30.0)])],
             75.0,
@@ -770,14 +798,63 @@ mod tests {
         let (lat, lon) = projection::mercator_inverse(
             geometry.site_x + f64::from(first.x),
             geometry.site_y + f64::from(first.y),
-        )
-        .map_err(|error| error.to_string())?;
-        let (range_km, _) =
-            projection::inverse(lat, lon, SITE_LAT, SITE_LON).map_err(|error| error.to_string())?;
+        )?;
+        let (range_km, _) = projection::inverse(SITE_LAT, SITE_LON, lat, lon)?;
         assert!(
             (range_km - 50.0).abs() < 1e-3,
             "ring point range {range_km}"
         );
+        Ok(())
+    }
+
+    /// North is positive Mercator y and must draw above the site; east is
+    /// positive Mercator x and must draw to the right. Both expectations come
+    /// from the map, not from the transform under test.
+    #[test]
+    fn north_and_east_plot_on_the_expected_sides_of_the_site() -> Result<(), TestError> {
+        let (_, geometry) = build(
+            vec![radial(89.5, 90.5, 0.0, vec![GateValue::Measured(30.0)])],
+            75.0,
+        )?;
+        let viewport = radar_viewport(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 900.0)));
+        let transform = ViewTransform::new(viewport, &geometry)?;
+        let (north_lat, north_lon) = projection::forward(75.0, 0.0, SITE_LAT, SITE_LON)?;
+        let north = place_offset(north_lat, north_lon, geometry.site_x, geometry.site_y)?;
+        assert!(north.y > 0.0, "north offset y {}", north.y);
+        assert!(
+            transform.screen(north).y < viewport.center().y,
+            "north draws below the site"
+        );
+        let (east_lat, east_lon) = projection::forward(75.0, 90.0, SITE_LAT, SITE_LON)?;
+        let east = place_offset(east_lat, east_lon, geometry.site_x, geometry.site_y)?;
+        assert!(east.x > 0.0, "east offset x {}", east.x);
+        assert!(
+            transform.screen(east).x > viewport.center().x,
+            "east draws left of the site"
+        );
+        Ok(())
+    }
+
+    /// Bowling Green is east and north of KHPX; Paducah is east and north of
+    /// KPAH. Both are independent geographic facts about the station catalog.
+    #[test]
+    fn a_place_marker_sits_on_the_expected_bearing_from_the_station() -> Result<(), TestError> {
+        let cases = [
+            (
+                36.736_9,
+                -87.285,
+                36.990_3,
+                -86.443_6,
+                "Bowling Green from KHPX",
+            ),
+            (37.068_33, -88.771_94, 37.083_4, -88.6, "Paducah from KPAH"),
+        ];
+        for (site_lat, site_lon, place_lat, place_lon, label) in cases {
+            let (site_x, site_y) = projection::mercator(site_lat, site_lon)?;
+            let offset = place_offset(place_lat, place_lon, site_x, site_y)?;
+            assert!(offset.x > 0.0, "{label}: east offset {}", offset.x);
+            assert!(offset.y > 0.0, "{label}: north offset {}", offset.y);
+        }
         Ok(())
     }
 }

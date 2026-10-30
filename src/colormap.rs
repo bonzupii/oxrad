@@ -1,4 +1,4 @@
-// oxrad — A storm-chaser-grade NEXRAD weather radar viewer
+// oxrad - A storm-chaser-grade NEXRAD weather radar viewer
 // Copyright (C) 2026 Micah Ostrow <bonzupii@protonmail.com>
 //
 // This program is free software: you can redistribute it and/or modify
@@ -63,7 +63,7 @@ fn interpolate(low: [u8; 3], high: [u8; 3], fraction: f32) -> [u8; 4] {
     ]
 }
 
-fn reflectivity_color(dbz: f32) -> Result<[u8; 4], ColorMapError> {
+pub fn color_for_reflectivity(dbz: f32) -> Result<[u8; 4], ColorMapError> {
     if !(MIN_REFLECTIVITY_DBZ..=MAX_REFLECTIVITY_DBZ).contains(&dbz) {
         return Err(ColorMapError::OutOfRange {
             product: PRODUCT,
@@ -96,10 +96,6 @@ fn reflectivity_color(dbz: f32) -> Result<[u8; 4], ColorMapError> {
         },
         |(_, rgb)| Ok(with_alpha(rgb)),
     )
-}
-
-pub fn color_for_reflectivity(dbz: f32) -> Result<[u8; 4], ColorMapError> {
-    reflectivity_color(dbz)
 }
 
 pub const fn range_folded_color() -> [u8; 4] {
@@ -143,7 +139,7 @@ mod tests {
     }
 
     fn expect_color(dbz: f32, expected: [u8; 4]) -> Result<(), TestFailure> {
-        let actual = reflectivity_color(dbz)?;
+        let actual = color_for_reflectivity(dbz)?;
         if actual == expected {
             Ok(())
         } else {
@@ -188,14 +184,14 @@ mod tests {
     #[test]
     fn a_nan_measurement_is_out_of_range_not_range_folded() {
         assert!(matches!(
-            reflectivity_color(f32::NAN),
+            color_for_reflectivity(f32::NAN),
             Err(ColorMapError::OutOfRange { product, value }) if product == PRODUCT && value.is_nan()
         ));
     }
 
     #[test]
     fn an_out_of_range_value_carries_itself() {
-        let result = reflectivity_color(95.0);
+        let result = color_for_reflectivity(95.0);
         assert!(
             matches!(result, Err(ColorMapError::OutOfRange { product, value }) if product == PRODUCT && value == 95.0),
             "expected OutOfRange carrying 95.0, got {result:?}"

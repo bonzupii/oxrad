@@ -1,4 +1,4 @@
-// oxrad — A storm-chaser-grade NEXRAD weather radar viewer
+// oxrad - A storm-chaser-grade NEXRAD weather radar viewer
 // Copyright (C) 2026 Micah Ostrow <bonzupii@protonmail.com>
 //
 // This program is free software: you can redistribute it and/or modify
@@ -59,6 +59,10 @@ impl DisplayState {
 
     pub const fn is_busy(&self) -> bool {
         matches!(self, Self::Waiting | Self::Building)
+    }
+
+    pub const fn retryable(&self) -> bool {
+        matches!(self, Self::Failed { .. })
     }
 }
 
@@ -127,12 +131,12 @@ impl Display {
     }
 
     pub fn retry(&mut self) {
-        let DisplayState::Failed { volume, .. } =
-            std::mem::replace(&mut self.state, DisplayState::Waiting)
-        else {
-            return;
-        };
-        self.send(self.generation, volume);
+        let state = std::mem::replace(&mut self.state, DisplayState::Waiting);
+        if let DisplayState::Failed { volume, .. } = state {
+            self.send(self.generation, volume);
+        } else {
+            self.state = state;
+        }
     }
 
     pub fn poll(&mut self) {

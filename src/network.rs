@@ -1,4 +1,4 @@
-// oxrad — A storm-chaser-grade NEXRAD weather radar viewer
+// oxrad - A storm-chaser-grade NEXRAD weather radar viewer
 // Copyright (C) 2026 Micah Ostrow <bonzupii@protonmail.com>
 //
 // This program is free software: you can redistribute it and/or modify
@@ -206,8 +206,10 @@ pub fn fetch_archive(key: &str) -> Result<Vec<u8>, RadarError> {
 mod tests {
     use super::*;
 
-    fn site() -> Result<SiteId, String> {
-        SiteId::parse("KPAH").map_err(|error| error.to_string())
+    use crate::test_support::TestError;
+
+    fn site() -> Result<SiteId, TestError> {
+        Ok(SiteId::parse("KPAH")?)
     }
 
     #[test]
@@ -246,9 +248,9 @@ mod tests {
     /// completeness sentinels inside the decoded volume. A network failure
     /// fails this test; it is not replaced with synthetic data.
     #[test]
-    fn live_listing_retrieves_a_complete_current_volume() -> Result<(), String> {
+    fn live_listing_retrieves_a_complete_current_volume() -> Result<(), TestError> {
         let site = site()?;
-        let key = latest_volume_key(&site).map_err(|error| error.to_string())?;
+        let key = latest_volume_key(&site)?;
         assert!(is_volume_key(&key), "listed key {key}");
         let name = key
             .rsplit('/')
@@ -269,30 +271,31 @@ mod tests {
             .filter(|character| *character != '_')
             .all(|character| character.is_ascii_digit());
         assert!(digits, "volume timestamp {stamp}");
-        let bytes = fetch_archive(&key).map_err(|error| error.to_string())?;
+        let bytes = fetch_archive(&key)?;
         assert!(bytes.len() > 1_000_000, "archive size {}", bytes.len());
-        let volume =
-            crate::radar::decode_volume(&site, &key, &bytes).map_err(|error| error.to_string())?;
+        let volume = crate::radar::decode_volume(&site, &key, &bytes)?;
         assert!(
             volume.sweep.radials.len() >= 360,
             "radial count {}",
             volume.sweep.radials.len()
         );
         assert_eq!(volume.skipped_radials, 0, "skipped radials");
-        let now = now_unix_ms().map_err(|error| error.to_string())?;
+        let now = now_unix_ms()?;
         let age_ms = now.saturating_sub(volume.scan_unix_ms);
         assert!(age_ms < 3 * 3_600_000, "live volume age {age_ms} ms");
         Ok(())
     }
 
     #[test]
-    fn a_missing_volume_is_reported_as_a_stale_listing() -> Result<(), String> {
+    fn a_missing_volume_is_reported_as_a_stale_listing() -> Result<(), TestError> {
         match fetch_archive("2026/10/30/KPAH/KPAH20261030_999999_V06") {
             Err(RadarError::VolumeGone { key }) => {
                 assert_eq!(key, "2026/10/30/KPAH/KPAH20261030_999999_V06");
                 Ok(())
             }
-            other => Err(format!("expected VolumeGone, got {other:?}")),
+            other => Err(TestError::from(format!(
+                "expected VolumeGone, got {other:?}"
+            ))),
         }
     }
 }

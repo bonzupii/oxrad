@@ -1,4 +1,4 @@
-// oxrad — A storm-chaser-grade NEXRAD weather radar viewer
+// oxrad - A storm-chaser-grade NEXRAD weather radar viewer
 // Copyright (C) 2026 Micah Ostrow <bonzupii@protonmail.com>
 //
 // This program is free software: you can redistribute it and/or modify
@@ -1129,10 +1129,12 @@ pub fn decode_volume(site: &SiteId, key: &str, bytes: &[u8]) -> Result<RadarVolu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::network;
 
-    fn site() -> Result<SiteId, String> {
-        SiteId::parse("KPAH").map_err(|error| error.to_string())
+    use crate::network;
+    use crate::test_support::TestError;
+
+    fn site() -> Result<SiteId, TestError> {
+        Ok(SiteId::parse("KPAH")?)
     }
 
     fn radial(
@@ -1154,31 +1156,16 @@ mod tests {
         }
     }
 
-    fn sweep(radials: Vec<Radial>) -> Result<RadarSweep, String> {
-        let mut assembly = SweepAssembly::start(radials.first().cloned().ok_or("no radials")?);
-        for radial in radials.into_iter().skip(1) {
+    fn sweep(radials: Vec<Radial>) -> Result<RadarSweep, TestError> {
+        let mut radials = radials.into_iter();
+        let first = radials.next().ok_or("no radials")?;
+        let mut assembly = SweepAssembly::start(first);
+        for radial in radials {
             assembly.push(radial);
         }
         assembly.ended = true;
         let site = site()?;
-        assembly
-            .into_radial_bins(&site)
-            .map_err(|error| error.to_string())
-    }
-
-    impl Clone for Radial {
-        fn clone(&self) -> Self {
-            Self {
-                elevation_number: self.elevation_number,
-                elevation_deg: self.elevation_deg,
-                azimuth_number: self.azimuth_number,
-                azimuth_deg: self.azimuth_deg,
-                spacing_deg: self.spacing_deg,
-                first_gate_km: self.first_gate_km,
-                gate_width_km: self.gate_width_km,
-                values: self.values.clone(),
-            }
-        }
+        Ok(assembly.into_radial_bins(&site)?)
     }
 
     fn span(left: f64, right: f64) -> f64 {
@@ -1213,7 +1200,7 @@ mod tests {
     }
 
     #[test]
-    fn azimuth_edges_bisect_neighbouring_radials() -> Result<(), String> {
+    fn azimuth_edges_bisect_neighbouring_radials() -> Result<(), TestError> {
         let bins = sweep(vec![
             radial(10.0, 1, 1, 0.5, 1),
             radial(10.5, 2, 1, 0.5, 1),
@@ -1247,7 +1234,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sweep_that_crosses_north_has_no_wide_wedge() -> Result<(), String> {
+    fn a_sweep_that_crosses_north_has_no_wide_wedge() -> Result<(), TestError> {
         // The measured azimuth sequence of a real KPAH sweep: it starts at
         // 275.18 degrees and wraps through north in the middle of the list.
         let bins = sweep(vec![
@@ -1280,7 +1267,7 @@ mod tests {
     }
 
     #[test]
-    fn a_full_circle_keeps_the_seam_half_a_radial_wide() -> Result<(), String> {
+    fn a_full_circle_keeps_the_seam_half_a_radial_wide() -> Result<(), TestError> {
         let mut radials = Vec::new();
         for step in 0..720_u16 {
             let azimuth = f64::from(step) * 0.5;
@@ -1301,7 +1288,7 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_radial_leaves_a_gap_instead_of_a_wide_bin() -> Result<(), String> {
+    fn a_missing_radial_leaves_a_gap_instead_of_a_wide_bin() -> Result<(), TestError> {
         let bins = sweep(vec![
             radial(0.0, 1, 1, 0.5, 1),
             radial(0.5, 2, 1, 0.5, 1),
@@ -1347,7 +1334,7 @@ mod tests {
     }
 
     #[test]
-    fn gate_counts_and_ranges_follow_the_radial_header() -> Result<(), String> {
+    fn gate_counts_and_ranges_follow_the_radial_header() -> Result<(), TestError> {
         let bins = sweep(vec![radial(0.0, 1, 1, 0.5, 4), radial(0.5, 2, 1, 0.5, 4)])?;
         let radial = bins.radials.first().ok_or("no radials")?;
         assert!((radial.first_gate_km - 2.0).abs() < 1e-12);
@@ -1414,15 +1401,12 @@ mod tests {
         let values = decode_moment(&block)?;
         assert!(matches!(values.first(), Some(GateValue::BelowThreshold)));
         assert!(matches!(values.get(1), Some(GateValue::RangeFolded)));
-        match values.get(2) {
-            Some(GateValue::Measured(dbz)) => assert!((dbz - 2.0).abs() < 1e-6, "value {dbz}"),
-            other => panic_free_failure(other),
-        }
+        assert!(
+            matches!(values.get(2), Some(GateValue::Measured(dbz)) if (dbz - 2.0).abs() < 1e-6),
+            "gate value {:?}",
+            values.get(2)
+        );
         Ok(())
-    }
-
-    fn panic_free_failure(value: Option<&GateValue>) {
-        let _ = value;
     }
 
     fn archive_header() -> Vec<u8> {
@@ -1434,22 +1418,22 @@ mod tests {
     }
 
     #[test]
-    fn archive_header_rejects_wrong_site_and_version() -> Result<(), String> {
+    fn archive_header_rejects_wrong_site_and_version() -> Result<(), TestError> {
         let header = archive_header();
         let site = site()?;
         assert!(validate_archive_header(&site, "key", &header).is_ok());
-        match validate_archive_header(
-            &SiteId::parse("KTLX").map_err(|e| e.to_string())?,
-            "key",
-            &header,
-        ) {
+        match validate_archive_header(&SiteId::parse("KTLX")?, "key", &header) {
             Err(RadarError::ArchiveSite {
                 expected, actual, ..
             }) => {
                 assert_eq!(expected, "KTLX");
                 assert_eq!(actual, *b"KPAH");
             }
-            other => return Err(format!("expected ArchiveSite, got {other:?}")),
+            other => {
+                return Err(TestError::from(format!(
+                    "expected ArchiveSite, got {other:?}"
+                )));
+            }
         }
         let mut broken = archive_header();
         broken.splice(0..4, *b"AR3V");
@@ -1461,19 +1445,21 @@ mod tests {
     }
 
     #[test]
-    fn header_only_archive_reports_an_incomplete_volume() -> Result<(), String> {
+    fn header_only_archive_reports_an_incomplete_volume() -> Result<(), TestError> {
         let site = site()?;
         match decode_volume(&site, "key", &archive_header()) {
             Err(RadarError::IncompleteVolume {
                 defect: VolumeDefect::MissingStart,
                 ..
             }) => Ok(()),
-            other => Err(format!("expected MissingStart, got {other:?}")),
+            other => Err(TestError::from(format!(
+                "expected MissingStart, got {other:?}"
+            ))),
         }
     }
 
     #[test]
-    fn truncated_archive_reports_bounds_with_key_and_offset() -> Result<(), String> {
+    fn truncated_archive_reports_bounds_with_key_and_offset() -> Result<(), TestError> {
         let site = site()?;
         match decode_volume(
             &site,
@@ -1484,7 +1470,9 @@ mod tests {
                 assert_eq!(key, "2026/10/30/KPAH/KPAH20261030_023529_V06");
                 Ok(())
             }
-            other => Err(format!("expected RecordBounds, got {other:?}")),
+            other => Err(TestError::from(format!(
+                "expected RecordBounds, got {other:?}"
+            ))),
         }
     }
 
@@ -1503,12 +1491,39 @@ mod tests {
     /// Retrieves the pinned archive from AWS and runs the application path from
     /// archive bytes to render-ready geometry. Network failure fails this test.
     #[test]
-    fn pinned_archive_decodes_to_a_renderable_sweep() -> Result<(), String> {
-        let bytes = network::fetch_archive(PINNED_KEY).map_err(|error| error.to_string())?;
+    fn pinned_archive_decodes_to_a_renderable_sweep() -> Result<(), TestError> {
+        let bytes = network::fetch_archive(PINNED_KEY)?;
         assert_eq!(bytes.len(), PINNED_BYTES, "pinned archive size");
         assert_eq!(sha256_hex(&bytes), PINNED_SHA256, "pinned archive digest");
+        // Validate every record's declared span against the bytes available.
+        // The final record length is negative by definition; its absolute
+        // length must end exactly at the archive boundary.
+        let mut offset = archive_header().len();
+        let mut final_record_is_negative = false;
+        while offset < bytes.len() {
+            let header: [u8; 4] = bytes
+                .get(offset..offset + 4)
+                .ok_or("record header")?
+                .try_into()
+                .map_err(|_| "record header")?;
+            let declared = i32::from_be_bytes(header);
+            assert_ne!(declared, 0, "zero record length at {offset}");
+            let length = usize::try_from(declared.unsigned_abs()).map_err(|_| "record length")?;
+            let end = offset
+                .checked_add(4)
+                .and_then(|start| start.checked_add(length))
+                .ok_or("record end overflow")?;
+            assert!(end <= bytes.len(), "record at {offset} ends at {end}");
+            offset = end;
+            final_record_is_negative = declared < 0;
+        }
+        assert_eq!(offset, bytes.len(), "records cover the archive");
+        assert!(
+            final_record_is_negative,
+            "final record has a negative length"
+        );
         let site = site()?;
-        let volume = decode_volume(&site, PINNED_KEY, &bytes).map_err(|error| error.to_string())?;
+        let volume = decode_volume(&site, PINNED_KEY, &bytes)?;
 
         // Published KPAH coordinates, independent of this decoder.
         assert!(
@@ -1580,16 +1595,21 @@ mod tests {
             "max ground range {}",
             volume.sweep.max_ground_range_km
         );
+        let measured = volume
+            .sweep
+            .radials
+            .iter()
+            .flat_map(|radial| &radial.values)
+            .filter(|value| matches!(**value, GateValue::Measured(_)))
+            .count();
         assert_eq!(
-            volume.sweep.below_threshold + volume.sweep.range_folded + volume.sweep.gate_count()
-                - volume.sweep.below_threshold
-                - volume.sweep.range_folded,
+            measured + volume.sweep.below_threshold + volume.sweep.range_folded,
             volume.sweep.gate_count(),
             "gate categories partition the gates"
         );
         assert_eq!(volume.skipped_radials, 0, "no radial is skipped");
 
-        let geometry = crate::render::build_geometry(&volume).map_err(|error| error.to_string())?;
+        let geometry = crate::render::build_geometry(&volume)?;
         assert!(geometry.index_count > 0, "mesh has triangles");
         // Web Mercator stretches ground distance by 1/cos(latitude). The mesh
         // bounds reach the poleward edge of the sweep, where that factor is

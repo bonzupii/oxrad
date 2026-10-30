@@ -1,4 +1,4 @@
-// oxrad — A storm-chaser-grade NEXRAD weather radar viewer
+// oxrad - A storm-chaser-grade NEXRAD weather radar viewer
 // Copyright (C) 2026 Micah Ostrow <bonzupii@protonmail.com>
 //
 // This program is free software: you can redistribute it and/or modify
@@ -148,24 +148,29 @@ pub fn forward(
     Ok((lat, normalize_lon(lon)))
 }
 
+/// Distance and initial bearing from `(origin_lat, origin_lon)` to
+/// `(target_lat, target_lon)` on the WGS84 ellipsoid.
+///
+/// The origin is first so a caller cannot accidentally reverse a bearing while
+/// still getting the same distance. Compass labels depend on this order.
 pub fn inverse(
+    origin_lat: f64,
+    origin_lon: f64,
     target_lat: f64,
     target_lon: f64,
-    site_lat: f64,
-    site_lon: f64,
 ) -> Result<(f64, f64), CoordinateError> {
+    validate_lat(origin_lat)?;
+    validate_lon(origin_lon)?;
     validate_lat(target_lat)?;
     validate_lon(target_lon)?;
-    validate_lat(site_lat)?;
-    validate_lon(site_lon)?;
 
-    if (target_lat - site_lat).abs() < 1e-12 && (target_lon - site_lon).abs() < 1e-12 {
+    if (target_lat - origin_lat).abs() < 1e-12 && (target_lon - origin_lon).abs() < 1e-12 {
         return Ok((0.0, 0.0));
     }
 
     let geodesic = Geodesic::wgs84();
     let (distance_m, azimuth_deg, _back_azimuth, _arc_deg) =
-        geodesic.inverse(site_lat, site_lon, target_lat, target_lon);
+        geodesic.inverse(origin_lat, origin_lon, target_lat, target_lon);
     Ok((distance_m / METERS_PER_KM, azimuth_deg.rem_euclid(360.0)))
 }
 
@@ -318,7 +323,7 @@ mod tests {
         for (azimuth_deg, _expected_lat, _expected_lon) in REFERENCE {
             let (target_lat, target_lon) = forward(RANGE_KM, azimuth_deg, SITE_LAT, SITE_LON)?;
             let (range_km, recovered_azimuth) =
-                inverse(target_lat, target_lon, SITE_LAT, SITE_LON)?;
+                inverse(SITE_LAT, SITE_LON, target_lat, target_lon)?;
             expect_within(
                 "range m",
                 RANGE_KM * METERS_PER_KM,
@@ -360,9 +365,32 @@ mod tests {
         );
     }
 
+    /// A bearing depends on direction: east from the site is 90 degrees, and
+    /// the reciprocal bearing back to the site is 270 degrees.
+    #[test]
+    fn inverse_bearing_is_relative_to_the_origin() -> Result<(), TestFailure> {
+        let (east_lat, east_lon) = forward(RANGE_KM, 90.0, SITE_LAT, SITE_LON)?;
+        let (_, outward) = inverse(SITE_LAT, SITE_LON, east_lat, east_lon)?;
+        let (_, inward) = inverse(east_lat, east_lon, SITE_LAT, SITE_LON)?;
+        expect_within("outward bearing", 90.0, outward, 1e-9)?;
+        // A geodesic's return bearing is not the exact reciprocal of its
+        // outgoing bearing: meridians converge toward the pole. At this
+        // latitude the 75 km return bearing is about 270.5 degrees, but it
+        // must still point west rather than east.
+        if !(270.0..271.0).contains(&inward) {
+            return Err(TestFailure::Value {
+                label: "inward bearing direction",
+                expected: 270.5,
+                actual: inward,
+                tolerance: 0.5,
+            });
+        }
+        Ok(())
+    }
+
     #[test]
     fn inverse_rejects_invalid_latitude() {
-        let result = inverse(91.0, 0.0, SITE_LAT, SITE_LON);
+        let result = inverse(SITE_LAT, SITE_LON, 91.0, 0.0);
         assert!(
             matches!(result, Err(CoordinateError::Latitude { lat }) if lat == 91.0),
             "expected Latitude error carrying 91.0, got {result:?}"
@@ -371,7 +399,7 @@ mod tests {
 
     #[test]
     fn inverse_rejects_invalid_longitude() {
-        let result = inverse(0.0, 181.0, SITE_LAT, SITE_LON);
+        let result = inverse(SITE_LAT, SITE_LON, 0.0, 181.0);
         assert!(
             matches!(result, Err(CoordinateError::Longitude { lon }) if lon == 181.0),
             "expected Longitude error carrying 181.0, got {result:?}"

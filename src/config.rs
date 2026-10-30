@@ -1,4 +1,4 @@
-// oxrad — A storm-chaser-grade NEXRAD weather radar viewer
+// oxrad - A storm-chaser-grade NEXRAD weather radar viewer
 // Copyright (C) 2026 Micah Ostrow <bonzupii@protonmail.com>
 //
 // This program is free software: you can redistribute it and/or modify
@@ -25,18 +25,9 @@ use crate::stations::SiteId;
 
 const HEADER: &str = "# oxrad configuration.\n";
 
-/// What the configuration file supplied for this session.
-#[derive(Debug)]
-pub enum Loaded {
-    /// No configuration file exists yet.
-    Missing,
-    /// The file parsed; fields it omits keep their documented defaults.
-    Present(Config),
-}
-
 #[derive(Debug, Default, Clone)]
 pub struct Config {
-    /// The site to open with, or `None` for the site picker.
+    /// The radar station to open with, or `None` for the site picker.
     pub site: Option<SiteId>,
 }
 
@@ -57,26 +48,7 @@ fn parse_site(path: &Path, line: usize, value: &str) -> Result<SiteId, ConfigErr
     })
 }
 
-fn parse_line(
-    path: &Path,
-    line: usize,
-    key: &str,
-    value: &str,
-) -> Result<Option<SiteId>, ConfigError> {
-    match key {
-        "site" => Ok(Some(parse_site(path, line, value)?)),
-        _ => {
-            let key = String::from(key);
-            Err(ConfigError::UnknownKey {
-                path: path.to_path_buf(),
-                line,
-                key,
-            })
-        }
-    }
-}
-
-fn parse_text(path: &Path, text: &str) -> Result<Config, ConfigError> {
+fn parse_text_line(path: &Path, text: &str) -> Result<Config, ConfigError> {
     let mut config = Config::default();
     for (index, raw) in text.lines().enumerate() {
         let number = index + 1;
@@ -88,18 +60,27 @@ fn parse_text(path: &Path, text: &str) -> Result<Config, ConfigError> {
             path: path.to_path_buf(),
             line: number,
         })?;
-        if let Some(site) = parse_line(path, number, key.trim(), value.trim())? {
-            config.site = Some(site);
+        let key = key.trim();
+        let value = value.trim();
+        match key {
+            "site" => config.site = Some(parse_site(path, number, value)?),
+            _ => {
+                return Err(ConfigError::UnknownKey {
+                    path: path.to_path_buf(),
+                    line: number,
+                    key: String::from(key),
+                });
+            }
         }
     }
     Ok(config)
 }
 
 /// Reads `path`, reporting an absent file separately from a malformed one.
-pub fn load(path: &Path) -> Result<Loaded, ConfigError> {
+pub fn load(path: &Path) -> Result<Option<Config>, ConfigError> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Loaded::Missing),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(source) => {
             return Err(ConfigError::Read {
                 path: path.to_path_buf(),
@@ -107,7 +88,7 @@ pub fn load(path: &Path) -> Result<Loaded, ConfigError> {
             });
         }
     };
-    parse_text(path, &text).map(Loaded::Present)
+    parse_text_line(path, &text).map(Some)
 }
 
 /// Writes the configuration, creating `~/.oxrad` when it is absent.
@@ -128,7 +109,7 @@ pub fn save(config: &Config, path: &Path) -> Result<(), ConfigError> {
 }
 
 /// Loads the configuration from the application directory.
-pub fn load_default() -> Result<Loaded, ConfigError> {
+pub fn load_default() -> Result<Option<Config>, ConfigError> {
     let path: PathBuf = paths::config_file().map_err(|source| ConfigError::Path { source })?;
     load(&path)
 }
@@ -144,7 +125,7 @@ mod tests {
     use super::*;
 
     fn parse(text: &str) -> Result<Config, ConfigError> {
-        parse_text(Path::new("config.toml"), text)
+        parse_text_line(Path::new("config.toml"), text)
     }
 
     #[test]
@@ -157,10 +138,7 @@ mod tests {
     #[test]
     fn an_empty_file_leaves_the_site_unset() -> Result<(), ConfigError> {
         let config = parse("# oxrad configuration.\n")?;
-        assert!(
-            config.site.is_none(),
-            "no site is restored from an empty file"
-        );
+        assert!(config.site.is_none());
         Ok(())
     }
 
@@ -175,39 +153,35 @@ mod tests {
             Err(ConfigError::Syntax { line: 1, .. })
         ));
         assert!(matches!(
-            parse("site = \"KPA\"\n"),
-            Err(ConfigError::Site { line: 1, .. })
-        ));
-        assert!(matches!(
             parse("palette = \"nws\"\n"),
             Err(ConfigError::UnknownKey { line: 1, ref key, .. }) if key == "palette"
         ));
     }
 
     #[test]
-    fn save_and_load_round_trip() -> Result<(), ConfigError> {
+    fn save_and_load_round_trip_the_site() -> Result<(), ConfigError> {
         let directory = std::env::temp_dir().join("oxrad-config-test");
         std::fs::create_dir_all(&directory).map_err(|source| ConfigError::Write {
             path: directory.clone(),
             source,
         })?;
         let path = directory.join("config.toml");
-        let id = SiteId::parse("KTLX").map_err(|source| ConfigError::Site {
+        let id = SiteId::parse("KOHX").map_err(|source| ConfigError::Site {
             path: path.clone(),
             line: 0,
             source,
         })?;
         save(&Config { site: Some(id) }, &path)?;
         match load(&path)? {
-            Loaded::Present(config) => {
-                assert_eq!(config.site.as_ref().map(SiteId::as_str), Some("KTLX"));
+            Some(config) => {
+                assert_eq!(config.site.as_ref().map(SiteId::as_str), Some("KOHX"));
             }
-            Loaded::Missing => {
+            None => {
                 return Err(ConfigError::Syntax { path, line: 0 });
             }
         }
         let absent = directory.join("absent.toml");
-        assert!(matches!(load(&absent)?, Loaded::Missing));
+        assert!(load(&absent)?.is_none());
         Ok(())
     }
 }

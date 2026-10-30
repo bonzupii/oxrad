@@ -1,4 +1,4 @@
-// oxrad — A storm-chaser-grade NEXRAD weather radar viewer
+// oxrad - A storm-chaser-grade NEXRAD weather radar viewer
 // Copyright (C) 2026 Micah Ostrow <bonzupii@protonmail.com>
 //
 // This program is free software: you can redistribute it and/or modify
@@ -27,7 +27,9 @@ const ERROR_COLOR: Color32 = Color32::from_rgb(255, 122, 122);
 const LEGEND_WIDTH: f32 = 14.0;
 const LEGEND_HEIGHT: f32 = 260.0;
 const LEGEND_BANDS: usize = 20;
-const RING_LABEL_INDEX: usize = 32;
+/// Due-south point of each ring, where labels stack clear of the legend and
+/// the eastbound pointer readout.
+const RING_LABEL_INDEX: usize = 64;
 
 fn polyline(painter: &egui::Painter, points: &[Pos2], transform: &ViewTransform, stroke: Stroke) {
     for pair in points.windows(2) {
@@ -49,13 +51,16 @@ pub fn draw_rings(painter: &egui::Painter, geometry: &RadarGeometry, transform: 
     for ring in &geometry.rings {
         polyline(painter, &ring.points, transform, stroke);
         if let Some(point) = ring.points.get(RING_LABEL_INDEX) {
-            painter.text(
-                transform.screen(*point) + Vec2::new(4.0, -4.0),
-                Align2::LEFT_BOTTOM,
-                format!("{:.0} km", ring.range_km),
-                FontId::monospace(10.0),
-                RING_COLOR,
+            let label = format!("{:.0} km", ring.range_km);
+            let galley = painter.layout_no_wrap(label, FontId::monospace(10.0), RING_COLOR);
+            let centre = transform.screen(*point) + Vec2::new(0.0, 4.0);
+            let origin = Pos2::new(centre.x - galley.size().x / 2.0, centre.y);
+            painter.rect_filled(
+                Rect::from_min_size(origin - Vec2::splat(2.0), galley.size() + Vec2::splat(4.0)),
+                CornerRadius::same(2),
+                Color32::from_black_alpha(170),
             );
+            painter.galley(origin, galley, RING_COLOR);
         }
     }
 }

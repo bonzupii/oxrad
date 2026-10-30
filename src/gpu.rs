@@ -1,4 +1,4 @@
-// oxrad — A storm-chaser-grade NEXRAD weather radar viewer
+// oxrad - A storm-chaser-grade NEXRAD weather radar viewer
 // Copyright (C) 2026 Micah Ostrow <bonzupii@protonmail.com>
 //
 // This program is free software: you can redistribute it and/or modify
@@ -28,7 +28,6 @@ use crate::render::{self, RadarGeometry};
 const SHADER: &str = r#"
 struct Frame {
     scale: vec2<f32>,
-    padding: vec2<f32>,
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -82,10 +81,12 @@ struct RadarDraw {
     index_count: u32,
 }
 
-fn uniform_bytes(scale: f32) -> [u8; 16] {
-    let values = [scale, -scale, 0.0_f32, 0.0_f32];
-    let mut bytes = [0_u8; 16];
-    for (chunk, value) in bytes.chunks_mut(4).zip(values) {
+/// The clip-space scale for a mesh whose vertices carry north-positive
+/// kilometre offsets. WebGPU clip space has y up, so both axes keep their
+/// sign; the screen transform in `render` applies the downward pixel flip.
+fn uniform_bytes(scale: f32) -> [u8; 8] {
+    let mut bytes = [0_u8; 8];
+    for (chunk, value) in bytes.chunks_mut(4).zip([scale, scale]) {
         chunk.copy_from_slice(&value.to_le_bytes());
     }
     bytes
@@ -217,5 +218,33 @@ impl egui_wgpu::CallbackTrait for RadarDraw {
         pass.set_vertex_buffer(0, self.vertices.slice(..));
         pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..self.index_count, 0, 0..1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::uniform_bytes;
+
+    use crate::test_support::TestError;
+
+    fn component(bytes: [u8; 8], offset: usize) -> Result<f32, TestError> {
+        let slice = bytes
+            .get(offset..offset + 4)
+            .ok_or_else(|| format!("uniform byte offset {offset}"))?;
+        let value: [u8; 4] = slice
+            .try_into()
+            .map_err(|_| format!("uniform byte offset {offset}"))?;
+        Ok(f32::from_le_bytes(value))
+    }
+
+    /// Clip space has y up. A north-positive vertex must therefore keep a
+    /// positive y scale; negating it here drew the bins upside down while the
+    /// screen-space rings and readout stayed north-up.
+    #[test]
+    fn clip_space_keeps_north_positive() -> Result<(), TestError> {
+        let bytes = uniform_bytes(2.0);
+        assert_eq!(component(bytes, 0)?, 2.0, "x scale");
+        assert_eq!(component(bytes, 4)?, 2.0, "y scale");
+        Ok(())
     }
 }
