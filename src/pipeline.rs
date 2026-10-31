@@ -231,6 +231,7 @@ impl Pipeline {
                         Some(RetrievedVolume {
                             volume,
                             origin: ArchiveOrigin::from_cache(from_cache),
+                            history_key: None,
                         })
                     }
                     Ok(None) => {

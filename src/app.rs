@@ -1010,10 +1010,15 @@ impl OxradApp {
                     "History playing"
                 }
                 HistoryState::LoadingVolume => "History loading",
+                HistoryState::Reviewing if self.display.state.error().is_some() => {
+                    "History render error"
+                }
+                HistoryState::Reviewing if self.display.state.is_busy() => "History preparing",
                 HistoryState::Reviewing if self.history.playback == GlobalPlayback::Playing => {
                     "History playing"
                 }
                 HistoryState::Reviewing => "History review",
+                HistoryState::Failed => "History error",
                 _ if self.site.is_some() => "Idle",
                 _ => "Idle · No site selected",
             },
@@ -1557,19 +1562,15 @@ impl OxradApp {
                 ui.separator();
                 ui.label(self.phase());
                 self.pipeline_cache_status(ui);
-                if matches!(
-                    self.history.state,
-                    HistoryState::LoadingVolume | HistoryState::Reviewing
-                ) && let Some(key) = &self.history.key
-                {
-                    ui.separator();
-                    ui.label(
-                        RichText::new(format!("History {}", history::key_label(key)))
-                            .size(11.0)
-                            .color(MUTED),
-                    );
-                }
                 if let Some(frame) = &self.display.frame {
+                    if let Some(key) = &frame.history_key {
+                        ui.separator();
+                        ui.label(
+                            RichText::new(format!("History {}", history::key_label(key)))
+                                .size(11.0)
+                                .color(MUTED),
+                        );
+                    }
                     scan_status(ui, frame, failed);
                 }
             });
@@ -2690,26 +2691,18 @@ impl OxradApp {
                 from_cache,
                 cache_warning,
             } if event_generation == generation => {
-                let label = history::key_label(&key);
-                self.history.key = Some(key);
+                self.history.key = Some(key.clone());
                 self.history.state = HistoryState::Reviewing;
                 self.history.scrub_index = None;
                 self.display.submit(
                     RetrievedVolume {
                         volume,
                         origin: ArchiveOrigin::from_cache(from_cache),
+                        history_key: Some(key),
                     },
                     self.product,
                 );
-                let mut notice = if from_cache {
-                    format!("Reviewing cached radar scan {label}.")
-                } else {
-                    format!("Reviewing radar scan {label}.")
-                };
-                if let Some(warning) = cache_warning {
-                    notice = format!("{notice} Cache warning: {warning}.");
-                }
-                self.notice = Some(notice);
+                self.notice = cache_warning.map(|warning| format!("NEXRAD cache: {warning}"));
                 if self.history.playback == GlobalPlayback::Playing {
                     self.history.next_frame =
                         Some(due_after(Duration::from_millis(HISTORY_FRAME_MS)));
@@ -2962,11 +2955,17 @@ impl OxradApp {
             .key
             .as_deref()
             .map_or_else(|| String::from("selected scan"), history::key_label);
-        ui.label(
-            RichText::new(format!("Reviewing {key}"))
-                .size(11.0)
-                .color(TEXT),
-        );
+        let displayed = self
+            .display
+            .frame
+            .as_ref()
+            .and_then(|frame| frame.history_key.as_deref());
+        let message = if displayed == self.history.key.as_deref() && displayed.is_some() {
+            format!("Reviewing {key}")
+        } else {
+            format!("Preparing {key}…")
+        };
+        ui.label(RichText::new(message).size(11.0).color(TEXT));
         ui.label(
             RichText::new("Live radar is paused while you inspect this scan.")
                 .size(10.0)

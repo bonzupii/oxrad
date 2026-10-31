@@ -643,6 +643,7 @@ mod tests {
                 75.0,
             )?,
             origin: crate::radar::ArchiveOrigin::Cached,
+            history_key: Some(String::from("2026/10/30/KPAH/KPAH20261030_023529_V06")),
         };
         sender
             .send(BuildRequest {
@@ -656,6 +657,10 @@ mod tests {
             .map_err(|error| TestError::from(format!("render result failed: {error}")))?;
         assert_eq!(result.generation, 42);
         assert_eq!(result.volume.origin, crate::radar::ArchiveOrigin::Cached);
+        assert_eq!(
+            result.volume.history_key.as_deref(),
+            Some("2026/10/30/KPAH/KPAH20261030_023529_V06")
+        );
         assert_eq!(result.volume.volume.site.as_str(), "KPAH");
         assert!(result.geometry?.index_count > 0);
         Ok(())

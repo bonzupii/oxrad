@@ -124,6 +124,7 @@ impl ArchiveOrigin {
 pub struct RetrievedVolume {
     pub volume: RadarVolume,
     pub origin: ArchiveOrigin,
+    pub history_key: Option<String>,
 }
 
 #[derive(Debug)]

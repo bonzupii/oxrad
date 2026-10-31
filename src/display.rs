@@ -28,6 +28,7 @@ use crate::render::{self, RadarGeometry};
 pub struct Frame {
     pub volume: RadarVolume,
     pub origin: ArchiveOrigin,
+    pub history_key: Option<String>,
     pub geometry: RadarGeometry,
     pub mesh: Option<RadarMesh>,
 }
@@ -172,6 +173,7 @@ impl Display {
             RetrievedVolume {
                 volume: frame.volume,
                 origin: frame.origin,
+                history_key: frame.history_key,
             },
             product,
         );
@@ -225,6 +227,7 @@ impl Display {
                     self.frame = Some(Frame {
                         volume: result.volume.volume,
                         origin: result.volume.origin,
+                        history_key: result.volume.history_key,
                         geometry,
                         mesh,
                     });
