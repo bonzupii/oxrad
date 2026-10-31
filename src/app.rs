@@ -245,6 +245,7 @@ pub struct OxradApp {
     warning_generation: u64,
     warnings: Vec<Warning>,
     warnings_without_geometry: usize,
+    warnings_rejected: usize,
     warning_layer: RadarLayer,
     warning_state: WarningState,
     warning_request_due: Option<Instant>,
@@ -313,6 +314,7 @@ impl OxradApp {
             warning_generation: 0,
             warnings: Vec::new(),
             warnings_without_geometry: 0,
+            warnings_rejected: 0,
             warning_layer: RadarLayer::Shown,
             warning_state: WarningState::Idle,
             warning_request_due: Some(Instant::now()),
@@ -556,8 +558,16 @@ impl OxradApp {
     fn apply_warning_event(&mut self, event: WarningEvent) {
         match event {
             WarningEvent::Ready { generation, set } if generation == self.warning_generation => {
+                let rejected = set.rejected;
                 self.warnings = set.warnings;
                 self.warnings_without_geometry = set.without_geometry;
+                self.warnings_rejected = rejected.len();
+                if let Some(message) = rejected.first() {
+                    self.notice = Some(format!(
+                        "{} active alerts could not be read. First problem: {message}",
+                        rejected.len()
+                    ));
+                }
                 self.warning_state = WarningState::Ready;
                 self.warning_refresh_due =
                     Some(Instant::now() + Duration::from_secs(WARNING_REFRESH_SECS));
@@ -2058,12 +2068,24 @@ impl OxradApp {
                 Pos2::new(rect.left() + 16.0, rect.top() + 288.0),
                 Align2::LEFT_TOP,
                 format!(
-                    "Most severe: {} · {} · expires {}",
-                    warning.event, warning.area, warning.expires
+                    "Most severe: {} · {} · {} · expires {}",
+                    warning.event,
+                    warning.area,
+                    warning.urgency.label(),
+                    warning.expires
                 ),
                 FontId::monospace(10.0),
                 ERROR,
             );
+            if !warning.sent.is_empty() {
+                ui.painter().text(
+                    Pos2::new(rect.left() + 16.0, rect.top() + 304.0),
+                    Align2::LEFT_TOP,
+                    format!("Issued {}", warning.sent),
+                    FontId::monospace(10.0),
+                    MUTED,
+                );
+            }
         }
         let centre = self.map_view.center_latlon().map_or_else(
             |_| String::from("unavailable"),
@@ -2170,15 +2192,15 @@ impl OxradApp {
             WarningState::Loading => String::from(" · warnings loading"),
             WarningState::Ready => {
                 let mut text = format!(" · {} warnings", self.warnings.len());
-                if self.warnings_without_geometry > 0
+                if (self.warnings_without_geometry > 0 || self.warnings_rejected > 0)
                     && write!(
                         text,
-                        " ({} without polygons)",
-                        self.warnings_without_geometry
+                        " · {} without polygons · {} unreadable",
+                        self.warnings_without_geometry, self.warnings_rejected
                     )
                     .is_err()
                 {
-                    text.push_str(" (geometry count unavailable)");
+                    text.push_str(" · warning counts unavailable");
                 }
                 text
             }

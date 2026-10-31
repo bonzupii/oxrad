@@ -50,11 +50,44 @@ impl Severity {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Urgency {
+    Immediate,
+    Expected,
+    Future,
+    Past,
+    Unknown,
+}
+
+impl Urgency {
+    fn parse(value: Option<&str>) -> Self {
+        match value {
+            Some("Immediate") => Self::Immediate,
+            Some("Expected") => Self::Expected,
+            Some("Future") => Self::Future,
+            Some("Past") => Self::Past,
+            Some(_) | None => Self::Unknown,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Immediate => "immediate",
+            Self::Expected => "expected",
+            Self::Future => "future",
+            Self::Past => "past",
+            Self::Unknown => "urgency unknown",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Warning {
     pub event: String,
     pub severity: Severity,
+    pub urgency: Urgency,
     pub area: String,
+    pub sent: String,
     pub expires: String,
     pub polygons: Vec<Vec<(f64, f64)>>,
 }
@@ -63,6 +96,7 @@ pub struct Warning {
 pub struct WarningSet {
     pub warnings: Vec<Warning>,
     pub without_geometry: usize,
+    pub rejected: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -228,7 +262,9 @@ fn parse_warning(feature: &Value) -> Result<Warning, WarningError> {
         detail: "event name",
     })?;
     let severity = Severity::parse(text(properties, "severity"));
+    let urgency = Urgency::parse(text(properties, "urgency"));
     let area = text(properties, "areaDesc").map_or_else(String::new, String::from);
+    let sent = text(properties, "sent").map_or_else(String::new, String::from);
     let expires = text(properties, "expires").map_or_else(String::new, String::from);
     let polygons = match feature.get("geometry") {
         Some(geometry) if !geometry.is_null() => polygons(geometry, id)?,
@@ -237,15 +273,15 @@ fn parse_warning(feature: &Value) -> Result<Warning, WarningError> {
     Ok(Warning {
         event: String::from(event),
         severity,
+        urgency,
         area,
+        sent,
         expires,
         polygons,
     })
 }
 
-/// Retrieves and parses the current active warning collection.
-pub fn fetch() -> Result<WarningSet, WarningError> {
-    let document = provider::get_json(ALERTS_URL, "application/geo+json")?;
+fn parse_collection(document: &Value) -> Result<WarningSet, WarningError> {
     let features =
         document
             .get("features")
@@ -255,17 +291,29 @@ pub fn fetch() -> Result<WarningSet, WarningError> {
             })?;
     let mut warnings = Vec::with_capacity(features.len());
     let mut without_geometry = 0_usize;
+    let mut rejected = Vec::new();
     for feature in features {
-        let warning = parse_warning(feature)?;
-        if warning.polygons.is_empty() {
-            without_geometry = without_geometry.saturating_add(1);
+        match parse_warning(feature) {
+            Ok(warning) => {
+                if warning.polygons.is_empty() {
+                    without_geometry = without_geometry.saturating_add(1);
+                }
+                warnings.push(warning);
+            }
+            Err(error) => rejected.push(error.to_string()),
         }
-        warnings.push(warning);
     }
     Ok(WarningSet {
         warnings,
         without_geometry,
+        rejected,
     })
+}
+
+/// Retrieves and parses the current active warning collection.
+pub fn fetch() -> Result<WarningSet, WarningError> {
+    let document = provider::get_json(ALERTS_URL, "application/geo+json")?;
+    parse_collection(&document)
 }
 
 pub enum WarningEvent {
@@ -329,8 +377,10 @@ mod tests {
                 "id": "urn:test:1",
                 "event": "Severe Thunderstorm Warning",
                 "severity": "Severe",
+                "urgency": "Immediate",
                 "headline": "Severe Thunderstorm Warning for test county",
                 "areaDesc": "Test County",
+                "sent": "2026-10-31T11:55:00-05:00",
                 "expires": "2026-10-31T12:00:00-05:00"
             },
             "geometry": geometry
@@ -351,8 +401,38 @@ mod tests {
         let warning = parse_warning(&feature)?;
         assert_eq!(warning.event, "Severe Thunderstorm Warning");
         assert!(matches!(warning.severity, Severity::Severe));
+        assert!(matches!(warning.urgency, Urgency::Immediate));
         assert_eq!(warning.area, "Test County");
+        assert_eq!(warning.sent, "2026-10-31T11:55:00-05:00");
         assert_eq!(warning.polygons.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn one_malformed_alert_does_not_discard_the_others() -> Result<(), TestError> {
+        let valid = warning_feature(json!({
+            "type": "Polygon",
+            "coordinates": [[
+                [-88.0, 37.0],
+                [-87.0, 37.0],
+                [-87.0, 38.0],
+                [-88.0, 37.0]
+            ]]
+        }));
+        let malformed = json!({
+            "properties": { "id": "urn:test:bad" },
+            "geometry": Value::Null
+        });
+        let set = parse_collection(&json!({ "features": [valid, malformed] }))?;
+        assert_eq!(set.warnings.len(), 1);
+        assert_eq!(set.rejected.len(), 1);
+        assert!(
+            set.rejected
+                .first()
+                .is_some_and(|message| message.contains("urn:test:bad")),
+            "rejection message {:?}",
+            set.rejected
+        );
         Ok(())
     }
 
