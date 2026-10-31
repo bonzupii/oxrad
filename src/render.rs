@@ -26,8 +26,9 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use eframe::egui::{Color32, Pos2, Rect, Vec2};
 
-use crate::colormap::{color_for_reflectivity, range_folded_color};
+use crate::colormap::{color_for_product, range_folded_color};
 use crate::error::{CoordinateError, RenderError};
+use crate::product::RadarProduct;
 use crate::projection;
 use crate::radar::{GateValue, RadarVolume, RadialBins};
 
@@ -88,10 +89,11 @@ impl RadialLookup {
 /// Azimuth and gate lookup over the sweep that was drawn.
 pub struct SweepLookup {
     radials: Vec<RadialLookup>,
+    product: RadarProduct,
 }
 
 impl SweepLookup {
-    fn new(volume: &RadarVolume) -> Self {
+    fn new(volume: &RadarVolume, product: RadarProduct) -> Self {
         let mut radials: Vec<RadialLookup> = Vec::with_capacity(volume.sweep.radials.len());
         let mut previous: Option<f64> = None;
         for radial in &volume.sweep.radials {
@@ -99,17 +101,18 @@ impl SweepLookup {
             let left = previous.map_or(radial.azimuth_left_deg, |value| {
                 value + (radial.azimuth_left_deg - value).rem_euclid(360.0)
             });
+            let moment = radial.moment(product);
             radials.push(RadialLookup {
                 left,
                 span,
                 elevation_deg: radial.elevation_deg,
-                first_gate_km: radial.first_gate_km,
-                gate_width_km: radial.gate_width_km,
-                gate_count: radial.values.len(),
+                first_gate_km: moment.map_or(radial.first_gate_km, |moment| moment.first_gate_km),
+                gate_width_km: moment.map_or(radial.gate_width_km, |moment| moment.gate_width_km),
+                gate_count: moment.map_or(0, |moment| moment.values.len()),
             });
             previous = Some(left);
         }
-        Self { radials }
+        Self { radials, product }
     }
 
     fn radial_at(&self, azimuth_deg: f64) -> Option<usize> {
@@ -145,7 +148,11 @@ impl SweepLookup {
         let Some(radial) = volume.sweep.radials.get(index) else {
             return Ok(None);
         };
-        let Some(value) = radial.values.get(gate).copied() else {
+        let Some(value) = radial
+            .moment(self.product)
+            .and_then(|moment| moment.values.get(gate))
+            .copied()
+        else {
             return Ok(None);
         };
         Ok(Some(GateHit {
@@ -164,6 +171,7 @@ pub struct RadarGeometry {
     pub rings: Vec<RangeRing>,
     pub grid: Vec<Vec<Pos2>>,
     pub lookup: SweepLookup,
+    pub product: RadarProduct,
     pub site_lat: f64,
     pub site_lon: f64,
     pub site_x: f64,
@@ -172,6 +180,7 @@ pub struct RadarGeometry {
 
 pub struct BuildRequest {
     pub volume: RadarVolume,
+    pub product: RadarProduct,
     pub generation: u64,
 }
 
@@ -187,9 +196,11 @@ pub fn start_build_thread() -> (Sender<BuildRequest>, Receiver<BuildResult>) {
     let (result_sender, result_receiver) = mpsc::channel::<BuildResult>();
     std::thread::spawn(move || {
         while let Ok(request) = request_receiver.recv() {
-            let geometry = catch_unwind(AssertUnwindSafe(|| build_geometry(&request.volume)))
-                .map_err(|_| RenderError::Panic)
-                .and_then(std::convert::identity);
+            let geometry = catch_unwind(AssertUnwindSafe(|| {
+                build_geometry_for(&request.volume, request.product)
+            }))
+            .map_err(|_| RenderError::Panic)
+            .and_then(std::convert::identity);
             let result = BuildResult {
                 volume: request.volume,
                 geometry,
@@ -224,9 +235,9 @@ fn place_corner(
     place_offset(lat, lon, site_x, site_y).map_err(|source| RenderError::Coordinate { source })
 }
 
-fn bin_color(value: GateValue) -> Result<Option<Color32>, RenderError> {
+fn bin_color(product: RadarProduct, value: GateValue) -> Result<Option<Color32>, RenderError> {
     let rgba = match value {
-        GateValue::Measured(dbz) => color_for_reflectivity(dbz),
+        GateValue::Measured(value) => color_for_product(product, value),
         GateValue::BelowThreshold => return Ok(None),
         GateValue::RangeFolded => Ok(range_folded_color()),
     }
@@ -294,16 +305,20 @@ impl BuildState {
 
 fn radial_quads(
     radial: &RadialBins,
+    product: RadarProduct,
     left_path: &projection::GeodesicPath,
     right_path: &projection::GeodesicPath,
     build: &mut BuildState,
 ) -> Result<(), RenderError> {
-    let width = radial.gate_width_km;
-    for (gate, value) in radial.values.iter().enumerate() {
-        let centre = radial.first_gate_km + gate as f64 * width;
+    let Some(moment) = radial.moment(product) else {
+        return Ok(());
+    };
+    let width = moment.gate_width_km;
+    for (gate, value) in moment.values.iter().enumerate() {
+        let centre = moment.first_gate_km + gate as f64 * width;
+        let colour = bin_color(product, *value)?;
         let near_slant = centre - width / 2.0;
         let far_slant = centre + width / 2.0;
-        let colour = bin_color(*value)?;
         if build.near_slant != Some(near_slant) {
             build.near =
                 build.corners_at(near_slant, radial.elevation_deg, left_path, right_path)?;
@@ -400,12 +415,23 @@ fn build_grid(
 }
 
 /// Builds the mesh, overlays, and pointer lookup for one volume.
-pub fn build_geometry(volume: &RadarVolume) -> Result<RadarGeometry, RenderError> {
+/// Builds the mesh for one product from the selected sweep.
+pub fn build_geometry_for(
+    volume: &RadarVolume,
+    product: RadarProduct,
+) -> Result<RadarGeometry, RenderError> {
     let (site_x, site_y) = projection::mercator(volume.site_lat, volume.site_lon)
         .map_err(|source| RenderError::Coordinate { source })?;
+    let gate_capacity = volume
+        .sweep
+        .radials
+        .iter()
+        .filter_map(|radial| radial.moment(product))
+        .map(|moment| moment.values.len())
+        .sum::<usize>();
     let mut build = BuildState {
-        vertices: Vec::new(),
-        indices: Vec::new(),
+        vertices: Vec::with_capacity(gate_capacity.saturating_mul(4 * VERTEX_BYTES)),
+        indices: Vec::with_capacity(gate_capacity.saturating_mul(6 * 4)),
         extent_km: 0.0,
         site_x,
         site_y,
@@ -426,20 +452,26 @@ pub fn build_geometry(volume: &RadarVolume) -> Result<RadarGeometry, RenderError
         )
         .map_err(|source| RenderError::Coordinate { source })?;
         build.near_slant = None;
-        radial_quads(radial, &left_path, &right_path, &mut build)?;
+        radial_quads(radial, product, &left_path, &right_path, &mut build)?;
     }
     let index_count =
         u32::try_from(build.indices.len() / 4).map_err(|_| RenderError::MeshSize {
             vertices: build.vertices.len() / VERTEX_BYTES,
         })?;
+    let extent_km = if build.extent_km > 0.0 {
+        build.extent_km
+    } else {
+        volume.sweep.max_ground_range_km.max(1.0)
+    };
     Ok(RadarGeometry {
-        extent_km: build.extent_km,
+        extent_km,
         vertices: build.vertices,
         indices: build.indices,
         index_count,
         rings: build_rings(volume, site_x, site_y)?,
         grid: build_grid(volume, site_x, site_y)?,
-        lookup: SweepLookup::new(volume),
+        lookup: SweepLookup::new(volume, product),
+        product,
         site_lat: volume.site_lat,
         site_lon: volume.site_lon,
         site_x,
@@ -557,7 +589,14 @@ mod tests {
             elevation_deg,
             first_gate_km: 74.75,
             gate_width_km: 0.5,
-            values,
+            moments: vec![crate::radar::MomentBins {
+                product: RadarProduct::Reflectivity,
+                first_gate_km: 74.75,
+                gate_width_km: 0.5,
+                values,
+                below_threshold: 0,
+                range_folded: 0,
+            }],
         }
     }
 
@@ -574,10 +613,12 @@ mod tests {
                 elevation_deg: 0.0,
                 elevation_number: 1,
                 radials,
+                products: vec![RadarProduct::Reflectivity],
                 below_threshold: 0,
                 range_folded: 0,
                 max_ground_range_km,
             },
+            sweeps: Vec::new(),
             skipped_radials: 0,
             skipped_non_data: 0,
             moment_error: None,
@@ -589,7 +630,7 @@ mod tests {
         max_ground_range_km: f64,
     ) -> Result<(RadarVolume, RadarGeometry), TestError> {
         let volume = volume(radials, max_ground_range_km)?;
-        let geometry = build_geometry(&volume)?;
+        let geometry = build_geometry_for(&volume, RadarProduct::Reflectivity)?;
         Ok((volume, geometry))
     }
 
@@ -720,7 +761,7 @@ mod tests {
             vec![radial(89.5, 90.5, 0.0, vec![GateValue::Measured(95.0)])],
             75.0,
         )?;
-        match build_geometry(&volume) {
+        match build_geometry_for(&volume, RadarProduct::Reflectivity) {
             Err(RenderError::Color {
                 source: ColorMapError::OutOfRange { value, .. },
             }) => {

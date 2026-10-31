@@ -21,6 +21,7 @@ use eframe::egui::{Rect, Shape};
 
 use crate::error::RenderError;
 use crate::gpu::{self, RadarGpu, RadarMesh};
+use crate::product::RadarProduct;
 use crate::radar::RadarVolume;
 use crate::render::{self, RadarGeometry};
 
@@ -44,7 +45,7 @@ pub enum DisplayState {
     Unavailable(RenderError),
     Failed {
         error: RenderError,
-        volume: RadarVolume,
+        volume: Box<RadarVolume>,
     },
 }
 
@@ -72,8 +73,9 @@ pub struct Display {
     receiver: Receiver<render::BuildResult>,
     pub state: DisplayState,
     pub frame: Option<Frame>,
-    queued: Option<(u64, RadarVolume)>,
+    queued: Option<(u64, RadarVolume, RadarProduct)>,
     generation: u64,
+    product: RadarProduct,
 }
 
 impl Display {
@@ -92,6 +94,7 @@ impl Display {
             frame: None,
             queued: None,
             generation: 0,
+            product: RadarProduct::Reflectivity,
         }
     }
 
@@ -107,24 +110,54 @@ impl Display {
         };
     }
 
-    pub fn submit(&mut self, volume: RadarVolume) {
+    pub fn submit(&mut self, volume: RadarVolume, product: RadarProduct) {
         if self.gpu.is_none() {
             return;
         }
+        self.product = product;
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         if matches!(self.state, DisplayState::Building) {
-            self.queued = Some((generation, volume));
+            self.queued = Some((generation, volume, product));
         } else {
-            self.send(generation, volume);
+            self.send(generation, volume, product);
         }
     }
 
-    fn send(&mut self, generation: u64, volume: RadarVolume) {
-        match self
-            .sender
-            .send(render::BuildRequest { volume, generation })
+    /// Rebuilds the displayed volume for a product or tilt change.
+    pub fn rebuild(&mut self, product: RadarProduct, elevation: Option<u8>) -> bool {
+        if self.gpu.is_none() {
+            return false;
+        }
+        let Some(mut frame) = self.frame.take() else {
+            self.product = product;
+            return false;
+        };
+        let selected_elevation = elevation.or_else(|| {
+            (!frame.volume.sweep.products.contains(&product))
+                .then(|| frame.volume.elevation_for_product(product))
+                .flatten()
+        });
+        if let Some(number) = selected_elevation
+            && (!frame.volume.sweep_has_product(number, product)
+                || !frame.volume.select_sweep(number))
         {
+            self.frame = Some(frame);
+            return false;
+        }
+        self.product = product;
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        self.send(generation, frame.volume, product);
+        true
+    }
+
+    fn send(&mut self, generation: u64, volume: RadarVolume, product: RadarProduct) {
+        match self.sender.send(render::BuildRequest {
+            volume,
+            product,
+            generation,
+        }) {
             Ok(()) => self.state = DisplayState::Building,
             Err(_) => self.state = DisplayState::Unavailable(RenderError::WorkerStopped),
         }
@@ -133,7 +166,7 @@ impl Display {
     pub fn retry(&mut self) {
         let state = std::mem::replace(&mut self.state, DisplayState::Waiting);
         if let DisplayState::Failed { volume, .. } = state {
-            self.send(self.generation, volume);
+            self.send(self.generation, *volume, self.product);
         } else {
             self.state = state;
         }
@@ -153,8 +186,8 @@ impl Display {
         // A queued volume waits for the worker to finish whatever it was doing,
         // including work that this frame has already superseded. Sending it here
         // is what keeps the display from waiting on a build that never starts.
-        if let Some((generation, volume)) = self.queued.take() {
-            self.send(generation, volume);
+        if let Some((generation, volume, product)) = self.queued.take() {
+            self.send(generation, volume, product);
             return;
         }
         if !matches!(self.state, DisplayState::Building) || result.generation != self.generation {
@@ -172,12 +205,12 @@ impl Display {
                 }
                 Err(error) => DisplayState::Failed {
                     error,
-                    volume: result.volume,
+                    volume: Box::new(result.volume),
                 },
             },
             Err(error) => DisplayState::Failed {
                 error,
-                volume: result.volume,
+                volume: Box::new(result.volume),
             },
         };
     }

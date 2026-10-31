@@ -13,9 +13,10 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
-//! The reflectivity palette.
+//! Product color scales.
 
 use crate::error::ColorMapError;
+use crate::product::RadarProduct;
 
 const KEYPOINTS: [(f32, [u8; 3]); 20] = [
     (-20.0, [50, 79, 79]),
@@ -96,6 +97,94 @@ pub fn color_for_reflectivity(dbz: f32) -> Result<[u8; 4], ColorMapError> {
         },
         |(_, rgb)| Ok(with_alpha(rgb)),
     )
+}
+
+const VELOCITY_RAMP: [(f32, [u8; 3]); 5] = [
+    (-100.0, [24, 48, 120]),
+    (-30.0, [40, 110, 210]),
+    (0.0, [235, 235, 235]),
+    (30.0, [214, 126, 24]),
+    (100.0, [150, 24, 24]),
+];
+const SPECTRUM_WIDTH_RAMP: [(f32, [u8; 3]); 4] = [
+    (0.0, [30, 30, 38]),
+    (5.0, [90, 70, 130]),
+    (15.0, [190, 130, 90]),
+    (30.0, [245, 245, 220]),
+];
+const ZDR_RAMP: [(f32, [u8; 3]); 5] = [
+    (-8.0, [50, 60, 160]),
+    (-2.0, [110, 150, 220]),
+    (0.0, [210, 210, 210]),
+    (3.0, [240, 180, 80]),
+    (8.0, [210, 60, 40]),
+];
+const CC_RAMP: [(f32, [u8; 3]); 4] = [
+    (0.0, [28, 28, 32]),
+    (0.5, [100, 70, 150]),
+    (0.85, [180, 180, 210]),
+    (1.05, [250, 250, 250]),
+];
+const PHI_RAMP: [(f32, [u8; 3]); 3] = [
+    (0.0, [35, 70, 170]),
+    (180.0, [235, 235, 235]),
+    (360.0, [150, 40, 160]),
+];
+const KDP_RAMP: [(f32, [u8; 3]); 3] = [
+    (-10.0, [40, 80, 170]),
+    (0.0, [225, 225, 225]),
+    (10.0, [200, 40, 40]),
+];
+
+fn ramp_color(
+    ramp: &[(f32, [u8; 3])],
+    product: &'static str,
+    value: f32,
+    minimum: f32,
+    maximum: f32,
+) -> Result<[u8; 4], ColorMapError> {
+    if !value.is_finite() || !(minimum..=maximum).contains(&value) {
+        return Err(ColorMapError::OutOfRange { product, value });
+    }
+    let mut previous: Option<(f32, [u8; 3])> = None;
+    for (key, rgb) in ramp {
+        match previous {
+            None => {
+                if value < *key {
+                    return Ok(with_alpha(*rgb));
+                }
+            }
+            Some((low, low_rgb)) => {
+                if value < *key {
+                    let fraction = (value - low) / (*key - low);
+                    return Ok(interpolate(low_rgb, *rgb, fraction));
+                }
+            }
+        }
+        previous = Some((*key, *rgb));
+    }
+    previous.map_or_else(
+        || Err(ColorMapError::OutOfRange { product, value }),
+        |(_, rgb)| Ok(with_alpha(rgb)),
+    )
+}
+
+/// The color for a value of the selected product.
+pub fn color_for_product(product: RadarProduct, value: f32) -> Result<[u8; 4], ColorMapError> {
+    if product == RadarProduct::Reflectivity {
+        return color_for_reflectivity(value);
+    }
+    let (minimum, maximum) = product.value_range();
+    let ramp: &[(f32, [u8; 3])] = match product {
+        RadarProduct::Velocity => &VELOCITY_RAMP,
+        RadarProduct::SpectrumWidth => &SPECTRUM_WIDTH_RAMP,
+        RadarProduct::DifferentialReflectivity => &ZDR_RAMP,
+        RadarProduct::CorrelationCoefficient => &CC_RAMP,
+        RadarProduct::DifferentialPhase => &PHI_RAMP,
+        RadarProduct::SpecificDifferentialPhase => &KDP_RAMP,
+        RadarProduct::Reflectivity => &KEYPOINTS,
+    };
+    ramp_color(ramp, product.id(), value, minimum, maximum)
 }
 
 pub const fn range_folded_color() -> [u8; 4] {
@@ -186,6 +275,25 @@ mod tests {
         assert!(matches!(
             color_for_reflectivity(f32::NAN),
             Err(ColorMapError::OutOfRange { product, value }) if product == PRODUCT && value.is_nan()
+        ));
+    }
+
+    #[test]
+    fn every_product_produces_a_color_inside_its_range() -> Result<(), TestFailure> {
+        for product in RadarProduct::ALL {
+            let (minimum, maximum) = product.value_range();
+            let middle = minimum + (maximum - minimum) / 2.0;
+            let color = color_for_product(product, middle)?;
+            assert_eq!(color[3], 255, "{} alpha", product.id());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_product_out_of_range_carries_its_name() {
+        assert!(matches!(
+            color_for_product(RadarProduct::Velocity, 200.0),
+            Err(ColorMapError::OutOfRange { product: "DVEL", value }) if value == 200.0
         ));
     }
 

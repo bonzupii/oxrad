@@ -18,7 +18,7 @@
 use std::collections::hash_map::RandomState;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::error::RadarError;
 use crate::network;
@@ -27,6 +27,7 @@ use crate::retry::{self, BASE_DELAY, MAX_DELAY, error_update};
 use crate::stations::SiteId;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
+const SHUTDOWN_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 
 /// A failed pipeline step and the stage it failed in.
 #[derive(Debug)]
@@ -120,7 +121,7 @@ impl PipelineState {
 
 enum Event {
     Working(Operation),
-    Update(FetchUpdate),
+    Update(Box<FetchUpdate>),
 }
 
 struct Archive {
@@ -365,6 +366,29 @@ fn fetch(
     }
 }
 
+enum WaitOutcome {
+    Retry,
+    Elapsed,
+    Stopped,
+}
+
+/// Waits in short slices so dropping the pipeline closes the retry channel and
+/// releases the worker without waiting for the full poll interval.
+fn wait_for_retry(retries: &Receiver<()>, timeout: Duration) -> WaitOutcome {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return WaitOutcome::Elapsed;
+        }
+        match retries.recv_timeout(remaining.min(SHUTDOWN_CHECK_INTERVAL)) {
+            Ok(()) => return WaitOutcome::Retry,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return WaitOutcome::Stopped,
+        }
+    }
+}
+
 struct Fetcher {
     site: SiteId,
     events: Sender<Event>,
@@ -429,18 +453,18 @@ impl Fetcher {
                 },
             };
             let wait = update.retry_in;
-            if events.send(Event::Update(update)).is_err() {
+            if events.send(Event::Update(Box::new(update))).is_err() {
                 return;
             }
             let timeout = wait.unwrap_or(POLL_INTERVAL);
-            match retries.recv_timeout(timeout) {
-                Ok(()) => state.reset_retry(),
-                Err(mpsc::RecvTimeoutError::Timeout) if wait.is_some() => {
+            match wait_for_retry(retries, timeout) {
+                WaitOutcome::Retry => state.reset_retry(),
+                WaitOutcome::Elapsed if wait.is_some() => {
                     state.delay = state.delay.saturating_mul(2).min(MAX_DELAY);
                     state.attempt = state.attempt.saturating_add(1);
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                WaitOutcome::Elapsed => {}
+                WaitOutcome::Stopped => return,
             }
         }
     }
@@ -456,6 +480,19 @@ mod tests {
     fn operation_names_read_as_actions() {
         assert_eq!(Operation::Fetching.description(), "Fetch");
         assert_eq!(Operation::Decoding.description(), "Decode");
+    }
+
+    #[test]
+    fn dropping_the_retry_channel_releases_a_long_wait() -> Result<(), TestError> {
+        let (sender, receiver) = mpsc::channel::<()>();
+        drop(sender);
+        let started = Instant::now();
+        assert!(matches!(
+            wait_for_retry(&receiver, Duration::from_secs(30)),
+            WaitOutcome::Stopped
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        Ok(())
     }
 
     #[test]

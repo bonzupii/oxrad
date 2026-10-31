@@ -24,8 +24,8 @@ use std::io::{Cursor, Read};
 use nexrad_decode::messages::MessageContents;
 use nexrad_decode::messages::digital_radar_data::{GenericDataBlock, Message as DigitalRadarData};
 
-use crate::colormap::{MAX_REFLECTIVITY_DBZ, MIN_REFLECTIVITY_DBZ};
 use crate::error::{CoordinateError, MessageDefect, MomentError, RadarError, VolumeDefect};
+use crate::product::RadarProduct;
 use crate::projection;
 use crate::stations::SiteId;
 use crate::time::MS_PER_DAY;
@@ -33,6 +33,8 @@ use crate::time::MS_PER_DAY;
 const ARCHIVE_HEADER_BYTES: usize = 24;
 const RECORD_LENGTH_BYTES: usize = 4;
 const MAX_RECORD_BYTES: u64 = 16 * 1024 * 1024;
+// The Type 29/31 segment-size field excludes 12 bytes of the 28-byte message
+// header. The pinned KPAH record places the next header at 9956, not 9944.
 const CTM_BYTES: usize = 12;
 const MESSAGE_HEADER_BYTES: usize = 28;
 const LEGACY_MESSAGE_BYTES: usize = 2432;
@@ -50,7 +52,20 @@ pub enum GateValue {
     RangeFolded,
 }
 
-/// One gate column of a sweep: its azimuth boundaries and gate geometry.
+/// One product's gate column on a radial, with the geometry read from that
+/// product's own moment block.
+#[derive(Debug)]
+pub struct MomentBins {
+    pub product: RadarProduct,
+    pub first_gate_km: f64,
+    pub gate_width_km: f64,
+    pub values: Vec<GateValue>,
+    pub below_threshold: usize,
+    pub range_folded: usize,
+}
+
+/// One gate column of a sweep: its azimuth boundaries and every moment the
+/// radial collected. A moment absent from `moments` was not collected.
 #[derive(Debug)]
 pub struct RadialBins {
     pub azimuth_number: u16,
@@ -59,7 +74,13 @@ pub struct RadialBins {
     pub elevation_deg: f64,
     pub first_gate_km: f64,
     pub gate_width_km: f64,
-    pub values: Vec<GateValue>,
+    pub moments: Vec<MomentBins>,
+}
+
+impl RadialBins {
+    pub fn moment(&self, product: RadarProduct) -> Option<&MomentBins> {
+        self.moments.iter().find(|moment| moment.product == product)
+    }
 }
 
 #[derive(Debug)]
@@ -67,6 +88,7 @@ pub struct RadarSweep {
     pub elevation_deg: f64,
     pub elevation_number: u8,
     pub radials: Vec<RadialBins>,
+    pub products: Vec<RadarProduct>,
     pub below_threshold: usize,
     pub range_folded: usize,
     pub max_ground_range_km: f64,
@@ -74,7 +96,11 @@ pub struct RadarSweep {
 
 impl RadarSweep {
     pub fn gate_count(&self) -> usize {
-        self.radials.iter().map(|radial| radial.values.len()).sum()
+        self.radials
+            .iter()
+            .flat_map(|radial| &radial.moments)
+            .map(|moment| moment.values.len())
+            .sum()
     }
 }
 
@@ -84,10 +110,71 @@ pub struct RadarVolume {
     pub site_lat: f64,
     pub site_lon: f64,
     pub scan_unix_ms: u64,
+    /// The sweep selected for display.
     pub sweep: RadarSweep,
+    /// The other complete sweeps in the volume.
+    pub sweeps: Vec<RadarSweep>,
     pub skipped_radials: usize,
     pub skipped_non_data: usize,
-    pub moment_error: Option<MomentError>,
+    pub moment_error: Option<(RadarProduct, MomentError)>,
+}
+
+impl RadarVolume {
+    /// Moves a complete sweep into the display slot without cloning it.
+    pub fn select_sweep(&mut self, elevation_number: u8) -> bool {
+        let Some(index) = self
+            .sweeps
+            .iter()
+            .position(|sweep| sweep.elevation_number == elevation_number)
+        else {
+            return false;
+        };
+        let mut selected = self.sweeps.swap_remove(index);
+        std::mem::swap(&mut selected, &mut self.sweep);
+        self.sweeps.push(selected);
+        true
+    }
+
+    /// The lowest other sweep that carries a product.
+    pub fn elevation_for_product(&self, product: RadarProduct) -> Option<u8> {
+        self.sweeps
+            .iter()
+            .filter(|sweep| sweep.products.contains(&product))
+            .min_by_key(|sweep| sweep.elevation_number)
+            .map(|sweep| sweep.elevation_number)
+    }
+
+    pub fn supports_product(&self, product: RadarProduct) -> bool {
+        self.sweep.products.contains(&product)
+            || self
+                .sweeps
+                .iter()
+                .any(|sweep| sweep.products.contains(&product))
+    }
+
+    /// Tilts that carry the selected product; a tilt without it is not offered.
+    pub fn tilt_options_for(&self, product: RadarProduct) -> Vec<(u8, f64, bool)> {
+        let mut options: Vec<(u8, f64, bool)> = self
+            .sweeps
+            .iter()
+            .filter(|sweep| sweep.products.contains(&product))
+            .map(|sweep| (sweep.elevation_number, sweep.elevation_deg, false))
+            .collect();
+        if self.sweep.products.contains(&product) {
+            options.push((self.sweep.elevation_number, self.sweep.elevation_deg, true));
+        }
+        options.sort_by_key(|(number, _, _)| *number);
+        options
+    }
+
+    pub fn sweep_has_product(&self, elevation_number: u8, product: RadarProduct) -> bool {
+        if self.sweep.elevation_number == elevation_number {
+            return self.sweep.products.contains(&product);
+        }
+        self.sweeps.iter().any(|sweep| {
+            sweep.elevation_number == elevation_number && sweep.products.contains(&product)
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -143,8 +230,11 @@ enum RadialDefect {
     Azimuth,
     Spacing,
     GateGeometry,
-    MissingReflectivity,
-    Moment(MomentError),
+    MissingMoments,
+    Moment {
+        product: RadarProduct,
+        source: MomentError,
+    },
 }
 
 #[derive(Debug)]
@@ -154,9 +244,7 @@ struct Radial {
     azimuth_number: u16,
     azimuth_deg: f64,
     spacing_deg: f64,
-    first_gate_km: f64,
-    gate_width_km: f64,
-    values: Vec<GateValue>,
+    moments: Vec<MomentBins>,
 }
 
 fn parse_radial(radial: &DigitalRadarData) -> Result<Radial, RadialDefect> {
@@ -173,28 +261,76 @@ fn parse_radial(radial: &DigitalRadarData) -> Result<Radial, RadialDefect> {
     }
     let spacing_deg = commanded_spacing_deg(radial.header.azimuth_resolution_spacing)
         .ok_or(RadialDefect::Spacing)?;
-    let Some(block) = radial.reflectivity_data_block.as_ref() else {
-        return Err(RadialDefect::MissingReflectivity);
-    };
-    let gates = block.header.number_of_data_moment_gates;
-    let first_gate_km = f64::from(block.header.data_moment_range) / 1000.0;
-    let gate_width_km = f64::from(block.header.data_moment_range_sample_interval) / 1000.0;
-    if gates == 0 || !gate_width_km.is_finite() || gate_width_km <= 0.0 {
-        return Err(RadialDefect::GateGeometry);
+    let blocks = [
+        (
+            RadarProduct::Reflectivity,
+            radial.reflectivity_data_block.as_ref(),
+        ),
+        (RadarProduct::Velocity, radial.velocity_data_block.as_ref()),
+        (
+            RadarProduct::SpectrumWidth,
+            radial.spectrum_width_data_block.as_ref(),
+        ),
+        (
+            RadarProduct::DifferentialReflectivity,
+            radial.differential_reflectivity_data_block.as_ref(),
+        ),
+        (
+            RadarProduct::CorrelationCoefficient,
+            radial.correlation_coefficient_data_block.as_ref(),
+        ),
+        (
+            RadarProduct::DifferentialPhase,
+            radial.differential_phase_data_block.as_ref(),
+        ),
+        (
+            RadarProduct::SpecificDifferentialPhase,
+            radial.specific_diff_phase_data_block.as_ref(),
+        ),
+    ];
+    let mut moments = Vec::with_capacity(blocks.len());
+    for (product, block) in blocks {
+        let Some(block) = block else {
+            continue;
+        };
+        let gates = block.header.number_of_data_moment_gates;
+        let first_gate_km = f64::from(block.header.data_moment_range) / 1000.0;
+        let gate_width_km = f64::from(block.header.data_moment_range_sample_interval) / 1000.0;
+        if gates == 0 || !gate_width_km.is_finite() || gate_width_km <= 0.0 {
+            return Err(RadialDefect::GateGeometry);
+        }
+        if !first_gate_km.is_finite() || first_gate_km < gate_width_km / 2.0 {
+            return Err(RadialDefect::GateGeometry);
+        }
+        let values =
+            decode_moment(block).map_err(|source| RadialDefect::Moment { product, source })?;
+        let below_threshold = values
+            .iter()
+            .filter(|value| matches!(value, GateValue::BelowThreshold))
+            .count();
+        let range_folded = values
+            .iter()
+            .filter(|value| matches!(value, GateValue::RangeFolded))
+            .count();
+        moments.push(MomentBins {
+            product,
+            first_gate_km,
+            gate_width_km,
+            values,
+            below_threshold,
+            range_folded,
+        });
     }
-    if !first_gate_km.is_finite() || first_gate_km < gate_width_km / 2.0 {
-        return Err(RadialDefect::GateGeometry);
+    if moments.is_empty() {
+        return Err(RadialDefect::MissingMoments);
     }
-    let values = decode_moment(block).map_err(RadialDefect::Moment)?;
     Ok(Radial {
         elevation_number: radial.header.elevation_number,
         elevation_deg,
         azimuth_number: radial.header.azimuth_number,
         azimuth_deg,
         spacing_deg,
-        first_gate_km,
-        gate_width_km,
-        values,
+        moments,
     })
 }
 
@@ -237,7 +373,7 @@ fn decode_moment(block: &GenericDataBlock) -> Result<Vec<GateValue>, MomentError
             values.push(GateValue::RangeFolded);
         } else {
             let dbz = (raw - offset) / scale;
-            if !dbz.is_finite() || !(MIN_REFLECTIVITY_DBZ..=MAX_REFLECTIVITY_DBZ).contains(&dbz) {
+            if !dbz.is_finite() || dbz.abs() > 1.0e6 {
                 return Err(MomentError::Value { value: dbz });
             }
             values.push(GateValue::Measured(dbz));
@@ -311,14 +447,12 @@ impl SweepAssembly {
             self.skipped += 1;
             return;
         }
-        let expected = i64::from(self.radials.last().map_or(0, |last| last.azimuth_number)) + 1;
-        let actual = i64::from(radial.azimuth_number);
-        match actual - expected {
-            0 => {}
-            missing if missing > 0 => {
-                self.skipped += usize::try_from(missing).unwrap_or(usize::MAX);
+        if let Some(last) = self.radials.last().map(|last| last.azimuth_number) {
+            if radial.azimuth_number <= last {
+                self.skipped += 1;
+                return;
             }
-            _ => self.skipped += 1,
+            self.skipped += usize::from((radial.azimuth_number - last).saturating_sub(1));
         }
         self.radials.push(radial);
     }
@@ -349,14 +483,17 @@ impl SweepAssembly {
             };
             let left = azimuth_edge(centre, previous, radial.spacing_deg, false);
             let right = azimuth_edge(centre, next, radial.spacing_deg, true);
+            let Some(primary) = radial.moments.first() else {
+                continue;
+            };
             bins.push(RadialBins {
                 azimuth_number: radial.azimuth_number,
                 azimuth_left_deg: left,
                 azimuth_right_deg: right,
                 elevation_deg: radial.elevation_deg,
-                first_gate_km: radial.first_gate_km,
-                gate_width_km: radial.gate_width_km,
-                values: radial.values,
+                first_gate_km: primary.first_gate_km,
+                gate_width_km: primary.gate_width_km,
+                moments: radial.moments,
             });
         }
         if bins.len() < 2 {
@@ -367,7 +504,11 @@ impl SweepAssembly {
                 },
             });
         }
-        if bins.iter().all(|radial| radial.values.is_empty()) {
+        let products: Vec<RadarProduct> = RadarProduct::ALL
+            .into_iter()
+            .filter(|product| bins.iter().any(|radial| radial.moment(*product).is_some()))
+            .collect();
+        if products.is_empty() {
             return Err(RadarError::IncompleteVolume {
                 site: String::from(site.as_str()),
                 defect: VolumeDefect::NoReflectivity,
@@ -379,6 +520,7 @@ impl SweepAssembly {
                 elevation_deg,
                 elevation_number,
                 radials: bins,
+                products,
                 below_threshold: 0,
                 range_folded: 0,
                 max_ground_range_km: 0.0,
@@ -392,24 +534,27 @@ fn finish_sweep(site: &SiteId, mut sweep: RadarSweep) -> Result<RadarSweep, Rada
     let mut range_folded = 0_usize;
     let mut max_ground_range_km: f64 = 0.0;
     for radial in &sweep.radials {
-        for value in &radial.values {
-            match value {
-                GateValue::Measured(_) => {}
-                GateValue::BelowThreshold => below_threshold += 1,
-                GateValue::RangeFolded => range_folded += 1,
+        for moment in &radial.moments {
+            for value in &moment.values {
+                match value {
+                    GateValue::Measured(_) => {}
+                    GateValue::BelowThreshold => below_threshold += 1,
+                    GateValue::RangeFolded => range_folded += 1,
+                }
             }
+            let last_centre = moment.first_gate_km
+                + (moment.values.len().saturating_sub(1) as f64) * moment.gate_width_km;
+            let far_slant = last_centre + moment.gate_width_km / 2.0;
+            let far =
+                projection::ground_range(far_slant, radial.elevation_deg).map_err(|source| {
+                    RadarError::GateRange {
+                        site: String::from(site.as_str()),
+                        azimuth_number: radial.azimuth_number,
+                        source,
+                    }
+                })?;
+            max_ground_range_km = max_ground_range_km.max(far);
         }
-        let last_centre = radial.first_gate_km
-            + (radial.values.len().saturating_sub(1) as f64) * radial.gate_width_km;
-        let far_slant = last_centre + radial.gate_width_km / 2.0;
-        let far = projection::ground_range(far_slant, radial.elevation_deg).map_err(|source| {
-            RadarError::GateRange {
-                site: String::from(site.as_str()),
-                azimuth_number: radial.azimuth_number,
-                source,
-            }
-        })?;
-        max_ground_range_km = max_ground_range_km.max(far);
     }
     sweep.below_threshold = below_threshold;
     sweep.range_folded = range_folded;
@@ -428,7 +573,7 @@ struct VolumeAssembly {
     start_header: Option<(u16, u32)>,
     skipped_radials: usize,
     skipped_non_data: usize,
-    moment_error: Option<MomentError>,
+    moment_error: Option<(RadarProduct, MomentError)>,
 }
 
 impl VolumeAssembly {
@@ -531,8 +676,8 @@ impl VolumeAssembly {
 
     fn record(&mut self, defect: RadialDefect) {
         self.skipped_radials += 1;
-        if let RadialDefect::Moment(error) = defect {
-            self.moment_error.get_or_insert(error);
+        if let RadialDefect::Moment { product, source } = defect {
+            self.moment_error.get_or_insert((product, source));
         }
     }
 
@@ -587,21 +732,31 @@ impl VolumeAssembly {
                 |source| RadarError::SiteCoordinates { source },
             )
         })?;
-        let sweep = self
-            .sweeps
-            .into_iter()
-            .min_by_key(|sweep| sweep.elevation_number)
-            .ok_or(RadarError::IncompleteVolume {
+        let mut decoded = Vec::with_capacity(self.sweeps.len());
+        for assembly in self.sweeps {
+            if let Ok(sweep) = assembly.into_radial_bins(site) {
+                decoded.push(sweep);
+            }
+        }
+        let Some(lowest) = decoded
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, sweep)| sweep.elevation_number)
+            .map(|(index, _)| index)
+        else {
+            return Err(RadarError::IncompleteVolume {
                 site: String::from(site.as_str()),
                 defect: VolumeDefect::NoCompleteSweep,
-            })?;
-        let sweep = sweep.into_radial_bins(site)?;
+            });
+        };
+        let sweep = decoded.swap_remove(lowest);
         Ok(RadarVolume {
             site: site.clone(),
             site_lat: site_fix.lat,
             site_lon: site_fix.lon,
             scan_unix_ms,
             sweep,
+            sweeps: decoded,
             skipped_radials: self.skipped_radials,
             skipped_non_data: self.skipped_non_data,
             moment_error: self.moment_error,
@@ -996,12 +1151,13 @@ fn validate_radial(payload: &[u8]) -> Result<(), MessageDefect> {
             blocks,
             radial_length: radial.len(),
         })?;
-        let Ok(pointer) = usize::try_from(raw) else {
-            return Err(MessageDefect::PointerUnrepresentable {
-                index,
-                pointer: raw,
-            });
-        };
+        if raw == 0 {
+            continue;
+        }
+        let pointer = usize::try_from(raw).map_err(|_| MessageDefect::PointerUnrepresentable {
+            index,
+            pointer: raw,
+        })?;
         if pointer < table_end {
             return Err(MessageDefect::PointerInsideTable {
                 index,
@@ -1150,9 +1306,14 @@ mod tests {
             azimuth_number: number,
             azimuth_deg: azimuth,
             spacing_deg: 0.5,
-            first_gate_km: 2.0,
-            gate_width_km: 0.25,
-            values: vec![GateValue::Measured(20.0); gates],
+            moments: vec![MomentBins {
+                product: RadarProduct::Reflectivity,
+                first_gate_km: 2.0,
+                gate_width_km: 0.25,
+                values: vec![GateValue::Measured(20.0); gates],
+                below_threshold: 0,
+                range_folded: 0,
+            }],
         }
     }
 
@@ -1170,6 +1331,45 @@ mod tests {
 
     fn span(left: f64, right: f64) -> f64 {
         (right - left).rem_euclid(360.0)
+    }
+
+    #[test]
+    fn type_31_message_size_includes_the_twelve_unscaled_bytes() {
+        assert_eq!(message_size(4972, 1, 1, 31), 9956);
+        assert_eq!(message_size(1208, 1, 1, 15), 2432);
+        assert_eq!(message_size(u16::MAX, 0, 9956, 31), 9968);
+    }
+
+    #[test]
+    fn a_null_moment_pointer_is_an_absent_block() -> Result<(), TestError> {
+        let mut radial = vec![0_u8; 80];
+        radial[18..20].copy_from_slice(&80_u16.to_be_bytes());
+        radial[30..32].copy_from_slice(&2_u16.to_be_bytes());
+        radial[32..36].copy_from_slice(&0_u32.to_be_bytes());
+        radial[36..40].copy_from_slice(&40_u32.to_be_bytes());
+        radial[40..44].copy_from_slice(b"DREF");
+        radial[48..50].copy_from_slice(&1_u16.to_be_bytes());
+        radial[59] = 8;
+        validate_radial(&radial).map_err(|defect| format!("null pointer rejected: {defect}"))?;
+        radial[32..36].copy_from_slice(&1_u32.to_be_bytes());
+        assert!(matches!(
+            validate_radial(&radial),
+            Err(MessageDefect::PointerInsideTable { pointer: 1, .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn an_out_of_order_radial_is_skipped_instead_of_duplicated() -> Result<(), TestError> {
+        let bins = sweep(vec![
+            radial(0.0, 1, 1, 0.5, 1),
+            radial(0.5, 2, 1, 0.5, 1),
+            radial(0.25, 2, 1, 0.5, 1),
+            radial(1.5, 4, 1, 0.5, 1),
+        ])?;
+        assert_eq!(bins.radials.len(), 3);
+        assert_eq!(bins.radials.get(2).map(|r| r.azimuth_number), Some(4));
+        Ok(())
     }
 
     #[test]
@@ -1546,20 +1746,55 @@ mod tests {
         // A super-resolution surveillance cut covers a full circle at 0.5 degree
         // spacing, so 720 radials are expected.
         assert_eq!(volume.sweep.radials.len(), 720, "radial count");
-        let gates = volume
-            .sweep
-            .radials
-            .first()
-            .map_or(0, |radial| radial.values.len());
+        assert!(
+            volume.sweeps.len() >= 5,
+            "complete sweeps besides the lowest: {}",
+            volume.sweeps.len()
+        );
+        for product in [
+            RadarProduct::Reflectivity,
+            RadarProduct::DifferentialReflectivity,
+            RadarProduct::CorrelationCoefficient,
+            RadarProduct::DifferentialPhase,
+            RadarProduct::SpecificDifferentialPhase,
+        ] {
+            assert!(
+                volume.sweep.products.contains(&product),
+                "lowest sweep lacks {}",
+                product.id()
+            );
+        }
+        for product in [RadarProduct::Velocity, RadarProduct::SpectrumWidth] {
+            assert!(
+                volume
+                    .sweeps
+                    .iter()
+                    .any(|sweep| sweep.products.contains(&product)),
+                "no sweep carries {}",
+                product.id()
+            );
+        }
+        assert!(
+            volume
+                .sweeps
+                .iter()
+                .any(|sweep| sweep.elevation_number != volume.sweep.elevation_number),
+            "a second elevation is retained"
+        );
+        let gates = volume.sweep.radials.first().map_or(0, |radial| {
+            radial
+                .moment(RadarProduct::Reflectivity)
+                .map_or(0, |moment| moment.values.len())
+        });
         // A super-resolution cut carries 1832 gates of 250 m from 2.000 km,
         // which is 460 km of coverage.
         assert_eq!(gates, 1832, "gates per radial");
         assert!(
-            volume
-                .sweep
-                .radials
-                .iter()
-                .all(|radial| radial.values.len() == gates),
+            volume.sweep.radials.iter().all(|radial| {
+                radial
+                    .moment(RadarProduct::Reflectivity)
+                    .is_some_and(|moment| moment.values.len() == gates)
+            }),
             "every radial carries the same gate count"
         );
         for radial in &volume.sweep.radials {
@@ -1599,7 +1834,8 @@ mod tests {
             .sweep
             .radials
             .iter()
-            .flat_map(|radial| &radial.values)
+            .flat_map(|radial| &radial.moments)
+            .flat_map(|moment| &moment.values)
             .filter(|value| matches!(**value, GateValue::Measured(_)))
             .count();
         assert_eq!(
@@ -1607,9 +1843,30 @@ mod tests {
             volume.sweep.gate_count(),
             "gate categories partition the gates"
         );
+        for product in &volume.sweep.products {
+            let gates = volume
+                .sweep
+                .radials
+                .iter()
+                .filter_map(|radial| radial.moment(*product))
+                .map(|moment| moment.values.len())
+                .sum::<usize>();
+            let below = volume
+                .sweep
+                .radials
+                .iter()
+                .filter_map(|radial| radial.moment(*product))
+                .map(|moment| moment.below_threshold)
+                .sum::<usize>();
+            assert!(
+                below <= gates,
+                "{} below-threshold count {below} exceeds {gates} gates",
+                product.id()
+            );
+        }
         assert_eq!(volume.skipped_radials, 0, "no radial is skipped");
 
-        let geometry = crate::render::build_geometry(&volume)?;
+        let geometry = crate::render::build_geometry_for(&volume, RadarProduct::Reflectivity)?;
         assert!(geometry.index_count > 0, "mesh has triangles");
         // Web Mercator stretches ground distance by 1/cos(latitude). The mesh
         // bounds reach the poleward edge of the sweep, where that factor is

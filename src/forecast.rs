@@ -13,11 +13,11 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
-//! Forecast for the place the user searched, from the National Weather Service.
+//! Global weather and forecast from Open-Meteo.
 //!
-//! The request uses the place's own coordinates. The forecast carries that
-//! `Place` unchanged so the UI can state exactly which location it describes,
-//! independently of the radar station supplying observations.
+//! The request uses the searched place's coordinates. The forecast carries
+//! that `Place` unchanged so the UI can state exactly which location it
+//! describes, independently of the radar station supplying observations.
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -29,37 +29,53 @@ use serde_json::Value;
 use crate::place::Place;
 use crate::provider::{self, JsonError};
 
-const NWS_POINTS: &str = "https://api.weather.gov/points";
-const NWS_ACCEPT: &str = "application/geo+json";
-const FORECAST_URL_PREFIX: &str = "https://api.weather.gov/";
+const OPEN_METEO: &str = "https://api.open-meteo.com/v1/forecast";
+const FORECAST_DAYS: u8 = 7;
+const HOURLY_LIMIT: usize = 24;
+const PROVIDER: &str = "Open-Meteo";
 
-/// One forecast period as the provider published it.
+/// Current conditions at the selected place.
+#[derive(Debug, Clone)]
+pub struct CurrentWeather {
+    pub observed: String,
+    pub temperature: f64,
+    pub apparent: f64,
+    pub humidity: f64,
+    pub precipitation: f64,
+    pub wind: String,
+    pub short: String,
+    pub unit: String,
+}
+
+/// One hourly or daily forecast period.
 #[derive(Debug, Clone)]
 pub struct ForecastPeriod {
     pub name: String,
     pub start: String,
     pub temperature: f64,
+    pub minimum: Option<f64>,
     pub unit: String,
     pub wind: String,
     pub short: String,
     pub precipitation: Option<u8>,
 }
 
-/// The forecast for one place, with its provider identity and issue time.
+/// The forecast for one place, with its provider identity and local timezone.
 #[derive(Debug, Clone)]
 pub struct Forecast {
     pub place: Place,
-    pub updated: Option<String>,
-    pub grid: String,
-    pub provider_location: String,
-    pub periods: Vec<ForecastPeriod>,
+    pub provider: &'static str,
+    pub timezone: String,
+    pub timezone_abbreviation: String,
+    pub current: CurrentWeather,
+    pub hourly: Vec<ForecastPeriod>,
+    pub daily: Vec<ForecastPeriod>,
 }
 
 /// Why a forecast could not be produced.
 #[derive(Debug)]
 pub enum ForecastError {
     Provider { source: JsonError },
-    Unsupported { country: String },
     NoPeriods,
     Shape { field: &'static str },
     WorkerStopped,
@@ -71,11 +87,7 @@ impl ForecastError {
     pub const fn is_transient(&self) -> bool {
         match self {
             Self::Provider { source } => source.is_transient(),
-            Self::Unsupported { .. }
-            | Self::NoPeriods
-            | Self::Shape { .. }
-            | Self::WorkerStopped
-            | Self::WorkerPanic => false,
+            Self::NoPeriods | Self::Shape { .. } | Self::WorkerStopped | Self::WorkerPanic => false,
         }
     }
 
@@ -83,23 +95,14 @@ impl ForecastError {
     pub const fn retry_after(&self) -> Option<&str> {
         match self {
             Self::Provider { source } => source.retry_after(),
-            Self::Unsupported { .. }
-            | Self::NoPeriods
-            | Self::Shape { .. }
-            | Self::WorkerStopped
-            | Self::WorkerPanic => None,
+            Self::NoPeriods | Self::Shape { .. } | Self::WorkerStopped | Self::WorkerPanic => None,
         }
     }
 
     fn message(&self) -> String {
         match self {
             Self::Provider { source } => source.to_string(),
-            Self::Unsupported { country } => format!(
-                "The National Weather Service forecasts the United States only; {country} is outside its coverage."
-            ),
-            Self::NoPeriods => {
-                String::from("The National Weather Service returned no forecast periods.")
-            }
+            Self::NoPeriods => String::from("Open-Meteo returned no forecast periods."),
             Self::Shape { field } => {
                 format!("The forecast response has no usable {field}.")
             }
@@ -119,35 +122,41 @@ impl Error for ForecastError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Provider { source } => Some(source),
-            Self::Unsupported { .. }
-            | Self::NoPeriods
-            | Self::Shape { .. }
-            | Self::WorkerStopped
-            | Self::WorkerPanic => None,
+            Self::NoPeriods | Self::Shape { .. } | Self::WorkerStopped | Self::WorkerPanic => None,
         }
     }
-}
-
-/// The gridpoint request for the place's own coordinates.
-pub fn points_url(place: &Place) -> Result<String, ForecastError> {
-    if !place.lat.is_finite() || !(-90.0..=90.0).contains(&place.lat) {
-        return Err(ForecastError::Shape {
-            field: "place latitude",
-        });
-    }
-    if !place.lon.is_finite() || !(-180.0..=180.0).contains(&place.lon) {
-        return Err(ForecastError::Shape {
-            field: "place longitude",
-        });
-    }
-    Ok(format!("{NWS_POINTS}/{:.4},{:.4}", place.lat, place.lon))
 }
 
 const fn shape(field: &'static str) -> ForecastError {
     ForecastError::Shape { field }
 }
 
-fn required_text(value: &Value, field: &'static str) -> Result<String, ForecastError> {
+/// The forecast request for the place's own coordinates.
+pub fn request_url(place: &Place) -> Result<String, ForecastError> {
+    if !place.lat.is_finite() || !(-90.0..=90.0).contains(&place.lat) {
+        return Err(shape("place latitude"));
+    }
+    if !place.lon.is_finite() || !(-180.0..=180.0).contains(&place.lon) {
+        return Err(shape("place longitude"));
+    }
+    Ok(format!(
+        "{OPEN_METEO}?latitude={:.4}&longitude={:.4}\
+         &current=temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,weather_code,wind_speed_10m,wind_direction_10m\
+         &hourly=temperature_2m,precipitation_probability,weather_code,wind_speed_10m\
+         &daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max\
+         &timezone=auto&forecast_days={FORECAST_DAYS}",
+        place.lat, place.lon
+    ))
+}
+
+fn object<'a>(value: &'a Value, field: &'static str) -> Result<&'a Value, ForecastError> {
+    value
+        .get(field)
+        .filter(|value| value.is_object())
+        .ok_or_else(|| shape(field))
+}
+
+fn text(value: &Value, field: &'static str) -> Result<String, ForecastError> {
     value
         .get(field)
         .and_then(Value::as_str)
@@ -156,128 +165,258 @@ fn required_text(value: &Value, field: &'static str) -> Result<String, ForecastE
         .ok_or_else(|| shape(field))
 }
 
-fn forecast_area(value: &Value) -> String {
-    let city = value
-        .get("city")
-        .and_then(Value::as_str)
-        .filter(|text| !text.trim().is_empty());
-    let state = value
-        .get("state")
-        .and_then(Value::as_str)
-        .filter(|text| !text.trim().is_empty());
-    match (city, state) {
-        (Some(city), Some(state)) => format!("{city}, {state}"),
-        (Some(city), None) => String::from(city),
-        (None, _) => String::new(),
-    }
+fn number(value: &Value, field: &'static str) -> Result<f64, ForecastError> {
+    value
+        .get(field)
+        .and_then(Value::as_f64)
+        .filter(|number| number.is_finite())
+        .ok_or_else(|| shape(field))
 }
 
-fn parse_precipitation(period: &Value) -> Result<Option<u8>, ForecastError> {
-    let Some(value) = period
-        .get("probabilityOfPrecipitation")
-        .and_then(|value| value.get("value"))
-    else {
-        return Ok(None);
+fn array<'a>(value: &'a Value, field: &'static str) -> Result<&'a [Value], ForecastError> {
+    value
+        .get(field)
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .ok_or_else(|| shape(field))
+}
+
+fn array_text(array: &[Value], index: usize, field: &'static str) -> Result<String, ForecastError> {
+    array
+        .get(index)
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .map(String::from)
+        .ok_or_else(|| shape(field))
+}
+
+fn array_number(array: &[Value], index: usize, field: &'static str) -> Result<f64, ForecastError> {
+    array
+        .get(index)
+        .and_then(Value::as_f64)
+        .filter(|number| number.is_finite())
+        .ok_or_else(|| shape(field))
+}
+
+fn array_probability(
+    array: &[Value],
+    index: usize,
+    field: &'static str,
+) -> Result<Option<u8>, ForecastError> {
+    let Some(value) = array.get(index) else {
+        return Err(shape(field));
     };
     if value.is_null() {
         return Ok(None);
     }
-    let number = value
-        .as_u64()
-        .ok_or_else(|| shape("precipitation probability"))?;
-    let probability = u8::try_from(number).map_err(|_| shape("precipitation probability"))?;
-    Ok(Some(probability))
+    let number = value.as_f64().ok_or_else(|| shape(field))?;
+    if !number.is_finite() || !(0.0..=100.0).contains(&number) {
+        return Err(shape(field));
+    }
+    let rounded = number.round();
+    u8::try_from(rounded as u32)
+        .map(Some)
+        .map_err(|_| shape(field))
 }
 
-fn parse_period(period: &Value) -> Result<ForecastPeriod, ForecastError> {
-    let temperature = period
-        .get("temperature")
-        .and_then(Value::as_f64)
-        .filter(|value| value.is_finite())
-        .ok_or_else(|| shape("temperature"))?;
-    let precipitation = parse_precipitation(period)?;
-    Ok(ForecastPeriod {
-        name: required_text(period, "name")?,
-        start: required_text(period, "startTime")?,
-        temperature,
-        unit: required_text(period, "temperatureUnit")?,
-        wind: required_text(period, "windSpeed")?,
-        short: required_text(period, "shortForecast")?,
-        precipitation,
+fn wind(degrees: f64, speed: f64, unit: &str) -> String {
+    let direction = if !degrees.is_finite() {
+        String::from("direction unavailable")
+    } else {
+        let headings = [
+            "north",
+            "northeast",
+            "east",
+            "southeast",
+            "south",
+            "southwest",
+            "west",
+            "northwest",
+        ];
+        let index = ((degrees.rem_euclid(360.0) + 22.5) / 45.0).floor() as usize % headings.len();
+        headings
+            .get(index)
+            .map_or_else(|| String::from("unknown"), |heading| String::from(*heading))
+    };
+    format!("{speed:.0} {unit} from the {direction}")
+}
+
+const fn weather_text(code: u64) -> &'static str {
+    match code {
+        0 => "clear sky",
+        1 => "mainly clear",
+        2 => "partly cloudy",
+        3 => "overcast",
+        45 | 48 => "fog",
+        51 | 53 | 55 => "drizzle",
+        56 | 57 => "freezing drizzle",
+        61 | 63 | 65 => "rain",
+        66 | 67 => "freezing rain",
+        71 | 73 | 75 => "snow",
+        77 => "snow grains",
+        80..=82 => "rain showers",
+        85 | 86 => "snow showers",
+        95 => "thunderstorm",
+        96 | 99 => "thunderstorm with hail",
+        _ => "weather code not supplied",
+    }
+}
+
+fn weather_code(codes: &[Value], index: usize, field: &'static str) -> Result<u64, ForecastError> {
+    codes
+        .get(index)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| shape(field))
+}
+
+fn current(document: &Value, unit: &str, wind_unit: &str) -> Result<CurrentWeather, ForecastError> {
+    let current = object(document, "current")?;
+    let degrees = number(current, "wind_direction_10m")?;
+    let speed = number(current, "wind_speed_10m")?;
+    Ok(CurrentWeather {
+        observed: text(current, "time")?,
+        temperature: number(current, "temperature_2m")?,
+        apparent: number(current, "apparent_temperature")?,
+        humidity: number(current, "relative_humidity_2m")?,
+        precipitation: number(current, "precipitation")?,
+        wind: wind(degrees, speed, wind_unit),
+        short: String::from(weather_text(
+            current
+                .get("weather_code")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| shape("current weather code"))?,
+        )),
+        unit: String::from(unit),
     })
 }
 
-fn fetch_periods(url: &str) -> Result<(Option<String>, Vec<ForecastPeriod>), ForecastError> {
-    let document =
-        provider::get_json(url, NWS_ACCEPT).map_err(|source| ForecastError::Provider { source })?;
-    let properties = document
-        .get("properties")
-        .ok_or_else(|| shape("forecast properties"))?;
-    let updated = properties
-        .get("updateTime")
-        .and_then(Value::as_str)
-        .or_else(|| properties.get("generatedAt").and_then(Value::as_str))
-        .map(String::from);
-    let periods_json = properties
-        .get("periods")
+fn hourly(
+    document: &Value,
+    unit: &str,
+    wind_unit: &str,
+) -> Result<Vec<ForecastPeriod>, ForecastError> {
+    let hourly = object(document, "hourly")?;
+    let times = array(hourly, "time")?;
+    let temperatures = array(hourly, "temperature_2m")?;
+    let winds = array(hourly, "wind_speed_10m")?;
+    let codes = array(hourly, "weather_code")?;
+    let probabilities = hourly
+        .get("precipitation_probability")
         .and_then(Value::as_array)
-        .ok_or_else(|| shape("forecast periods"))?;
-    let mut periods = Vec::with_capacity(periods_json.len());
-    for period in periods_json {
-        periods.push(parse_period(period)?);
+        .map(Vec::as_slice);
+    let count = times.len().min(HOURLY_LIMIT);
+    if count == 0 {
+        return Ok(Vec::new());
     }
-    if periods.is_empty() {
+    let mut periods = Vec::with_capacity(count);
+    for index in 0..count {
+        let start = array_text(times, index, "hourly time")?;
+        let name = start
+            .get(11..16)
+            .map_or_else(|| start.clone(), String::from);
+        periods.push(ForecastPeriod {
+            name,
+            precipitation: probabilities
+                .map(|values| array_probability(values, index, "hourly precipitation probability"))
+                .transpose()?
+                .flatten(),
+            start,
+            temperature: array_number(temperatures, index, "hourly temperature")?,
+            minimum: None,
+            unit: String::from(unit),
+            wind: format!(
+                "{:.0} {wind_unit}",
+                array_number(winds, index, "hourly wind")?
+            ),
+            short: String::from(weather_text(weather_code(
+                codes,
+                index,
+                "hourly weather code",
+            )?)),
+        });
+    }
+    Ok(periods)
+}
+
+fn daily(document: &Value, unit: &str) -> Result<Vec<ForecastPeriod>, ForecastError> {
+    let daily = object(document, "daily")?;
+    let times = array(daily, "time")?;
+    let maximums = array(daily, "temperature_2m_max")?;
+    let minimums = array(daily, "temperature_2m_min")?;
+    let codes = array(daily, "weather_code")?;
+    let probabilities = daily
+        .get("precipitation_probability_max")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice);
+    let count = times.len().min(usize::from(FORECAST_DAYS));
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let mut periods = Vec::with_capacity(count);
+    for index in 0..count {
+        let start = array_text(times, index, "daily time")?;
+        let name = match index {
+            0 => String::from("Today"),
+            1 => String::from("Tomorrow"),
+            _ => start.clone(),
+        };
+        periods.push(ForecastPeriod {
+            name,
+            precipitation: probabilities
+                .map(|values| array_probability(values, index, "daily precipitation probability"))
+                .transpose()?
+                .flatten(),
+            start,
+            temperature: array_number(maximums, index, "daily high")?,
+            minimum: Some(array_number(minimums, index, "daily low")?),
+            unit: String::from(unit),
+            wind: String::new(),
+            short: String::from(weather_text(weather_code(
+                codes,
+                index,
+                "daily weather code",
+            )?)),
+        });
+    }
+    Ok(periods)
+}
+
+fn parse_document(place: &Place, document: &Value) -> Result<Forecast, ForecastError> {
+    let timezone = text(document, "timezone")?;
+    let timezone_abbreviation = text(document, "timezone_abbreviation")?;
+    let current_units = object(document, "current_units")?;
+    let hourly_units = object(document, "hourly_units")?;
+    let unit = current_units
+        .get("temperature_2m")
+        .and_then(Value::as_str)
+        .ok_or_else(|| shape("temperature unit"))?;
+    let wind_unit = hourly_units
+        .get("wind_speed_10m")
+        .and_then(Value::as_str)
+        .ok_or_else(|| shape("wind unit"))?;
+    let current = current(document, unit, wind_unit)?;
+    let hourly = hourly(document, unit, wind_unit)?;
+    let daily = daily(document, unit)?;
+    if hourly.is_empty() && daily.is_empty() {
         return Err(ForecastError::NoPeriods);
     }
-    Ok((updated, periods))
-}
-
-/// Fetches the forecast for the place, using only the place's coordinates.
-pub fn fetch(place: &Place) -> Result<Forecast, ForecastError> {
-    if !place.in_united_states() {
-        let country = if place.country.trim().is_empty() {
-            String::from("this location")
-        } else {
-            place.country.clone()
-        };
-        return Err(ForecastError::Unsupported { country });
-    }
-    let points = points_url(place)?;
-    let document = provider::get_json(&points, NWS_ACCEPT)
-        .map_err(|source| ForecastError::Provider { source })?;
-    let properties = document
-        .get("properties")
-        .ok_or_else(|| shape("gridpoint properties"))?;
-    let forecast_url = properties
-        .get("forecast")
-        .and_then(Value::as_str)
-        .filter(|url| url.starts_with(FORECAST_URL_PREFIX))
-        .ok_or_else(|| shape("forecast URL"))?;
-    let grid_id = properties
-        .get("gridId")
-        .and_then(Value::as_str)
-        .ok_or_else(|| shape("forecast office"))?;
-    let grid_x = properties
-        .get("gridX")
-        .and_then(Value::as_i64)
-        .ok_or_else(|| shape("grid X"))?;
-    let grid_y = properties
-        .get("gridY")
-        .and_then(Value::as_i64)
-        .ok_or_else(|| shape("grid Y"))?;
-    let grid = format!("{grid_id} {grid_x},{grid_y}");
-    let provider_location = properties
-        .get("relativeLocation")
-        .and_then(|value| value.get("properties"))
-        .map_or_else(String::new, forecast_area);
-    let (updated, periods) = fetch_periods(forecast_url)?;
     Ok(Forecast {
         place: place.clone(),
-        updated,
-        grid,
-        provider_location,
-        periods,
+        provider: PROVIDER,
+        timezone,
+        timezone_abbreviation,
+        current,
+        hourly,
+        daily,
     })
+}
+
+/// Fetches the global forecast for the place, using only its coordinates.
+pub fn fetch(place: &Place) -> Result<Forecast, ForecastError> {
+    let url = request_url(place)?;
+    let document = provider::get_json(&url, "application/json")
+        .map_err(|source| ForecastError::Provider { source })?;
+    parse_document(place, &document)
 }
 
 struct ForecastRequest {
@@ -399,9 +538,9 @@ mod tests {
     }
 
     #[test]
-    fn the_gridpoint_request_uses_the_town_coordinates() -> Result<(), TestError> {
+    fn the_forecast_request_uses_the_town_coordinates() -> Result<(), TestError> {
         let place = bowling_green()?;
-        let url = points_url(&place)?;
+        let url = request_url(&place)?;
         assert!(url.contains("36.9903"), "request URL {url}");
         assert!(url.contains("-86.4436"), "request URL {url}");
         assert!(
@@ -416,71 +555,72 @@ mod tests {
     }
 
     #[test]
-    fn an_invalid_precipitation_probability_is_not_silently_dropped() {
+    fn weather_codes_and_wind_directions_are_readable() {
+        assert_eq!(weather_text(0), "clear sky");
+        assert_eq!(weather_text(95), "thunderstorm");
+        assert_eq!(wind(0.0, 10.0, "km/h"), "10 km/h from the north");
+        assert_eq!(wind(90.0, 10.0, "km/h"), "10 km/h from the east");
+    }
+
+    #[test]
+    fn malformed_numbers_are_an_error_not_a_default() {
         assert!(matches!(
-            parse_precipitation(&serde_json::json!({
-                "probabilityOfPrecipitation": { "value": 300 }
-            })),
+            array_probability(&[serde_json::json!(101)], 0, "probability"),
             Err(ForecastError::Shape {
-                field: "precipitation probability"
+                field: "probability"
             })
         ));
         assert!(matches!(
-            parse_precipitation(&serde_json::json!({
-                "probabilityOfPrecipitation": { "value": null }
-            })),
+            array_probability(&[serde_json::json!(null)], 0, "probability"),
             Ok(None)
         ));
     }
 
-    #[test]
-    fn a_non_united_states_place_reports_outside_coverage() -> Result<(), TestError> {
-        let place = Place::new("Dublin", "Leinster", "Ireland", "ie", 53.349_8, -6.260_3)?;
-        match fetch(&place) {
-            Err(ForecastError::Unsupported { country }) => {
-                assert_eq!(country, "Ireland");
-                Ok(())
-            }
-            other => Err(TestError::from(format!(
-                "expected Unsupported, got {other:?}"
-            ))),
-        }
-    }
-
-    /// Exercises the real provider with the searched town's coordinates and
-    /// verifies the returned forecast describes that town, not the radar site.
+    /// Exercises the real global provider with the searched town's coordinates.
     #[test]
     fn the_live_forecast_belongs_to_the_searched_town() -> Result<(), TestError> {
         let place = bowling_green()?;
         let forecast = fetch(&place)?;
         assert_eq!(forecast.place, place, "the forecast carries its place");
+        assert_eq!(forecast.provider, "Open-Meteo");
         assert!(
-            !forecast.periods.is_empty(),
-            "the provider returned no periods"
-        );
-        let first = forecast.periods.first().ok_or("no first period")?;
-        assert!(!first.name.is_empty(), "period name");
-        assert!(
-            (first.temperature > -80.0 && first.temperature < 140.0),
-            "temperature {} {}",
-            first.temperature,
-            first.unit
+            !forecast.hourly.is_empty(),
+            "the provider returned no hourly periods"
         );
         assert!(
-            forecast.grid.split_whitespace().count() == 2,
-            "grid {}",
-            forecast.grid
+            !forecast.daily.is_empty(),
+            "the provider returned no daily periods"
         );
         assert!(
-            !forecast.provider_location.is_empty(),
-            "the provider named no forecast area"
+            forecast.timezone.contains("Chicago"),
+            "forecast timezone {}",
+            forecast.timezone
+        );
+        assert!(
+            (forecast.current.temperature > -80.0 && forecast.current.temperature < 140.0),
+            "current temperature {} {}",
+            forecast.current.temperature,
+            forecast.current.unit
         );
         assert!(
             forecast
-                .updated
-                .as_deref()
-                .is_some_and(|value| !value.is_empty()),
-            "the provider supplied no issue time"
+                .daily
+                .iter()
+                .all(|period| period.minimum.is_some_and(|low| low <= period.temperature)),
+            "every daily low must not exceed its high"
+        );
+        Ok(())
+    }
+
+    /// The same provider serves places outside the United States.
+    #[test]
+    fn a_non_united_states_place_gets_a_live_forecast() -> Result<(), TestError> {
+        let place = Place::new("Dublin", "Leinster", "Ireland", "ie", 53.349_8, -6.260_3)?;
+        let forecast = fetch(&place)?;
+        assert_eq!(forecast.provider, "Open-Meteo");
+        assert!(
+            !forecast.daily.is_empty(),
+            "Dublin received no daily periods"
         );
         Ok(())
     }

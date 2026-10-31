@@ -2400,6 +2400,7 @@ dependencies = [
  "eframe",
  "geographiclib-rs",
  "nexrad-decode",
+ "quick-xml",
  "serde_json",
  "sha2",
  "ureq",

@@ -428,7 +428,7 @@ impl Site {
 
 Found on the first `DigitalRadarData` message where `header.radial_status == 0` (ElevationStart) or `header.radial_status == 3` (VolumeScanStart). Cast to f64 for projection calls: `volume_data_block.latitude as f64`, `volume_data_block.longitude as f64`.
 
-Rendering uses the volume header coordinates. The source catalog supplies coordinates for site selection and the catalog-versus-header diagnostic described in ROADMAP.md.
+Rendering uses the volume header coordinates. Runtime-discovered station metadata supplies coordinates for site selection and for the catalog-versus-header diagnostic. There is no bundled site catalog.
 
 ---
 

@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use crate::error::{
-    CatalogError, ColorMapError, CoordinateError, MomentError, RadarError, RenderError, SiteIdError,
+    ColorMapError, CoordinateError, MomentError, RadarError, RenderError, SiteIdError,
 };
 use crate::forecast::ForecastError;
 use crate::place::PlaceError;
@@ -12,7 +12,6 @@ use crate::provider::JsonError;
 pub enum TestError {
     Message(String),
     SiteId(SiteIdError),
-    Catalog(CatalogError),
     Coordinate(CoordinateError),
     Moment(MomentError),
     Render(RenderError),
@@ -29,7 +28,6 @@ impl Display for TestError {
         match self {
             Self::Message(message) => formatter.write_str(message),
             Self::SiteId(error) => Display::fmt(error, formatter),
-            Self::Catalog(error) => Display::fmt(error, formatter),
             Self::Coordinate(error) => Display::fmt(error, formatter),
             Self::Moment(error) => Display::fmt(error, formatter),
             Self::Render(error) => Display::fmt(error, formatter),
@@ -47,7 +45,6 @@ impl Error for TestError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::SiteId(error) => Some(error),
-            Self::Catalog(error) => Some(error),
             Self::Coordinate(error) => Some(error),
             Self::Moment(error) => Some(error),
             Self::Render(error) => Some(error),
@@ -77,12 +74,6 @@ impl From<String> for TestError {
 impl From<SiteIdError> for TestError {
     fn from(value: SiteIdError) -> Self {
         Self::SiteId(value)
-    }
-}
-
-impl From<CatalogError> for TestError {
-    fn from(value: CatalogError) -> Self {
-        Self::Catalog(value)
     }
 }
 

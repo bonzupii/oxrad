@@ -101,59 +101,6 @@ impl Display for SiteIdError {
 
 impl Error for SiteIdError {}
 
-/// A defect in the bundled site catalog, which is fixed at build time.
-#[derive(Debug)]
-pub enum CatalogError {
-    Empty,
-    Fields { line: usize },
-    Identifier { line: usize, source: SiteIdError },
-    Name { line: usize },
-    Number { line: usize },
-    Latitude { line: usize, lat: f64 },
-    Longitude { line: usize, lon: f64 },
-    Duplicate { line: usize, id: String },
-}
-
-impl CatalogError {
-    fn message(&self) -> String {
-        match self {
-            Self::Empty => String::from("The radar site catalog is empty."),
-            Self::Fields { line } => {
-                format!("Catalog line {line} does not hold four tab-separated fields.")
-            }
-            Self::Identifier { line, source } => {
-                format!("Catalog line {line} has an invalid identifier: {source}")
-            }
-            Self::Name { line } => format!("Catalog line {line} has an empty name."),
-            Self::Number { line } => {
-                format!("Catalog line {line} has a coordinate that is not a number.")
-            }
-            Self::Latitude { line, lat } => {
-                format!("Catalog line {line} has latitude {lat}, outside -90 to 90.")
-            }
-            Self::Longitude { line, lon } => {
-                format!("Catalog line {line} has longitude {lon}, outside -180 to 180.")
-            }
-            Self::Duplicate { line, id } => format!("Catalog line {line} repeats site {id}."),
-        }
-    }
-}
-
-impl Display for CatalogError {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.message())
-    }
-}
-
-impl Error for CatalogError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Identifier { source, .. } => Some(source),
-            _ => None,
-        }
-    }
-}
-
 /// A failure reading or writing the application directory.
 #[derive(Debug)]
 pub enum PathError {
@@ -518,6 +465,10 @@ pub enum RadarError {
     ListingBody {
         prefix: String,
     },
+    ListingXml {
+        prefix: String,
+        source: quick_xml::Error,
+    },
     NoVolume {
         site: String,
     },
@@ -621,9 +572,8 @@ impl RadarError {
             Self::ListingBody { prefix } => {
                 format!("The listing for {prefix} is not UTF-8 text.")
             }
-            Self::NoVolume { site } => {
-                format!("No volume was listed for {site} in the last three days.")
-            }
+            Self::ListingXml { prefix, source } => format!("{prefix} listing is not XML: {source}"),
+            Self::NoVolume { site } => format!("No {site} volume in the last three days."),
             Self::ArchiveVersion { key, version } => {
                 format!("{key} declares {version:?}, which is not AR2V.")
             }
@@ -719,6 +669,7 @@ impl Error for RadarError {
             Self::MessageStructure { defect, .. } => Some(defect),
             Self::SiteCoordinates { source } => Some(source),
             Self::GateRange { source, .. } => Some(source),
+            Self::ListingXml { source, .. } => Some(source),
             Self::IncompleteVolume { defect, .. } => Some(defect),
             Self::Clock { source } => Some(source),
             Self::DateRange { source } => Some(source),

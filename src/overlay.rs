@@ -13,11 +13,12 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
-//! Grid, range rings, and the reflectivity legend.
+//! Grid, range rings, and the active product legend.
 
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Stroke, Vec2};
 
-use crate::colormap::{MAX_REFLECTIVITY_DBZ, MIN_REFLECTIVITY_DBZ, color_for_reflectivity};
+use crate::colormap::color_for_product;
+use crate::product::RadarProduct;
 use crate::render::{RadarGeometry, ViewTransform};
 
 const GRID_COLOR: Color32 = Color32::from_rgb(90, 100, 114);
@@ -65,17 +66,22 @@ pub fn draw_rings(painter: &egui::Painter, geometry: &RadarGeometry, transform: 
     }
 }
 
-fn legend_colour(fraction: f32) -> Result<[u8; 4], crate::error::ColorMapError> {
-    let value = MAX_REFLECTIVITY_DBZ - fraction * (MAX_REFLECTIVITY_DBZ - MIN_REFLECTIVITY_DBZ);
-    color_for_reflectivity(value)
+fn legend_colour(
+    product: RadarProduct,
+    fraction: f32,
+) -> Result<[u8; 4], crate::error::ColorMapError> {
+    let (minimum, maximum) = product.value_range();
+    let value = maximum - fraction * (maximum - minimum);
+    color_for_product(product, value)
 }
 
-pub fn draw_legend(painter: &egui::Painter, rect: Rect) {
+pub fn draw_legend(painter: &egui::Painter, rect: Rect, product: RadarProduct) {
+    let (minimum, maximum) = product.value_range();
+    let range = maximum - minimum;
     let x = rect.right() - 42.0;
     let top = rect.top() + 32.0;
     let height = LEGEND_HEIGHT.min((rect.height() - 72.0).max(20.0));
     let band_height = height / LEGEND_BANDS as f32;
-    let range = MAX_REFLECTIVITY_DBZ - MIN_REFLECTIVITY_DBZ;
     painter.rect_filled(
         Rect::from_min_max(
             Pos2::new(x - 42.0, top - 28.0),
@@ -87,13 +93,13 @@ pub fn draw_legend(painter: &egui::Painter, rect: Rect) {
     painter.text(
         Pos2::new(x + LEGEND_WIDTH / 2.0, top - 10.0),
         Align2::CENTER_BOTTOM,
-        "dBZ",
-        FontId::monospace(11.0),
+        format!("{} {}", product.id(), product.unit()),
+        FontId::monospace(10.0),
         TEXT_COLOR,
     );
     for index in 0..LEGEND_BANDS {
         let fraction = (index as f32 + 0.5) / LEGEND_BANDS as f32;
-        let rgba = match legend_colour(fraction) {
+        let rgba = match legend_colour(product, fraction) {
             Ok(value) => value,
             Err(error) => {
                 painter.text(
@@ -114,22 +120,13 @@ pub fn draw_legend(painter: &egui::Painter, rect: Rect) {
             colour,
         );
     }
-    for (value, label) in [
-        (MAX_REFLECTIVITY_DBZ, format!("{MAX_REFLECTIVITY_DBZ:.1}")),
-        (75.0, String::from("75")),
-        (60.0, String::from("60")),
-        (50.0, String::from("50")),
-        (35.0, String::from("35")),
-        (20.0, String::from("20")),
-        (0.0, String::from("0")),
-        (MIN_REFLECTIVITY_DBZ, format!("{MIN_REFLECTIVITY_DBZ:.0}")),
-    ] {
-        let fraction = (MAX_REFLECTIVITY_DBZ - value) / range;
+    for fraction in [0.0_f32, 0.25, 0.5, 0.75, 1.0] {
+        let value = maximum - fraction * range;
         let y = top + height * fraction;
         painter.text(
             Pos2::new(x - 4.0, y),
             Align2::RIGHT_CENTER,
-            label,
+            format!("{value:.1}"),
             FontId::monospace(10.0),
             TEXT_COLOR,
         );

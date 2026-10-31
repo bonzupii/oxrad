@@ -10,11 +10,14 @@ No banned code pattern receives an exception. A banned pattern that appears requ
 
 ## Gates
 
-Both must pass before any milestone is considered complete. There are no partial completions.
+All of these must pass before a delivery is considered complete.
 
 ```
+cargo fmt --all -- --check
 cargo clippy -- -D warnings
 cargo test
+cargo build
+cargo build --release --locked
 ```
 
 The lint set is the `[lints]` table in `Cargo.toml` and the thresholds in `clippy.toml`. `#[allow]` is not available.
@@ -57,7 +60,7 @@ Ownership resolution order: `&T` → `&mut T` → move `T`. `clone()` to satisfy
 
 ## Structure
 
-Edition 2024. One module per logical concern, named files (`radar.rs`, `tiles.rs`), no `mod.rs`. `main.rs` holds argument parsing and app construction. No unlisted dependency without asking. Implement only the current milestone: no stubs, no scaffolding ahead.
+Edition 2024. One module per logical concern, named files (`radar.rs`, `tiles.rs`), no `mod.rs`. `main.rs` holds argument parsing and app construction. No unlisted dependency without asking. Implement the complete behavior of each control and data path. A stub, dead control, placeholder adapter, or documentation-only capability is prohibited regardless of phase labels.
 
 ## Radar Data Integrity
 

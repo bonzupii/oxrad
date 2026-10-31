@@ -23,16 +23,16 @@ use eframe::egui::{
 
 use crate::config::{self, Config};
 use crate::display::{Display, DisplayState, Frame};
-use crate::error::CatalogError;
 use crate::forecast::{Forecast, ForecastError, ForecastFeed, ForecastOutcome, ForecastPeriod};
 use crate::gpu::RadarGpu;
 use crate::overlay;
 use crate::pipeline::{Pipeline, PipelineState};
 use crate::place::{self, Place, PlaceSearch, SearchOutcome};
+use crate::product::RadarProduct;
 use crate::provider::{JsonError, timestamp_label};
 use crate::radar::GateValue;
 use crate::render::{self, ViewTransform};
-use crate::stations::{self, SiteId, Station};
+use crate::stations::{self, SiteId, Station, StationError, StationFeed, StationOutcome};
 use crate::time;
 
 const BACKGROUND: Color32 = Color32::from_rgb(8, 10, 14);
@@ -51,6 +51,13 @@ const SEARCH_ROW_HEIGHT: f32 = 34.0;
 const STATION_LIST_HEIGHT: f32 = 220.0;
 const FORECAST_RETRY_BASE_SECS: u64 = 2;
 const FORECAST_RETRY_MAX_SECS: u64 = 60;
+const STATION_REFRESH_SECS: u64 = 6 * 60 * 60;
+const STATION_RETRY_SECS: u64 = 15 * 60;
+
+fn due_after(delay: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(delay).unwrap_or(now)
+}
 
 fn forecast_retry_delay(error: &ForecastError, attempt: u32) -> Duration {
     if let Some(value) = error.retry_after()
@@ -82,10 +89,6 @@ enum ForecastState {
     Ready {
         forecast: Forecast,
     },
-    Unsupported {
-        place: Place,
-        reason: String,
-    },
     Failed {
         place: Place,
         error: ForecastError,
@@ -96,7 +99,10 @@ enum ForecastState {
 }
 
 pub struct OxradApp {
-    stations: Result<Vec<Station>, CatalogError>,
+    stations: Result<Vec<Station>, StationError>,
+    station_feed: StationFeed,
+    station_refresh_due: Instant,
+    pending_site: Option<SiteId>,
     config: Config,
     config_writable: bool,
     notice: Option<String>,
@@ -109,6 +115,7 @@ pub struct OxradApp {
     display: Display,
     forecast: ForecastFeed,
     forecast_state: ForecastState,
+    product: RadarProduct,
     station_query: String,
     station_picker_open: bool,
     first_run: bool,
@@ -116,7 +123,6 @@ pub struct OxradApp {
 
 impl OxradApp {
     pub fn new(gpu: Option<RadarGpu>, initial: Option<SiteId>) -> Self {
-        let stations = stations::catalog();
         let mut config = Config::default();
         let mut config_writable = true;
         let mut notice = None;
@@ -129,8 +135,16 @@ impl OxradApp {
             }
         }
         let restored_site = initial.or_else(|| config.site.clone());
+        let stations = match stations::load_cache() {
+            Ok(Some(cached)) => Ok(cached),
+            Ok(None) => Err(StationError::NoStations),
+            Err(error) => Err(error),
+        };
         let mut app = Self {
             stations,
+            station_feed: StationFeed::new(),
+            station_refresh_due: due_after(Duration::from_secs(STATION_REFRESH_SECS)),
+            pending_site: restored_site.clone(),
             config,
             config_writable,
             notice,
@@ -143,24 +157,56 @@ impl OxradApp {
             display: Display::new(gpu),
             forecast: ForecastFeed::new(),
             forecast_state: ForecastState::Empty,
+            product: RadarProduct::Reflectivity,
             station_query: String::new(),
             station_picker_open: restored_site.is_none(),
             first_run: true,
         };
-        if let Some(id) = restored_site {
-            match &app.stations {
-                Ok(list) if stations::find(list, &id).is_some() => app.open_site(id, false),
-                Ok(_) => {
-                    app.notice = Some(format!(
-                        "Site {id} is not in the radar site catalog; choose a station."
-                    ));
-                }
-                Err(error) => {
-                    app.notice = Some(format!("Radar station catalog unavailable: {error}"));
-                }
+        if let Some(id) = restored_site
+            && let Ok(list) = &app.stations
+        {
+            if stations::find(list, &id).is_some() {
+                app.open_site(id, false);
+                app.pending_site = None;
+            } else {
+                app.notice = Some(format!(
+                    "Site {id} is not in the discovered radar source; choose a station."
+                ));
             }
         }
         app
+    }
+
+    fn apply_stations(&mut self, outcome: StationOutcome) {
+        match outcome {
+            StationOutcome::Ready(discovery) => {
+                self.station_refresh_due = due_after(Duration::from_secs(STATION_REFRESH_SECS));
+                self.stations = Ok(discovery.stations);
+                if let Some(warning) = discovery.cache_warning {
+                    self.notice = Some(format!(
+                        "Station metadata is live, but the cache was not updated: {warning}"
+                    ));
+                }
+                if self.site.is_none()
+                    && let Some(pending) = self.pending_site.clone()
+                    && let Ok(list) = &self.stations
+                    && stations::find(list, &pending).is_some()
+                {
+                    self.open_site(pending, true);
+                    self.pending_site = None;
+                }
+            }
+            StationOutcome::Failed(error) => {
+                self.station_refresh_due = due_after(Duration::from_secs(STATION_RETRY_SECS));
+                if self.stations.is_err() {
+                    self.stations = Err(error);
+                } else {
+                    self.notice = Some(format!(
+                        "Live station discovery failed; using cached station metadata: {error}"
+                    ));
+                }
+            }
+        }
     }
 
     fn open_site(&mut self, id: SiteId, persist: bool) {
@@ -218,7 +264,7 @@ impl OxradApp {
         if !place.in_united_states() {
             self.clear_site();
             self.notice = Some(format!(
-                "No radar source covers {} yet. The forecast on the right is for {}.",
+                "No supported radar source covers {}. The Open-Meteo forecast on the right is still available for {}.",
                 place.country,
                 place.label()
             ));
@@ -260,19 +306,6 @@ impl OxradApp {
     }
 
     fn start_forecast(&mut self, place: &Place, attempt: u32) {
-        if !place.in_united_states() {
-            let country = if place.country.trim().is_empty() {
-                String::from("this location")
-            } else {
-                place.country.clone()
-            };
-            let error = ForecastError::Unsupported { country };
-            self.forecast_state = ForecastState::Unsupported {
-                place: place.clone(),
-                reason: error.to_string(),
-            };
-            return;
-        }
         let last = self.remembered_forecast(place);
         match self.forecast.start(place) {
             Ok(()) => {
@@ -303,9 +336,7 @@ impl OxradApp {
                 .as_ref()
                 .filter(|forecast| forecast.place.same_place(place))
                 .cloned(),
-            ForecastState::Ready { .. }
-            | ForecastState::Empty
-            | ForecastState::Unsupported { .. } => None,
+            ForecastState::Ready { .. } | ForecastState::Empty => None,
         }
     }
 
@@ -344,7 +375,7 @@ impl OxradApp {
                         ForecastState::Loading { last, attempt, .. }
                         | ForecastState::Failed { last, attempt, .. } => (last, attempt),
                         ForecastState::Ready { forecast } => (Some(forecast), 0),
-                        ForecastState::Empty | ForecastState::Unsupported { .. } => (None, 0),
+                        ForecastState::Empty => (None, 0),
                     };
                 let retry_at = if error.is_transient() {
                     Instant::now().checked_add(forecast_retry_delay(&error, attempt))
@@ -366,9 +397,16 @@ impl OxradApp {
         if let Some(pipeline) = self.pipeline.as_mut()
             && let Some(volume) = pipeline.poll()
         {
-            self.display.submit(volume);
+            self.display.submit(volume, self.product);
         }
         self.display.poll();
+        if let Some(outcome) = self.station_feed.poll() {
+            self.apply_stations(outcome);
+        }
+        if self.station_feed.is_finished() && Instant::now() >= self.station_refresh_due {
+            self.station_feed = StationFeed::new();
+            self.station_refresh_due = due_after(Duration::from_secs(STATION_REFRESH_SECS));
+        }
         while let Some(outcome) = self.search.poll() {
             self.apply_search(outcome);
         }
@@ -385,8 +423,7 @@ impl OxradApp {
             ForecastState::Failed { .. }
             | ForecastState::Empty
             | ForecastState::Loading { .. }
-            | ForecastState::Ready { .. }
-            | ForecastState::Unsupported { .. } => None,
+            | ForecastState::Ready { .. } => None,
         };
         if let Some((place, attempt)) = retry {
             self.start_forecast(&place, attempt);
@@ -512,6 +549,7 @@ impl OxradApp {
                         ui.separator();
                         ui.add_space(12.0);
                         self.station_section(ui);
+                        self.product_section(ui);
                         if let Some(notice) = &self.notice {
                             ui.add_space(12.0);
                             ui.colored_label(STALE, notice);
@@ -609,6 +647,93 @@ impl OxradApp {
             });
     }
 
+    fn product_section(&mut self, ui: &mut egui::Ui) {
+        let capabilities: Vec<RadarProduct> = self
+            .site_station()
+            .map(|station| station.capabilities().to_vec())
+            .unwrap_or_default();
+        if capabilities.is_empty() {
+            return;
+        }
+        ui.add_space(12.0);
+        ui.label(RichText::new("Product and tilt").size(12.0).color(MUTED));
+        ui.add_space(4.0);
+        let available_products: Vec<RadarProduct> = self
+            .display
+            .frame
+            .as_ref()
+            .map(|frame| {
+                RadarProduct::ALL
+                    .into_iter()
+                    .filter(|product| frame.volume.supports_product(*product))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut requested_product = None;
+        ui.horizontal_wrapped(|ui| {
+            for product in &capabilities {
+                let available =
+                    available_products.is_empty() || available_products.contains(product);
+                let selected = *product == self.product;
+                let label = format!("{} {}", product.id(), product.unit());
+                let button = ui.add_enabled(
+                    available,
+                    egui::Button::new(label).fill(if selected { HIGHLIGHT } else { CARD }),
+                );
+                let button = if available {
+                    button.on_hover_text(product.description())
+                } else {
+                    button.on_disabled_hover_text("Not carried by this sweep.")
+                };
+                if button.clicked() {
+                    requested_product = Some(*product);
+                }
+            }
+        });
+        let tilt_options: Vec<(u8, f64, bool)> = self
+            .display
+            .frame
+            .as_ref()
+            .map(|frame| frame.volume.tilt_options_for(self.product))
+            .unwrap_or_default();
+        let mut requested_tilt = None;
+        if tilt_options.is_empty() {
+            ui.label(
+                RichText::new("Tilts appear when a volume is loaded.")
+                    .size(10.0)
+                    .color(MUTED),
+            );
+        } else {
+            ui.label(RichText::new("Tilt").size(11.0).color(MUTED));
+            ui.horizontal_wrapped(|ui| {
+                for (number, elevation, selected) in tilt_options {
+                    let label = format!("{number} · {elevation:.2}°");
+                    if ui
+                        .add(egui::Button::new(label).fill(if selected { HIGHLIGHT } else { CARD }))
+                        .clicked()
+                        && !selected
+                    {
+                        requested_tilt = Some(number);
+                    }
+                }
+            });
+        }
+        if let Some(product) = requested_product {
+            self.product = product;
+            if self.display.frame.is_some() && !self.display.rebuild(product, requested_tilt) {
+                self.notice = Some(String::from(
+                    "That product and tilt could not be prepared from the displayed volume.",
+                ));
+            }
+        } else if let Some(number) = requested_tilt
+            && !self.display.rebuild(self.product, Some(number))
+        {
+            self.notice = Some(String::from(
+                "That tilt is not available in the displayed volume.",
+            ));
+        }
+    }
+
     fn station_section(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new("Radar station").size(12.0).color(MUTED));
         ui.add_space(4.0);
@@ -635,11 +760,7 @@ impl OxradApp {
                         .color(MUTED),
                     );
                 }
-                ui.label(
-                    RichText::new("Radar observations come from this station, not from your town.")
-                        .size(10.0)
-                        .color(MUTED),
-                );
+                station_details(ui, station);
             }
             _ => {
                 ui.label(RichText::new("No radar station selected").size(13.0));
@@ -649,9 +770,12 @@ impl OxradApp {
             && !place.in_united_states()
         {
             ui.label(
-                RichText::new(format!("No radar source covers {} yet.", place.country))
-                    .size(11.0)
-                    .color(MUTED),
+                RichText::new(format!(
+                    "No supported radar source covers {}.",
+                    place.country
+                ))
+                .size(11.0)
+                .color(MUTED),
             );
         }
         ui.add_space(8.0);
@@ -745,10 +869,6 @@ impl OxradApp {
                             );
                         });
                     }
-                    ForecastState::Unsupported { place, reason } => {
-                        ui.label(RichText::new(place.label()).size(14.0).strong());
-                        ui.colored_label(STALE, reason);
-                    }
                     ForecastState::Failed {
                         place,
                         error,
@@ -836,10 +956,19 @@ impl OxradApp {
             ui.horizontal_wrapped(|ui| {
                 match (&self.site, self.site_station()) {
                     (Some(site), Some(station)) => {
-                        ui.strong(format!("{site} · {} · Base reflectivity", station.name));
+                        ui.strong(format!(
+                            "{site} · {} · {} ({})",
+                            station.name,
+                            self.product.label(),
+                            self.product.id()
+                        ));
                     }
                     (Some(site), None) => {
-                        ui.strong(format!("{site} · Base reflectivity"));
+                        ui.strong(format!(
+                            "{site} · {} ({})",
+                            self.product.label(),
+                            self.product.id()
+                        ));
                     }
                     (None, _) => {
                         ui.strong("No radar station");
@@ -947,7 +1076,7 @@ impl OxradApp {
         }
         overlay::draw_grid(ui.painter(), &frame.geometry, &transform);
         overlay::draw_rings(ui.painter(), &frame.geometry, &transform);
-        overlay::draw_legend(ui.painter(), rect);
+        overlay::draw_legend(ui.painter(), rect, frame.geometry.product);
         if let Some(place) = &self.place {
             draw_place_marker(ui.painter(), frame, &transform, viewport, rect, place);
         }
@@ -992,10 +1121,10 @@ impl OxradApp {
                 ],
             ),
             (Some(place), None, _) if !place.in_united_states() => (
-                "No radar source covers this place yet",
+                "No supported radar source covers this place",
                 vec![
                     format!("The forecast on the right is for {}.", place.label()),
-                    String::from("Radar coverage will expand as sources are added."),
+                    String::from("Radar coverage is limited to the sources currently configured."),
                 ],
             ),
             (Some(place), None, _) => (
@@ -1042,10 +1171,91 @@ impl OxradApp {
     }
 }
 
+fn station_details(ui: &mut egui::Ui, station: &Station) {
+    let capabilities: Vec<&str> = station
+        .capabilities()
+        .iter()
+        .map(|product| product.label())
+        .collect();
+    let dual_polarization = station
+        .supports(crate::product::RadarProduct::DifferentialReflectivity)
+        && station
+            .capabilities()
+            .iter()
+            .any(|product| product.is_dual_polarization());
+    ui.label(
+        RichText::new(format!(
+            "{} · {} · {}{}",
+            station.source.label(),
+            station.kind.label(),
+            if capabilities.is_empty() {
+                String::from("no supported products")
+            } else {
+                capabilities.join(", ")
+            },
+            if dual_polarization {
+                " · dual-polarization"
+            } else {
+                ""
+            }
+        ))
+        .size(10.0)
+        .color(MUTED),
+    )
+    .on_hover_text(
+        station
+            .capabilities()
+            .iter()
+            .map(|product| {
+                let (minimum, maximum) = product.value_range();
+                format!(
+                    "{} ({} to {} {}): {}",
+                    product.id(),
+                    minimum,
+                    maximum,
+                    product.unit(),
+                    product.description()
+                )
+            })
+            .collect::<Vec<String>>()
+            .join("\n"),
+    );
+    if let Some(elevation) = station.elevation_m {
+        ui.label(
+            RichText::new(format!("Site elevation {elevation:.0} m"))
+                .size(10.0)
+                .color(MUTED),
+        );
+    }
+    if let Some(status) = &station.status {
+        ui.label(
+            RichText::new(format!("RDA status: {status}"))
+                .size(10.0)
+                .color(MUTED),
+        );
+    }
+    if let Some(last_data) = &station.last_data {
+        ui.label(
+            RichText::new(format!("Level II last received: {last_data}"))
+                .size(10.0)
+                .color(MUTED),
+        );
+    }
+    ui.label(
+        RichText::new(format!(
+            "Source {} via {}. Radar observations come from this station, not from your town.",
+            station.source.id(),
+            station.source.provider()
+        ))
+        .size(10.0)
+        .color(MUTED),
+    );
+}
+
 fn search_results(
     ui: &mut egui::Ui,
     places: &[Place],
-    stations: &Result<Vec<Station>, CatalogError>,
+    stations: &Result<Vec<Station>, StationError>,
 ) -> Option<Place> {
     if places.is_empty() {
         ui.colored_label(STALE, "No place matches that search. Check the spelling.");
@@ -1068,7 +1278,7 @@ fn search_results(
                     Ok(None) => format!("{} · no radar source", place.country),
                     Err(error) => format!("{} · {error}", place.country),
                 },
-                Err(error) => format!("{} · station catalog unavailable: {error}", place.country),
+                Err(error) => format!("{} · station feed unavailable: {error}", place.country),
             }
         };
         let label = format!("{}\n{}", place.label(), detail);
@@ -1103,33 +1313,61 @@ fn forecast_body(ui: &mut egui::Ui, forecast: &Forecast, stale: bool) {
         ui.colored_label(STALE, "Stale forecast");
     }
     ui.add_space(4.0);
-    let updated = forecast.updated.as_deref().map_or_else(
-        || String::from("Issue time unavailable"),
-        |text| format!("Updated {}", timestamp_label(text)),
-    );
     ui.label(
         RichText::new(format!(
-            "National Weather Service · {updated} · grid {}",
-            forecast.grid
+            "{} · {} ({}) · {}",
+            forecast.provider,
+            forecast.timezone,
+            forecast.timezone_abbreviation,
+            timestamp_label(&forecast.current.observed)
         ))
         .size(10.0)
         .color(MUTED),
     );
-    if !forecast.provider_location.is_empty() {
-        ui.label(
-            RichText::new(format!("Forecast area: {}", forecast.provider_location))
-                .size(10.0)
-                .color(MUTED),
-        );
-    }
     ui.separator();
+    ui.label(RichText::new("Now").size(12.0).strong().color(TEXT));
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            RichText::new(format!(
+                "{:.0} {}",
+                forecast.current.temperature, forecast.current.unit
+            ))
+            .size(20.0)
+            .strong(),
+        );
+        ui.label(
+            RichText::new(&forecast.current.short)
+                .size(12.0)
+                .color(TEXT),
+        );
+    });
+    ui.label(
+        RichText::new(format!(
+            "Feels {:.0} {} · humidity {:.0}% · {} · precipitation {:.1} mm",
+            forecast.current.apparent,
+            forecast.current.unit,
+            forecast.current.humidity,
+            forecast.current.wind,
+            forecast.current.precipitation
+        ))
+        .size(10.0)
+        .color(MUTED),
+    );
+    ui.add_space(6.0);
+    ui.separator();
+    ui.label(RichText::new("Hourly").size(12.0).strong().color(TEXT));
     let list_height = (ui.available_height() - 8.0).max(80.0);
     egui::ScrollArea::vertical()
         .max_height(list_height)
         .auto_shrink([false, false])
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
         .show(ui, |ui| {
-            for period in &forecast.periods {
+            for period in &forecast.hourly {
+                forecast_period(ui, period);
+            }
+            ui.add_space(6.0);
+            ui.label(RichText::new("Daily").size(12.0).strong().color(TEXT));
+            for period in &forecast.daily {
                 forecast_period(ui, period);
             }
         });
@@ -1138,22 +1376,25 @@ fn forecast_body(ui: &mut egui::Ui, forecast: &Forecast, stale: bool) {
 fn forecast_period(ui: &mut egui::Ui, period: &ForecastPeriod) {
     ui.label(RichText::new(&period.name).size(12.0).strong().color(TEXT));
     ui.horizontal_wrapped(|ui| {
-        ui.label(
-            RichText::new(format!("{:.0} {}", period.temperature, period.unit))
-                .size(17.0)
-                .strong(),
+        let temperature = period.minimum.map_or_else(
+            || format!("{:.0} {}", period.temperature, period.unit),
+            |minimum| format!("{:.0}/{:.0} {}", period.temperature, minimum, period.unit),
         );
+        ui.label(RichText::new(temperature).size(17.0).strong());
         ui.label(RichText::new(&period.short).size(12.0).color(TEXT));
     });
     let precipitation = period
         .precipitation
         .map_or_else(String::new, |chance| format!(" · {chance}% precipitation"));
+    let wind = if period.wind.is_empty() {
+        String::new()
+    } else {
+        format!(" · wind {}", period.wind)
+    };
     ui.label(
         RichText::new(format!(
-            "{} · wind {}{}",
-            timestamp_label(&period.start),
-            period.wind,
-            precipitation
+            "{}{wind}{precipitation}",
+            timestamp_label(&period.start)
         ))
         .size(10.0)
         .color(MUTED),
@@ -1252,9 +1493,14 @@ fn draw_place_marker(
 }
 
 fn map_caption(painter: &egui::Painter, rect: Rect, frame: &Frame) {
+    let product = frame.geometry.product;
     let label = format!(
-        "{} · Base reflectivity · tilt {} at {:.2}°",
-        frame.volume.site, frame.volume.sweep.elevation_number, frame.volume.sweep.elevation_deg
+        "{} · {} ({}) · tilt {} at {:.2}°",
+        frame.volume.site,
+        product.label(),
+        product.id(),
+        frame.volume.sweep.elevation_number,
+        frame.volume.sweep.elevation_deg
     );
     painter.text(
         Pos2::new(rect.left() + 16.0, rect.top() + 14.0),
@@ -1312,15 +1558,27 @@ fn scan_status(ui: &mut egui::Ui, frame: &Frame, failed: bool) {
 
 fn diagnostics(ui: &mut egui::Ui, frame: &Frame, catalog: Option<&Station>) {
     let volume = &frame.volume;
+    let product = frame.geometry.product;
+    let (gates, below, folded) = volume
+        .sweep
+        .radials
+        .iter()
+        .filter_map(|radial| radial.moment(product))
+        .fold((0_usize, 0_usize, 0_usize), |counts, moment| {
+            (
+                counts.0.saturating_add(moment.values.len()),
+                counts.1.saturating_add(moment.below_threshold),
+                counts.2.saturating_add(moment.range_folded),
+            )
+        });
+    let radials = volume.sweep.radials.len();
+    let total_gates = volume.sweep.gate_count();
+    let max_range = volume.sweep.max_ground_range_km;
+    let skipped = volume.skipped_radials;
+    let non_data = volume.skipped_non_data;
+    let id = product.id();
     let text = format!(
-        "{} radials · {} gates · {} below threshold · {} range folded · {:.0} km · Skipped radials: {} · Non-data messages: {}",
-        volume.sweep.radials.len(),
-        volume.sweep.gate_count(),
-        volume.sweep.below_threshold,
-        volume.sweep.range_folded,
-        volume.sweep.max_ground_range_km,
-        volume.skipped_radials,
-        volume.skipped_non_data
+        "{radials} radials · {total_gates} gates total · {gates} {id} gates · {below} below threshold · {folded} range folded · {max_range:.0} km · Skipped radials: {skipped} · Non-data messages: {non_data}"
     );
     let catalog_note =
         catalog.map_or_else(String::new, |station| {
@@ -1340,14 +1598,14 @@ fn diagnostics(ui: &mut egui::Ui, frame: &Frame, catalog: Option<&Station>) {
     } else {
         ui.label(RichText::new(text).size(10.0).color(MUTED));
     }
-    if let Some(error) = &volume.moment_error {
-        ui.colored_label(STALE, format!("Rejected reflectivity radial: {error}"));
+    if let Some((product, error)) = &volume.moment_error {
+        ui.colored_label(STALE, format!("Rejected {} radial: {error}", product.id()));
     }
 }
 
-fn gate_label(value: Option<GateValue>) -> String {
+fn gate_label(value: Option<GateValue>, product: RadarProduct) -> String {
     match value {
-        Some(GateValue::Measured(dbz)) => format!("{dbz:.1} dBZ"),
+        Some(GateValue::Measured(value)) => format!("{value:.2} {}", product.unit()),
         Some(GateValue::BelowThreshold) => String::from("below threshold"),
         Some(GateValue::RangeFolded) => String::from("range folded"),
         None => String::from("no radar data"),
@@ -1376,6 +1634,7 @@ fn readout(ui: &egui::Ui, frame: &Frame, transform: &ViewTransform, viewport: Re
         }
     };
     let (value, site) = if viewport.contains(position) {
+        let product = frame.geometry.product;
         let value = match frame
             .geometry
             .lookup
@@ -1383,10 +1642,10 @@ fn readout(ui: &egui::Ui, frame: &Frame, transform: &ViewTransform, viewport: Re
         {
             Ok(Some(hit)) => format!(
                 "{} · {:.2}° beam",
-                gate_label(Some(hit.value)),
+                gate_label(Some(hit.value), product),
                 hit.elevation_deg
             ),
-            Ok(None) => gate_label(None),
+            Ok(None) => gate_label(None, product),
             Err(error) => format!("readout unavailable: {error}"),
         };
         (value, format!("{}: ", frame.volume.site))

@@ -70,19 +70,26 @@ pub fn mercator(lat: f64, lon: f64) -> Result<(f64, f64), CoordinateError> {
     if !(-MERCATOR_LIMIT_DEG..=MERCATOR_LIMIT_DEG).contains(&lat) {
         return Err(CoordinateError::MercatorLatitude { lat });
     }
+    let lon = normalize_lon(lon).to_radians();
     let lat = lat.to_radians();
     Ok((
-        MERCATOR_RADIUS_KM * lon.to_radians(),
+        MERCATOR_RADIUS_KM * lon,
         MERCATOR_RADIUS_KM * (std::f64::consts::FRAC_PI_4 + lat / 2.0).tan().ln(),
     ))
 }
 
 pub fn mercator_inverse(x: f64, y: f64) -> Result<(f64, f64), CoordinateError> {
+    if !x.is_finite() || !y.is_finite() {
+        return Err(CoordinateError::MercatorLatitude { lat: y });
+    }
     let lon = normalize_lon((x / MERCATOR_RADIUS_KM).to_degrees());
     let lat =
         (2.0 * (y / MERCATOR_RADIUS_KM).exp().atan() - std::f64::consts::FRAC_PI_2).to_degrees();
     validate_lat(lat)?;
     validate_lon(lon)?;
+    if !(-MERCATOR_LIMIT_DEG..=MERCATOR_LIMIT_DEG).contains(&lat) {
+        return Err(CoordinateError::MercatorLatitude { lat });
+    }
     Ok((lat, lon))
 }
 
@@ -92,8 +99,9 @@ pub fn mercator_wrap_delta(x: f64) -> f64 {
 }
 
 fn normalize_lon(lon: f64) -> f64 {
-    let wrapped = (lon + 180.0).rem_euclid(360.0) - 180.0;
-    if wrapped == -180.0 { 180.0 } else { wrapped }
+    // Web Mercator puts -180 and +180 on opposite edges. The western edge is
+    // canonical so an antimeridian crossing never jumps a full world width.
+    (lon + 180.0).rem_euclid(360.0) - 180.0
 }
 
 pub struct GeodesicPath {
@@ -121,6 +129,7 @@ impl GeodesicPath {
             self.line
                 ._gen_position(false, range_km * METERS_PER_KM, mask);
         validate_lat(lat)?;
+        let lon = normalize_lon(lon);
         validate_lon(lon)?;
         Ok((lat, lon))
     }
@@ -344,6 +353,50 @@ mod tests {
                 ROUND_TRIP_AZIMUTH_TOLERANCE_DEG,
             )?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn antimeridian_uses_the_western_edge() -> Result<(), TestFailure> {
+        let (west, _) = mercator(0.0, -180.0)?;
+        let (east, _) = mercator(0.0, 180.0)?;
+        let world_width = 2.0 * std::f64::consts::PI * MERCATOR_RADIUS_KM;
+        expect_within("west x", -world_width / 2.0, west, 1e-9)?;
+        expect_within("east x", -world_width / 2.0, east, 1e-9)?;
+        let (_, lon) = mercator_inverse(west, 0.0)?;
+        expect_within("inverse west longitude", -180.0, lon, 1e-12)
+    }
+
+    #[test]
+    fn mercator_rejects_coordinates_outside_its_domain() {
+        assert!(matches!(
+            mercator(86.0, 0.0),
+            Err(CoordinateError::MercatorLatitude { lat }) if lat == 86.0
+        ));
+        let outside = MERCATOR_RADIUS_KM * std::f64::consts::PI * 2.0;
+        assert!(matches!(
+            mercator_inverse(0.0, outside),
+            Err(CoordinateError::MercatorLatitude { .. })
+        ));
+        assert!(matches!(
+            mercator_inverse(f64::INFINITY, 0.0),
+            Err(CoordinateError::MercatorLatitude { .. })
+        ));
+    }
+
+    #[test]
+    fn polar_geodesics_are_finite() -> Result<(), TestFailure> {
+        let (range_km, azimuth_deg) = inverse(0.0, 0.0, 0.0, 180.0)?;
+        expect_within("antipodal range km", 20_003.93, range_km, 1.0)?;
+        expect_within("antipodal bearing range", 0.0, azimuth_deg, 360.0)?;
+        let (lat, lon) = forward(0.0, 0.0, SITE_LAT, SITE_LON)?;
+        expect_within("zero range latitude", SITE_LAT, lat, 1e-12)?;
+        expect_within("zero range longitude", SITE_LON, lon, 1e-12)?;
+        let (lat, lon) = forward(1.0e-4, 90.0, SITE_LAT, SITE_LON)?;
+        assert!(
+            lat.is_finite() && lon.is_finite(),
+            "near point {lat}, {lon}"
+        );
         Ok(())
     }
 

@@ -60,17 +60,17 @@ pub struct RadarGpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
-    frame_uniform: wgpu::Buffer,
-    frame_bind_group: wgpu::BindGroup,
 }
 
-/// Uploaded buffers for one volume's mesh.
+/// Uploaded buffers and transform for one volume's mesh.
 pub struct RadarMesh {
     pipeline: wgpu::RenderPipeline,
     frame_bind_group: wgpu::BindGroup,
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     index_count: u32,
+    /// Kept alive with its bind group so another mesh cannot overwrite its scale.
+    _uniform: wgpu::Buffer,
 }
 
 struct RadarDraw {
@@ -136,25 +136,10 @@ impl RadarGpu {
             multiview_mask: None,
             cache: None,
         });
-        let frame_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("radar frame uniform"),
-            contents: &uniform_bytes(0.0),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-        let frame_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("radar frame bind group"),
-            layout: &pipeline.get_bind_group_layout(0),
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: frame_uniform.as_entire_binding(),
-            }],
-        });
         Self {
             device,
             queue: state.queue.clone(),
             pipeline,
-            frame_uniform,
-            frame_bind_group,
         }
     }
 
@@ -180,14 +165,30 @@ impl RadarGpu {
                 contents: &geometry.indices,
                 usage: wgpu::BufferUsages::INDEX,
             });
+        let frame_uniform = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("radar mesh uniform"),
+                contents: &uniform_bytes(scale as f32),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+        let frame_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("radar mesh bind group"),
+            layout: &self.pipeline.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: frame_uniform.as_entire_binding(),
+            }],
+        });
         self.queue
-            .write_buffer(&self.frame_uniform, 0, &uniform_bytes(scale as f32));
+            .write_buffer(&frame_uniform, 0, &uniform_bytes(scale as f32));
         Ok(RadarMesh {
             pipeline: self.pipeline.clone(),
-            frame_bind_group: self.frame_bind_group.clone(),
+            frame_bind_group,
             vertices,
             indices,
             index_count: geometry.index_count,
+            _uniform: frame_uniform,
         })
     }
 }

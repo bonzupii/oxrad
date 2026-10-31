@@ -21,6 +21,7 @@ use crate::error::PathError;
 
 const APPLICATION_DIRECTORY: &str = ".oxrad";
 const CONFIG_FILE: &str = "config.toml";
+const STATION_CACHE_FILE: &str = "stations.json";
 
 fn home_directory() -> Result<PathBuf, PathError> {
     for variable in ["HOME", "USERPROFILE"] {
@@ -41,4 +42,9 @@ pub fn application_directory() -> Result<PathBuf, PathError> {
 /// `~/.oxrad/config.toml`.
 pub fn config_file() -> Result<PathBuf, PathError> {
     Ok(application_directory()?.join(CONFIG_FILE))
+}
+
+/// `~/.oxrad/stations.json`.
+pub fn station_cache_file() -> Result<PathBuf, PathError> {
+    Ok(application_directory()?.join(STATION_CACHE_FILE))
 }

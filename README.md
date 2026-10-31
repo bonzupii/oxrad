@@ -1,16 +1,37 @@
 # oxrad
 
-Storm-chaser-grade weather radar viewer.
+Free desktop weather and radar workstation.
 
 ![Historical screenshot](screenshot.png)
 
 The screenshot is historical and does not verify the current build.
 
-oxrad is a desktop weather and radar application for everyday use, storm chasers, emergency managers, and weather spotters. It restores the last radar station, finds the nearest WSR-88D station to a searched United States town, and shows live Level II base reflectivity with a latitude/longitude grid, 50 km range rings, a dBZ legend, the scan time and its age, and a pointer readout of the gate under the cursor. The forecast panel requests the National Weather Service forecast for the town's exact coordinates. Radar and forecast remain separate: the radar station and the forecast point are labeled independently.
+oxrad is built for ordinary people and for storm spotters, chasers, meteorologists, and scientists. It has two separate jobs that share one window. A place search answers where the user is and what the weather will do there. A radar station answers what the radar is observing. The town and the station are separate identities throughout the data model and the interface.
 
-Forecasts use the National Weather Service and cover the United States. Places outside that coverage are identified as outside forecast service. This build is a single-station Milestone 1 display, not the full overlay stack. Do not rely on it for weather or safety decisions.
+The application is free software under GPLv3. It has no account, subscription, advertisement, or paid tier.
 
-NEXRAD is the first radar source. [ROADMAP.md](ROADMAP.md) specifies worldwide weather and radar coverage, source catalogs, forecasts, and the milestone plan.
+## What works today
+
+- Ordinary place-name search through OpenStreetMap Nominatim, with international names and Unicode. Results show the resolved place and its nearest supported radar station. The place and station remain separate: changing the station never changes the forecast point.
+- A global current, hourly, and daily forecast from Open-Meteo for the searched place. The panel shows current conditions, 24 hourly periods, seven daily periods, local timezone, units, provider, and source time. A failed refresh preserves the last good forecast and labels it as last received.
+- Runtime radar-station discovery from the National Weather Service GeoJSON endpoint. No TSV or TOML site catalog ships with the application. Successful discovery is cached at `~/.oxrad/stations.json`; a later network failure keeps the cached metadata and reports that it is cached. A saved site is opened after discovery completes.
+- Live NEXRAD Level II acquisition from the public Unidata AWS archive, bzip2 record framing, Type 31 parsing, complete volume assembly, and Archive II validation.
+- Every complete elevation sweep in a volume is retained. The tilt selector offers only sweeps that carry the selected product and moves the selected sweep into the display without cloning it.
+- All seven NEXRAD moments are decoded: base reflectivity (`DREF`), base velocity (`DVEL`), spectrum width (`DSW`), differential reflectivity (`DZDR`), correlation coefficient (`DRHO`), differential phase (`DPHI`), and specific differential phase (`DKDP`). A product is offered only when the source and the loaded volume carry it. Selecting velocity from a split-cut surveillance sweep moves to the lowest sweep that actually carries velocity.
+- Product-specific color scales and legends, radial velocity units, readouts with the selected product's units and beam elevation, scan time and age, grid, range rings, station marker, and pointer latitude/longitude/range/azimuth.
+- Honest failure states for configuration, station discovery, place search, forecast, fetch, decode, and rendering. The last good radar frame stays visible with its age; a failed refresh does not become a current-data indicator.
+- Saved site restoration from `~/.oxrad/config.toml`, and `--site KPAH` for an explicit start.
+
+## What is not implemented
+
+- Radar ingestion outside the United States. NEXRAD is the only radar adapter. There is no DWD, ECCC, BoM, JMA, CMA, IMD, Roshydromet, SMN, MetService, OPERA, or ODIM_H5 decoder yet. The station list excludes TDWR because no TDWR Level II acquisition path exists.
+- Viewport-aware multi-station acquisition, mosaics, composite products, overlap resolution, and multi-mesh rendering. The current renderer and pipeline are single-station.
+- Time history, looping, a scrubber, side-by-side panes, warning polygons, storm tracks, storm motion, map tiles, pan/zoom, measurement tools, and location-permission handling.
+- A first-run location picker. There is no onboarding overlay, and none is planned. The application opens with the saved site when one exists and normal station and place controls in the left rail.
+- Colorblind-safe palette alternatives and a light theme. The current interface is dark-only.
+- The required two independent full-system clean reviews. No separate reviewer process was available in this environment.
+
+Do not use this build for safety decisions. Radar coverage, warnings, and geographic products are incomplete.
 
 ## Running
 
@@ -18,35 +39,46 @@ NEXRAD is the first radar source. [ROADMAP.md](ROADMAP.md) specifies worldwide w
 cargo run --release
 ```
 
-The application restores the last radar station from `~/.oxrad/config.toml`. A town search sets the forecast location for the session. With no saved station it opens the station list in the left rail and the pipeline stays idle until a station is chosen. The list contains every WSR-88D site in the bundled National Weather Service catalog and filters on identifier or place name. The search field submits a town or place query to Nominatim; the result list shows each place and its nearest radar station.
+Linux needs an X11 or Wayland client library, `libxkbcommon`, and a Vulkan loader and driver for winit and wgpu. `--help` prints the command-line usage. `--site KPAH` starts with that NEXRAD site instead of the saved one.
 
-`--site KPAH` overrides the saved station, and `--help` prints the usage.
+The application stores configuration and the station cache under `~/.oxrad`.
 
-Linux needs libxkbcommon, an X11 or Wayland client library, and a Vulkan loader with a working driver, as required by winit and wgpu.
+## Data sources
 
-## Data source
+| Source | Use | Coverage | Status |
+|---|---|---|---|
+| Unidata NEXRAD Level II S3 archive | Radar volumes | United States WSR-88D | Implemented |
+| NWS `api.weather.gov/radar/stations` | Runtime station discovery | United States WSR-88D and TDWR metadata | Implemented; TDWR excluded from selection |
+| Open-Meteo forecast API | Current, hourly, daily forecast | Global | Implemented |
+| OpenStreetMap Nominatim | Place search | Global | Implemented |
 
-Volumes come from the public NEXRAD Level II archive at `unidata-nexrad-level2.s3.amazonaws.com`. Requests carry `oxrad/<version>` as their user agent and send nothing else. The volume listing is paginated to exhaustion and ordered by timestamp, and a volume is accepted only when its radials include the volume start and volume end records.
+Live station discovery is refreshed every six hours. A failed refresh keeps the cached list and retries after fifteen minutes. A failed discovery with no cache is reported in the station panel.
 
-Town search uses Nominatim at `nominatim.openstreetmap.org` with an identifying `oxrad/<version>` user agent. Searches are limited to one request per second, only the current request is allowed in flight, and successful results are cached for the session. Search results are © OpenStreetMap contributors. Forecast requests go to `api.weather.gov/points/{lat},{lon}`, then to the grid forecast URL that response supplies. Query text and forecast coordinates are not written to the error log.
-
-## Tests
-
-```
-cargo test
-```
-
-Five tests use the network, because the paths they cover use real services. One retrieves the pinned archive documented in [tests/fixtures/README.md](tests/fixtures/README.md) and verifies its size and SHA-256 before decoding it. One lists and retrieves the current KPAH volume from the live feed. One confirms that a missing volume is reported as a stale listing. One resolves a town through the live Nominatim service. One requests the live National Weather Service forecast for a United States point. Each fails when its service is unreachable. No radar archive is stored in this repository.
+Requests carry `oxrad/<version> (https://github.com/bonzupii/oxrad)` as the user agent. Place-search text and forecast coordinates are not written to logs.
 
 ## Development
 
-[ROADMAP.md](ROADMAP.md) is the architecture and development roadmap. [STYLE.md](STYLE.md) is the code and prose style guide. [AGENTS.md](AGENTS.md) holds the rules that bind changes to this repository.
+`ROADMAP.md` describes the target architecture, implemented state, and remaining work. `STYLE.md` is the code and prose guide. `AGENTS.md` binds changes to the product and engineering constraints. `API.md` records the NEXRAD crate interface. `docs/DEPENDENCIES.md` records direct dependencies and their purpose. `docs/NETWORK.md` records every network path and its limits.
 
-Both gates must pass:
+Gates:
 
 ```
+cargo fmt --all -- --check
 cargo clippy -- -D warnings
 cargo test
+cargo build
+cargo build --release --locked
 ```
 
-Licensed under GPLv3. Copyright (C) 2026 Micah Ostrow <bonzupii@protonmail.com>
+`cargo test` currently runs 99 tests. Eight use the network because the paths they cover are real services:
+
+- the pinned KPAH archive download, size check, SHA-256 check, and full decode;
+- the live KPAH listing and retrieval;
+- the missing-volume 404 path;
+- live place search;
+- live Open-Meteo forecasts for a United States place and a place outside the United States;
+- live NWS station discovery and the cache round trip.
+
+A network failure fails those tests; they are not replaced with synthetic data. No radar archive is stored in the repository.
+
+Licensed under GPLv3. Copyright (C) 2026 Micah Ostrow <bonzupii@protonmail.com>.

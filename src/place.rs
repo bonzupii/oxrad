@@ -474,7 +474,8 @@ impl PlaceSearch {
 mod tests {
     use super::*;
 
-    use crate::stations::{self, SiteId};
+    use crate::product::RadarProduct;
+    use crate::stations::{RadarSource, SiteId, Station, StationKind};
     use crate::test_support::TestError;
 
     const PADUCAH_LAT: f64 = 37.083_4;
@@ -482,8 +483,27 @@ mod tests {
     const BOWLING_GREEN_LAT: f64 = 36.990_3;
     const BOWLING_GREEN_LON: f64 = -86.443_6;
 
+    fn station(id: &str, name: &str, lat: f64, lon: f64) -> Result<Station, TestError> {
+        Ok(Station {
+            id: SiteId::parse(id)?,
+            name: String::from(name),
+            lat,
+            lon,
+            elevation_m: None,
+            kind: StationKind::Wsr88d,
+            source: RadarSource::Nexrad,
+            status: None,
+            last_data: None,
+        })
+    }
+
     fn catalog() -> Result<Vec<Station>, TestError> {
-        Ok(stations::catalog()?)
+        assert_eq!(RadarProduct::ALL.len(), 7);
+        Ok(vec![
+            station("KPAH", "Paducah", 37.068_33, -88.771_94)?,
+            station("KHPX", "Fort Campbell", 36.736_9, -87.285_0)?,
+            station("KOHX", "Nashville", 36.247_2, -86.562_5)?,
+        ])
     }
 
     fn id(code: &str) -> Result<SiteId, TestError> {

@@ -18,6 +18,9 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use quick_xml::Reader;
+use quick_xml::events::Event;
+
 use crate::error::RadarError;
 use crate::stations::SiteId;
 use crate::time::{MS_PER_DAY, civil_from_days, now_unix_ms};
@@ -90,27 +93,77 @@ fn hex_digit(value: u8) -> char {
     }
 }
 
-fn tag_values<'a>(text: &'a str, tag: &str) -> Vec<&'a str> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let mut values = Vec::new();
-    let mut remaining = text;
-    while let Some(start) = remaining.find(&open) {
-        let Some(after_open) = remaining.get(start + open.len()..) else {
-            break;
-        };
-        let Some(end) = after_open.find(&close) else {
-            break;
-        };
-        if let Some(value) = after_open.get(..end) {
-            values.push(value);
+#[derive(Default)]
+struct ListingPage {
+    keys: Vec<String>,
+    truncated: Option<bool>,
+    continuation: Option<String>,
+}
+
+fn listing_xml(prefix: &str, xml: &str) -> Result<ListingPage, RadarError> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut names: Vec<Vec<u8>> = Vec::new();
+    let mut page = ListingPage::default();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(event)) => names.push(event.name().as_ref().to_vec()),
+            Ok(Event::End(_)) => {
+                names.pop();
+            }
+            Ok(Event::Text(text)) => {
+                let value = text.decode().map_err(|source| RadarError::ListingXml {
+                    prefix: String::from(prefix),
+                    source: source.into(),
+                })?;
+                let Some(name) = names.last() else {
+                    continue;
+                };
+                match name.as_slice() {
+                    b"Key" if names.iter().any(|name| name.as_slice() == b"Contents") => {
+                        page.keys.push(value.into_owned());
+                    }
+                    b"IsTruncated" => {
+                        let parsed = match value.trim() {
+                            "true" => true,
+                            "false" => false,
+                            _ => {
+                                return Err(RadarError::Listing {
+                                    prefix: String::from(prefix),
+                                });
+                            }
+                        };
+                        if page.truncated.replace(parsed).is_some() {
+                            return Err(RadarError::Listing {
+                                prefix: String::from(prefix),
+                            });
+                        }
+                    }
+                    b"NextContinuationToken" if page.continuation.is_some() => {
+                        return Err(RadarError::Listing {
+                            prefix: String::from(prefix),
+                        });
+                    }
+                    b"NextContinuationToken" => page.continuation = Some(value.into_owned()),
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(source) => {
+                return Err(RadarError::ListingXml {
+                    prefix: String::from(prefix),
+                    source,
+                });
+            }
         }
-        let Some(next) = after_open.get(end + close.len()..) else {
-            break;
-        };
-        remaining = next;
     }
-    values
+    if page.truncated.is_none() {
+        return Err(RadarError::Listing {
+            prefix: String::from(prefix),
+        });
+    }
+    Ok(page)
 }
 
 /// Paginates a bucket listing prefix to exhaustion.
@@ -136,21 +189,18 @@ fn list_keys(prefix: &str) -> Result<Vec<String>, RadarError> {
         let xml = String::from_utf8(body).map_err(|_| RadarError::ListingBody {
             prefix: String::from(prefix),
         })?;
-        keys.extend(tag_values(&xml, "Key").into_iter().map(String::from));
-        match tag_values(&xml, "IsTruncated").as_slice() {
-            ["false"] => break,
-            ["true"] => {}
-            _ => {
+        let page = listing_xml(prefix, &xml)?;
+        keys.extend(page.keys);
+        match page.truncated {
+            Some(false) => break,
+            Some(true) => {}
+            None => {
                 return Err(RadarError::Listing {
                     prefix: String::from(prefix),
                 });
             }
         }
-        let next = tag_values(&xml, "NextContinuationToken")
-            .into_iter()
-            .next()
-            .map(String::from);
-        token = match next {
+        token = match page.continuation {
             Some(value) if seen_tokens.insert(value.clone()) => Some(value),
             Some(_) | None => {
                 return Err(RadarError::Listing {
@@ -222,20 +272,33 @@ mod tests {
     }
 
     #[test]
-    fn listing_xml_fields_are_extracted() {
-        let xml = "<ListBucketResult><IsTruncated>true</IsTruncated>\
-                   <Contents><Key>2026/10/30/KPAH/KPAH20261030_023529_V06</Key></Contents>\
-                   <Contents><Key>2026/10/30/KPAH/KPAH20261030_024005_V06</Key></Contents>\
-                   <NextContinuationToken>abc</NextContinuationToken></ListBucketResult>";
+    fn listing_xml_tolerates_whitespace_and_nesting() -> Result<(), TestError> {
+        let xml = "<?xml version=\"1.0\"?>\n<ListBucketResult>\n\
+                   <IsTruncated>\n true \n</IsTruncated>\n\
+                   <Contents><Key> 2026/10/30/KPAH/KPAH20261030_023529_V06 </Key></Contents>\n\
+                   <Contents><Key>2026/10/30/KPAH/KPAH20261030_024005_V06</Key></Contents>\n\
+                   <NextContinuationToken>\n abc \n</NextContinuationToken>\n\
+                   </ListBucketResult>";
+        let page = listing_xml("prefix", xml)?;
         assert_eq!(
-            tag_values(xml, "Key"),
+            page.keys,
             vec![
                 "2026/10/30/KPAH/KPAH20261030_023529_V06",
                 "2026/10/30/KPAH/KPAH20261030_024005_V06"
             ]
         );
-        assert_eq!(tag_values(xml, "IsTruncated"), vec!["true"]);
-        assert_eq!(tag_values(xml, "NextContinuationToken"), vec!["abc"]);
+        assert_eq!(page.truncated, Some(true));
+        assert_eq!(page.continuation.as_deref(), Some("abc"));
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_listing_xml_is_rejected() {
+        let xml = "<ListBucketResult><IsTruncated>false</ListBucketResult>";
+        assert!(matches!(
+            listing_xml("prefix", xml),
+            Err(RadarError::ListingXml { .. })
+        ));
     }
 
     #[test]

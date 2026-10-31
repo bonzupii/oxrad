@@ -25,6 +25,7 @@ mod overlay;
 mod paths;
 mod pipeline;
 mod place;
+mod product;
 mod projection;
 mod provider;
 mod radar;
