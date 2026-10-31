@@ -272,9 +272,13 @@ impl OxradApp {
         self.pipeline = Some(Pipeline::start(id.clone()));
         self.site = Some(id.clone());
         self.station_picker_open = false;
+        self.view_radars.clear();
         self.config.site = Some(id);
         if persist {
             self.save_config();
+        }
+        if self.scene_mode == SceneMode::Map {
+            self.ensure_viewport_radars();
         }
     }
 
@@ -288,6 +292,7 @@ impl OxradApp {
         self.site = None;
         self.pipeline = None;
         self.display.reset();
+        self.view_radars.clear();
         self.config.site = None;
     }
 
