@@ -150,7 +150,7 @@ The offline vector map, pointer-anchored Mercator zoom, drag pan, station marker
 
 ### Phase 4: multi-station acquisition and composition (in progress)
 
-Bounded independent pipelines and per-mesh transforms now render the selected station plus up to three nearby stations in the map viewport. Remaining work is a common scan time, stale-candidate rejection, deterministic per-product overlap values, gap disclosure, contributing-station controls, and tests for overlap order and viewport changes during loading.
+Bounded independent pipelines and per-mesh transforms now render the selected station plus up to three nearby stations in the map viewport, with debounced re-query after pan or zoom and contributing-site labels. Remaining work is a common scan time, stale-candidate rejection, deterministic per-product overlap values, gap disclosure, and tests for overlap order and viewport changes during loading.
 
 ### Phase 5: time history and professional inspection
 

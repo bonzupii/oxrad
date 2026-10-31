@@ -1277,10 +1277,7 @@ impl OxradApp {
             egui::Sense::click_and_drag(),
         );
         self.map_input(ui, rect, &interaction);
-        if self
-            .map_reload_due
-            .is_some_and(|due| Instant::now() >= due)
-        {
+        if self.map_reload_due.is_some_and(|due| Instant::now() >= due) {
             self.map_reload_due = None;
             self.reload_viewport_radars();
         }
@@ -1539,6 +1536,10 @@ impl OxradApp {
             self.focus_map_context();
             self.schedule_viewport_reload();
         }
+        self.map_status(ui, rect);
+    }
+
+    fn map_status(&self, ui: &egui::Ui, rect: Rect) {
         let countries = self.map.as_ref().map_or(0, WorldMap::country_count);
         let contributing = self
             .view_radars
