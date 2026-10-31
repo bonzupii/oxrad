@@ -215,6 +215,22 @@ impl HistoryWorker {
     }
 }
 
+/// The next key in a playback sequence, wrapping at the end.
+///
+/// The oldest key starts a fresh sequence; a current key that is not in the
+/// list is treated like no current key so playback cannot wedge on stale state.
+pub fn next_key(keys: &[String], current: Option<&str>) -> Option<String> {
+    if keys.is_empty() {
+        return None;
+    }
+    current
+        .and_then(|current| keys.iter().position(|key| key == current))
+        .map_or_else(
+            || keys.first().cloned(),
+            |index| keys.get(index.wrapping_add(1) % keys.len()).cloned(),
+        )
+}
+
 /// A stable, human-readable label for an Archive II object key.
 pub fn key_label(key: &str) -> String {
     let name = key.rsplit('/').next().unwrap_or(key);
@@ -251,6 +267,20 @@ mod tests {
             key_label("2026/10/30/KPAH/KPAH20261030_023529_V06"),
             "2026-10-30 02:35:29 UTC"
         );
+    }
+
+    #[test]
+    fn history_playback_advances_and_wraps() {
+        let keys = vec![
+            String::from("first"),
+            String::from("second"),
+            String::from("third"),
+        ];
+        assert_eq!(next_key(&keys, None).as_deref(), Some("first"));
+        assert_eq!(next_key(&keys, Some("first")).as_deref(), Some("second"));
+        assert_eq!(next_key(&keys, Some("third")).as_deref(), Some("first"));
+        assert_eq!(next_key(&keys, Some("missing")).as_deref(), Some("first"));
+        assert_eq!(next_key(&[], None), None);
     }
 
     #[test]

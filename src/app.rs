@@ -66,6 +66,7 @@ const STATION_RETRY_SECS: u64 = 15 * 60;
 const GLOBAL_REFRESH_SECS: u64 = 5 * 60;
 const GLOBAL_RETRY_SECS: u64 = 60;
 const GLOBAL_PLAYBACK_MS: u64 = 650;
+const HISTORY_FRAME_MS: u64 = 900;
 const WARNING_REFRESH_SECS: u64 = 5 * 60;
 const WARNING_RETRY_SECS: u64 = 2 * 60;
 
@@ -144,6 +145,12 @@ enum HistoryState {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryStart {
+    Oldest,
+    Current,
+}
+
 struct HistoryView {
     feed: HistoryFeed,
     generation: u64,
@@ -151,6 +158,8 @@ struct HistoryView {
     key: Option<String>,
     state: HistoryState,
     error: Option<HistoryError>,
+    playback: GlobalPlayback,
+    next_frame: Option<Instant>,
 }
 
 impl HistoryView {
@@ -162,6 +171,8 @@ impl HistoryView {
             key: None,
             state: HistoryState::Idle,
             error: None,
+            playback: GlobalPlayback::Stopped,
+            next_frame: None,
         }
     }
 
@@ -171,6 +182,8 @@ impl HistoryView {
         self.key = None;
         self.state = HistoryState::Idle;
         self.error = None;
+        self.playback = GlobalPlayback::Stopped;
+        self.next_frame = None;
     }
 }
 
@@ -817,6 +830,7 @@ impl OxradApp {
         }
         self.display.poll();
         self.poll_history();
+        self.advance_history_playback();
         let mut layer_failure = None;
         for layer in &mut self.view_radars {
             if let Some(volume) = layer.pipeline.poll() {
@@ -907,6 +921,7 @@ impl OxradApp {
                 self.history.state,
                 HistoryState::LoadingKeys | HistoryState::LoadingVolume
             )
+            || self.history.playback == GlobalPlayback::Playing
             || (self.site.is_some()
                 && (self.display.state.is_busy()
                     || self
@@ -919,7 +934,13 @@ impl OxradApp {
     fn phase(&self) -> &'static str {
         self.pipeline.as_ref().map_or_else(
             || match self.history.state {
+                HistoryState::LoadingVolume if self.history.playback == GlobalPlayback::Playing => {
+                    "History playing"
+                }
                 HistoryState::LoadingVolume => "History loading",
+                HistoryState::Reviewing if self.history.playback == GlobalPlayback::Playing => {
+                    "History playing"
+                }
                 HistoryState::Reviewing => "History review",
                 _ if self.site.is_some() => "Idle",
                 _ => "Idle · No site selected",
@@ -2493,6 +2514,12 @@ impl OxradApp {
                 self.history.state = HistoryState::Reviewing;
                 self.display.submit(volume, self.product);
                 self.notice = Some(format!("Reviewing radar scan {label}."));
+                if self.history.playback == GlobalPlayback::Playing {
+                    self.history.next_frame =
+                        Some(due_after(Duration::from_millis(HISTORY_FRAME_MS)));
+                } else {
+                    self.history.next_frame = None;
+                }
             }
             HistoryEvent::Failed {
                 generation: event_generation,
@@ -2508,6 +2535,8 @@ impl OxradApp {
         self.notice = Some(format!("Radar history: {error}"));
         self.history.error = Some(error);
         self.history.state = HistoryState::Failed;
+        self.history.playback = GlobalPlayback::Stopped;
+        self.history.next_frame = None;
     }
 
     fn request_history_keys(&mut self) {
@@ -2540,6 +2569,7 @@ impl OxradApp {
         self.pipeline = None;
         self.history.key = Some(key.to_owned());
         self.history.error = None;
+        self.history.next_frame = None;
         match self.history.feed.request_volume(&site, key) {
             Ok(generation) => {
                 self.history.generation = generation;
@@ -2547,6 +2577,72 @@ impl OxradApp {
             }
             Err(error) => self.history_failure(error),
         }
+    }
+
+    fn start_history_playback(&mut self, start: HistoryStart) {
+        let key = match start {
+            HistoryStart::Oldest => history::next_key(&self.history.keys, None),
+            HistoryStart::Current => {
+                let current = self
+                    .history
+                    .key
+                    .as_deref()
+                    .filter(|key| self.history.keys.iter().any(|item| item == *key));
+                current
+                    .map(String::from)
+                    .or_else(|| history::next_key(&self.history.keys, None))
+            }
+        };
+        let Some(key) = key else {
+            self.notice = Some(String::from(
+                "Load the recent scan list before playing radar history.",
+            ));
+            return;
+        };
+        self.history.playback = GlobalPlayback::Playing;
+        self.history.next_frame = None;
+        self.request_history_volume(&key);
+    }
+
+    fn toggle_history_playback(&mut self) {
+        if self.history.playback == GlobalPlayback::Playing {
+            self.history.playback = GlobalPlayback::Stopped;
+            self.history.next_frame = None;
+        } else {
+            self.start_history_playback(HistoryStart::Current);
+        }
+    }
+
+    fn advance_history_playback(&mut self) {
+        if self.history.playback != GlobalPlayback::Playing {
+            return;
+        }
+        if !self
+            .history
+            .next_frame
+            .is_some_and(|due| Instant::now() >= due)
+        {
+            return;
+        }
+        if self.display.state.error().is_some() {
+            self.history.playback = GlobalPlayback::Stopped;
+            self.history.next_frame = None;
+            self.notice = Some(String::from(
+                "History playback stopped because the current frame could not be prepared.",
+            ));
+            return;
+        }
+        if self.display.state.is_busy() {
+            self.history.next_frame = Some(due_after(Duration::from_millis(BUSY_REPAINT_MS)));
+            return;
+        }
+        let Some(key) = history::next_key(&self.history.keys, self.history.key.as_deref()) else {
+            self.history.playback = GlobalPlayback::Stopped;
+            self.history.next_frame = None;
+            return;
+        };
+        self.history.next_frame = None;
+        self.request_history_volume(&key);
     }
 
     fn return_to_live(&mut self) {
@@ -2572,6 +2668,8 @@ impl OxradApp {
         let mut selected = None;
         let mut retry = None;
         let mut resume = false;
+        let mut play_all = false;
+        let mut play_toggle = false;
         match self.history.state {
             HistoryState::Idle => {
                 ui.label(
@@ -2603,6 +2701,9 @@ impl OxradApp {
                 } else if let Some(key) = self.history_scan_list(ui) {
                     selected = Some(key);
                 }
+                if !self.history.keys.is_empty() && ui.button("Play all scans").clicked() {
+                    play_all = true;
+                }
                 if ui.small_button("Refresh scan list").clicked() {
                     load = true;
                 }
@@ -2623,24 +2724,9 @@ impl OxradApp {
                 });
             }
             HistoryState::Reviewing => {
-                let key = self
-                    .history
-                    .key
-                    .as_deref()
-                    .map_or_else(|| String::from("selected scan"), history::key_label);
-                ui.label(
-                    RichText::new(format!("Reviewing {key}"))
-                        .size(11.0)
-                        .color(TEXT),
-                );
-                ui.label(
-                    RichText::new("Live radar is paused while you inspect this scan.")
-                        .size(10.0)
-                        .color(MUTED),
-                );
-                if ui.button("Return to live radar").clicked() {
-                    resume = true;
-                }
+                let (toggle, live) = self.history_reviewing_ui(ui);
+                play_toggle = toggle;
+                resume = live;
             }
             HistoryState::Failed => {
                 let (reload, retry_key) = self.history_failure_controls(ui);
@@ -2648,7 +2734,63 @@ impl OxradApp {
                 retry = retry_key;
             }
         }
+        if play_all {
+            self.start_history_playback(HistoryStart::Oldest);
+        }
+        if play_toggle {
+            self.toggle_history_playback();
+        }
         self.apply_history_actions(load, selected, retry, resume);
+    }
+
+    fn history_reviewing_ui(&self, ui: &mut egui::Ui) -> (bool, bool) {
+        let mut play_toggle = false;
+        let mut resume = false;
+        let key = self
+            .history
+            .key
+            .as_deref()
+            .map_or_else(|| String::from("selected scan"), history::key_label);
+        ui.label(
+            RichText::new(format!("Reviewing {key}"))
+                .size(11.0)
+                .color(TEXT),
+        );
+        ui.label(
+            RichText::new("Live radar is paused while you inspect this scan.")
+                .size(10.0)
+                .color(MUTED),
+        );
+        ui.horizontal(|ui| {
+            let label = if self.history.playback == GlobalPlayback::Playing {
+                "Pause history"
+            } else {
+                "Play history"
+            };
+            if ui.button(label).clicked() {
+                play_toggle = true;
+            }
+            if let Some(index) = self
+                .history
+                .keys
+                .iter()
+                .position(|item| Some(item.as_str()) == self.history.key.as_deref())
+            {
+                ui.label(
+                    RichText::new(format!(
+                        "Frame {}/{}",
+                        index.saturating_add(1),
+                        self.history.keys.len()
+                    ))
+                    .size(10.0)
+                    .color(MUTED),
+                );
+            }
+        });
+        if ui.button("Return to live radar").clicked() {
+            resume = true;
+        }
+        (play_toggle, resume)
     }
 
     fn history_scan_list(&self, ui: &mut egui::Ui) -> Option<String> {
