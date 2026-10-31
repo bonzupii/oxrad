@@ -166,6 +166,7 @@ impl OxradApp {
             }
         }
         let restored_site = initial.or_else(|| config.site.clone());
+        let restored_place = config.place.clone();
         let stations = match stations::load_cache() {
             Ok(Some(cached)) => Ok(cached),
             Ok(None) => Err(StationError::NoStations),
@@ -182,7 +183,7 @@ impl OxradApp {
             query: String::new(),
             search: PlaceSearch::new(),
             search_state: SearchState::Idle,
-            place: None,
+            place: restored_place.clone(),
             site: None,
             pipeline: None,
             display: Display::new(gpu),
@@ -197,6 +198,13 @@ impl OxradApp {
             map_view: MapView::default(),
             map_radar: RadarLayer::Shown,
         };
+        if let Some(place) = &restored_place {
+            match MapView::focus(place.lat, place.lon, 2_200.0) {
+                Ok(view) => app.map_view = view,
+                Err(error) => app.notice = Some(format!("Map centre unavailable: {error}")),
+            }
+            app.start_forecast(place, 0);
+        }
         if let Some(id) = restored_site
             && let Ok(list) = &app.stations
         {
@@ -317,6 +325,7 @@ impl OxradApp {
             Err(error) => self.notice = Some(format!("Map centre unavailable: {error}")),
         }
         self.place = Some(place.clone());
+        self.config.place = Some(place.clone());
         self.start_forecast(place, 0);
         if !place.in_united_states() {
             self.clear_site();
@@ -1320,9 +1329,10 @@ impl OxradApp {
             self.map_radar = self.map_radar.toggled();
         }
         let has_place = self.place.is_some();
-        let start_x = rect.right() - if has_place { 140.0 } else { 86.0 };
-        let zoom_rect =
-            Rect::from_min_size(Pos2::new(start_x, rect.top() + 14.0), Vec2::new(32.0, 30.0));
+        let zoom_rect = Rect::from_min_size(
+            Pos2::new(rect.left() + 16.0, rect.top() + 104.0),
+            Vec2::new(32.0, 30.0),
+        );
         if ui.put(zoom_rect, egui::Button::new("+")).clicked()
             && let Err(error) = self.map_view.zoom_at(rect, rect.center(), 1.6)
         {

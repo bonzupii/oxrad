@@ -21,7 +21,7 @@ The application is free software under GPLv3. It has no account, subscription, a
 - Product-specific color scales and legends, radial velocity units, readouts with the selected product's units and beam elevation, scan time and age, grid, range rings, station marker, and pointer latitude/longitude/range/azimuth.
 - An offline Natural Earth 1:110m vector map with country fills, borders, labels, a graticule, a scale bar, coordinates, and runtime radar-site markers. The map pans by dragging, zooms under the pointer, and selects a radar site by clicking its marker. The current single-station radar volume can be shown or hidden on the map at its true geographic position, with gate values under the pointer. It has no tile account or network dependency.
 - Honest failure states for configuration, station discovery, place search, forecast, fetch, decode, and rendering. The last good radar frame stays visible with its age; a failed refresh does not become a current-data indicator.
-- Saved site restoration from `~/.oxrad/config.toml`, and `--site KPAH` for an explicit start.
+- Saved town and radar restoration from `~/.oxrad/config.toml`, and `--site KPAH` for an explicit radar start. The town’s forecast point and the radar station are stored as separate identities.
 
 ## What is not implemented
 
@@ -71,7 +71,7 @@ cargo build
 cargo build --release --locked
 ```
 
-`cargo test` currently runs 103 tests. Eight use the network because the paths they cover are real services:
+`cargo test` currently runs 105 tests. Eight use the network because the paths they cover are real services:
 
 - the pinned KPAH archive download, size check, SHA-256 check, and full decode;
 - the live KPAH listing and retrieval;

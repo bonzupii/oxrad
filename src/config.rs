@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::ConfigError;
 use crate::paths;
+use crate::place::{Place, PlaceError};
 use crate::stations::SiteId;
 
 const HEADER: &str = "# oxrad configuration.\n";
@@ -29,6 +30,8 @@ const HEADER: &str = "# oxrad configuration.\n";
 pub struct Config {
     /// The radar station to open with, or `None` for the site picker.
     pub site: Option<SiteId>,
+    /// The searched forecast point restored on the next launch.
+    pub place: Option<Place>,
 }
 
 fn strip_quotes(value: &str) -> Option<&str> {
@@ -48,8 +51,78 @@ fn parse_site(path: &Path, line: usize, value: &str) -> Result<SiteId, ConfigErr
     })
 }
 
+#[derive(Default)]
+struct PlaceFields {
+    name: Option<String>,
+    region: Option<String>,
+    country: Option<String>,
+    country_code: Option<String>,
+    lat: Option<String>,
+    lon: Option<String>,
+    line: usize,
+}
+
+impl PlaceFields {
+    const fn is_empty(&self) -> bool {
+        self.name.is_none()
+            && self.region.is_none()
+            && self.country.is_none()
+            && self.country_code.is_none()
+            && self.lat.is_none()
+            && self.lon.is_none()
+    }
+}
+
+fn quoted_text(path: &Path, line: usize, value: &str) -> Result<String, ConfigError> {
+    strip_quotes(value)
+        .map(String::from)
+        .ok_or_else(|| ConfigError::Syntax {
+            path: path.to_path_buf(),
+            line,
+        })
+}
+
+fn finish_place(path: &Path, fields: PlaceFields) -> Result<Option<Place>, ConfigError> {
+    if fields.is_empty() {
+        return Ok(None);
+    }
+    let (Some(name), Some(region), Some(country), Some(country_code), Some(lat), Some(lon)) = (
+        fields.name,
+        fields.region,
+        fields.country,
+        fields.country_code,
+        fields.lat,
+        fields.lon,
+    ) else {
+        return Err(ConfigError::IncompletePlaceEntry {
+            path: path.to_path_buf(),
+            line: fields.line,
+        });
+    };
+    let lat = lat.parse::<f64>().map_err(|_| ConfigError::PlaceNumber {
+        path: path.to_path_buf(),
+        line: fields.line,
+        field: "latitude",
+        value: lat,
+    })?;
+    let lon = lon.parse::<f64>().map_err(|_| ConfigError::PlaceNumber {
+        path: path.to_path_buf(),
+        line: fields.line,
+        field: "longitude",
+        value: lon,
+    })?;
+    Place::new(&name, &region, &country, &country_code, lat, lon)
+        .map(Some)
+        .map_err(|source: PlaceError| ConfigError::PlaceEntry {
+            path: path.to_path_buf(),
+            line: fields.line,
+            source,
+        })
+}
+
 fn parse_text_line(path: &Path, text: &str) -> Result<Config, ConfigError> {
     let mut config = Config::default();
+    let mut place = PlaceFields::default();
     for (index, raw) in text.lines().enumerate() {
         let number = index + 1;
         let line = raw.trim();
@@ -64,6 +137,42 @@ fn parse_text_line(path: &Path, text: &str) -> Result<Config, ConfigError> {
         let value = value.trim();
         match key {
             "site" => config.site = Some(parse_site(path, number, value)?),
+            "place_name" => {
+                place.name = Some(quoted_text(path, number, value)?);
+                if place.line == 0 {
+                    place.line = number;
+                }
+            }
+            "place_region" => {
+                place.region = Some(quoted_text(path, number, value)?);
+                if place.line == 0 {
+                    place.line = number;
+                }
+            }
+            "place_country" => {
+                place.country = Some(quoted_text(path, number, value)?);
+                if place.line == 0 {
+                    place.line = number;
+                }
+            }
+            "place_country_code" => {
+                place.country_code = Some(quoted_text(path, number, value)?);
+                if place.line == 0 {
+                    place.line = number;
+                }
+            }
+            "place_lat" => {
+                place.lat = Some(quoted_text(path, number, value)?);
+                if place.line == 0 {
+                    place.line = number;
+                }
+            }
+            "place_lon" => {
+                place.lon = Some(quoted_text(path, number, value)?);
+                if place.line == 0 {
+                    place.line = number;
+                }
+            }
             _ => {
                 return Err(ConfigError::UnknownKey {
                     path: path.to_path_buf(),
@@ -73,6 +182,7 @@ fn parse_text_line(path: &Path, text: &str) -> Result<Config, ConfigError> {
             }
         }
     }
+    config.place = finish_place(path, place)?;
     Ok(config)
 }
 
@@ -98,10 +208,20 @@ pub fn save(config: &Config, path: &Path) -> Result<(), ConfigError> {
         path: directory.to_path_buf(),
         source,
     })?;
-    let body = config.site.as_ref().map_or_else(
-        || String::from(HEADER),
-        |site| format!("{HEADER}site = \"{site}\"\n"),
-    );
+    let mut lines: Vec<String> = vec![String::from(HEADER.trim_end())];
+    if let Some(site) = &config.site {
+        lines.push(format!("site = \"{site}\""));
+    }
+    if let Some(place) = &config.place {
+        lines.push(format!("place_name = \"{}\"", place.name));
+        lines.push(format!("place_region = \"{}\"", place.region));
+        lines.push(format!("place_country = \"{}\"", place.country));
+        lines.push(format!("place_country_code = \"{}\"", place.country_code));
+        lines.push(format!("place_lat = \"{:.6}\"", place.lat));
+        lines.push(format!("place_lon = \"{:.6}\"", place.lon));
+    }
+    let mut body = lines.join("\n");
+    body.push('\n');
     fs::write(path, body).map_err(|source| ConfigError::Write {
         path: path.to_path_buf(),
         source,
@@ -171,7 +291,13 @@ mod tests {
             line: 0,
             source,
         })?;
-        save(&Config { site: Some(id) }, &path)?;
+        save(
+            &Config {
+                site: Some(id),
+                place: None,
+            },
+            &path,
+        )?;
         match load(&path)? {
             Some(config) => {
                 assert_eq!(config.site.as_ref().map(SiteId::as_str), Some("KOHX"));
@@ -183,5 +309,51 @@ mod tests {
         let absent = directory.join("absent.toml");
         assert!(load(&absent)?.is_none());
         Ok(())
+    }
+    #[test]
+    fn a_saved_place_round_trips_without_restoring_a_site() -> Result<(), ConfigError> {
+        let directory = std::env::temp_dir().join("oxrad-config-place-test");
+        std::fs::create_dir_all(&directory).map_err(|source| ConfigError::Write {
+            path: directory.clone(),
+            source,
+        })?;
+        let path = directory.join("config.toml");
+        let place = Place::new("Dublin", "County Dublin", "Ireland", "ie", 53.3494, -6.2603)
+            .map_err(|source| ConfigError::PlaceEntry {
+                path: path.clone(),
+                line: 0,
+                source,
+            })?;
+        save(
+            &Config {
+                site: None,
+                place: Some(place),
+            },
+            &path,
+        )?;
+        let loaded = load(&path)?.ok_or(ConfigError::Syntax {
+            path: path.clone(),
+            line: 0,
+        })?;
+        let restored = loaded.place.ok_or(ConfigError::Syntax {
+            path: path.clone(),
+            line: 0,
+        })?;
+        assert_eq!(restored.name, "Dublin");
+        assert_eq!(restored.country_code, "ie");
+        assert!((restored.lat - 53.3494).abs() < 1e-6);
+        assert!(
+            loaded.site.is_none(),
+            "a place must not restore a radar site"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_incomplete_saved_place_names_the_problem() {
+        assert!(matches!(
+            parse("place_name = \"Dublin\"\n"),
+            Err(ConfigError::IncompletePlaceEntry { line: 1, .. })
+        ));
     }
 }

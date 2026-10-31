@@ -20,6 +20,8 @@ use std::fmt::{self, Display, Formatter};
 use std::io;
 use std::path::PathBuf;
 
+use crate::place::PlaceError;
+
 /// A value that cannot be placed on the ellipsoid or in the view.
 #[derive(Debug)]
 pub enum CoordinateError {
@@ -145,6 +147,21 @@ pub enum ConfigError {
         line: usize,
         source: SiteIdError,
     },
+    IncompletePlaceEntry {
+        path: PathBuf,
+        line: usize,
+    },
+    PlaceNumber {
+        path: PathBuf,
+        line: usize,
+        field: &'static str,
+        value: String,
+    },
+    PlaceEntry {
+        path: PathBuf,
+        line: usize,
+        source: PlaceError,
+    },
     Path {
         source: PathError,
     },
@@ -172,6 +189,23 @@ impl ConfigError {
                     path.display()
                 )
             }
+            Self::IncompletePlaceEntry { path, line } => format!(
+                "{} line {line} starts a saved place, but one or more place fields are missing.",
+                path.display()
+            ),
+            Self::PlaceNumber {
+                path,
+                line,
+                field,
+                value,
+            } => format!(
+                "{} line {line} has an invalid saved-place {field}: {value:?}.",
+                path.display()
+            ),
+            Self::PlaceEntry { path, line, source } => format!(
+                "{} line {line} has an invalid saved place: {source}",
+                path.display()
+            ),
             Self::Path { source } => source.to_string(),
         }
     }
@@ -188,8 +222,12 @@ impl Error for ConfigError {
         match self {
             Self::Read { source, .. } | Self::Write { source, .. } => Some(source),
             Self::Site { source, .. } => Some(source),
+            Self::PlaceEntry { source, .. } => Some(source),
             Self::Path { source } => Some(source),
-            Self::Syntax { .. } | Self::UnknownKey { .. } => None,
+            Self::Syntax { .. }
+            | Self::UnknownKey { .. }
+            | Self::IncompletePlaceEntry { .. }
+            | Self::PlaceNumber { .. } => None,
         }
     }
 }
