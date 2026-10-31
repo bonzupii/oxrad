@@ -36,7 +36,8 @@ const TILE_SIZE: u32 = 512;
 const COLOR_SCHEME: u8 = 2;
 const MAX_ZOOM: u8 = 7;
 const MAX_FRAMES: usize = 24;
-const MAX_CACHED_TILES: usize = 52;
+const MAX_CACHED_TILES: usize = 120;
+const MAX_VIEW_TILES: usize = 8;
 const MANIFEST_LIFETIME: Duration = Duration::from_secs(90);
 const EARTH_KM_PER_DEGREE: f64 = 111.32;
 
@@ -53,7 +54,14 @@ pub struct GlobalFrame {
     pub path: String,
 }
 
-/// The Web Mercator tile covering the current map view.
+/// The Web Mercator tiles covering the current map view.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TileGrid {
+    pub zoom: u8,
+    pub tiles: Vec<TileBounds>,
+}
+
+/// One Web Mercator tile in the viewport grid.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TileBounds {
     pub zoom: u8,
@@ -73,10 +81,11 @@ pub struct DecodedTile {
     pub rgba: Vec<u8>,
 }
 
-/// A manifest update from the global source.
+/// One decoded tile with the geographic bounds it occupies.
 #[derive(Debug)]
-pub struct Manifest {
+pub struct TileImage {
     pub bounds: TileBounds,
+    pub image: DecodedTile,
 }
 
 /// Messages sent from the global radar worker to the UI.
@@ -84,12 +93,11 @@ pub struct Manifest {
 pub enum GlobalEvent {
     Manifest {
         generation: u64,
-        manifest: Manifest,
     },
     Frame {
         generation: u64,
         frame: GlobalFrame,
-        tile: DecodedTile,
+        tiles: Vec<TileImage>,
     },
     Failed {
         generation: u64,
@@ -121,11 +129,6 @@ pub enum GlobalRadarError {
     },
     InvalidPath {
         path: String,
-    },
-    Tile {
-        zoom: u8,
-        x: u32,
-        y: u32,
     },
     Pixels {
         width: u32,
@@ -159,9 +162,6 @@ impl GlobalRadarError {
             Self::InvalidPath { path } => {
                 format!("The global radar manifest names an unusable frame path {path:?}.")
             }
-            Self::Tile { zoom, x, y } => {
-                format!("Global radar tile {zoom}/{x}/{y} is outside its zoom grid.")
-            }
             Self::Pixels {
                 width,
                 height,
@@ -192,7 +192,6 @@ impl Error for GlobalRadarError {
             | Self::InvalidTime { .. }
             | Self::InvalidHost { .. }
             | Self::InvalidPath { .. }
-            | Self::Tile { .. }
             | Self::Pixels { .. }
             | Self::WorkerStopped => None,
         }
@@ -346,38 +345,44 @@ impl Worker {
         request: &RadarRequest,
     ) -> Result<Option<RadarRequest>, GlobalRadarError> {
         let snapshot = self.manifest()?;
-        let bounds = tile_for_view(request.center_lat, request.center_lon, request.span_km)?;
+        let grid = tile_grid_for_view(request.center_lat, request.center_lon, request.span_km)?;
         if self
             .events
             .send(GlobalEvent::Manifest {
                 generation: request.generation,
-                manifest: Manifest { bounds },
             })
             .is_err()
         {
             return Err(GlobalRadarError::WorkerStopped);
         }
         for frame in snapshot.frames.iter().rev() {
-            if let Some(next) = self.next_request()? {
-                return Ok(Some(next));
+            let mut decoded = Vec::with_capacity(grid.tiles.len());
+            for bounds in &grid.tiles {
+                if let Some(next) = self.next_request()? {
+                    return Ok(Some(next));
+                }
+                let url = tile_url(&snapshot.host, frame, *bounds)?;
+                let key = cache_key(frame, *bounds);
+                let png = match self.tiles.remove(&key) {
+                    Some(cached) => cached,
+                    None => network::http_get(&url)?,
+                };
+                let image = decode_tile(&png, &url)?;
+                if self.tiles.len() >= MAX_CACHED_TILES {
+                    self.tiles.clear();
+                }
+                self.tiles.insert(key, png);
+                decoded.push(TileImage {
+                    bounds: *bounds,
+                    image,
+                });
             }
-            let url = tile_url(&snapshot.host, frame, bounds)?;
-            let key = cache_key(frame, bounds);
-            let png = match self.tiles.remove(&key) {
-                Some(cached) => cached,
-                None => network::http_get(&url)?,
-            };
-            let tile = decode_tile(&png, &url)?;
-            if self.tiles.len() >= MAX_CACHED_TILES {
-                self.tiles.clear();
-            }
-            self.tiles.insert(key, png);
             if self
                 .events
                 .send(GlobalEvent::Frame {
                     generation: request.generation,
                     frame: frame.clone(),
-                    tile,
+                    tiles: decoded,
                 })
                 .is_err()
             {
@@ -496,11 +501,6 @@ fn parse_manifest(bytes: &[u8]) -> Result<ManifestSnapshot, GlobalRadarError> {
     })
 }
 
-fn normalized_lon(lon: f64) -> f64 {
-    let wrapped = ((lon + 180.0) % 360.0 + 360.0) % 360.0;
-    wrapped - 180.0
-}
-
 fn tile_latitude(y: f64, count: f64) -> f64 {
     (std::f64::consts::PI * (1.0 - 2.0 * y / count))
         .sinh()
@@ -508,17 +508,19 @@ fn tile_latitude(y: f64, count: f64) -> f64 {
         .to_degrees()
 }
 
-/// Selects the Web Mercator tile that contains the map centre and covers the
-/// largest dimension of the current view at the best available zoom.
+/// Selects a bounded grid of Web Mercator tiles that covers the square view.
+///
+/// The zoom is the highest level that keeps the grid at or below eight tiles,
+/// so local views keep detail and wide views remain bounded.
 ///
 /// # Errors
 ///
 /// Returns [`GlobalRadarError::Shape`] for non-finite or out-of-range views.
-pub fn tile_for_view(
+pub fn tile_grid_for_view(
     center_lat: f64,
     center_lon: f64,
     span_km: f64,
-) -> Result<TileBounds, GlobalRadarError> {
+) -> Result<TileGrid, GlobalRadarError> {
     if !(center_lat.is_finite()
         && center_lon.is_finite()
         && span_km.is_finite()
@@ -532,42 +534,88 @@ pub fn tile_for_view(
     }
     let latitude_radians = center_lat.to_radians();
     let longitude_km = EARTH_KM_PER_DEGREE * latitude_radians.cos().max(0.05);
-    let needed_degrees = (span_km / EARTH_KM_PER_DEGREE).max(span_km / longitude_km);
-    let mut zoom = 0_u8;
-    for candidate in (0..=MAX_ZOOM).rev() {
-        let width = 360.0 / f64::from(1_u32 << candidate);
-        if width >= needed_degrees {
-            zoom = candidate;
-            break;
+    let lat_extent = (span_km / EARTH_KM_PER_DEGREE).min(170.0);
+    let lon_extent = (span_km / longitude_km).min(360.0);
+    for zoom in (0..=MAX_ZOOM).rev() {
+        let grid = grid_at_zoom(center_lat, center_lon, lat_extent, lon_extent, zoom)?;
+        if !grid.tiles.is_empty() && grid.tiles.len() <= MAX_VIEW_TILES {
+            return Ok(grid);
         }
     }
+    Err(GlobalRadarError::Shape {
+        detail: "a viewport grid within the tile budget",
+    })
+}
+
+fn mercator_fraction(lat: f64) -> f64 {
+    let radians = lat.to_radians();
+    (1.0 - (radians.tan() + 1.0 / radians.cos()).ln() / std::f64::consts::PI) / 2.0
+}
+
+fn grid_at_zoom(
+    center_lat: f64,
+    center_lon: f64,
+    lat_extent: f64,
+    lon_extent: f64,
+    zoom: u8,
+) -> Result<TileGrid, GlobalRadarError> {
     let count = 1_u32 << zoom;
     let count_f = f64::from(count);
-    let lon = normalized_lon(center_lon);
-    let x_float = ((lon + 180.0) / 360.0 * count_f).floor();
-    let mercator_y = (1.0
-        - (latitude_radians.tan() + 1.0 / latitude_radians.cos()).ln() / std::f64::consts::PI)
-        / 2.0;
-    let y_float = (mercator_y * count_f).floor();
-    if !(x_float.is_finite() && y_float.is_finite()) {
+    let count_i = i64::from(count);
+    let north = (center_lat + lat_extent / 2.0).min(85.0);
+    let south = (center_lat - lat_extent / 2.0).max(-85.0);
+    let west = center_lon - lon_extent / 2.0;
+    let east = center_lon + lon_extent / 2.0;
+    let x_start = ((west + 180.0) / 360.0 * count_f).floor() as i64;
+    let x_end = ((east + 180.0) / 360.0 * count_f).floor() as i64;
+    let y_start = (mercator_fraction(north) * count_f)
+        .floor()
+        .clamp(0.0, f64::from(count.saturating_sub(1))) as u32;
+    let y_end = (mercator_fraction(south) * count_f)
+        .floor()
+        .clamp(0.0, f64::from(count.saturating_sub(1))) as u32;
+    if x_end < x_start {
         return Err(GlobalRadarError::Shape {
-            detail: "a finite tile index",
+            detail: "a finite tile grid",
         });
     }
-    let x = x_float.clamp(0.0, f64::from(count.saturating_sub(1))) as u32;
-    let y = y_float.clamp(0.0, f64::from(count.saturating_sub(1))) as u32;
-    if x >= count || y >= count {
-        return Err(GlobalRadarError::Tile { zoom, x, y });
+    let x_count = x_end.saturating_sub(x_start).saturating_add(1);
+    let y_count = i64::from(y_end)
+        .saturating_sub(i64::from(y_start))
+        .saturating_add(1);
+    if x_count.saturating_mul(y_count) > MAX_VIEW_TILES as i64 {
+        return Ok(TileGrid {
+            zoom,
+            tiles: Vec::new(),
+        });
     }
-    Ok(TileBounds {
-        zoom,
-        x,
-        y,
-        west: 360.0 * f64::from(x) / count_f - 180.0,
-        east: 360.0 * f64::from(x.saturating_add(1)) / count_f - 180.0,
-        north: tile_latitude(f64::from(y), count_f),
-        south: tile_latitude(f64::from(y.saturating_add(1)), count_f),
-    })
+    let mut tiles = Vec::new();
+    for x in x_start..=x_end {
+        let wrapped = x.rem_euclid(count_i) as u32;
+        for y in y_start..=y_end {
+            if tiles
+                .iter()
+                .any(|tile: &TileBounds| tile.x == wrapped && tile.y == y)
+            {
+                continue;
+            }
+            tiles.push(TileBounds {
+                zoom,
+                x: wrapped,
+                y,
+                west: 360.0 * f64::from(wrapped) / count_f - 180.0,
+                east: 360.0 * f64::from(wrapped.saturating_add(1)) / count_f - 180.0,
+                north: tile_latitude(f64::from(y), count_f),
+                south: tile_latitude(f64::from(y.saturating_add(1)), count_f),
+            });
+        }
+    }
+    if tiles.is_empty() {
+        return Err(GlobalRadarError::Shape {
+            detail: "at least one viewport tile",
+        });
+    }
+    Ok(TileGrid { zoom, tiles })
 }
 
 fn tile_url(
@@ -630,20 +678,33 @@ mod tests {
     use crate::test_support::TestError;
 
     #[test]
-    fn tile_covers_the_centre_and_uses_web_mercator_bounds() -> Result<(), TestError> {
-        let bounds = tile_for_view(40.71, -74.01, 950.0)?;
-        assert!(bounds.west <= -74.01 && -74.01 <= bounds.east);
-        assert!(bounds.south <= 40.71 && 40.71 <= bounds.north);
-        assert!(bounds.north > bounds.south);
-        assert!(bounds.east > bounds.west);
+    fn tile_grid_covers_the_centre_and_uses_web_mercator_bounds() -> Result<(), TestError> {
+        let grid = tile_grid_for_view(40.71, -74.01, 950.0)?;
+        let covered = grid.tiles.iter().any(|bounds| {
+            bounds.west <= -74.01
+                && -74.01 <= bounds.east
+                && bounds.south <= 40.71
+                && 40.71 <= bounds.north
+        });
+        assert!(covered, "grid does not contain the map centre");
+        assert!(!grid.tiles.is_empty());
         Ok(())
     }
 
     #[test]
-    fn world_view_uses_the_first_tile() -> Result<(), TestError> {
-        let bounds = tile_for_view(0.0, 0.0, 40_000.0)?;
-        assert_eq!(bounds.zoom, 0);
-        assert_eq!((bounds.x, bounds.y), (0, 0));
+    fn wide_view_uses_multiple_bounded_tiles() -> Result<(), TestError> {
+        let grid = tile_grid_for_view(40.0, -74.0, 18_000.0)?;
+        assert!(grid.tiles.len() > 1, "wide view used one tile");
+        assert!(grid.tiles.len() <= MAX_VIEW_TILES);
+        Ok(())
+    }
+
+    #[test]
+    fn world_view_uses_a_bounded_grid() -> Result<(), TestError> {
+        let grid = tile_grid_for_view(0.0, 0.0, 40_000.0)?;
+        assert!(grid.tiles.len() > 1);
+        assert!(grid.tiles.len() <= MAX_VIEW_TILES);
+        assert!(grid.tiles.iter().all(|tile| tile.west >= -180.0));
         Ok(())
     }
 
@@ -682,8 +743,9 @@ mod tests {
             .frames
             .last()
             .ok_or("global manifest has no frames")?;
-        let bounds = tile_for_view(40.71, -74.01, 950.0)?;
-        let url = tile_url(&manifest.host, frame, bounds)?;
+        let grid = tile_grid_for_view(40.71, -74.01, 950.0)?;
+        let bounds = grid.tiles.first().ok_or("global viewport has no tile")?;
+        let url = tile_url(&manifest.host, frame, *bounds)?;
         let png = network::http_get(&url)?;
         let tile = decode_tile(&png, &url)?;
         assert_eq!(tile.width, TILE_SIZE);

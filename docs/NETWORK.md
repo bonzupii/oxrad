@@ -48,7 +48,7 @@ The object is downloaded into memory and decoded in a worker. A 404 is reported 
 
 RainViewer supplies a manifest of 10-minute reflectivity frames for the previous two hours. The manifest is accepted only from an HTTPS host and only with validated frame paths and times. The manifest is cached in the worker for 90 seconds; decoded PNG bytes are cached for up to 52 tiles. Each viewport request selects the best Web Mercator zoom up to level 7 and fetches the tile containing the map centre.
 
-The current tile request covers the map centre, not the full rectangular viewport when the view is wider than one tile. Wide views can therefore leave parts of the map uncovered until the next viewport-grid increment. This is an implementation limitation, not a claim of complete global coverage.
+The viewport is covered by a bounded grid of at most eight Web Mercator tiles at the highest zoom that fits the budget. Tile bounds travel with each frame so the renderer places every tile independently, including views that cross the antimeridian. Uncovered areas remain uncovered only where RainViewer itself has no radar coverage or the source supplied no echo.
 
 A new viewport request supersedes the previous generation; stale manifest, frame, and error messages are discarded. A source failure is reported in the UI and retried after 60 seconds. RainViewer requires visible attribution in the application, which the map shows as "Weather data by RainViewer".
 

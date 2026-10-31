@@ -26,7 +26,7 @@ use crate::config::{self, Config};
 use crate::display::{Display, DisplayState, Frame};
 use crate::forecast::{Forecast, ForecastError, ForecastFeed, ForecastOutcome, ForecastPeriod};
 use crate::global_radar::{
-    self, DecodedTile, GlobalEvent, GlobalRadarError, GlobalRadarFeed, TileBounds,
+    self, DecodedTile, GlobalEvent, GlobalRadarError, GlobalRadarFeed, TileBounds, TileImage,
 };
 use crate::gpu::RadarGpu;
 use crate::map::{self, MapError, MapView, WorldMap};
@@ -101,9 +101,14 @@ enum GlobalState {
     Failed,
 }
 
+struct GlobalTileTexture {
+    bounds: TileBounds,
+    texture: egui::TextureHandle,
+}
+
 struct GlobalFrameTexture {
     time_unix_ms: u64,
-    texture: egui::TextureHandle,
+    tiles: Vec<GlobalTileTexture>,
 }
 
 fn due_after(delay: Duration) -> Instant {
@@ -212,7 +217,6 @@ pub struct OxradApp {
     global_feed: GlobalRadarFeed,
     global_generation: u64,
     global_frames: Vec<GlobalFrameTexture>,
-    global_bounds: Option<TileBounds>,
     global_index: usize,
     global_layer: RadarLayer,
     global_playback: GlobalPlayback,
@@ -273,7 +277,6 @@ impl OxradApp {
             global_feed: GlobalRadarFeed::new(),
             global_generation: 0,
             global_frames: Vec::new(),
-            global_bounds: None,
             global_index: 0,
             global_layer: RadarLayer::Shown,
             global_playback: GlobalPlayback::Stopped,
@@ -1435,10 +1438,7 @@ impl OxradApp {
 
     fn apply_global_event(&mut self, context: &egui::Context, event: GlobalEvent) {
         match event {
-            GlobalEvent::Manifest {
-                generation,
-                manifest,
-            } => {
+            GlobalEvent::Manifest { generation } => {
                 if generation != self.global_generation {
                     return;
                 }
@@ -1448,45 +1448,16 @@ impl OxradApp {
                 self.global_next_frame = None;
                 self.global_state = GlobalState::Loading;
                 self.global_refresh_due = Some(due_after(Duration::from_secs(GLOBAL_REFRESH_SECS)));
-                self.global_bounds = Some(manifest.bounds);
             }
             GlobalEvent::Frame {
                 generation,
                 frame,
-                tile,
+                tiles,
             } => {
                 if generation != self.global_generation {
                     return;
                 }
-                match global_texture(context, frame.time_unix_ms, tile) {
-                    Ok(texture) => {
-                        let was_live =
-                            self.global_index.saturating_add(1) >= self.global_frames.len();
-                        let position = self
-                            .global_frames
-                            .partition_point(|stored| stored.time_unix_ms < frame.time_unix_ms);
-                        self.global_frames.insert(
-                            position,
-                            GlobalFrameTexture {
-                                time_unix_ms: frame.time_unix_ms,
-                                texture,
-                            },
-                        );
-                        if was_live {
-                            self.global_index = self.global_frames.len().saturating_sub(1);
-                        } else if position <= self.global_index {
-                            self.global_index = self.global_index.saturating_add(1);
-                        }
-                        self.global_state = GlobalState::Ready;
-                    }
-                    Err(error) => {
-                        self.notice =
-                            Some(format!("Global radar tile could not be shown: {error}"));
-                        self.global_state = GlobalState::Failed;
-                        self.global_refresh_due =
-                            Some(due_after(Duration::from_secs(GLOBAL_RETRY_SECS)));
-                    }
-                }
+                self.add_global_frame(context, frame.time_unix_ms, tiles);
             }
             GlobalEvent::Failed { generation, error } => {
                 if generation != self.global_generation {
@@ -1497,6 +1468,47 @@ impl OxradApp {
                 self.global_refresh_due = Some(due_after(Duration::from_secs(GLOBAL_RETRY_SECS)));
             }
         }
+    }
+
+    fn add_global_frame(
+        &mut self,
+        context: &egui::Context,
+        time_unix_ms: u64,
+        tiles: Vec<TileImage>,
+    ) {
+        let mut textures = Vec::with_capacity(tiles.len());
+        for tile in tiles {
+            match global_texture(context, time_unix_ms, tile.bounds, tile.image) {
+                Ok(texture) => textures.push(GlobalTileTexture {
+                    bounds: tile.bounds,
+                    texture,
+                }),
+                Err(error) => {
+                    self.notice = Some(format!("Global radar tile could not be shown: {error}"));
+                    self.global_state = GlobalState::Failed;
+                    self.global_refresh_due =
+                        Some(due_after(Duration::from_secs(GLOBAL_RETRY_SECS)));
+                    return;
+                }
+            }
+        }
+        let was_live = self.global_index.saturating_add(1) >= self.global_frames.len();
+        let position = self
+            .global_frames
+            .partition_point(|stored| stored.time_unix_ms < time_unix_ms);
+        self.global_frames.insert(
+            position,
+            GlobalFrameTexture {
+                time_unix_ms,
+                tiles: textures,
+            },
+        );
+        if was_live {
+            self.global_index = self.global_frames.len().saturating_sub(1);
+        } else if position <= self.global_index {
+            self.global_index = self.global_index.saturating_add(1);
+        }
+        self.global_state = GlobalState::Ready;
     }
 
     fn advance_global_playback(&mut self) {
@@ -1516,29 +1528,30 @@ impl OxradApp {
         if !self.global_layer.is_shown() {
             return false;
         }
-        let Some(bounds) = self.global_bounds else {
-            return false;
-        };
         let Some(frame) = self.global_frames.get(self.global_index) else {
             return false;
         };
-        let (Some(north_west), Some(south_east)) = (
-            transform.screen(bounds.north, bounds.west),
-            transform.screen(bounds.south, bounds.east),
-        ) else {
-            return false;
-        };
-        let image_rect = Rect::from_two_pos(north_west, south_east);
-        if image_rect.width() <= 0.0 || image_rect.height() <= 0.0 {
-            return false;
+        let mut drew = false;
+        for tile in &frame.tiles {
+            let (Some(north_west), Some(south_east)) = (
+                transform.screen(tile.bounds.north, tile.bounds.west),
+                transform.screen(tile.bounds.south, tile.bounds.east),
+            ) else {
+                continue;
+            };
+            let image_rect = Rect::from_two_pos(north_west, south_east);
+            if image_rect.width() <= 0.0 || image_rect.height() <= 0.0 {
+                continue;
+            }
+            ui.painter().image(
+                tile.texture.id(),
+                image_rect,
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+            drew = true;
         }
-        ui.painter().image(
-            frame.texture.id(),
-            image_rect,
-            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-            Color32::WHITE,
-        );
-        true
+        drew
     }
 
     fn global_controls(&mut self, ui: &mut egui::Ui, rect: Rect) {
@@ -2144,6 +2157,7 @@ impl OxradApp {
 fn global_texture(
     context: &egui::Context,
     time_unix_ms: u64,
+    bounds: TileBounds,
     tile: DecodedTile,
 ) -> Result<egui::TextureHandle, GlobalRadarError> {
     let DecodedTile {
@@ -2170,7 +2184,10 @@ fn global_texture(
     }
     let image = egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba);
     Ok(context.load_texture(
-        format!("global-radar-{time_unix_ms}"),
+        format!(
+            "global-radar-{time_unix_ms}-{}-{}-{}",
+            bounds.zoom, bounds.x, bounds.y
+        ),
         image,
         egui::TextureOptions::LINEAR,
     ))

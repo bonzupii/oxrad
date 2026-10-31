@@ -74,7 +74,7 @@ cargo build
 cargo build --release --locked
 ```
 
-`cargo test` currently runs 112 tests. Nine use the network because the paths they cover are real services:
+`cargo test` currently runs 113 tests. Nine use the network because the paths they cover are real services:
 
 - the pinned KPAH archive download, size check, SHA-256 check, and full decode;
 - the live KPAH listing and retrieval;
