@@ -19,6 +19,7 @@ mod config;
 mod display;
 mod error;
 mod forecast;
+mod global_radar;
 mod gpu;
 mod map;
 mod network;

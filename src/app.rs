@@ -25,6 +25,9 @@ use eframe::egui::{
 use crate::config::{self, Config};
 use crate::display::{Display, DisplayState, Frame};
 use crate::forecast::{Forecast, ForecastError, ForecastFeed, ForecastOutcome, ForecastPeriod};
+use crate::global_radar::{
+    self, DecodedTile, GlobalEvent, GlobalRadarError, GlobalRadarFeed, TileBounds,
+};
 use crate::gpu::RadarGpu;
 use crate::map::{self, MapError, MapView, WorldMap};
 use crate::overlay;
@@ -56,6 +59,9 @@ const FORECAST_RETRY_MAX_SECS: u64 = 60;
 const VIEW_RADAR_LIMIT: usize = 3;
 const STATION_REFRESH_SECS: u64 = 6 * 60 * 60;
 const STATION_RETRY_SECS: u64 = 15 * 60;
+const GLOBAL_REFRESH_SECS: u64 = 5 * 60;
+const GLOBAL_RETRY_SECS: u64 = 60;
+const GLOBAL_PLAYBACK_MS: u64 = 650;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SceneMode {
@@ -80,6 +86,24 @@ impl RadarLayer {
             Self::Hidden => Self::Shown,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlobalPlayback {
+    Stopped,
+    Playing,
+}
+
+enum GlobalState {
+    Idle,
+    Loading,
+    Ready,
+    Failed,
+}
+
+struct GlobalFrameTexture {
+    time_unix_ms: u64,
+    texture: egui::TextureHandle,
 }
 
 fn due_after(delay: Duration) -> Instant {
@@ -185,6 +209,17 @@ pub struct OxradApp {
     map_view: MapView,
     map_radar: RadarLayer,
     map_reload_due: Option<Instant>,
+    global_feed: GlobalRadarFeed,
+    global_generation: u64,
+    global_frames: Vec<GlobalFrameTexture>,
+    global_bounds: Option<TileBounds>,
+    global_index: usize,
+    global_layer: RadarLayer,
+    global_playback: GlobalPlayback,
+    global_next_frame: Option<Instant>,
+    global_request_due: Option<Instant>,
+    global_refresh_due: Option<Instant>,
+    global_state: GlobalState,
 }
 
 impl OxradApp {
@@ -235,6 +270,17 @@ impl OxradApp {
             map_view: MapView::default(),
             map_radar: RadarLayer::Shown,
             map_reload_due: None,
+            global_feed: GlobalRadarFeed::new(),
+            global_generation: 0,
+            global_frames: Vec::new(),
+            global_bounds: None,
+            global_index: 0,
+            global_layer: RadarLayer::Shown,
+            global_playback: GlobalPlayback::Stopped,
+            global_next_frame: None,
+            global_request_due: None,
+            global_refresh_due: None,
+            global_state: GlobalState::Idle,
         };
         if let Some(place) = &restored_place {
             match MapView::focus(place.lat, place.lon, 2_200.0) {
@@ -437,9 +483,11 @@ impl OxradApp {
         self.start_forecast(place, 0);
         if !place.in_united_states() {
             self.clear_site();
+            self.scene_mode = SceneMode::Map;
+            self.ensure_viewport_radars();
+            self.request_global_radar();
             self.notice = Some(format!(
-                "No supported radar source covers {}. The Open-Meteo forecast on the right is still available for {}.",
-                place.country,
+                "Showing the global RainViewer composite for {}. No Level II site is selected outside the United States.",
                 place.label()
             ));
             self.save_config();
@@ -567,7 +615,7 @@ impl OxradApp {
         }
     }
 
-    fn update_workers(&mut self) {
+    fn update_workers(&mut self, context: &egui::Context) {
         if let Some(pipeline) = self.pipeline.as_mut()
             && let Some(volume) = pipeline.poll()
         {
@@ -633,6 +681,7 @@ impl OxradApp {
         if let Some((place, attempt)) = retry {
             self.start_forecast(&place, attempt);
         }
+        self.poll_global_radar(context);
     }
 
     fn site_station(&self) -> Option<&Station> {
@@ -656,6 +705,8 @@ impl OxradApp {
         }
         matches!(self.search_state, SearchState::Working { .. })
             || matches!(self.forecast_state, ForecastState::Loading { .. })
+            || matches!(self.global_state, GlobalState::Loading)
+            || matches!(self.global_playback, GlobalPlayback::Playing)
             || (self.site.is_some()
                 && (self.display.state.is_busy()
                     || self
@@ -714,6 +765,7 @@ impl OxradApp {
                         self.scene_mode = SceneMode::Map;
                         self.focus_map_context();
                         self.ensure_viewport_radars();
+                        self.global_request_due = Some(Instant::now());
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if let Some(place) = &self.place {
@@ -1265,21 +1317,34 @@ impl OxradApp {
     }
 
     fn map_scene(&mut self, ui: &mut egui::Ui) {
-        let rect = ui.max_rect();
+        let full_rect = ui.max_rect();
+        ui.painter()
+            .rect_filled(full_rect, CornerRadius::ZERO, BACKGROUND);
+        if self.global_layer.is_shown() && !self.global_frames.is_empty() {
+            self.global_history(ui);
+        }
+        let rect = ui.available_rect_before_wrap();
         if rect.width() <= 0.0 || rect.height() <= 0.0 {
             return;
         }
-        ui.painter()
-            .rect_filled(rect, CornerRadius::ZERO, BACKGROUND);
         let interaction = ui.interact(
             rect,
             ui.id().with("geographic-map"),
             egui::Sense::click_and_drag(),
         );
         self.map_input(ui, rect, &interaction);
-        if self.map_reload_due.is_some_and(|due| Instant::now() >= due) {
+        let now = Instant::now();
+        if self.map_reload_due.is_some_and(|due| now >= due) {
             self.map_reload_due = None;
             self.reload_viewport_radars();
+        }
+        if self.global_layer.is_shown()
+            && (self.global_request_due.is_some_and(|due| now >= due)
+                || self.global_refresh_due.is_some_and(|due| now >= due)
+                || matches!(self.global_state, GlobalState::Idle))
+        {
+            self.global_refresh_due = None;
+            self.request_global_radar();
         }
         let transform = match self.map_view.transform(rect) {
             Ok(transform) => transform,
@@ -1295,12 +1360,14 @@ impl OxradApp {
             }
         };
         self.map_basemap(ui, rect);
+        self.map_global(ui, &transform);
         let radar_visible = self.map_radar(ui, rect, &transform);
         let clicked_site = self.map_stations(ui, rect, &transform, &interaction);
         self.map_place(ui, &transform);
         map::draw_scale(ui.painter(), rect, &transform);
         self.map_controls(ui, rect);
         self.map_readout(ui, rect, &transform, radar_visible);
+        self.global_controls(ui, rect);
         if let Some(id) = clicked_site {
             self.choose_site(id);
         }
@@ -1331,6 +1398,263 @@ impl OxradApp {
     fn schedule_viewport_reload(&mut self) {
         let now = Instant::now();
         self.map_reload_due = now.checked_add(Duration::from_millis(700));
+        self.global_request_due = now.checked_add(Duration::from_millis(900));
+    }
+
+    fn request_global_radar(&mut self) {
+        self.global_request_due = None;
+        let (center_lat, center_lon) = match self.map_view.center_latlon() {
+            Ok(center) => center,
+            Err(error) => {
+                self.notice = Some(format!("Global radar view unavailable: {error}"));
+                return;
+            }
+        };
+        match self
+            .global_feed
+            .request(center_lat, center_lon, self.map_view.span_km())
+        {
+            Ok(generation) => {
+                self.global_generation = generation;
+                self.global_state = GlobalState::Loading;
+            }
+            Err(error) => {
+                self.notice = Some(format!("Global radar request failed: {error}"));
+                self.global_state = GlobalState::Failed;
+                self.global_refresh_due = Some(due_after(Duration::from_secs(GLOBAL_RETRY_SECS)));
+            }
+        }
+    }
+
+    fn poll_global_radar(&mut self, context: &egui::Context) {
+        while let Some(event) = self.global_feed.poll() {
+            self.apply_global_event(context, event);
+        }
+        self.advance_global_playback();
+    }
+
+    fn apply_global_event(&mut self, context: &egui::Context, event: GlobalEvent) {
+        match event {
+            GlobalEvent::Manifest {
+                generation,
+                manifest,
+            } => {
+                if generation != self.global_generation {
+                    return;
+                }
+                self.global_frames.clear();
+                self.global_index = 0;
+                self.global_playback = GlobalPlayback::Stopped;
+                self.global_next_frame = None;
+                self.global_state = GlobalState::Loading;
+                self.global_refresh_due = Some(due_after(Duration::from_secs(GLOBAL_REFRESH_SECS)));
+                self.global_bounds = Some(manifest.bounds);
+            }
+            GlobalEvent::Frame {
+                generation,
+                frame,
+                tile,
+            } => {
+                if generation != self.global_generation {
+                    return;
+                }
+                match global_texture(context, frame.time_unix_ms, tile) {
+                    Ok(texture) => {
+                        let was_live =
+                            self.global_index.saturating_add(1) >= self.global_frames.len();
+                        let position = self
+                            .global_frames
+                            .partition_point(|stored| stored.time_unix_ms < frame.time_unix_ms);
+                        self.global_frames.insert(
+                            position,
+                            GlobalFrameTexture {
+                                time_unix_ms: frame.time_unix_ms,
+                                texture,
+                            },
+                        );
+                        if was_live {
+                            self.global_index = self.global_frames.len().saturating_sub(1);
+                        } else if position <= self.global_index {
+                            self.global_index = self.global_index.saturating_add(1);
+                        }
+                        self.global_state = GlobalState::Ready;
+                    }
+                    Err(error) => {
+                        self.notice =
+                            Some(format!("Global radar tile could not be shown: {error}"));
+                        self.global_state = GlobalState::Failed;
+                        self.global_refresh_due =
+                            Some(due_after(Duration::from_secs(GLOBAL_RETRY_SECS)));
+                    }
+                }
+            }
+            GlobalEvent::Failed { generation, error } => {
+                if generation != self.global_generation {
+                    return;
+                }
+                self.notice = Some(format!("Global radar: {error}"));
+                self.global_state = GlobalState::Failed;
+                self.global_refresh_due = Some(due_after(Duration::from_secs(GLOBAL_RETRY_SECS)));
+            }
+        }
+    }
+
+    fn advance_global_playback(&mut self) {
+        if self.global_playback != GlobalPlayback::Playing || self.global_frames.len() < 2 {
+            return;
+        }
+        let now = Instant::now();
+        if self.global_next_frame.is_some_and(|due| now < due) {
+            return;
+        }
+        let count = self.global_frames.len();
+        self.global_index = self.global_index.saturating_add(1) % count;
+        self.global_next_frame = now.checked_add(Duration::from_millis(GLOBAL_PLAYBACK_MS));
+    }
+
+    fn map_global(&self, ui: &egui::Ui, transform: &map::MapTransform) -> bool {
+        if !self.global_layer.is_shown() {
+            return false;
+        }
+        let Some(bounds) = self.global_bounds else {
+            return false;
+        };
+        let Some(frame) = self.global_frames.get(self.global_index) else {
+            return false;
+        };
+        let (Some(north_west), Some(south_east)) = (
+            transform.screen(bounds.north, bounds.west),
+            transform.screen(bounds.south, bounds.east),
+        ) else {
+            return false;
+        };
+        let image_rect = Rect::from_two_pos(north_west, south_east);
+        if image_rect.width() <= 0.0 || image_rect.height() <= 0.0 {
+            return false;
+        }
+        ui.painter().image(
+            frame.texture.id(),
+            image_rect,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            Color32::WHITE,
+        );
+        true
+    }
+
+    fn global_controls(&mut self, ui: &mut egui::Ui, rect: Rect) {
+        let toggle = Rect::from_min_size(
+            Pos2::new(rect.left() + 16.0, rect.top() + 180.0),
+            Vec2::new(158.0, 28.0),
+        );
+        if ui
+            .put(
+                toggle,
+                egui::Button::new(if self.global_layer.is_shown() {
+                    "Global radar: on"
+                } else {
+                    "Global radar: off"
+                })
+                .fill(if self.global_layer.is_shown() {
+                    HIGHLIGHT
+                } else {
+                    CARD
+                }),
+            )
+            .on_hover_text("RainViewer global reflectivity composite with two hours of history.")
+            .clicked()
+        {
+            self.global_layer = self.global_layer.toggled();
+            if !self.global_layer.is_shown() {
+                self.global_playback = GlobalPlayback::Stopped;
+            } else if self.global_frames.is_empty() {
+                self.request_global_radar();
+            }
+        }
+    }
+
+    fn global_history(&mut self, ui: &mut egui::Ui) {
+        let last = self.global_frames.len().saturating_sub(1);
+        let index = self.global_index.min(last);
+        let Some(frame) = self.global_frames.get(index) else {
+            return;
+        };
+        let stamp = time::format_utc(frame.time_unix_ms)
+            .unwrap_or_else(|_| String::from("time unavailable"));
+        let count = self.global_frames.len();
+        let mut requested = index;
+        let mut playback = self.global_playback;
+        let mut scrub = false;
+        egui::Panel::bottom("global_history")
+            .exact_size(64.0)
+            .resizable(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(CARD)
+                    .inner_margin(egui::Margin::symmetric(10, 5)),
+            )
+            .show_inside(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let label = if playback == GlobalPlayback::Playing {
+                        "Pause"
+                    } else {
+                        "Play"
+                    };
+                    if ui.button(label).clicked() {
+                        playback = match playback {
+                            GlobalPlayback::Stopped => GlobalPlayback::Playing,
+                            GlobalPlayback::Playing => GlobalPlayback::Stopped,
+                        };
+                    }
+                    let slider_width = (ui.available_width() - 190.0).max(100.0);
+                    if ui
+                        .add_sized(
+                            [slider_width, 18.0],
+                            egui::Slider::new(&mut requested, 0..=last).show_value(false),
+                        )
+                        .changed()
+                    {
+                        scrub = true;
+                    }
+                    ui.label(
+                        RichText::new(format!(
+                            "{}/{} · {}",
+                            index.saturating_add(1),
+                            count,
+                            global_radar::PALETTE
+                        ))
+                        .size(10.0)
+                        .color(MUTED),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("Global composite · {stamp}"))
+                            .size(10.0)
+                            .monospace()
+                            .color(TEXT),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.hyperlink_to(
+                            RichText::new(global_radar::ATTRIBUTION)
+                                .size(9.0)
+                                .color(MUTED),
+                            "https://www.rainviewer.com/",
+                        );
+                    });
+                });
+            });
+        if scrub {
+            playback = GlobalPlayback::Stopped;
+            self.global_index = requested;
+        }
+        if playback != self.global_playback {
+            if playback == GlobalPlayback::Playing {
+                self.global_next_frame = Some(Instant::now());
+            } else {
+                self.global_next_frame = None;
+            }
+        }
+        self.global_playback = playback;
     }
 
     fn map_radar(&mut self, ui: &egui::Ui, rect: Rect, transform: &map::MapTransform) -> bool {
@@ -1547,11 +1871,21 @@ impl OxradApp {
             .map(|layer| layer.site.as_str())
             .collect::<Vec<_>>()
             .join(", ");
-        if !contributing.is_empty() {
+        let global = if self.global_layer.is_shown() {
+            match &self.global_state {
+                GlobalState::Idle => String::new(),
+                GlobalState::Loading => String::from(" · global loading"),
+                GlobalState::Ready => String::from(" · global RainViewer"),
+                GlobalState::Failed => String::from(" · global error"),
+            }
+        } else {
+            String::from(" · global off")
+        };
+        if !contributing.is_empty() || self.global_layer.is_shown() {
             ui.painter().text(
-                Pos2::new(rect.left() + 16.0, rect.top() + 178.0),
+                Pos2::new(rect.left() + 16.0, rect.top() + 216.0),
                 Align2::LEFT_TOP,
-                format!("Layers: {contributing}"),
+                format!("Layers: {contributing}{global}"),
                 FontId::monospace(10.0),
                 MUTED,
             );
@@ -1755,10 +2089,12 @@ impl OxradApp {
                 ],
             ),
             (Some(place), None, _) if !place.in_united_states() => (
-                "No supported radar source covers this place",
+                "No local Level II station selected",
                 vec![
                     format!("The forecast on the right is for {}.", place.label()),
-                    String::from("Radar coverage is limited to the sources currently configured."),
+                    String::from(
+                        "Open Map for the global RainViewer composite and its two-hour history.",
+                    ),
                 ],
             ),
             (Some(place), None, _) => (
@@ -1803,6 +2139,41 @@ impl OxradApp {
             ),
         }
     }
+}
+
+fn global_texture(
+    context: &egui::Context,
+    time_unix_ms: u64,
+    tile: DecodedTile,
+) -> Result<egui::TextureHandle, GlobalRadarError> {
+    let DecodedTile {
+        width,
+        height,
+        rgba,
+    } = tile;
+    let (Ok(width), Ok(height)) = (usize::try_from(width), usize::try_from(height)) else {
+        return Err(GlobalRadarError::Pixels {
+            width,
+            height,
+            bytes: rgba.len(),
+        });
+    };
+    let expected = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4));
+    if width == 0 || height == 0 || expected != Some(rgba.len()) {
+        return Err(GlobalRadarError::Pixels {
+            width: u32::try_from(width).unwrap_or(u32::MAX),
+            height: u32::try_from(height).unwrap_or(u32::MAX),
+            bytes: rgba.len(),
+        });
+    }
+    let image = egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba);
+    Ok(context.load_texture(
+        format!("global-radar-{time_unix_ms}"),
+        image,
+        egui::TextureOptions::LINEAR,
+    ))
 }
 
 fn draw_map_display(
@@ -1928,7 +2299,7 @@ fn search_results(
     let mut chosen: Option<Place> = None;
     for place in places {
         let detail = if !place.in_united_states() {
-            format!("{} · no radar source", place.country)
+            format!("{} · global radar composite", place.country)
         } else {
             match stations {
                 Ok(list) => match place::nearest_station(list, place.lat, place.lon) {
@@ -2355,7 +2726,7 @@ fn readout(ui: &egui::Ui, frame: &Frame, transform: &ViewTransform, viewport: Re
 
 impl eframe::App for OxradApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.update_workers();
+        self.update_workers(ui.ctx());
         self.header(ui);
         self.status(ui);
         self.rail(ui);

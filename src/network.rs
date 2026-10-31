@@ -36,7 +36,7 @@ const USER_AGENT: &str = concat!(
     " (https://github.com/bonzupii/oxrad)"
 );
 
-fn http_get(url: &str) -> Result<Vec<u8>, RadarError> {
+pub(crate) fn http_get(url: &str) -> Result<Vec<u8>, RadarError> {
     let mut response = ureq::get(url)
         .header("User-Agent", USER_AGENT)
         .config()

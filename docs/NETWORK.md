@@ -10,6 +10,8 @@ This document describes the network paths in the current implementation. It does
 | `nominatim.openstreetmap.org` | Place search | `GET /search` with `format=jsonv2`, a result limit, and a user agent |
 | `api.open-meteo.com` | Global forecast | `GET /v1/forecast` for current, hourly, and daily data |
 | `unidata-nexrad-level2.s3.amazonaws.com` | NEXRAD Level II archive | S3 list and object GET |
+| `api.rainviewer.com` | Global radar manifest | `GET /public/weather-maps.json` |
+| `tilecache.rainviewer.com` | Global radar image tiles | 512-pixel PNG tile GETs for each manifest frame |
 
 All requests identify the client as `oxrad/<CARGO_PKG_VERSION> (https://github.com/bonzupii/oxrad)`.
 
@@ -18,7 +20,7 @@ All requests identify the client as `oxrad/<CARGO_PKG_VERSION> (https://github.c
 | Path | Timeout | Body limit |
 |---|---|---|
 | JSON providers (`provider.rs`) | 10 seconds | 4 MiB |
-| NEXRAD S3 (`network.rs`) | 30 seconds | 64 MiB |
+| NEXRAD S3 and RainViewer tiles (`network.rs`, `global_radar.rs`) | 30 seconds | 64 MiB |
 
 The NEXRAD body limit is whole-response buffering. It is sufficient for an Archive II volume today and is a known memory limitation. Streaming acquisition is not implemented.
 
@@ -42,14 +44,22 @@ The archive client lists each UTC day under `{year}/{month}/{day}/{site}/`, filt
 
 The object is downloaded into memory and decoded in a worker. A 404 is reported as a stale listing (`VolumeGone`), not as an empty sky. A volume is accepted only when assembly sees volume-start and volume-end radials, complete sweep boundaries, and valid site coordinates.
 
+## Global radar composite
+
+RainViewer supplies a manifest of 10-minute reflectivity frames for the previous two hours. The manifest is accepted only from an HTTPS host and only with validated frame paths and times. The manifest is cached in the worker for 90 seconds; decoded PNG bytes are cached for up to 52 tiles. Each viewport request selects the best Web Mercator zoom up to level 7 and fetches the tile containing the map centre.
+
+The current tile request covers the map centre, not the full rectangular viewport when the view is wider than one tile. Wide views can therefore leave parts of the map uncovered until the next viewport-grid increment. This is an implementation limitation, not a claim of complete global coverage.
+
+A new viewport request supersedes the previous generation; stale manifest, frame, and error messages are discarded. A source failure is reported in the UI and retried after 60 seconds. RainViewer requires visible attribution in the application, which the map shows as "Weather data by RainViewer".
+
 ## Retry behavior
 
 Forecast retries use a 2 second base, exponential growth to 60 seconds, jitter, and `Retry-After` when a provider supplies it. NEXRAD fetch retries use the same base and cap. A deterministic decode failure retries once and then waits for a new volume or a manual retry. A changed forecast place supersedes the previous request; a stale answer is discarded by generation.
 
 ## Request cancellation
 
-The forecast and place workers use generation numbers so a superseded answer cannot overwrite a newer selection. The radar pipeline stops when it is dropped. There is no transfer-level cancellation: a request already in flight completes or reaches its timeout. Bounded worker shutdown and streaming cancellation are not implemented.
+The forecast, place, and global-radar workers use generation numbers so a superseded answer cannot overwrite a newer selection. The radar pipeline stops when it is dropped. There is no transfer-level cancellation: a request already in flight completes or reaches its timeout. Bounded worker shutdown and streaming cancellation are not implemented.
 
 ## Privacy
 
-Place queries are sent to Nominatim. Forecast coordinates are sent to Open-Meteo. Radar requests send only the site and time prefix. No account, API key, or device identifier is sent.
+Place queries are sent to Nominatim. Forecast coordinates are sent to Open-Meteo. Global radar requests send the map-centre tile coordinates to RainViewer. NEXRAD requests send only the site and time prefix. No account, API key, or device identifier is sent.

@@ -27,11 +27,11 @@ This section describes the repository as it exists, not the target.
 | Products | Implemented | DREF, DVEL, DSW, DZDR, DRHO, DPHI, DKDP |
 | Tilts | Implemented | Complete sweeps retained; tilt list filtered by selected product |
 | Geographic rendering | Implemented | WGS84 gate corners, Web Mercator, product palette, rings, grid, pointer readout |
-| Global radar ingestion | Not implemented | NEXRAD is the only radar format and the United States is the only radar coverage |
+| Global radar ingestion | Partial | RainViewer global reflectivity composite with two-hour history; no national Level II adapters outside the United States |
 | TDWR ingestion | Not implemented | TDWR stations are excluded from the selectable feed |
-| Viewport model | Partial | The map has Mercator pan, zoom, and the displayed radar mesh at its true site position; the radar scene remains a centered single-site disc and no multiple stations are composed |
+| Viewport model | Partial | The map has Mercator pan, zoom, a global radar tile, and independently placed station meshes; the radar scene remains a centered single-site disc and no common-time values are composed |
 | Multi-station composition | Partial | Map viewport overlays the selected station and up to three nearby stations as independent meshes; no common scan time or composite values |
-| Time history and looping | Not implemented | Only the newest completed volume is shown |
+| Time history and looping | Partial | RainViewer composite has 13 ten-minute frames with scrub and loop; NEXRAD still shows only the newest completed volume |
 | Warnings | Not implemented | No alert adapter or polygon layer |
 | Map base and labels | Implemented | Offline Natural Earth 1:110m countries, borders, labels, graticule, scale, and site markers; no local detail yet |
 | Measurement tools | Partial | Pointer latitude, longitude, range, azimuth, and gate value readout |
@@ -152,17 +152,17 @@ The offline vector map, pointer-anchored Mercator zoom, drag pan, station marker
 
 Bounded independent pipelines and per-mesh transforms now render the selected station plus up to three nearby stations in the map viewport, with debounced re-query after pan or zoom and contributing-site labels. Remaining work is a common scan time, stale-candidate rejection, deterministic per-product overlap values, gap disclosure, and tests for overlap order and viewport changes during loading.
 
-### Phase 5: time history and professional inspection
+### Phase 5: time history and professional inspection (in progress)
 
-Add a bounded volume history, time scrubber, loop playback, scan comparison, product comparison panes, storm motion where the data supports it, and a crosshair measurement workflow.
+The RainViewer global composite now has a 13-frame, two-hour scrubber and loop. Remaining work is NEXRAD volume history, scan comparison, product comparison panes, storm motion where the data supports it, and a crosshair measurement workflow.
 
 ### Phase 6: authoritative context
 
 Add warning polygons and metadata from authoritative alert feeds, base-map tiles, labels, layer toggles, and a clear distinction between observation, forecast, and warning time.
 
-### Phase 7: international radar adapters
+### Phase 7: international radar adapters (in progress)
 
-Implement and verify each authoritative source independently. The order is driven by accessible interfaces and formats, not by country prestige. DWD and other ODIM_H5 feeds require a tested HDF5/ODIM decoder before they can be listed as supported. Every adapter must expose its actual products, coverage, update cadence, and limitations.
+The RainViewer global composite is integrated as one global reflectivity source. Implement and verify each authoritative national source independently. The order is driven by accessible interfaces and formats, not by country prestige. DWD and other ODIM_H5 feeds require a tested HDF5/ODIM decoder before they can be listed as supported. Every adapter must expose its actual products, coverage, update cadence, and limitations.
 
 ### Phase 8: resilience, accessibility, and release
 

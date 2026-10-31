@@ -5,6 +5,7 @@ use crate::error::{
     ColorMapError, CoordinateError, MomentError, RadarError, RenderError, SiteIdError,
 };
 use crate::forecast::ForecastError;
+use crate::global_radar::GlobalRadarError;
 use crate::map::MapError;
 use crate::place::PlaceError;
 use crate::provider::JsonError;
@@ -21,6 +22,7 @@ pub enum TestError {
     Radar(RadarError),
     Place(PlaceError),
     Map(MapError),
+    GlobalRadar(GlobalRadarError),
     ColorMap(ColorMapError),
     Time(std::time::SystemTimeError),
 }
@@ -38,6 +40,7 @@ impl Display for TestError {
             Self::Radar(error) => Display::fmt(error, formatter),
             Self::Place(error) => Display::fmt(error, formatter),
             Self::Map(error) => Display::fmt(error, formatter),
+            Self::GlobalRadar(error) => Display::fmt(error, formatter),
             Self::ColorMap(error) => Display::fmt(error, formatter),
             Self::Time(error) => Display::fmt(error, formatter),
         }
@@ -56,6 +59,7 @@ impl Error for TestError {
             Self::Radar(error) => Some(error),
             Self::Place(error) => Some(error),
             Self::Map(error) => Some(error),
+            Self::GlobalRadar(error) => Some(error),
             Self::ColorMap(error) => Some(error),
             Self::Time(error) => Some(error),
             Self::Message(_) => None,
@@ -126,6 +130,12 @@ impl From<PlaceError> for TestError {
 impl From<MapError> for TestError {
     fn from(value: MapError) -> Self {
         Self::Map(value)
+    }
+}
+
+impl From<GlobalRadarError> for TestError {
+    fn from(value: GlobalRadarError) -> Self {
+        Self::GlobalRadar(value)
     }
 }
 

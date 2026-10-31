@@ -21,14 +21,15 @@ The application is free software under GPLv3. It has no account, subscription, a
 - Product-specific color scales and legends, radial velocity units, readouts with the selected product's units and beam elevation, scan time and age, grid, range rings, station marker, and pointer latitude/longitude/range/azimuth.
 - An offline Natural Earth 1:110m vector map with country fills, borders, labels, a graticule, a scale bar, coordinates, and runtime radar-site markers. The map pans by dragging, zooms under the pointer, and selects a radar site by clicking its marker. It has no tile account or network dependency.
 - Map-view radar overlays. The selected station and up to three nearby stations load through independent pipelines and render as independent meshes at their true geographic positions, farthest first so the selected site is on top. Each layer has its own fetch, decode, render, and failure state. Pan and zoom schedule a debounced re-query around the new centre, and the contributing site identifiers are shown on the map. This is a station overlay, not a time-aligned mosaic or composite product.
+- A live global radar composite from RainViewer, covering more than 1,200 radars in over 150 countries. It renders at Web Mercator tile bounds, carries ten-minute frames for the previous two hours, and provides a timestamp scrubber and loop. RainViewer attribution is shown on the map. This is a global composite source, not a national Level II feed and not a substitute for the seven NEXRAD moments.
 - Honest failure states for configuration, station discovery, place search, forecast, fetch, decode, and rendering. The last good radar frame stays visible with its age; a failed refresh does not become a current-data indicator.
 - Saved town and radar restoration from `~/.oxrad/config.toml`, and `--site KPAH` for an explicit radar start. The town’s forecast point and the radar station are stored as separate identities.
 
 ## What is not implemented
 
-- Radar ingestion outside the United States. NEXRAD is the only radar adapter. There is no DWD, ECCC, BoM, JMA, CMA, IMD, Roshydromet, SMN, MetService, OPERA, or ODIM_H5 decoder yet. The station list excludes TDWR because no TDWR Level II acquisition path exists.
+- National Level II or Level III adapters outside the United States. The RainViewer composite provides global reflectivity, but there is no DWD, ECCC, BoM, JMA, CMA, IMD, Roshydromet, SMN, MetService, OPERA, or ODIM_H5 decoder yet. The station list excludes TDWR because no TDWR Level II acquisition path exists.
 - A time-aligned multi-station mosaic or composite product. The map viewport can overlay the selected station and up to three nearby stations, but it does not choose a common scan time, fill gaps, or resolve overlapping gates into a composite value.
-- Time history, looping, a scrubber, side-by-side panes, warning polygons, storm tracks, storm motion, local state and city detail beyond the 1:110m country map, measurement tools, and location-permission handling. The map can pan and zoom with the single displayed radar volume attached, but it cannot yet acquire or compose multiple stations.
+- NEXRAD scan history, looping, and a scrubber. The RainViewer global composite has its own two-hour history and loop, but the Level II path still shows only the newest completed volume. Side-by-side panes, warning polygons, storm tracks, storm motion, local state and city detail beyond the 1:110m country map, measurement tools, and location-permission handling are also absent.
 - A first-run location picker. There is no onboarding overlay, and none is planned. The application opens with the saved site when one exists and normal station and place controls in the left rail.
 - Colorblind-safe palette alternatives and a light theme. The current interface is dark-only.
 - The required two independent full-system clean reviews. No separate reviewer process was available in this environment.
@@ -50,6 +51,7 @@ The application stores configuration and the station cache under `~/.oxrad`.
 | Source | Use | Coverage | Status |
 |---|---|---|---|
 | Unidata NEXRAD Level II S3 archive | Radar volumes | United States WSR-88D | Implemented |
+| RainViewer Weather Maps API | Global reflectivity composite and two-hour history | 1,200+ radars in 150+ countries | Implemented; free personal/community terms, visible attribution |
 | NWS `api.weather.gov/radar/stations` | Runtime station discovery | United States WSR-88D and TDWR metadata | Implemented; TDWR excluded from selection |
 | Open-Meteo forecast API | Current, hourly, daily forecast | Global | Implemented |
 | OpenStreetMap Nominatim | Place search | Global | Implemented |
@@ -72,14 +74,15 @@ cargo build
 cargo build --release --locked
 ```
 
-`cargo test` currently runs 107 tests. Eight use the network because the paths they cover are real services:
+`cargo test` currently runs 112 tests. Nine use the network because the paths they cover are real services:
 
 - the pinned KPAH archive download, size check, SHA-256 check, and full decode;
 - the live KPAH listing and retrieval;
 - the missing-volume 404 path;
 - live place search;
 - live Open-Meteo forecasts for a United States place and a place outside the United States;
-- live NWS station discovery and the cache round trip.
+- live NWS station discovery and the cache round trip;
+- the live RainViewer manifest and a real 512-pixel global tile decode.
 
 A network failure fails those tests; they are not replaced with synthetic data. No radar archive is stored in the repository.
 

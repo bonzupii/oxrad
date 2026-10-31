@@ -2399,6 +2399,7 @@ dependencies = [
  "bzip2-rs",
  "eframe",
  "geographiclib-rs",
+ "image",
  "nexrad-decode",
  "quick-xml",
  "serde_json",
