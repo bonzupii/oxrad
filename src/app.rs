@@ -166,6 +166,7 @@ struct HistoryView {
     error: Option<HistoryError>,
     playback: GlobalPlayback,
     next_frame: Option<Instant>,
+    scrub_index: Option<usize>,
 }
 
 impl HistoryView {
@@ -179,6 +180,7 @@ impl HistoryView {
             error: None,
             playback: GlobalPlayback::Stopped,
             next_frame: None,
+            scrub_index: None,
         }
     }
 
@@ -190,6 +192,7 @@ impl HistoryView {
         self.error = None;
         self.playback = GlobalPlayback::Stopped;
         self.next_frame = None;
+        self.scrub_index = None;
     }
 }
 
@@ -2553,6 +2556,7 @@ impl OxradApp {
                 let label = history::key_label(&key);
                 self.history.key = Some(key);
                 self.history.state = HistoryState::Reviewing;
+                self.history.scrub_index = None;
                 self.display.submit(volume, self.product);
                 self.notice = Some(format!("Reviewing radar scan {label}."));
                 if self.history.playback == GlobalPlayback::Playing {
@@ -2578,6 +2582,7 @@ impl OxradApp {
         self.history.state = HistoryState::Failed;
         self.history.playback = GlobalPlayback::Stopped;
         self.history.next_frame = None;
+        self.history.scrub_index = None;
     }
 
     fn request_history_keys(&mut self) {
@@ -2765,9 +2770,12 @@ impl OxradApp {
                 });
             }
             HistoryState::Reviewing => {
-                let (toggle, live) = self.history_reviewing_ui(ui);
+                let (toggle, live, scrub) = self.history_reviewing_ui(ui);
                 play_toggle = toggle;
                 resume = live;
+                if scrub.is_some() {
+                    selected = scrub;
+                }
             }
             HistoryState::Failed => {
                 let (reload, retry_key) = self.history_failure_controls(ui);
@@ -2784,9 +2792,10 @@ impl OxradApp {
         self.apply_history_actions(load, selected, retry, resume);
     }
 
-    fn history_reviewing_ui(&self, ui: &mut egui::Ui) -> (bool, bool) {
+    fn history_reviewing_ui(&mut self, ui: &mut egui::Ui) -> (bool, bool, Option<String>) {
         let mut play_toggle = false;
         let mut resume = false;
+        let mut scrub = None;
         let key = self
             .history
             .key
@@ -2802,6 +2811,30 @@ impl OxradApp {
                 .size(10.0)
                 .color(MUTED),
         );
+        if !self.history.keys.is_empty() {
+            let last = self.history.keys.len().saturating_sub(1);
+            let current = self
+                .history
+                .key
+                .as_deref()
+                .and_then(|key| self.history.keys.iter().position(|item| item == key))
+                .unwrap_or(0);
+            let mut requested = self.history.scrub_index.unwrap_or(current).min(last);
+            let response = ui.add(
+                egui::Slider::new(&mut requested, 0..=last)
+                    .show_value(false)
+                    .text("scan"),
+            );
+            if response.changed() {
+                self.history.scrub_index = Some(requested);
+            }
+            if (response.drag_stopped() || response.clicked())
+                && let Some(key) = self.history.keys.get(requested)
+            {
+                scrub = Some(key.clone());
+                self.history.scrub_index = None;
+            }
+        }
         ui.horizontal(|ui| {
             let label = if self.history.playback == GlobalPlayback::Playing {
                 "Pause history"
@@ -2831,7 +2864,7 @@ impl OxradApp {
         if ui.button("Return to live radar").clicked() {
             resume = true;
         }
-        (play_toggle, resume)
+        (play_toggle, resume, scrub)
     }
 
     fn history_scan_list(&self, ui: &mut egui::Ui) -> Option<String> {
@@ -2887,6 +2920,8 @@ impl OxradApp {
             self.request_history_volume(&key);
         }
         if let Some(key) = selected {
+            self.history.playback = GlobalPlayback::Stopped;
+            self.history.next_frame = None;
             self.request_history_volume(&key);
         }
         if resume {
