@@ -2916,6 +2916,72 @@ impl OxradApp {
         if let Some(index) = chosen {
             self.focus_warning(index);
         }
+        self.warning_detail(ui);
+    }
+
+    fn warning_detail(&self, ui: &mut egui::Ui) {
+        let Some(warning) = self
+            .selected_warning
+            .and_then(|index| self.warnings.get(index))
+        else {
+            return;
+        };
+        ui.add_space(10.0);
+        ui.separator();
+        ui.label(RichText::new("Selected alert").size(12.0).color(MUTED));
+        let title = if warning.headline.is_empty() {
+            format!("{} for {}", warning.event, warning.area)
+        } else {
+            warning.headline.clone()
+        };
+        ui.label(RichText::new(title).size(12.0).strong().color(TEXT));
+        ui.label(
+            RichText::new(format!(
+                "{} · {} · {}",
+                warning.severity.label(),
+                warning.urgency.label(),
+                warning.area
+            ))
+            .size(10.0)
+            .color(MUTED),
+        );
+        ui.label(
+            RichText::new(format!(
+                "Issued {} · expires {}",
+                warning.sent, warning.expires
+            ))
+            .size(10.0)
+            .color(MUTED),
+        );
+        if warning.description.is_empty() {
+            ui.label(
+                RichText::new("This alert carries no description text.")
+                    .size(10.0)
+                    .color(MUTED),
+            );
+        } else {
+            egui::ScrollArea::vertical()
+                .max_height(220.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.label(RichText::new(&warning.description).size(11.0).color(TEXT));
+                    if let Some(instruction) = &warning.instruction {
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new("Instructions")
+                                .size(11.0)
+                                .strong()
+                                .color(MUTED),
+                        );
+                        ui.label(RichText::new(instruction).size(11.0).color(TEXT));
+                    }
+                });
+        }
+        ui.label(
+            RichText::new(format!("Source: NWS active alerts · {}", warning.id))
+                .size(9.0)
+                .color(MUTED),
+        );
     }
 
     fn focus_warning(&mut self, index: usize) {
@@ -2923,6 +2989,7 @@ impl OxradApp {
             self.notice = Some(String::from("That warning is no longer available."));
             return;
         };
+        self.selected_warning = Some(index);
         let Some(ring) = warning.polygons.first() else {
             self.notice = Some(format!(
                 "Warning {} has no mapped polygon; its area is {}.",

@@ -48,6 +48,16 @@ impl Severity {
             Some(_) | None => Self::Unknown,
         }
     }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Extreme => "extreme",
+            Self::Severe => "severe",
+            Self::Moderate => "moderate",
+            Self::Minor => "minor",
+            Self::Unknown => "severity unknown",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,9 +93,13 @@ impl Urgency {
 
 #[derive(Debug, Clone)]
 pub struct Warning {
+    pub id: String,
     pub event: String,
     pub severity: Severity,
     pub urgency: Urgency,
+    pub headline: String,
+    pub description: String,
+    pub instruction: Option<String>,
     pub area: String,
     pub sent: String,
     pub expires: String,
@@ -263,6 +277,9 @@ fn parse_warning(feature: &Value) -> Result<Warning, WarningError> {
     })?;
     let severity = Severity::parse(text(properties, "severity"));
     let urgency = Urgency::parse(text(properties, "urgency"));
+    let headline = text(properties, "headline").map_or_else(String::new, String::from);
+    let description = text(properties, "description").map_or_else(String::new, String::from);
+    let instruction = text(properties, "instruction").map(String::from);
     let area = text(properties, "areaDesc").map_or_else(String::new, String::from);
     let sent = text(properties, "sent").map_or_else(String::new, String::from);
     let expires = text(properties, "expires").map_or_else(String::new, String::from);
@@ -271,9 +288,13 @@ fn parse_warning(feature: &Value) -> Result<Warning, WarningError> {
         Some(_) | None => Vec::new(),
     };
     Ok(Warning {
+        id: String::from(id),
         event: String::from(event),
         severity,
         urgency,
+        headline,
+        description,
+        instruction,
         area,
         sent,
         expires,
@@ -379,6 +400,8 @@ mod tests {
                 "severity": "Severe",
                 "urgency": "Immediate",
                 "headline": "Severe Thunderstorm Warning for test county",
+                "description": "A severe thunderstorm was located near Test City and is moving east.",
+                "instruction": "Move to an interior room on the lowest floor of a building.",
                 "areaDesc": "Test County",
                 "sent": "2026-10-31T11:55:00-05:00",
                 "expires": "2026-10-31T12:00:00-05:00"
@@ -399,9 +422,19 @@ mod tests {
             ]]
         }));
         let warning = parse_warning(&feature)?;
+        assert_eq!(warning.id, "urn:test:1");
         assert_eq!(warning.event, "Severe Thunderstorm Warning");
         assert!(matches!(warning.severity, Severity::Severe));
         assert!(matches!(warning.urgency, Urgency::Immediate));
+        assert_eq!(
+            warning.headline,
+            "Severe Thunderstorm Warning for test county"
+        );
+        assert!(warning.description.contains("Test City"));
+        assert_eq!(
+            warning.instruction.as_deref(),
+            Some("Move to an interior room on the lowest floor of a building.")
+        );
         assert_eq!(warning.area, "Test County");
         assert_eq!(warning.sent, "2026-10-31T11:55:00-05:00");
         assert_eq!(warning.polygons.len(), 1);
