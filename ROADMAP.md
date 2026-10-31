@@ -32,7 +32,7 @@ This section describes the repository as it exists, not the target.
 | Viewport model | Partial | The map has Mercator pan, zoom, a global radar tile, and independently placed station meshes; the radar scene remains a centered single-site disc and no common-time values are composed |
 | Multi-station composition | Partial | Map viewport overlays the selected station and up to three nearby stations within a six-minute scan window; no resampling, composite values, or gap fill |
 | Time history and looping | Partial | RainViewer composite has 13 ten-minute frames with scrub and loop; NEXRAD still shows only the newest completed volume |
-| Warnings | Partial | NWS active alerts for the United States and territories, drawn by severity with area, urgency, issuance, expiration, count, unreadable-alert count, and feed-failure state; no viewport filtering, selection, full text, or international alert feeds |
+| Warnings | Partial | NWS active alerts for the United States and territories, drawn by severity with area, urgency, issuance, expiration, count, unreadable-alert count, a selectable severity-sorted list, polygon focus, and feed-failure state; no viewport filtering, full alert text, or international alert feeds |
 | Map base and labels | Implemented | Offline Natural Earth 1:110m countries, borders, labels, graticule, scale, and site markers; no local detail yet |
 | Measurement tools | Partial | Pointer latitude, longitude, range, azimuth, and gate value readout |
 | Network cache | Partial | RainViewer manifest and tile bodies use a bounded disk cache with SHA-256 verification, atomic writes, corruption removal, and offline fallback; no HTTP validators, provider JSON, NEXRAD volumes, or forecast caching |
@@ -161,7 +161,7 @@ The RainViewer global composite now has a 13-frame, two-hour scrubber and loop. 
 
 ### Phase 6: authoritative context (in progress)
 
-NWS active-alert polygons, severity colors, area, urgency, issuance, expiration, layer toggle, refresh, and failure reporting are implemented for the United States and territories. One malformed alert is counted and does not discard the valid collection. Remaining work is viewport filtering, selectable alert detail with full text, and authoritative alert adapters for other regions. Observation, forecast, and warning time remain distinct concepts in the interface.
+NWS active-alert polygons, severity colors, area, urgency, issuance, expiration, layer toggle, refresh, and failure reporting are implemented for the United States and territories. One malformed alert is counted and does not discard the valid collection. Remaining work is viewport filtering, full alert text, and authoritative alert adapters for other regions. Observation, forecast, and warning time remain distinct concepts in the interface.
 
 ### Phase 7: international radar adapters (in progress)
 

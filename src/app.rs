@@ -133,6 +133,16 @@ const fn scans_align(reference_ms: u64, scan_ms: u64) -> bool {
     reference_ms.abs_diff(scan_ms) <= VIEW_RADAR_TIME_WINDOW_MS
 }
 
+const fn severity_rank(severity: Severity) -> u8 {
+    match severity {
+        Severity::Extreme => 4,
+        Severity::Severe => 3,
+        Severity::Moderate => 2,
+        Severity::Minor => 1,
+        Severity::Unknown => 0,
+    }
+}
+
 fn nearby_station_ids(
     stations: &[Station],
     center_lat: f64,
@@ -246,6 +256,7 @@ pub struct OxradApp {
     warnings: Vec<Warning>,
     warnings_without_geometry: usize,
     warnings_rejected: usize,
+    selected_warning: Option<usize>,
     warning_layer: RadarLayer,
     warning_state: WarningState,
     warning_request_due: Option<Instant>,
@@ -315,6 +326,7 @@ impl OxradApp {
             warnings: Vec::new(),
             warnings_without_geometry: 0,
             warnings_rejected: 0,
+            selected_warning: None,
             warning_layer: RadarLayer::Shown,
             warning_state: WarningState::Idle,
             warning_request_due: Some(Instant::now()),
@@ -562,6 +574,7 @@ impl OxradApp {
                 self.warnings = set.warnings;
                 self.warnings_without_geometry = set.without_geometry;
                 self.warnings_rejected = rejected.len();
+                self.selected_warning = None;
                 if let Some(message) = rejected.first() {
                     self.notice = Some(format!(
                         "{} active alerts could not be read. First problem: {message}",
@@ -934,6 +947,7 @@ impl OxradApp {
                         ui.add_space(12.0);
                         self.station_section(ui);
                         self.product_section(ui);
+                        self.warning_section(ui);
                         if let Some(notice) = &self.notice {
                             ui.add_space(12.0);
                             ui.colored_label(STALE, notice);
@@ -1823,7 +1837,7 @@ impl OxradApp {
         if !self.warning_layer.is_shown() {
             return;
         }
-        for warning in &self.warnings {
+        for (index, warning) in self.warnings.iter().enumerate() {
             let colour = match warning.severity {
                 Severity::Extreme => Color32::from_rgb(255, 58, 58),
                 Severity::Severe => Color32::from_rgb(255, 138, 32),
@@ -1850,8 +1864,13 @@ impl OxradApp {
                 if width > rect.width() * 4.0 {
                     continue;
                 }
+                let (width, colour) = if self.selected_warning == Some(index) {
+                    (4.0_f32, TEXT)
+                } else {
+                    (2.0_f32, colour)
+                };
                 ui.painter()
-                    .add(Shape::closed_line(points, Stroke::new(2.0_f32, colour)));
+                    .add(Shape::closed_line(points, Stroke::new(width, colour)));
             }
         }
     }
@@ -2219,13 +2238,114 @@ impl OxradApp {
     fn most_severe_warning(&self) -> Option<&Warning> {
         self.warnings
             .iter()
-            .max_by_key(|warning| match warning.severity {
-                Severity::Extreme => 4,
-                Severity::Severe => 3,
-                Severity::Moderate => 2,
-                Severity::Minor => 1,
-                Severity::Unknown => 0,
-            })
+            .max_by_key(|warning| severity_rank(warning.severity))
+    }
+
+    fn warning_section(&mut self, ui: &mut egui::Ui) {
+        if !self.warning_layer.is_shown() || self.warnings.is_empty() {
+            return;
+        }
+        ui.add_space(12.0);
+        ui.label(RichText::new("Active warnings").size(12.0).color(MUTED));
+        ui.label(
+            RichText::new("National Weather Service · United States and territories")
+                .size(10.0)
+                .color(MUTED),
+        );
+        let mut order: Vec<usize> = (0..self.warnings.len()).collect();
+        order.sort_by_key(|index| {
+            self.warnings
+                .get(*index)
+                .map_or(0, |warning| severity_rank(warning.severity))
+        });
+        order.reverse();
+        let mut chosen = None;
+        egui::ScrollArea::vertical()
+            .max_height(180.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for index in order.into_iter().take(40) {
+                    let Some(warning) = self.warnings.get(index) else {
+                        continue;
+                    };
+                    let selected = self.selected_warning == Some(index);
+                    let label = format!(
+                        "{} · {}\n{} · expires {}",
+                        warning.event,
+                        warning.area,
+                        warning.urgency.label(),
+                        warning.expires
+                    );
+                    if ui
+                        .add_sized(
+                            [ui.available_width(), 52.0],
+                            egui::Button::new(RichText::new(label).size(11.0)).fill(if selected {
+                                HIGHLIGHT
+                            } else {
+                                CARD
+                            }),
+                        )
+                        .clicked()
+                    {
+                        chosen = Some(index);
+                    }
+                }
+            });
+        if self.warnings.len() > 40 {
+            ui.label(
+                RichText::new(format!(
+                    "Showing 40 most severe of {} active alerts.",
+                    self.warnings.len()
+                ))
+                .size(10.0)
+                .color(MUTED),
+            );
+        }
+        if let Some(index) = chosen {
+            self.focus_warning(index);
+        }
+    }
+
+    fn focus_warning(&mut self, index: usize) {
+        let Some(warning) = self.warnings.get(index) else {
+            self.notice = Some(String::from("That warning is no longer available."));
+            return;
+        };
+        let Some(ring) = warning.polygons.first() else {
+            self.notice = Some(format!(
+                "Warning {} has no mapped polygon; its area is {}.",
+                warning.event, warning.area
+            ));
+            return;
+        };
+        let mut lat = 0.0_f64;
+        let mut lon = 0.0_f64;
+        for (point_lat, point_lon) in ring {
+            lat += *point_lat;
+            lon += *point_lon;
+        }
+        let count = ring.len() as f64;
+        if count <= 0.0 {
+            self.notice = Some(String::from("That warning polygon has no points."));
+            return;
+        }
+        lat /= count;
+        lon /= count;
+        let label = format!("{} for {}", warning.event, warning.area);
+        match MapView::focus(lat, lon, 700.0) {
+            Ok(view) => {
+                self.map_view = view;
+                self.scene_mode = SceneMode::Map;
+                self.selected_warning = Some(index);
+                self.schedule_viewport_reload();
+                self.notice = Some(format!(
+                    "Selected {label}; polygon centred near {lat:.2}, {lon:.2}."
+                ));
+            }
+            Err(error) => {
+                self.notice = Some(format!("Warning map centre unavailable: {error}"));
+            }
+        }
     }
 
     fn map_readout(
