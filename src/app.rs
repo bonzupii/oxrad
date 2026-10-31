@@ -136,6 +136,12 @@ enum WarningState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WarningScope {
+    All,
+    Viewport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HistoryState {
     Idle,
     LoadingKeys,
@@ -214,6 +220,26 @@ const fn severity_rank(severity: Severity) -> u8 {
         Severity::Minor => 1,
         Severity::Unknown => 0,
     }
+}
+
+fn warning_intersects(warning: &Warning, transform: &map::MapTransform, rect: Rect) -> bool {
+    warning.polygons.iter().any(|ring| {
+        let bounds = ring
+            .iter()
+            .filter_map(|(lat, lon)| transform.screen(*lat, *lon))
+            .fold(None, |bounds: Option<Rect>, point| {
+                Some(bounds.map_or_else(
+                    || Rect::from_min_max(point, point),
+                    |bounds| {
+                        Rect::from_min_max(
+                            Pos2::new(bounds.min.x.min(point.x), bounds.min.y.min(point.y)),
+                            Pos2::new(bounds.max.x.max(point.x), bounds.max.y.max(point.y)),
+                        )
+                    },
+                ))
+            });
+        bounds.is_some_and(|bounds| bounds.intersects(rect))
+    })
 }
 
 fn nearby_station_ids(
@@ -312,6 +338,7 @@ pub struct OxradApp {
     scene_mode: SceneMode,
     map: Result<WorldMap, MapError>,
     map_view: MapView,
+    map_viewport: Option<Rect>,
     map_radar: RadarLayer,
     map_reload_due: Option<Instant>,
     global_feed: GlobalRadarFeed,
@@ -334,6 +361,7 @@ pub struct OxradApp {
     measure_start: Option<(f64, f64)>,
     measure_end: Option<(f64, f64)>,
     warning_layer: RadarLayer,
+    warning_scope: WarningScope,
     warning_state: WarningState,
     warning_request_due: Option<Instant>,
     warning_refresh_due: Option<Instant>,
@@ -386,6 +414,7 @@ impl OxradApp {
             scene_mode: SceneMode::Radar,
             map: WorldMap::load(),
             map_view: MapView::default(),
+            map_viewport: None,
             map_radar: RadarLayer::Shown,
             map_reload_due: None,
             global_feed: GlobalRadarFeed::new(),
@@ -408,6 +437,7 @@ impl OxradApp {
             measure_start: None,
             measure_end: None,
             warning_layer: RadarLayer::Shown,
+            warning_scope: WarningScope::All,
             warning_state: WarningState::Idle,
             warning_request_due: Some(Instant::now()),
             warning_refresh_due: None,
@@ -1561,6 +1591,7 @@ impl OxradApp {
         if rect.width() <= 0.0 || rect.height() <= 0.0 {
             return;
         }
+        self.map_viewport = Some(rect);
         let interaction = ui.interact(
             rect,
             ui.id().with("geographic-map"),
@@ -1951,6 +1982,11 @@ impl OxradApp {
             return;
         }
         for (index, warning) in self.warnings.iter().enumerate() {
+            if self.warning_scope == WarningScope::Viewport
+                && !warning_intersects(warning, transform, rect)
+            {
+                continue;
+            }
             let colour = match warning.severity {
                 Severity::Extreme => Color32::from_rgb(255, 58, 58),
                 Severity::Severe => Color32::from_rgb(255, 138, 32),
@@ -2442,8 +2478,13 @@ impl OxradApp {
             return None;
         }
         let warnings = self.warning_layer_summary();
+        let scope = if self.warning_scope == WarningScope::Viewport {
+            " · warnings in view"
+        } else {
+            ""
+        };
         Some(format!(
-            "Layers: {contributing}{global}{warnings}{time_note}"
+            "Layers: {contributing}{global}{warnings}{scope}{time_note}"
         ))
     }
 
@@ -2864,6 +2905,14 @@ impl OxradApp {
                 .size(10.0)
                 .color(MUTED),
         );
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.warning_scope, WarningScope::All, "All active");
+            ui.selectable_value(
+                &mut self.warning_scope,
+                WarningScope::Viewport,
+                "Visible map",
+            );
+        });
         let mut order: Vec<usize> = (0..self.warnings.len()).collect();
         order.sort_by_key(|index| {
             self.warnings
@@ -2871,6 +2920,14 @@ impl OxradApp {
                 .map_or(0, |warning| severity_rank(warning.severity))
         });
         order.reverse();
+        if self.warning_scope == WarningScope::Viewport {
+            order.retain(|index| {
+                self.warnings
+                    .get(*index)
+                    .is_some_and(|warning| self.warning_visible(warning))
+            });
+        }
+        let visible = order.len();
         let mut chosen = None;
         egui::ScrollArea::vertical()
             .max_height(180.0)
@@ -2903,6 +2960,13 @@ impl OxradApp {
                     }
                 }
             });
+        if visible == 0 {
+            ui.label(
+                RichText::new("No active warnings intersect the visible map.")
+                    .size(10.0)
+                    .color(MUTED),
+            );
+        }
         if self.warnings.len() > 40 {
             ui.label(
                 RichText::new(format!(
@@ -2917,6 +2981,19 @@ impl OxradApp {
             self.focus_warning(index);
         }
         self.warning_detail(ui);
+    }
+
+    fn warning_visible(&self, warning: &Warning) -> bool {
+        if self.warning_scope == WarningScope::All {
+            return true;
+        }
+        let Some(rect) = self.map_viewport else {
+            return true;
+        };
+        let Ok(transform) = self.map_view.transform(rect) else {
+            return true;
+        };
+        warning_intersects(warning, &transform, rect)
     }
 
     fn warning_detail(&self, ui: &mut egui::Ui) {
