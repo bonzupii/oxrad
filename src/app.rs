@@ -87,6 +87,30 @@ fn due_after(delay: Duration) -> Instant {
     now.checked_add(delay).unwrap_or(now)
 }
 
+fn nearby_station_ids(
+    stations: &[Station],
+    center_lat: f64,
+    center_lon: f64,
+    radius_km: f64,
+    excluded: Option<&SiteId>,
+    limit: usize,
+) -> Result<Vec<SiteId>, crate::error::CoordinateError> {
+    let mut candidates: Vec<(f64, SiteId)> = Vec::new();
+    for station in stations {
+        if excluded == Some(&station.id) {
+            continue;
+        }
+        let (distance_km, _) =
+            crate::projection::inverse(center_lat, center_lon, station.lat, station.lon)?;
+        if distance_km <= radius_km {
+            candidates.push((distance_km, station.id.clone()));
+        }
+    }
+    candidates.sort_by(|left, right| left.0.total_cmp(&right.0));
+    candidates.truncate(limit);
+    Ok(candidates.into_iter().map(|(_, id)| id).collect())
+}
+
 fn forecast_retry_delay(error: &ForecastError, attempt: u32) -> Duration {
     if let Some(value) = error.retry_after()
         && let Ok(delay) = crate::retry::retry_after_delay(value)
@@ -355,24 +379,22 @@ impl OxradApp {
             return;
         };
         let radius_km = self.map_view.span_km() / 2.0 + 250.0;
-        let mut candidates: Vec<(f64, SiteId)> = Vec::new();
-        let mut distance_error = None;
-        for station in stations {
-            if self.site.as_ref() == Some(&station.id) {
-                continue;
+        let sites = match nearby_station_ids(
+            stations,
+            center_lat,
+            center_lon,
+            radius_km,
+            self.site.as_ref(),
+            VIEW_RADAR_LIMIT,
+        ) {
+            Ok(sites) => sites,
+            Err(error) => {
+                self.notice = Some(format!("Viewport radar distance failed: {error}"));
+                return;
             }
-            match crate::projection::inverse(center_lat, center_lon, station.lat, station.lon) {
-                Ok((distance_km, _)) if distance_km <= radius_km => {
-                    candidates.push((distance_km, station.id.clone()));
-                }
-                Ok(_) => {}
-                Err(error) => distance_error = Some(error.to_string()),
-            }
-        }
-        candidates.sort_by(|left, right| left.0.total_cmp(&right.0));
-        candidates.truncate(VIEW_RADAR_LIMIT);
-        let mut layers = Vec::with_capacity(candidates.len());
-        for (_, site) in candidates {
+        };
+        let mut layers = Vec::with_capacity(sites.len());
+        for site in sites {
             layers.push(ViewRadar {
                 pipeline: Pipeline::start(site.clone()),
                 display: Display::new(Some(gpu.clone())),
@@ -381,9 +403,6 @@ impl OxradApp {
             });
         }
         self.view_radars = layers;
-        if let Some(error) = distance_error {
-            self.notice = Some(format!("A viewport radar distance failed: {error}"));
-        }
     }
 
     fn reload_viewport_radars(&mut self) {
@@ -2321,6 +2340,7 @@ impl eframe::App for OxradApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestError;
 
     fn throttled(retry_after: Option<&str>) -> ForecastError {
         ForecastError::Provider {
@@ -2343,5 +2363,35 @@ mod tests {
         assert_eq!(first, Duration::from_secs(2));
         assert!(second > first, "{second:?} must exceed {first:?}");
         assert!(second <= Duration::from_secs(5));
+    }
+    fn test_station(id: &str, lat: f64, lon: f64) -> Result<Station, TestError> {
+        Ok(Station {
+            id: SiteId::parse(id)?,
+            name: String::from(id),
+            lat,
+            lon,
+            elevation_m: None,
+            kind: crate::stations::StationKind::Wsr88d,
+            source: crate::stations::RadarSource::Nexrad,
+            status: None,
+            last_data: None,
+        })
+    }
+
+    #[test]
+    fn viewport_station_selection_sorts_excludes_and_limits() -> Result<(), TestError> {
+        let stations = vec![
+            test_station("KAAA", 37.05, -88.05)?,
+            test_station("KAAB", 38.0, -88.05)?,
+            test_station("KAAC", 39.0, -88.05)?,
+            test_station("KAAD", 40.0, -88.05)?,
+        ];
+        let excluded = SiteId::parse("KAAA")?;
+        let selected = nearby_station_ids(&stations, 37.05, -88.05, 400.0, Some(&excluded), 2)?;
+        assert_eq!(
+            selected.iter().map(SiteId::as_str).collect::<Vec<_>>(),
+            vec!["KAAB", "KAAC"]
+        );
+        Ok(())
     }
 }
