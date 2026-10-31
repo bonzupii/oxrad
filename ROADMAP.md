@@ -35,6 +35,7 @@ This section describes the repository as it exists, not the target.
 | Warnings | Partial | NWS active alerts for the United States and territories, drawn by severity with area, urgency, issuance, expiration, count, unreadable-alert count, and feed-failure state; no viewport filtering, selection, full text, or international alert feeds |
 | Map base and labels | Implemented | Offline Natural Earth 1:110m countries, borders, labels, graticule, scale, and site markers; no local detail yet |
 | Measurement tools | Partial | Pointer latitude, longitude, range, azimuth, and gate value readout |
+| Network cache | Partial | RainViewer manifest and tile bodies use a bounded disk cache with SHA-256 verification, atomic writes, corruption removal, and offline fallback; no HTTP validators, provider JSON, NEXRAD volumes, or forecast caching |
 | Comparison panes | Not implemented | One scene |
 | Colorblind palette options | Not implemented | One product palette per product |
 | Independent reviews | Not completed | No separate reviewer process has been run |
@@ -168,7 +169,7 @@ The RainViewer global composite is integrated as one global reflectivity source.
 
 ### Phase 8: resilience, accessibility, and release
 
-Complete cancellation at the transfer boundary, volume caching, reduced idle repaint, colorblind-safe palettes, light and high-contrast themes, resize behavior, release packaging, and measured interaction budgets. Run the two independent full-system reviews required by the product directive. No commit is made before both reviews are clean.
+Complete cancellation at the transfer boundary, caching for NEXRAD volumes and every provider response, conditional revalidation, reduced idle repaint, colorblind-safe palettes, light and high-contrast themes, resize behavior, release packaging, and measured interaction budgets. Run the two independent full-system reviews required by the product directive. No commit is made before both reviews are clean.
 
 ## Gates
 

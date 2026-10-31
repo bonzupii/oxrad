@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use crate::cache::Store;
 use crate::error::RadarError;
 use crate::network;
 
@@ -102,6 +103,10 @@ pub enum GlobalEvent {
     Failed {
         generation: u64,
         error: GlobalRadarError,
+    },
+    Notice {
+        generation: u64,
+        message: String,
     },
 }
 
@@ -235,11 +240,18 @@ impl GlobalRadarFeed {
         let (requests, request_receiver) = mpsc::channel::<RadarRequest>();
         let (event_sender, events) = mpsc::channel::<GlobalEvent>();
         std::thread::spawn(move || {
+            let (cache, cache_error) = match Store::default_location() {
+                Ok(store) => (Some(store), None),
+                Err(error) => (None, Some(error.to_string())),
+            };
             Worker {
                 requests: request_receiver,
                 events: event_sender,
                 cached: None,
                 tiles: HashMap::new(),
+                cache,
+                cache_error,
+                cache_notice_sent: false,
             }
             .run();
         });
@@ -306,6 +318,9 @@ struct Worker {
     events: Sender<GlobalEvent>,
     cached: Option<CachedManifest>,
     tiles: HashMap<String, Vec<u8>>,
+    cache: Option<Store>,
+    cache_error: Option<String>,
+    cache_notice_sent: bool,
 }
 
 impl Worker {
@@ -314,6 +329,11 @@ impl Worker {
             return;
         };
         loop {
+            if let Some(message) = self.cache_error.take()
+                && self.cache_notice(message, request.generation).is_err()
+            {
+                return;
+            }
             match self.refresh(&request) {
                 Ok(Some(next)) => {
                     request = next;
@@ -344,7 +364,7 @@ impl Worker {
         &mut self,
         request: &RadarRequest,
     ) -> Result<Option<RadarRequest>, GlobalRadarError> {
-        let snapshot = self.manifest()?;
+        let snapshot = self.manifest(request.generation)?;
         let grid = tile_grid_for_view(request.center_lat, request.center_lon, request.span_km)?;
         if self
             .events
@@ -365,7 +385,14 @@ impl Worker {
                 let key = cache_key(frame, *bounds);
                 let png = match self.tiles.remove(&key) {
                     Some(cached) => cached,
-                    None => network::http_get(&url)?,
+                    None => match self.cached_body(&url, request.generation)? {
+                        Some(cached) => cached,
+                        None => {
+                            let downloaded = network::http_get(&url)?;
+                            self.store_body(&url, &downloaded, request.generation)?;
+                            downloaded
+                        }
+                    },
                 };
                 let image = decode_tile(&png, &url)?;
                 if self.tiles.len() >= MAX_CACHED_TILES {
@@ -389,7 +416,71 @@ impl Worker {
                 return Err(GlobalRadarError::WorkerStopped);
             }
         }
+        let prune_error = self.cache.as_ref().and_then(|cache| cache.prune().err());
+        if let Some(error) = prune_error {
+            self.cache_notice(error.to_string(), request.generation)?;
+        }
         self.next_request()
+    }
+    fn cached_body(
+        &mut self,
+        key: &str,
+        generation: u64,
+    ) -> Result<Option<Vec<u8>>, GlobalRadarError> {
+        let Some(cache) = self.cache.as_ref() else {
+            return Ok(None);
+        };
+        let outcome = match cache.load(key) {
+            Ok(Some(entry)) => Ok(Some(entry.body)),
+            Ok(None) => Ok(None),
+            Err(error) => {
+                let message = match cache.remove(key) {
+                    Ok(()) => error.to_string(),
+                    Err(remove_error) => {
+                        format!(
+                            "{error} The damaged entry also could not be removed: {remove_error}"
+                        )
+                    }
+                };
+                Err(message)
+            }
+        };
+        match outcome {
+            Ok(body) => Ok(body),
+            Err(message) => {
+                self.cache_notice(message, generation)?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn store_body(
+        &mut self,
+        key: &str,
+        bytes: &[u8],
+        generation: u64,
+    ) -> Result<(), GlobalRadarError> {
+        let outcome = match self.cache.as_ref() {
+            Some(cache) => cache.store(key, bytes),
+            None => return Ok(()),
+        };
+        if let Err(error) = outcome {
+            self.cache_notice(error.to_string(), generation)?;
+        }
+        Ok(())
+    }
+
+    fn cache_notice(&mut self, message: String, generation: u64) -> Result<(), GlobalRadarError> {
+        if self.cache_notice_sent {
+            return Ok(());
+        }
+        self.cache_notice_sent = true;
+        self.events
+            .send(GlobalEvent::Notice {
+                generation,
+                message,
+            })
+            .map_err(|_| GlobalRadarError::WorkerStopped)
     }
 
     fn next_request(&self) -> Result<Option<RadarRequest>, GlobalRadarError> {
@@ -400,20 +491,42 @@ impl Worker {
         }
     }
 
-    fn manifest(&mut self) -> Result<ManifestSnapshot, GlobalRadarError> {
+    fn manifest(&mut self, generation: u64) -> Result<ManifestSnapshot, GlobalRadarError> {
         if let Some(cached) = &self.cached
             && cached.fetched.elapsed() < MANIFEST_LIFETIME
         {
             return Ok(cached.snapshot.clone());
         }
-        let bytes = network::http_get(ENDPOINT)?;
-        let snapshot = parse_manifest(&bytes)?;
-        let result = snapshot.clone();
-        self.cached = Some(CachedManifest {
-            fetched: Instant::now(),
-            snapshot,
-        });
-        Ok(result)
+        match network::http_get(ENDPOINT) {
+            Ok(bytes) => {
+                let snapshot = parse_manifest(&bytes)?;
+                self.store_body(ENDPOINT, &bytes, generation)?;
+                let result = snapshot.clone();
+                self.cached = Some(CachedManifest {
+                    fetched: Instant::now(),
+                    snapshot,
+                });
+                Ok(result)
+            }
+            Err(source) => {
+                let Some(bytes) = self.cached_body(ENDPOINT, generation)? else {
+                    return Err(source.into());
+                };
+                let snapshot = parse_manifest(&bytes)?;
+                self.cache_notice(
+                    String::from(
+                        "The live global-radar manifest failed; using the cached manifest.",
+                    ),
+                    generation,
+                )?;
+                let result = snapshot.clone();
+                self.cached = Some(CachedManifest {
+                    fetched: Instant::now(),
+                    snapshot,
+                });
+                Ok(result)
+            }
+        }
     }
 }
 

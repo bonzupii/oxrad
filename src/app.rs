@@ -1576,6 +1576,14 @@ impl OxradApp {
                 self.global_state = GlobalState::Failed;
                 self.global_refresh_due = Some(due_after(Duration::from_secs(GLOBAL_RETRY_SECS)));
             }
+            GlobalEvent::Notice {
+                generation,
+                message,
+            } => {
+                if generation == self.global_generation {
+                    self.notice = Some(format!("Global radar cache: {message}"));
+                }
+            }
         }
     }
 

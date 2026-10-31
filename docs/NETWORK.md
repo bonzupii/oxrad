@@ -58,6 +58,14 @@ The viewport is covered by a bounded grid of at most eight Web Mercator tiles at
 
 A new viewport request supersedes the previous generation; stale manifest, frame, and error messages are discarded. A source failure is reported in the UI and retried after 60 seconds. RainViewer requires visible attribution in the application, which the map shows as "Weather data by RainViewer".
 
+## RainViewer cache
+
+RainViewer manifest bytes and decoded-source PNG bodies are stored under `~/.oxrad/cache/responses/v1`. Cache keys are URLs; file names are SHA-256 digests of those keys. Each entry has a JSON metadata sidecar containing the schema, key, fetch time, byte length, and SHA-256 body digest. A body is usable only when its length and digest match the sidecar.
+
+Writes go to a temporary file and are renamed into place, with metadata written last. A failed or interrupted write leaves no committed entry. A damaged entry is removed when it is encountered and the live request is attempted; the cache problem is surfaced in the notice area. Pruning runs after a complete viewport refresh and keeps at most 256 entries and 128 MiB, removing the oldest fetch times first. Bodies larger than 32 MiB are not cached.
+
+The in-memory tile map holds up to 120 PNG bodies and is cleared when that limit is reached. The manifest remains fresh for 90 seconds in memory. If a live manifest request fails and a cached manifest exists, the cached manifest is used and a notice says so; tiles that were never cached still require the network. HTTP ETag, Last-Modified, conditional requests, and stale-while-revalidate are not implemented. Other providers and NEXRAD volumes are not yet in this cache.
+
 ## Retry behavior
 
 Forecast retries use a 2 second base, exponential growth to 60 seconds, jitter, and `Retry-After` when a provider supplies it. NEXRAD fetch retries use the same base and cap. A deterministic decode failure retries once and then waits for a new volume or a manual retry. A changed forecast place supersedes the previous request; a stale answer is discarded by generation.

@@ -33,6 +33,7 @@ The application is free software under GPLv3. It has no account, subscription, a
 - NEXRAD scan history, looping, and a scrubber. The RainViewer global composite has its own two-hour history and loop, but the Level II path still shows only the newest completed volume. Side-by-side panes, storm tracks, storm motion, local state and city detail beyond the 1:110m country map, distance measurements, and location-permission handling are also absent.
 - Warning detail beyond the national feed summary. The warning layer does not yet filter alerts to the viewport, expose issuance and urgency fields, or open a selected alert's full text.
 - A first-run location picker. There is no onboarding overlay, and none is planned. The application opens with the saved site when one exists and normal station and place controls in the left rail.
+- Persistent caching outside the RainViewer global composite. NEXRAD listings and volumes, forecast responses, place searches, station documents, and warning polygons still rely on live requests or their existing separate caches; HTTP validators and conditional revalidation are not implemented.
 - Colorblind-safe palette alternatives and a light theme. The current interface is dark-only.
 - The required two independent full-system clean reviews. No separate reviewer process was available in this environment.
 
@@ -46,7 +47,7 @@ cargo run --release
 
 Linux needs an X11 or Wayland client library, `libxkbcommon`, and a Vulkan loader and driver for winit and wgpu. `--help` prints the command-line usage. `--site KPAH` starts with that NEXRAD site instead of the saved one.
 
-The application stores configuration and the station cache under `~/.oxrad`.
+The application stores configuration and station metadata under `~/.oxrad`. Downloaded RainViewer manifests and tiles are kept in a bounded, integrity-checked cache under `~/.oxrad/cache`, so previously viewed global radar frames can be reopened when their source is unreachable.
 
 ## Data sources
 
@@ -77,7 +78,7 @@ cargo build
 cargo build --release --locked
 ```
 
-`cargo test` currently runs 121 tests. Ten use the network because the paths they cover are real services:
+`cargo test` currently runs 124 tests. Ten use the network because the paths they cover are real services:
 
 - the pinned KPAH archive download, size check, SHA-256 check, and full decode;
 - the live KPAH listing and retrieval;

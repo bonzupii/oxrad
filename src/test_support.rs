@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
+use crate::cache::CacheError;
 use crate::error::{
     ColorMapError, CoordinateError, MomentError, RadarError, RenderError, SiteIdError,
 };
@@ -25,6 +26,7 @@ pub enum TestError {
     Map(MapError),
     GlobalRadar(GlobalRadarError),
     Warning(WarningError),
+    Cache(CacheError),
     ColorMap(ColorMapError),
     Time(std::time::SystemTimeError),
 }
@@ -44,6 +46,7 @@ impl Display for TestError {
             Self::Map(error) => Display::fmt(error, formatter),
             Self::GlobalRadar(error) => Display::fmt(error, formatter),
             Self::Warning(error) => Display::fmt(error, formatter),
+            Self::Cache(error) => Display::fmt(error, formatter),
             Self::ColorMap(error) => Display::fmt(error, formatter),
             Self::Time(error) => Display::fmt(error, formatter),
         }
@@ -64,6 +67,7 @@ impl Error for TestError {
             Self::Map(error) => Some(error),
             Self::GlobalRadar(error) => Some(error),
             Self::Warning(error) => Some(error),
+            Self::Cache(error) => Some(error),
             Self::ColorMap(error) => Some(error),
             Self::Time(error) => Some(error),
             Self::Message(_) => None,
@@ -146,6 +150,12 @@ impl From<GlobalRadarError> for TestError {
 impl From<WarningError> for TestError {
     fn from(value: WarningError) -> Self {
         Self::Warning(value)
+    }
+}
+
+impl From<CacheError> for TestError {
+    fn from(value: CacheError) -> Self {
+        Self::Cache(value)
     }
 }
 
