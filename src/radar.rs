@@ -104,6 +104,28 @@ impl RadarSweep {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveOrigin {
+    Downloaded,
+    Cached,
+}
+
+impl ArchiveOrigin {
+    pub const fn from_cache(from_cache: bool) -> Self {
+        if from_cache {
+            Self::Cached
+        } else {
+            Self::Downloaded
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct RetrievedVolume {
+    pub volume: RadarVolume,
+    pub origin: ArchiveOrigin,
+}
+
 #[derive(Debug)]
 pub struct RadarVolume {
     pub site: SiteId,

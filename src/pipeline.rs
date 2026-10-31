@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use crate::cache::CacheError;
 use crate::error::RadarError;
 use crate::network;
-use crate::radar::{self, RadarVolume};
+use crate::radar::{self, ArchiveOrigin, RadarVolume, RetrievedVolume};
 use crate::retry::{self, BASE_DELAY, MAX_DELAY, error_update};
 use crate::stations::SiteId;
 
@@ -145,7 +145,6 @@ pub struct Pipeline {
     events: Receiver<Event>,
     retry: Sender<()>,
     pub state: PipelineState,
-    pub from_cache: bool,
     cache_warning: Option<String>,
 }
 
@@ -184,12 +183,11 @@ impl Pipeline {
                 operation: Operation::Fetching,
                 last_failure: None,
             },
-            from_cache: false,
             cache_warning: None,
         }
     }
 
-    pub fn poll(&mut self) -> Option<RadarVolume> {
+    pub fn poll(&mut self) -> Option<RetrievedVolume> {
         match self.events.try_recv() {
             Ok(event) => self.apply(event),
             Err(TryRecvError::Empty) => None,
@@ -206,7 +204,7 @@ impl Pipeline {
         }
     }
 
-    fn apply(&mut self, event: Event) -> Option<RadarVolume> {
+    fn apply(&mut self, event: Event) -> Option<RetrievedVolume> {
         match event {
             Event::Working(operation) => {
                 let previous = std::mem::replace(&mut self.state, PipelineState::Ready);
@@ -214,7 +212,6 @@ impl Pipeline {
                     operation,
                     last_failure: previous.into_failure(),
                 };
-                self.from_cache = false;
                 None
             }
             Event::Update(update) => {
@@ -231,11 +228,12 @@ impl Pipeline {
                 match result {
                     Ok(Some(volume)) => {
                         self.state = PipelineState::Ready;
-                        self.from_cache = from_cache;
-                        Some(volume)
+                        Some(RetrievedVolume {
+                            volume,
+                            origin: ArchiveOrigin::from_cache(from_cache),
+                        })
                     }
                     Ok(None) => {
-                        self.from_cache = false;
                         let previous = std::mem::replace(&mut self.state, PipelineState::Ready);
                         if let Some(failure) = previous.into_failure() {
                             self.state = PipelineState::Failed(failure);
@@ -243,7 +241,6 @@ impl Pipeline {
                         None
                     }
                     Err(failure) => {
-                        self.from_cache = false;
                         self.state = PipelineState::Failed(Failure {
                             operation: failure.operation,
                             error: failure.error,
@@ -533,6 +530,71 @@ mod tests {
     use super::*;
 
     use crate::test_support::TestError;
+
+    fn volume(site: SiteId) -> RadarVolume {
+        RadarVolume {
+            site,
+            site_lat: 37.06833,
+            site_lon: -88.77194,
+            scan_unix_ms: 1_793_327_729_000,
+            sweep: crate::radar::RadarSweep {
+                elevation_deg: 0.5,
+                elevation_number: 1,
+                radials: Vec::new(),
+                products: Vec::new(),
+                below_threshold: 0,
+                range_folded: 0,
+                max_ground_range_km: 0.0,
+            },
+            sweeps: Vec::new(),
+            skipped_radials: 0,
+            skipped_non_data: 0,
+            moment_error: None,
+        }
+    }
+
+    #[test]
+    fn cache_origin_belongs_to_the_fetched_volume() -> Result<(), TestError> {
+        let site = SiteId::parse("KPAH")?;
+        let (_events, event_receiver) = mpsc::channel();
+        let (retry, _retries) = mpsc::channel();
+        let mut pipeline = Pipeline {
+            site: site.clone(),
+            events: event_receiver,
+            retry,
+            state: PipelineState::Ready,
+            cache_warning: None,
+        };
+        let fetched = pipeline
+            .apply(Event::Update(Box::new(FetchUpdate {
+                result: Ok(Some(volume(site))),
+                retry_in: None,
+                waiting_for_next_volume: false,
+                from_cache: true,
+                cache_warning: None,
+            })))
+            .ok_or("cached volume not returned")?;
+        assert_eq!(fetched.origin, ArchiveOrigin::Cached);
+        assert!(
+            pipeline
+                .apply(Event::Working(Operation::Fetching))
+                .is_none()
+        );
+        assert_eq!(fetched.origin, ArchiveOrigin::Cached);
+        assert!(
+            pipeline
+                .apply(Event::Update(Box::new(FetchUpdate {
+                    result: Ok(None),
+                    retry_in: None,
+                    waiting_for_next_volume: false,
+                    from_cache: false,
+                    cache_warning: None,
+                })))
+                .is_none()
+        );
+        assert_eq!(fetched.origin, ArchiveOrigin::Cached);
+        Ok(())
+    }
 
     #[test]
     fn operation_names_read_as_actions() {

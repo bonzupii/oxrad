@@ -37,7 +37,7 @@ use crate::pipeline::{Pipeline, PipelineState};
 use crate::place::{self, Place, PlaceSearch, SearchOutcome};
 use crate::product::RadarProduct;
 use crate::provider::{JsonError, timestamp_label};
-use crate::radar::GateValue;
+use crate::radar::{ArchiveOrigin, GateValue, RetrievedVolume};
 use crate::render::{self, ViewTransform};
 use crate::stations::{self, SiteId, Station, StationError, StationFeed, StationOutcome};
 use crate::time;
@@ -1518,9 +1518,10 @@ impl OxradApp {
 
     fn pipeline_cache_status(&self, ui: &mut egui::Ui) {
         if self
-            .pipeline
+            .display
+            .frame
             .as_ref()
-            .is_some_and(|pipeline| pipeline.from_cache)
+            .is_some_and(|frame| frame.origin == ArchiveOrigin::Cached)
         {
             ui.label(RichText::new("cached volume").size(11.0).color(STALE));
         }
@@ -2693,7 +2694,13 @@ impl OxradApp {
                 self.history.key = Some(key);
                 self.history.state = HistoryState::Reviewing;
                 self.history.scrub_index = None;
-                self.display.submit(volume, self.product);
+                self.display.submit(
+                    RetrievedVolume {
+                        volume,
+                        origin: ArchiveOrigin::from_cache(from_cache),
+                    },
+                    self.product,
+                );
                 let mut notice = if from_cache {
                     format!("Reviewing cached radar scan {label}.")
                 } else {

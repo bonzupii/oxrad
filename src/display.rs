@@ -22,11 +22,12 @@ use eframe::egui::{Rect, Shape};
 use crate::error::RenderError;
 use crate::gpu::{self, RadarGpu, RadarMesh};
 use crate::product::RadarProduct;
-use crate::radar::RadarVolume;
+use crate::radar::{ArchiveOrigin, RadarVolume, RetrievedVolume};
 use crate::render::{self, RadarGeometry};
 
 pub struct Frame {
     pub volume: RadarVolume,
+    pub origin: ArchiveOrigin,
     pub geometry: RadarGeometry,
     pub mesh: Option<RadarMesh>,
 }
@@ -45,7 +46,7 @@ pub enum DisplayState {
     Unavailable(RenderError),
     Failed {
         error: RenderError,
-        volume: Box<RadarVolume>,
+        volume: Box<RetrievedVolume>,
     },
 }
 
@@ -73,7 +74,7 @@ pub struct Display {
     receiver: Receiver<render::BuildResult>,
     pub state: DisplayState,
     pub frame: Option<Frame>,
-    queued: Option<(u64, RadarVolume, RadarProduct)>,
+    queued: Option<(u64, RetrievedVolume, RadarProduct)>,
     generation: u64,
     product: RadarProduct,
 }
@@ -128,7 +129,7 @@ impl Display {
         };
     }
 
-    pub fn submit(&mut self, volume: RadarVolume, product: RadarProduct) {
+    pub fn submit(&mut self, volume: RetrievedVolume, product: RadarProduct) {
         if self.gpu.is_none() {
             return;
         }
@@ -166,11 +167,18 @@ impl Display {
         self.product = product;
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
-        self.send(generation, frame.volume, product);
+        self.send(
+            generation,
+            RetrievedVolume {
+                volume: frame.volume,
+                origin: frame.origin,
+            },
+            product,
+        );
         true
     }
 
-    fn send(&mut self, generation: u64, volume: RadarVolume, product: RadarProduct) {
+    fn send(&mut self, generation: u64, volume: RetrievedVolume, product: RadarProduct) {
         match self.sender.send(render::BuildRequest {
             volume,
             product,
@@ -215,7 +223,8 @@ impl Display {
             Ok(geometry) => match self.upload(&geometry) {
                 Ok(mesh) => {
                     self.frame = Some(Frame {
-                        volume: result.volume,
+                        volume: result.volume.volume,
+                        origin: result.volume.origin,
                         geometry,
                         mesh,
                     });

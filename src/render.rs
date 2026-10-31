@@ -30,7 +30,7 @@ use crate::colormap::{color_for_product, range_folded_color};
 use crate::error::{CoordinateError, RenderError};
 use crate::product::RadarProduct;
 use crate::projection;
-use crate::radar::{GateValue, RadarVolume, RadialBins};
+use crate::radar::{GateValue, RadarVolume, RadialBins, RetrievedVolume};
 
 const RADAR_ALPHA: u8 = 255;
 const VERTEX_BYTES: usize = 12;
@@ -179,13 +179,13 @@ pub struct RadarGeometry {
 }
 
 pub struct BuildRequest {
-    pub volume: RadarVolume,
+    pub volume: RetrievedVolume,
     pub product: RadarProduct,
     pub generation: u64,
 }
 
 pub struct BuildResult {
-    pub volume: RadarVolume,
+    pub volume: RetrievedVolume,
     pub geometry: Result<RadarGeometry, RenderError>,
     pub generation: u64,
 }
@@ -197,7 +197,7 @@ pub fn start_build_thread() -> (Sender<BuildRequest>, Receiver<BuildResult>) {
     std::thread::spawn(move || {
         while let Ok(request) = request_receiver.recv() {
             let geometry = catch_unwind(AssertUnwindSafe(|| {
-                build_geometry_for(&request.volume, request.product)
+                build_geometry_for(&request.volume.volume, request.product)
             }))
             .map_err(|_| RenderError::Panic)
             .and_then(std::convert::identity);
@@ -632,6 +632,33 @@ mod tests {
         let volume = volume(radials, max_ground_range_km)?;
         let geometry = build_geometry_for(&volume, RadarProduct::Reflectivity)?;
         Ok((volume, geometry))
+    }
+
+    #[test]
+    fn render_worker_returns_the_origin_with_the_matching_volume() -> Result<(), TestError> {
+        let (sender, receiver) = start_build_thread();
+        let retrieved = RetrievedVolume {
+            volume: volume(
+                vec![radial(89.5, 90.5, 0.0, vec![GateValue::Measured(2.0)])],
+                75.0,
+            )?,
+            origin: crate::radar::ArchiveOrigin::Cached,
+        };
+        sender
+            .send(BuildRequest {
+                volume: retrieved,
+                product: RadarProduct::Reflectivity,
+                generation: 42,
+            })
+            .map_err(|error| TestError::from(format!("render request failed: {error}")))?;
+        let result = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .map_err(|error| TestError::from(format!("render result failed: {error}")))?;
+        assert_eq!(result.generation, 42);
+        assert_eq!(result.volume.origin, crate::radar::ArchiveOrigin::Cached);
+        assert_eq!(result.volume.volume.site.as_str(), "KPAH");
+        assert!(result.geometry?.index_count > 0);
+        Ok(())
     }
 
     fn vertex(geometry: &RadarGeometry, index: usize) -> Result<Pos2, TestError> {
