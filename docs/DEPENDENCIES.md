@@ -12,6 +12,10 @@ This is the direct dependency record required by `STYLE.md`. It records what eac
 | `serde_json` | 1.0 | JSON parsing for station, place, and forecast providers | No | MIT/Apache-2.0 | Provider documents are parsed into oxrad's own types at the adapter boundary |
 | `ureq` | 3.5.0 | HTTPS client | Yes | MIT/Apache-2.0 | Confined to `provider.rs` and `network.rs`; timeouts and body limits are set there |
 
+## Data assets
+
+`assets/ne_110m_admin_0_countries.geojson` is Natural Earth 1:110m Admin 0 Countries, public domain. It is compiled into the binary with `include_str!` and parsed with `serde_json`; it is not a tile service and has no network or attribution requirement. Its provenance and licence are recorded in `assets/README.md`.
+
 ## Development dependency
 
 | Crate | Version | Concern | Network I/O | License |

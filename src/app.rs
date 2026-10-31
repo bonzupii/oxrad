@@ -25,6 +25,7 @@ use crate::config::{self, Config};
 use crate::display::{Display, DisplayState, Frame};
 use crate::forecast::{Forecast, ForecastError, ForecastFeed, ForecastOutcome, ForecastPeriod};
 use crate::gpu::RadarGpu;
+use crate::map::{self, MapError, MapView, WorldMap};
 use crate::overlay;
 use crate::pipeline::{Pipeline, PipelineState};
 use crate::place::{self, Place, PlaceSearch, SearchOutcome};
@@ -53,6 +54,12 @@ const FORECAST_RETRY_BASE_SECS: u64 = 2;
 const FORECAST_RETRY_MAX_SECS: u64 = 60;
 const STATION_REFRESH_SECS: u64 = 6 * 60 * 60;
 const STATION_RETRY_SECS: u64 = 15 * 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SceneMode {
+    Radar,
+    Map,
+}
 
 fn due_after(delay: Duration) -> Instant {
     let now = Instant::now();
@@ -119,6 +126,9 @@ pub struct OxradApp {
     station_query: String,
     station_picker_open: bool,
     first_run: bool,
+    scene_mode: SceneMode,
+    map: Result<WorldMap, MapError>,
+    map_view: MapView,
 }
 
 impl OxradApp {
@@ -161,6 +171,9 @@ impl OxradApp {
             station_query: String::new(),
             station_picker_open: restored_site.is_none(),
             first_run: true,
+            scene_mode: SceneMode::Radar,
+            map: WorldMap::load(),
+            map_view: MapView::default(),
         };
         if let Some(id) = restored_site
             && let Ok(list) = &app.stations
@@ -256,9 +269,31 @@ impl OxradApp {
         }
     }
 
+    fn focus_map_context(&mut self) {
+        let place = self
+            .place
+            .as_ref()
+            .map(|place| (place.lat, place.lon, 2_200.0));
+        let station = self
+            .site_station()
+            .map(|station| (station.lat, station.lon, 950.0));
+        let target = place.or(station);
+        let Some((lat, lon, span)) = target else {
+            return;
+        };
+        match MapView::focus(lat, lon, span) {
+            Ok(view) => self.map_view = view,
+            Err(error) => self.notice = Some(format!("Map centre unavailable: {error}")),
+        }
+    }
+
     fn choose_place(&mut self, place: &Place) {
         self.query.clear();
         self.search_state = SearchState::Idle;
+        match MapView::focus(place.lat, place.lon, 2_200.0) {
+            Ok(view) => self.map_view = view,
+            Err(error) => self.notice = Some(format!("Map centre unavailable: {error}")),
+        }
         self.place = Some(place.clone());
         self.start_forecast(place, 0);
         if !place.in_united_states() {
@@ -487,7 +522,7 @@ impl OxradApp {
         )
     }
 
-    fn header(&self, ui: &mut egui::Ui) {
+    fn header(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("header")
             .exact_size(46.0)
             .show_inside(ui, |ui| {
@@ -495,6 +530,20 @@ impl OxradApp {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("oxrad").size(21.0).strong().color(TEXT));
                     ui.label(RichText::new("weather radar").size(12.0).color(MUTED));
+                    ui.add_space(18.0);
+                    if ui
+                        .selectable_label(self.scene_mode == SceneMode::Radar, "Radar")
+                        .clicked()
+                    {
+                        self.scene_mode = SceneMode::Radar;
+                    }
+                    if ui
+                        .selectable_label(self.scene_mode == SceneMode::Map, "Map")
+                        .clicked()
+                    {
+                        self.scene_mode = SceneMode::Map;
+                        self.focus_map_context();
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if let Some(place) = &self.place {
                             ui.label(
@@ -1035,6 +1084,257 @@ impl OxradApp {
     }
 
     fn scene(&mut self, ui: &mut egui::Ui) {
+        match self.scene_mode {
+            SceneMode::Radar => self.radar_scene(ui),
+            SceneMode::Map => self.map_scene(ui),
+        }
+    }
+
+    fn map_scene(&mut self, ui: &mut egui::Ui) {
+        let rect = ui.max_rect();
+        if rect.width() <= 0.0 || rect.height() <= 0.0 {
+            return;
+        }
+        ui.painter()
+            .rect_filled(rect, CornerRadius::ZERO, BACKGROUND);
+        let interaction = ui.interact(
+            rect,
+            ui.id().with("geographic-map"),
+            egui::Sense::click_and_drag(),
+        );
+        self.map_input(ui, rect, &interaction);
+        let transform = match self.map_view.transform(rect) {
+            Ok(transform) => transform,
+            Err(error) => {
+                ui.painter().text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    format!("The map is unavailable: {error}"),
+                    FontId::proportional(15.0),
+                    ERROR,
+                );
+                return;
+            }
+        };
+        self.map_basemap(ui, rect);
+        let clicked_site = self.map_stations(ui, rect, &transform, &interaction);
+        self.map_place(ui, &transform);
+        map::draw_scale(ui.painter(), rect, &transform);
+        self.map_controls(ui, rect);
+        self.map_readout(ui, rect, &transform);
+        if let Some(id) = clicked_site {
+            self.choose_site(id);
+        }
+    }
+
+    fn map_input(&mut self, ui: &egui::Ui, rect: Rect, interaction: &egui::Response) {
+        if interaction.dragged() {
+            let delta = ui.input(|input| input.pointer.delta());
+            if let Err(error) = self.map_view.pan(rect, delta) {
+                self.notice = Some(format!("Map pan failed: {error}"));
+            }
+        }
+        if interaction.hovered() {
+            let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+            if scroll.abs() > 0.01
+                && let Some(pointer) = ui.input(|input| input.pointer.hover_pos())
+            {
+                let factor = (f64::from(scroll) / 240.0).exp();
+                if let Err(error) = self.map_view.zoom_at(rect, pointer, factor) {
+                    self.notice = Some(format!("Map zoom failed: {error}"));
+                }
+            }
+        }
+    }
+
+    fn map_basemap(&self, ui: &egui::Ui, rect: Rect) {
+        match &self.map {
+            Ok(world) => {
+                if let Err(error) = world.draw(ui.painter(), &self.map_view, rect) {
+                    ui.painter().text(
+                        rect.left_top() + Vec2::new(18.0, 52.0),
+                        Align2::LEFT_TOP,
+                        format!("The basemap could not be drawn: {error}"),
+                        FontId::proportional(13.0),
+                        ERROR,
+                    );
+                }
+            }
+            Err(error) => {
+                ui.painter().text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    format!("The basemap could not be loaded: {error}"),
+                    FontId::proportional(14.0),
+                    ERROR,
+                );
+            }
+        }
+    }
+
+    fn map_stations(
+        &self,
+        ui: &egui::Ui,
+        rect: Rect,
+        transform: &map::MapTransform,
+        interaction: &egui::Response,
+    ) -> Option<SiteId> {
+        let pointer = ui.input(|input| input.pointer.hover_pos());
+        let mut nearest: Option<(f32, SiteId)> = None;
+        if let Ok(stations) = &self.stations {
+            for station in stations {
+                let Some(position) = transform.screen(station.lat, station.lon) else {
+                    continue;
+                };
+                if !rect.shrink(2.0).contains(position) {
+                    continue;
+                }
+                let selected = self.site.as_ref() == Some(&station.id);
+                if selected {
+                    ui.painter()
+                        .circle_stroke(position, 8.0, Stroke::new(2.0_f32, STALE));
+                }
+                ui.painter().circle_filled(
+                    position,
+                    if selected { 4.0 } else { 2.4 },
+                    if selected {
+                        STALE
+                    } else {
+                        Color32::from_rgb(105, 202, 214)
+                    },
+                );
+                if selected || self.map_view.span_km() < 1_800.0 {
+                    ui.painter().text(
+                        position + Vec2::new(7.0, -7.0),
+                        Align2::LEFT_BOTTOM,
+                        station.id.as_str(),
+                        FontId::monospace(10.0),
+                        if selected { STALE } else { MUTED },
+                    );
+                }
+                if let Some(pointer) = pointer {
+                    let distance = position.distance(pointer);
+                    if distance <= 12.0 && nearest.as_ref().is_none_or(|(best, _)| distance < *best)
+                    {
+                        nearest = Some((distance, station.id.clone()));
+                    }
+                }
+            }
+        }
+        if interaction.clicked() {
+            nearest.map(|(_, id)| id)
+        } else {
+            None
+        }
+    }
+
+    fn map_place(&self, ui: &egui::Ui, transform: &map::MapTransform) {
+        let Some(place) = &self.place else {
+            return;
+        };
+        let Some(position) = transform.screen(place.lat, place.lon) else {
+            return;
+        };
+        ui.painter()
+            .circle_filled(position, 5.0, Color32::from_rgb(245, 245, 240));
+        ui.painter().text(
+            position + Vec2::new(8.0, 8.0),
+            Align2::LEFT_TOP,
+            place.label(),
+            FontId::proportional(11.0),
+            TEXT,
+        );
+    }
+
+    fn map_controls(&mut self, ui: &mut egui::Ui, rect: Rect) {
+        let has_place = self.place.is_some();
+        let start_x = rect.right() - if has_place { 140.0 } else { 86.0 };
+        let zoom_rect =
+            Rect::from_min_size(Pos2::new(start_x, rect.top() + 14.0), Vec2::new(32.0, 30.0));
+        if ui.put(zoom_rect, egui::Button::new("+")).clicked()
+            && let Err(error) = self.map_view.zoom_at(rect, rect.center(), 1.6)
+        {
+            self.notice = Some(format!("Map zoom failed: {error}"));
+        }
+        if ui
+            .put(
+                zoom_rect.translate(Vec2::new(36.0, 0.0)),
+                egui::Button::new("−"),
+            )
+            .clicked()
+            && let Err(error) = self.map_view.zoom_at(rect, rect.center(), 1.0 / 1.6)
+        {
+            self.notice = Some(format!("Map zoom failed: {error}"));
+        }
+        if has_place
+            && ui
+                .put(
+                    Rect::from_min_size(
+                        zoom_rect.min + Vec2::new(72.0, 0.0),
+                        Vec2::new(58.0, 30.0),
+                    ),
+                    egui::Button::new("Focus"),
+                )
+                .clicked()
+        {
+            self.focus_map_context();
+        }
+        let countries = self.map.as_ref().map_or(0, WorldMap::country_count);
+        let centre = self.map_view.center_latlon().map_or_else(
+            |_| String::from("unavailable"),
+            |(lat, lon)| format!("{lat:.2}, {lon:.2}"),
+        );
+        ui.painter().text(
+            rect.left_top() + Vec2::new(16.0, 16.0),
+            Align2::LEFT_TOP,
+            "Geographic map",
+            FontId::proportional(15.0),
+            TEXT,
+        );
+        ui.painter().text(
+            rect.left_top() + Vec2::new(16.0, 36.0),
+            Align2::LEFT_TOP,
+            format!(
+                "Centre {centre} · {countries} countries · {:.0} km wide",
+                self.map_view.span_km()
+            ),
+            FontId::proportional(10.0),
+            MUTED,
+        );
+        ui.painter().text(
+            Pos2::new(rect.right() - 12.0, rect.bottom() - 12.0),
+            Align2::RIGHT_BOTTOM,
+            "Natural Earth 1:110m · public domain",
+            FontId::proportional(10.0),
+            MUTED,
+        );
+        ui.painter().text(
+            rect.left_top() + Vec2::new(16.0, 52.0),
+            Align2::LEFT_TOP,
+            "Drag to pan · scroll to zoom · click a radar site",
+            FontId::proportional(10.0),
+            MUTED,
+        );
+    }
+
+    fn map_readout(&self, ui: &egui::Ui, rect: Rect, transform: &map::MapTransform) {
+        let Some(pointer) = ui.input(|input| input.pointer.hover_pos()) else {
+            return;
+        };
+        if !rect.contains(pointer) {
+            return;
+        }
+        let (lat, lon) = transform.latlon_at(pointer);
+        ui.painter().text(
+            pointer + Vec2::new(12.0, 12.0),
+            Align2::LEFT_TOP,
+            format!("{lat:.4}, {lon:.4}"),
+            FontId::monospace(11.0),
+            TEXT,
+        );
+    }
+
+    fn radar_scene(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
         ui.painter()
             .rect_filled(rect, CornerRadius::ZERO, BACKGROUND);

@@ -29,11 +29,11 @@ This section describes the repository as it exists, not the target.
 | Geographic rendering | Implemented | WGS84 gate corners, Web Mercator, product palette, rings, grid, pointer readout |
 | Global radar ingestion | Not implemented | NEXRAD is the only radar format and the United States is the only radar coverage |
 | TDWR ingestion | Not implemented | TDWR stations are excluded from the selectable feed |
-| Viewport model | Not implemented | The view is a centered radar disc; no geographic pan or zoom |
+| Viewport model | Partial | The separate map scene has Mercator pan and zoom; the radar scene remains a centered single-site disc |
 | Multi-station composition | Not implemented | One station, one volume, one mesh, one pipeline |
 | Time history and looping | Not implemented | Only the newest completed volume is shown |
 | Warnings | Not implemented | No alert adapter or polygon layer |
-| Map base and labels | Not implemented | Grid, range rings, site marker, and town marker only |
+| Map base and labels | Implemented | Offline Natural Earth 1:110m countries, borders, labels, graticule, scale, and site markers; no local detail yet |
 | Measurement tools | Partial | Pointer latitude, longitude, range, azimuth, and gate value readout |
 | Comparison panes | Not implemented | One scene |
 | Colorblind palette options | Not implemented | One product palette per product |
@@ -144,9 +144,9 @@ Place search, international names, global forecast, stale handling, place/statio
 
 NWS discovery, typed parsing, disk cache, atomic cache writes, offline fallback, and scheduled refresh. Add source adapters for other countries from this boundary.
 
-### Phase 3: geographic viewport and multi-station foundation (next)
+### Phase 3: geographic viewport and multi-station foundation (in progress)
 
-Add an explicit viewport bounding box, pan and zoom, viewport station filtering, coverage intersection, a station selection model, and a persistent station list. This must precede composite products because a composite without a viewport is only a fixed disc.
+The offline vector map, pointer-anchored Mercator zoom, drag pan, station markers, and click selection are implemented. Remaining work is one shared geographic viewport for the radar layer, viewport station filtering, coverage intersection, a multi-station selection model, and a persistent station list. This must precede composite products because a composite without a shared viewport is only a fixed disc.
 
 ### Phase 4: multi-station acquisition and composition
 

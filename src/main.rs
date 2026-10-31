@@ -20,6 +20,7 @@ mod display;
 mod error;
 mod forecast;
 mod gpu;
+mod map;
 mod network;
 mod overlay;
 mod paths;
