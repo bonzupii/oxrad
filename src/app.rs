@@ -225,6 +225,16 @@ const fn severity_rank(severity: Severity) -> u8 {
     }
 }
 
+const fn warning_colour(severity: Severity) -> Color32 {
+    match severity {
+        Severity::Extreme => Color32::from_rgb(255, 58, 58),
+        Severity::Severe => Color32::from_rgb(255, 138, 32),
+        Severity::Moderate => Color32::from_rgb(255, 214, 64),
+        Severity::Minor => Color32::from_rgb(100, 190, 255),
+        Severity::Unknown => Color32::from_rgb(190, 198, 210),
+    }
+}
+
 fn warning_intersects(warning: &Warning, transform: &map::MapTransform, rect: Rect) -> bool {
     warning.polygons.iter().any(|ring| {
         let bounds = ring
@@ -1990,13 +2000,7 @@ impl OxradApp {
             {
                 continue;
             }
-            let colour = match warning.severity {
-                Severity::Extreme => Color32::from_rgb(255, 58, 58),
-                Severity::Severe => Color32::from_rgb(255, 138, 32),
-                Severity::Moderate => Color32::from_rgb(255, 214, 64),
-                Severity::Minor => Color32::from_rgb(100, 190, 255),
-                Severity::Unknown => Color32::from_rgb(190, 198, 210),
-            };
+            let colour = warning_colour(warning.severity);
             for ring in &warning.polygons {
                 let points: Vec<Pos2> = ring
                     .iter()
@@ -2026,6 +2030,69 @@ impl OxradApp {
                     .add(Shape::closed_line(points, Stroke::new(width, colour)));
             }
         }
+    }
+
+    fn radar_warnings(
+        &self,
+        painter: &egui::Painter,
+        frame: &Frame,
+        transform: &ViewTransform,
+        viewport: Rect,
+    ) -> Option<String> {
+        if !self.warning_layer.is_shown() {
+            return None;
+        }
+        for warning in &self.warnings {
+            let mut rings = Vec::new();
+            let mut bounds: Option<Rect> = None;
+            for ring in &warning.polygons {
+                let mut points = Vec::with_capacity(ring.len());
+                for (lat, lon) in ring {
+                    let offset = match render::place_offset(
+                        *lat,
+                        *lon,
+                        frame.geometry.site_x,
+                        frame.geometry.site_y,
+                    ) {
+                        Ok(offset) => offset,
+                        Err(error) => {
+                            return Some(format!(
+                                "Warning {} could not be placed: {error}",
+                                warning.event
+                            ));
+                        }
+                    };
+                    let point = transform.screen(offset);
+                    points.push(point);
+                    bounds = Some(bounds.map_or_else(
+                        || Rect::from_min_max(point, point),
+                        |bounds| {
+                            Rect::from_min_max(
+                                Pos2::new(bounds.min.x.min(point.x), bounds.min.y.min(point.y)),
+                                Pos2::new(bounds.max.x.max(point.x), bounds.max.y.max(point.y)),
+                            )
+                        },
+                    ));
+                }
+                if points.len() >= 3 {
+                    rings.push(points);
+                }
+            }
+            if rings.is_empty() || !bounds.is_some_and(|bounds| bounds.intersects(viewport)) {
+                continue;
+            }
+            let selected = self.selected_warning.as_deref() == Some(warning.id.as_str());
+            let width = if selected { 4.0_f32 } else { 2.0_f32 };
+            let colour = if selected {
+                TEXT
+            } else {
+                warning_colour(warning.severity)
+            };
+            for points in rings {
+                painter.add(Shape::closed_line(points, Stroke::new(width, colour)));
+            }
+        }
+        None
     }
 
     fn map_measure(
@@ -3259,6 +3326,9 @@ impl OxradApp {
         }
         overlay::draw_grid(ui.painter(), &frame.geometry, &transform);
         overlay::draw_rings(ui.painter(), &frame.geometry, &transform);
+        if let Some(error) = self.radar_warnings(ui.painter(), frame, &transform, viewport) {
+            self.notice = Some(error);
+        }
         overlay::draw_legend(ui.painter(), rect, frame.geometry.product);
         if let Some(place) = &self.place {
             draw_place_marker(ui.painter(), frame, &transform, viewport, rect, place);
