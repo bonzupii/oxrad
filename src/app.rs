@@ -359,7 +359,7 @@ pub struct OxradApp {
     warnings: Vec<Warning>,
     warnings_without_geometry: usize,
     warnings_rejected: usize,
-    selected_warning: Option<usize>,
+    selected_warning: Option<String>,
     measure: MeasureMode,
     measure_start: Option<(f64, f64)>,
     measure_end: Option<(f64, f64)>,
@@ -1984,7 +1984,7 @@ impl OxradApp {
         if !self.warning_layer.is_shown() {
             return;
         }
-        for (index, warning) in self.warnings.iter().enumerate() {
+        for warning in &self.warnings {
             if self.warning_scope == WarningScope::Viewport
                 && !warning_intersects(warning, transform, rect)
             {
@@ -2016,11 +2016,12 @@ impl OxradApp {
                 if width > rect.width() * 4.0 {
                     continue;
                 }
-                let (width, colour) = if self.selected_warning == Some(index) {
-                    (4.0_f32, TEXT)
-                } else {
-                    (2.0_f32, colour)
-                };
+                let (width, colour) =
+                    if self.selected_warning.as_deref() == Some(warning.id.as_str()) {
+                        (4.0_f32, TEXT)
+                    } else {
+                        (2.0_f32, colour)
+                    };
                 ui.painter()
                     .add(Shape::closed_line(points, Stroke::new(width, colour)));
             }
@@ -2972,7 +2973,7 @@ impl OxradApp {
                     let Some(warning) = self.warnings.get(index) else {
                         continue;
                     };
-                    let selected = self.selected_warning == Some(index);
+                    let selected = self.selected_warning.as_deref() == Some(warning.id.as_str());
                     let label = format!(
                         "{} · {}\n{} · expires {}",
                         warning.event,
@@ -3034,7 +3035,8 @@ impl OxradApp {
     fn warning_detail(&self, ui: &mut egui::Ui) {
         let Some(warning) = self
             .selected_warning
-            .and_then(|index| self.warnings.get(index))
+            .as_deref()
+            .and_then(|id| self.warnings.iter().find(|warning| warning.id == id))
         else {
             return;
         };
@@ -3101,7 +3103,7 @@ impl OxradApp {
             self.notice = Some(String::from("That warning is no longer available."));
             return;
         };
-        self.selected_warning = Some(index);
+        self.selected_warning = Some(warning.id.clone());
         let Some(ring) = warning.polygons.first() else {
             self.notice = Some(format!(
                 "Warning {} has no mapped polygon; its area is {}.",
@@ -3127,7 +3129,6 @@ impl OxradApp {
             Ok(view) => {
                 self.map_view = view;
                 self.scene_mode = SceneMode::Map;
-                self.selected_warning = Some(index);
                 self.schedule_viewport_reload();
                 self.notice = Some(format!(
                     "Selected {label}; polygon centred near {lat:.2}, {lon:.2}."
