@@ -184,6 +184,7 @@ pub struct OxradApp {
     map: Result<WorldMap, MapError>,
     map_view: MapView,
     map_radar: RadarLayer,
+    map_reload_due: Option<Instant>,
 }
 
 impl OxradApp {
@@ -233,6 +234,7 @@ impl OxradApp {
             map: WorldMap::load(),
             map_view: MapView::default(),
             map_radar: RadarLayer::Shown,
+            map_reload_due: None,
         };
         if let Some(place) = &restored_place {
             match MapView::focus(place.lat, place.lon, 2_200.0) {
@@ -1275,6 +1277,13 @@ impl OxradApp {
             egui::Sense::click_and_drag(),
         );
         self.map_input(ui, rect, &interaction);
+        if self
+            .map_reload_due
+            .is_some_and(|due| Instant::now() >= due)
+        {
+            self.map_reload_due = None;
+            self.reload_viewport_radars();
+        }
         let transform = match self.map_view.transform(rect) {
             Ok(transform) => transform,
             Err(error) => {
@@ -1303,8 +1312,9 @@ impl OxradApp {
     fn map_input(&mut self, ui: &egui::Ui, rect: Rect, interaction: &egui::Response) {
         if interaction.dragged() {
             let delta = ui.input(|input| input.pointer.delta());
-            if let Err(error) = self.map_view.pan(rect, delta) {
-                self.notice = Some(format!("Map pan failed: {error}"));
+            match self.map_view.pan(rect, delta) {
+                Ok(()) => self.schedule_viewport_reload(),
+                Err(error) => self.notice = Some(format!("Map pan failed: {error}")),
             }
         }
         if interaction.hovered() {
@@ -1313,11 +1323,17 @@ impl OxradApp {
                 && let Some(pointer) = ui.input(|input| input.pointer.hover_pos())
             {
                 let factor = (f64::from(scroll) / 240.0).exp();
-                if let Err(error) = self.map_view.zoom_at(rect, pointer, factor) {
-                    self.notice = Some(format!("Map zoom failed: {error}"));
+                match self.map_view.zoom_at(rect, pointer, factor) {
+                    Ok(()) => self.schedule_viewport_reload(),
+                    Err(error) => self.notice = Some(format!("Map zoom failed: {error}")),
                 }
             }
         }
+    }
+
+    fn schedule_viewport_reload(&mut self) {
+        let now = Instant::now();
+        self.map_reload_due = now.checked_add(Duration::from_millis(700));
     }
 
     fn map_radar(&mut self, ui: &egui::Ui, rect: Rect, transform: &map::MapTransform) -> bool {
@@ -1491,10 +1507,11 @@ impl OxradApp {
             Pos2::new(rect.left() + 16.0, rect.top() + 104.0),
             Vec2::new(32.0, 30.0),
         );
-        if ui.put(zoom_rect, egui::Button::new("+")).clicked()
-            && let Err(error) = self.map_view.zoom_at(rect, rect.center(), 1.6)
-        {
-            self.notice = Some(format!("Map zoom failed: {error}"));
+        if ui.put(zoom_rect, egui::Button::new("+")).clicked() {
+            match self.map_view.zoom_at(rect, rect.center(), 1.6) {
+                Ok(()) => self.schedule_viewport_reload(),
+                Err(error) => self.notice = Some(format!("Map zoom failed: {error}")),
+            }
         }
         if ui
             .put(
@@ -1502,9 +1519,11 @@ impl OxradApp {
                 egui::Button::new("−"),
             )
             .clicked()
-            && let Err(error) = self.map_view.zoom_at(rect, rect.center(), 1.0 / 1.6)
         {
-            self.notice = Some(format!("Map zoom failed: {error}"));
+            match self.map_view.zoom_at(rect, rect.center(), 1.0 / 1.6) {
+                Ok(()) => self.schedule_viewport_reload(),
+                Err(error) => self.notice = Some(format!("Map zoom failed: {error}")),
+            }
         }
         if has_place
             && ui
@@ -1518,8 +1537,24 @@ impl OxradApp {
                 .clicked()
         {
             self.focus_map_context();
+            self.schedule_viewport_reload();
         }
         let countries = self.map.as_ref().map_or(0, WorldMap::country_count);
+        let contributing = self
+            .view_radars
+            .iter()
+            .map(|layer| layer.site.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !contributing.is_empty() {
+            ui.painter().text(
+                Pos2::new(rect.left() + 16.0, rect.top() + 178.0),
+                Align2::LEFT_TOP,
+                format!("Layers: {contributing}"),
+                FontId::monospace(10.0),
+                MUTED,
+            );
+        }
         let centre = self.map_view.center_latlon().map_or_else(
             |_| String::from("unavailable"),
             |(lat, lon)| format!("{lat:.2}, {lon:.2}"),
