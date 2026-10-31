@@ -213,12 +213,14 @@ impl WorldMap {
             else {
                 continue;
             };
+            // Natural Earth names these fields by axis: LABEL_X is longitude.
+            // Storing them as (latitude, longitude) requires Y first.
             let label = properties
-                .get("LABEL_X")
+                .get("LABEL_Y")
                 .and_then(serde_json::Value::as_f64)
                 .zip(
                     properties
-                        .get("LABEL_Y")
+                        .get("LABEL_X")
                         .and_then(serde_json::Value::as_f64),
                 );
             let label_rank = properties
@@ -659,6 +661,20 @@ mod tests {
     fn embedded_world_has_the_natural_earth_countries() -> Result<(), TestError> {
         let map = WorldMap::load()?;
         assert_eq!(map.country_count(), 177);
+        Ok(())
+    }
+
+    #[test]
+    fn country_labels_use_latitude_before_longitude() -> Result<(), TestError> {
+        let map = WorldMap::load()?;
+        let france = map
+            .countries
+            .iter()
+            .find(|country| country.name == "France")
+            .ok_or("France missing")?;
+        let (lat, lon) = france.label.ok_or("France label missing")?;
+        assert!((40.0..=53.0).contains(&lat), "France label latitude {lat}");
+        assert!((-6.0..=10.0).contains(&lon), "France label longitude {lon}");
         Ok(())
     }
 

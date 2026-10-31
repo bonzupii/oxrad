@@ -57,6 +57,7 @@ struct VertexOutput {
 
 const VERTEX_STRIDE: u64 = 12;
 
+#[derive(Clone)]
 pub struct RadarGpu {
     device: wgpu::Device,
     queue: wgpu::Queue,

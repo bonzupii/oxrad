@@ -53,6 +53,7 @@ const SEARCH_ROW_HEIGHT: f32 = 34.0;
 const STATION_LIST_HEIGHT: f32 = 220.0;
 const FORECAST_RETRY_BASE_SECS: u64 = 2;
 const FORECAST_RETRY_MAX_SECS: u64 = 60;
+const VIEW_RADAR_LIMIT: usize = 3;
 const STATION_REFRESH_SECS: u64 = 6 * 60 * 60;
 const STATION_RETRY_SECS: u64 = 15 * 60;
 
@@ -125,7 +126,16 @@ enum ForecastState {
     },
 }
 
+struct ViewRadar {
+    site: SiteId,
+    pipeline: Pipeline,
+    display: Display,
+    failure_reported: bool,
+}
+
 pub struct OxradApp {
+    gpu: Option<RadarGpu>,
+    view_radars: Vec<ViewRadar>,
     stations: Result<Vec<Station>, StationError>,
     station_feed: StationFeed,
     station_refresh_due: Instant,
@@ -173,6 +183,8 @@ impl OxradApp {
             Err(error) => Err(error),
         };
         let mut app = Self {
+            gpu: gpu.clone(),
+            view_radars: Vec::new(),
             stations,
             station_feed: StationFeed::new(),
             station_refresh_due: due_after(Duration::from_secs(STATION_REFRESH_SECS)),
@@ -237,6 +249,9 @@ impl OxradApp {
                 {
                     self.open_site(pending, true);
                     self.pending_site = None;
+                }
+                if self.scene_mode == SceneMode::Map {
+                    self.ensure_viewport_radars();
                 }
             }
             StationOutcome::Failed(error) => {
@@ -314,6 +329,73 @@ impl OxradApp {
         match MapView::focus(lat, lon, span) {
             Ok(view) => self.map_view = view,
             Err(error) => self.notice = Some(format!("Map centre unavailable: {error}")),
+        }
+    }
+
+    fn ensure_viewport_radars(&mut self) {
+        if !self.view_radars.is_empty() {
+            return;
+        }
+        let Some(gpu) = self.gpu.clone() else {
+            return;
+        };
+        let (center_lat, center_lon) = match self.map_view.center_latlon() {
+            Ok(center) => center,
+            Err(error) => {
+                self.notice = Some(format!("Viewport radar centre unavailable: {error}"));
+                return;
+            }
+        };
+        let Ok(stations) = &self.stations else {
+            return;
+        };
+        let radius_km = self.map_view.span_km() / 2.0 + 250.0;
+        let mut candidates: Vec<(f64, SiteId)> = Vec::new();
+        let mut distance_error = None;
+        for station in stations {
+            if self.site.as_ref() == Some(&station.id) {
+                continue;
+            }
+            match crate::projection::inverse(center_lat, center_lon, station.lat, station.lon) {
+                Ok((distance_km, _)) if distance_km <= radius_km => {
+                    candidates.push((distance_km, station.id.clone()));
+                }
+                Ok(_) => {}
+                Err(error) => distance_error = Some(error.to_string()),
+            }
+        }
+        candidates.sort_by(|left, right| left.0.total_cmp(&right.0));
+        candidates.truncate(VIEW_RADAR_LIMIT);
+        let mut layers = Vec::with_capacity(candidates.len());
+        for (_, site) in candidates {
+            layers.push(ViewRadar {
+                pipeline: Pipeline::start(site.clone()),
+                display: Display::new(Some(gpu.clone())),
+                site,
+                failure_reported: false,
+            });
+        }
+        self.view_radars = layers;
+        if let Some(error) = distance_error {
+            self.notice = Some(format!("A viewport radar distance failed: {error}"));
+        }
+    }
+
+    fn reload_viewport_radars(&mut self) {
+        self.view_radars.clear();
+        self.ensure_viewport_radars();
+    }
+
+    fn refresh_view_radars(&mut self) {
+        for layer in &mut self.view_radars {
+            let elevation = layer
+                .display
+                .frame
+                .as_ref()
+                .and_then(|frame| frame.volume.elevation_for_product(self.product));
+            if layer.display.frame.is_some() && !layer.display.rebuild(self.product, elevation) {
+                layer.failure_reported = false;
+            }
         }
     }
 
@@ -466,6 +548,37 @@ impl OxradApp {
             self.display.submit(volume, self.product);
         }
         self.display.poll();
+        let mut layer_failure = None;
+        for layer in &mut self.view_radars {
+            if let Some(volume) = layer.pipeline.poll() {
+                layer.display.submit(volume, self.product);
+                layer.failure_reported = false;
+            }
+            layer.display.poll();
+            let failure = layer
+                .pipeline
+                .state
+                .failure()
+                .map(|failure| failure.error.to_string())
+                .or_else(|| {
+                    layer
+                        .display
+                        .state
+                        .error()
+                        .map(std::string::ToString::to_string)
+                });
+            if let Some(message) = failure {
+                if !layer.failure_reported {
+                    layer_failure = Some(format!("Viewport radar {}: {message}", layer.site));
+                    layer.failure_reported = true;
+                }
+            } else {
+                layer.failure_reported = false;
+            }
+        }
+        if let Some(message) = layer_failure {
+            self.notice = Some(message);
+        }
         if let Some(outcome) = self.station_feed.poll() {
             self.apply_stations(outcome);
         }
@@ -574,6 +687,7 @@ impl OxradApp {
                     {
                         self.scene_mode = SceneMode::Map;
                         self.focus_map_context();
+                        self.ensure_viewport_radars();
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if let Some(place) = &self.place {
@@ -805,12 +919,15 @@ impl OxradApp {
                     "That product and tilt could not be prepared from the displayed volume.",
                 ));
             }
+            self.refresh_view_radars();
         } else if let Some(number) = requested_tilt
             && !self.display.rebuild(self.product, Some(number))
         {
             self.notice = Some(String::from(
                 "That tilt is not available in the displayed volume.",
             ));
+        } else if requested_tilt.is_some() {
+            self.refresh_view_radars();
         }
     }
 
@@ -1183,32 +1300,38 @@ impl OxradApp {
         if !self.map_radar.is_shown() {
             return false;
         }
-        let Some(frame) = &self.display.frame else {
-            return false;
-        };
-        let Some(site) = transform.screen(frame.geometry.site_lat, frame.geometry.site_lon) else {
-            return false;
-        };
-        let kilometers_per_pixel = transform.kilometers_per_pixel();
         let span_km = self.map_view.span_km();
-        if !(span_km.is_finite() && span_km > 0.0 && rect.width() > 0.0 && rect.height() > 0.0) {
-            return false;
+        let mut drew = false;
+        for layer in self.view_radars.iter().rev() {
+            let matches_product = layer
+                .display
+                .frame
+                .as_ref()
+                .is_some_and(|frame| frame.geometry.product == self.product);
+            if matches_product {
+                match draw_map_display(&layer.display, ui.painter(), rect, transform, span_km) {
+                    Ok(true) => drew = true,
+                    Ok(false) => {}
+                    Err(error) => {
+                        self.notice = Some(format!(
+                            "Viewport radar {} could not be placed: {error}",
+                            layer.site
+                        ));
+                    }
+                }
+            }
         }
-        let origin = [
-            ((site.x - rect.center().x) as f64 * kilometers_per_pixel) as f32,
-            (-(site.y - rect.center().y) as f64 * kilometers_per_pixel) as f32,
-        ];
-        let scale_x = (2.0 / span_km) as f32;
-        let scale_y = (2.0 * f64::from(rect.width()) / (span_km * f64::from(rect.height()))) as f32;
-        if let Err(error) = self.display.set_map_view(scale_x, scale_y, origin) {
-            self.notice = Some(format!("Radar map transform failed: {error}"));
-            return false;
+        match draw_map_display(&self.display, ui.painter(), rect, transform, span_km) {
+            Ok(true) => drew = true,
+            Ok(false) => {}
+            Err(error) => {
+                self.notice = Some(format!("Selected radar could not be placed: {error}"))
+            }
         }
-        if let Some(shape) = frame.shape(rect) {
-            ui.painter().add(shape);
+        if drew {
+            overlay::draw_legend(ui.painter(), rect, self.product);
         }
-        overlay::draw_legend(ui.painter(), rect, frame.geometry.product);
-        true
+        drew
     }
 
     fn map_basemap(&self, ui: &egui::Ui, rect: Rect) {
@@ -1315,6 +1438,17 @@ impl OxradApp {
             Pos2::new(rect.left() + 16.0, rect.top() + 70.0),
             Vec2::new(116.0, 28.0),
         );
+        let reload_rect = Rect::from_min_size(
+            Pos2::new(rect.left() + 16.0, rect.top() + 142.0),
+            Vec2::new(116.0, 28.0),
+        );
+        if ui
+            .put(reload_rect, egui::Button::new("Reload nearby"))
+            .on_hover_text("Find up to three stations around the current map centre.")
+            .clicked()
+        {
+            self.reload_viewport_radars();
+        }
         if ui
             .put(
                 layer_rect,
@@ -1377,8 +1511,9 @@ impl OxradApp {
             rect.left_top() + Vec2::new(16.0, 36.0),
             Align2::LEFT_TOP,
             format!(
-                "Centre {centre} · {countries} countries · {:.0} km wide",
-                self.map_view.span_km()
+                "Centre {centre} · {countries} countries · {:.0} km wide · {} viewport radars",
+                self.map_view.span_km(),
+                self.view_radars.len()
             ),
             FontId::proportional(10.0),
             MUTED,
@@ -1608,6 +1743,36 @@ impl OxradApp {
             ),
         }
     }
+}
+
+fn draw_map_display(
+    display: &Display,
+    painter: &egui::Painter,
+    rect: Rect,
+    transform: &map::MapTransform,
+    span_km: f64,
+) -> Result<bool, crate::error::RenderError> {
+    let Some(frame) = &display.frame else {
+        return Ok(false);
+    };
+    let Some(site) = transform.screen(frame.geometry.site_lat, frame.geometry.site_lon) else {
+        return Ok(false);
+    };
+    if !(span_km.is_finite() && span_km > 0.0 && rect.width() > 0.0 && rect.height() > 0.0) {
+        return Ok(false);
+    }
+    let kilometers_per_pixel = transform.kilometers_per_pixel();
+    let origin = [
+        ((site.x - rect.center().x) as f64 * kilometers_per_pixel) as f32,
+        (-(site.y - rect.center().y) as f64 * kilometers_per_pixel) as f32,
+    ];
+    let scale_x = (2.0 / span_km) as f32;
+    let scale_y = (2.0 * f64::from(rect.width()) / (span_km * f64::from(rect.height()))) as f32;
+    display.set_map_view(scale_x, scale_y, origin)?;
+    if let Some(shape) = frame.shape(rect) {
+        painter.add(shape);
+    }
+    Ok(true)
 }
 
 fn station_details(ui: &mut egui::Ui, station: &Station) {

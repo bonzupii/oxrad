@@ -19,14 +19,15 @@ The application is free software under GPLv3. It has no account, subscription, a
 - Every complete elevation sweep in a volume is retained. The tilt selector offers only sweeps that carry the selected product and moves the selected sweep into the display without cloning it.
 - All seven NEXRAD moments are decoded: base reflectivity (`DREF`), base velocity (`DVEL`), spectrum width (`DSW`), differential reflectivity (`DZDR`), correlation coefficient (`DRHO`), differential phase (`DPHI`), and specific differential phase (`DKDP`). A product is offered only when the source and the loaded volume carry it. Selecting velocity from a split-cut surveillance sweep moves to the lowest sweep that actually carries velocity.
 - Product-specific color scales and legends, radial velocity units, readouts with the selected product's units and beam elevation, scan time and age, grid, range rings, station marker, and pointer latitude/longitude/range/azimuth.
-- An offline Natural Earth 1:110m vector map with country fills, borders, labels, a graticule, a scale bar, coordinates, and runtime radar-site markers. The map pans by dragging, zooms under the pointer, and selects a radar site by clicking its marker. The current single-station radar volume can be shown or hidden on the map at its true geographic position, with gate values under the pointer. It has no tile account or network dependency.
+- An offline Natural Earth 1:110m vector map with country fills, borders, labels, a graticule, a scale bar, coordinates, and runtime radar-site markers. The map pans by dragging, zooms under the pointer, and selects a radar site by clicking its marker. It has no tile account or network dependency.
+- Map-view radar overlays. The selected station and up to three nearby stations load through independent pipelines and render as independent meshes at their true geographic positions, farthest first so the selected site is on top. Each layer has its own fetch, decode, render, and failure state. This is a station overlay, not a time-aligned mosaic or composite product.
 - Honest failure states for configuration, station discovery, place search, forecast, fetch, decode, and rendering. The last good radar frame stays visible with its age; a failed refresh does not become a current-data indicator.
 - Saved town and radar restoration from `~/.oxrad/config.toml`, and `--site KPAH` for an explicit radar start. The town’s forecast point and the radar station are stored as separate identities.
 
 ## What is not implemented
 
 - Radar ingestion outside the United States. NEXRAD is the only radar adapter. There is no DWD, ECCC, BoM, JMA, CMA, IMD, Roshydromet, SMN, MetService, OPERA, or ODIM_H5 decoder yet. The station list excludes TDWR because no TDWR Level II acquisition path exists.
-- Viewport-aware multi-station acquisition, mosaics, composite products, overlap resolution, and multi-mesh rendering. The current renderer and pipeline are single-station.
+- A time-aligned multi-station mosaic or composite product. The map viewport can overlay the selected station and up to three nearby stations, but it does not choose a common scan time, fill gaps, or resolve overlapping gates into a composite value.
 - Time history, looping, a scrubber, side-by-side panes, warning polygons, storm tracks, storm motion, local state and city detail beyond the 1:110m country map, measurement tools, and location-permission handling. The map can pan and zoom with the single displayed radar volume attached, but it cannot yet acquire or compose multiple stations.
 - A first-run location picker. There is no onboarding overlay, and none is planned. The application opens with the saved site when one exists and normal station and place controls in the left rail.
 - Colorblind-safe palette alternatives and a light theme. The current interface is dark-only.
@@ -71,7 +72,7 @@ cargo build
 cargo build --release --locked
 ```
 
-`cargo test` currently runs 105 tests. Eight use the network because the paths they cover are real services:
+`cargo test` currently runs 106 tests. Eight use the network because the paths they cover are real services:
 
 - the pinned KPAH archive download, size check, SHA-256 check, and full decode;
 - the live KPAH listing and retrieval;

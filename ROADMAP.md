@@ -30,7 +30,7 @@ This section describes the repository as it exists, not the target.
 | Global radar ingestion | Not implemented | NEXRAD is the only radar format and the United States is the only radar coverage |
 | TDWR ingestion | Not implemented | TDWR stations are excluded from the selectable feed |
 | Viewport model | Partial | The map has Mercator pan, zoom, and the displayed radar mesh at its true site position; the radar scene remains a centered single-site disc and no multiple stations are composed |
-| Multi-station composition | Not implemented | One station, one volume, one mesh, one pipeline |
+| Multi-station composition | Partial | Map viewport overlays the selected station and up to three nearby stations as independent meshes; no common scan time or composite values |
 | Time history and looping | Not implemented | Only the newest completed volume is shown |
 | Warnings | Not implemented | No alert adapter or polygon layer |
 | Map base and labels | Implemented | Offline Natural Earth 1:110m countries, borders, labels, graticule, scale, and site markers; no local detail yet |
@@ -148,9 +148,9 @@ NWS discovery, typed parsing, disk cache, atomic cache writes, offline fallback,
 
 The offline vector map, pointer-anchored Mercator zoom, drag pan, station markers, and click selection are implemented. Remaining work is one shared geographic viewport for the radar layer, viewport station filtering, coverage intersection, a multi-station selection model, and a persistent station list. This must precede composite products because a composite without a shared viewport is only a fixed disc.
 
-### Phase 4: multi-station acquisition and composition
+### Phase 4: multi-station acquisition and composition (in progress)
 
-Run bounded per-station pipelines, cache volumes by source and scan time, choose a common time, reject stale candidates, and apply deterministic overlap rules. Render one independent mesh per station with per-mesh transforms. Expose contributing stations and missing regions. Test overlap order, stale exclusion, and viewport changes during loading.
+Bounded independent pipelines and per-mesh transforms now render the selected station plus up to three nearby stations in the map viewport. Remaining work is a common scan time, stale-candidate rejection, deterministic per-product overlap values, gap disclosure, contributing-station controls, and tests for overlap order and viewport changes during loading.
 
 ### Phase 5: time history and professional inspection
 
