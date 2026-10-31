@@ -57,6 +57,7 @@ const STATION_LIST_HEIGHT: f32 = 220.0;
 const FORECAST_RETRY_BASE_SECS: u64 = 2;
 const FORECAST_RETRY_MAX_SECS: u64 = 60;
 const VIEW_RADAR_LIMIT: usize = 3;
+const VIEW_RADAR_TIME_WINDOW_MS: u64 = 6 * 60 * 1000;
 const STATION_REFRESH_SECS: u64 = 6 * 60 * 60;
 const STATION_RETRY_SECS: u64 = 15 * 60;
 const GLOBAL_REFRESH_SECS: u64 = 5 * 60;
@@ -114,6 +115,10 @@ struct GlobalFrameTexture {
 fn due_after(delay: Duration) -> Instant {
     let now = Instant::now();
     now.checked_add(delay).unwrap_or(now)
+}
+
+const fn scans_align(reference_ms: u64, scan_ms: u64) -> bool {
+    reference_ms.abs_diff(scan_ms) <= VIEW_RADAR_TIME_WINDOW_MS
 }
 
 fn nearby_station_ids(
@@ -1670,36 +1675,61 @@ impl OxradApp {
         self.global_playback = playback;
     }
 
+    fn displayed_scan_reference(&self) -> Option<u64> {
+        self.display
+            .frame
+            .as_ref()
+            .map(|frame| frame.volume.scan_unix_ms)
+            .or_else(|| {
+                self.view_radars
+                    .iter()
+                    .filter_map(|layer| layer.display.frame.as_ref())
+                    .map(|frame| frame.volume.scan_unix_ms)
+                    .max()
+            })
+    }
+
     fn map_radar(&mut self, ui: &egui::Ui, rect: Rect, transform: &map::MapTransform) -> bool {
         if !self.map_radar.is_shown() {
             return false;
         }
         let span_km = self.map_view.span_km();
+        let reference = self.displayed_scan_reference();
         let mut drew = false;
         for layer in self.view_radars.iter().rev() {
-            let matches_product = layer
-                .display
-                .frame
-                .as_ref()
-                .is_some_and(|frame| frame.geometry.product == self.product);
-            if matches_product {
-                match draw_map_display(&layer.display, ui.painter(), rect, transform, span_km) {
-                    Ok(true) => drew = true,
-                    Ok(false) => {}
-                    Err(error) => {
-                        self.notice = Some(format!(
-                            "Viewport radar {} could not be placed: {error}",
-                            layer.site
-                        ));
-                    }
+            let Some(frame) = layer.display.frame.as_ref() else {
+                continue;
+            };
+            if frame.geometry.product != self.product {
+                continue;
+            }
+            if !reference.is_none_or(|reference| scans_align(reference, frame.volume.scan_unix_ms))
+            {
+                continue;
+            }
+            match draw_map_display(&layer.display, ui.painter(), rect, transform, span_km) {
+                Ok(true) => drew = true,
+                Ok(false) => {}
+                Err(error) => {
+                    self.notice = Some(format!(
+                        "Viewport radar {} could not be placed: {error}",
+                        layer.site
+                    ));
                 }
             }
         }
-        match draw_map_display(&self.display, ui.painter(), rect, transform, span_km) {
-            Ok(true) => drew = true,
-            Ok(false) => {}
-            Err(error) => {
-                self.notice = Some(format!("Selected radar could not be placed: {error}"))
+        let selected_matches = self
+            .display
+            .frame
+            .as_ref()
+            .is_some_and(|frame| frame.geometry.product == self.product);
+        if selected_matches {
+            match draw_map_display(&self.display, ui.painter(), rect, transform, span_km) {
+                Ok(true) => drew = true,
+                Ok(false) => {}
+                Err(error) => {
+                    self.notice = Some(format!("Selected radar could not be placed: {error}"))
+                }
             }
         }
         if drew {
@@ -1878,12 +1908,41 @@ impl OxradApp {
 
     fn map_status(&self, ui: &egui::Ui, rect: Rect) {
         let countries = self.map.as_ref().map_or(0, WorldMap::country_count);
-        let contributing = self
-            .view_radars
-            .iter()
-            .map(|layer| layer.site.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let reference = self.displayed_scan_reference();
+        let mut contributing = Vec::new();
+        let mut excluded = Vec::new();
+        if self.map_radar.is_shown() {
+            if self
+                .display
+                .frame
+                .as_ref()
+                .is_some_and(|frame| frame.geometry.product == self.product)
+                && let Some(site) = &self.site
+            {
+                contributing.push(format!("{site} selected"));
+            }
+            for layer in &self.view_radars {
+                let Some(frame) = layer.display.frame.as_ref() else {
+                    continue;
+                };
+                if frame.geometry.product != self.product {
+                    continue;
+                }
+                if reference
+                    .is_none_or(|reference| scans_align(reference, frame.volume.scan_unix_ms))
+                {
+                    contributing.push(layer.site.to_string());
+                } else {
+                    excluded.push(layer.site.to_string());
+                }
+            }
+        }
+        let contributing = contributing.join(", ");
+        let time_note = if excluded.is_empty() {
+            String::new()
+        } else {
+            format!(" · time-excluded: {}", excluded.join(", "))
+        };
         let global = if self.global_layer.is_shown() {
             match &self.global_state {
                 GlobalState::Idle => String::new(),
@@ -1898,7 +1957,7 @@ impl OxradApp {
             ui.painter().text(
                 Pos2::new(rect.left() + 16.0, rect.top() + 216.0),
                 Align2::LEFT_TOP,
-                format!("Layers: {contributing}{global}"),
+                format!("Layers: {contributing}{global}{time_note}"),
                 FontId::monospace(10.0),
                 MUTED,
             );
@@ -1956,7 +2015,10 @@ impl OxradApp {
         }
         let (lat, lon) = transform.latlon_at(pointer);
         let mut label = format!("{lat:.4}, {lon:.4}");
-        if radar_visible && let Some(frame) = &self.display.frame {
+        if radar_visible
+            && let Some(frame) = &self.display.frame
+            && frame.geometry.product == self.product
+        {
             match crate::projection::inverse(
                 frame.geometry.site_lat,
                 frame.geometry.site_lon,
@@ -2774,6 +2836,13 @@ mod tests {
                 retry_after: retry_after.map(String::from),
             },
         }
+    }
+
+    #[test]
+    fn viewport_scans_share_a_bounded_time_window() {
+        assert!(scans_align(0, VIEW_RADAR_TIME_WINDOW_MS));
+        assert!(scans_align(VIEW_RADAR_TIME_WINDOW_MS, 0));
+        assert!(!scans_align(0, VIEW_RADAR_TIME_WINDOW_MS.saturating_add(1)));
     }
 
     #[test]

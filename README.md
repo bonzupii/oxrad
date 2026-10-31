@@ -20,7 +20,7 @@ The application is free software under GPLv3. It has no account, subscription, a
 - All seven NEXRAD moments are decoded: base reflectivity (`DREF`), base velocity (`DVEL`), spectrum width (`DSW`), differential reflectivity (`DZDR`), correlation coefficient (`DRHO`), differential phase (`DPHI`), and specific differential phase (`DKDP`). A product is offered only when the source and the loaded volume carry it. Selecting velocity from a split-cut surveillance sweep moves to the lowest sweep that actually carries velocity.
 - Product-specific color scales and legends, radial velocity units, readouts with the selected product's units and beam elevation, scan time and age, grid, range rings, station marker, and pointer latitude/longitude/range/azimuth.
 - An offline Natural Earth 1:110m vector map with country fills, borders, labels, a graticule, a scale bar, coordinates, and runtime radar-site markers. The map pans by dragging, zooms under the pointer, and selects a radar site by clicking its marker. It has no tile account or network dependency.
-- Map-view radar overlays. The selected station and up to three nearby stations load through independent pipelines and render as independent meshes at their true geographic positions, farthest first so the selected site is on top. Each layer has its own fetch, decode, render, and failure state. Pan and zoom schedule a debounced re-query around the new centre, and the contributing site identifiers are shown on the map. This is a station overlay, not a time-aligned mosaic or composite product.
+- Map-view radar overlays. The selected station and up to three nearby stations load through independent pipelines and render as independent meshes at their true geographic positions, farthest first so the selected site is on top. Each layer has its own fetch, decode, render, and failure state. Layers whose scans differ from the selected station by more than six minutes are withheld and named as time-excluded in the map status, so a stale station cannot be mistaken for a simultaneous observation. Pan and zoom schedule a debounced re-query around the new centre, and the contributing site identifiers are shown on the map. This is a time-bounded station overlay, not a value-composited mosaic.
 - A live global radar composite from RainViewer, covering more than 1,200 radars in over 150 countries. It renders at Web Mercator tile bounds, carries ten-minute frames for the previous two hours, and provides a timestamp scrubber and loop. RainViewer attribution is shown on the map. This is a global composite source, not a national Level II feed and not a substitute for the seven NEXRAD moments.
 - Honest failure states for configuration, station discovery, place search, forecast, fetch, decode, and rendering. The last good radar frame stays visible with its age; a failed refresh does not become a current-data indicator.
 - Saved town and radar restoration from `~/.oxrad/config.toml`, and `--site KPAH` for an explicit radar start. The town’s forecast point and the radar station are stored as separate identities.
@@ -28,7 +28,7 @@ The application is free software under GPLv3. It has no account, subscription, a
 ## What is not implemented
 
 - National Level II or Level III adapters outside the United States. The RainViewer composite provides global reflectivity, but there is no DWD, ECCC, BoM, JMA, CMA, IMD, Roshydromet, SMN, MetService, OPERA, or ODIM_H5 decoder yet. The station list excludes TDWR because no TDWR Level II acquisition path exists.
-- A time-aligned multi-station mosaic or composite product. The map viewport can overlay the selected station and up to three nearby stations, but it does not choose a common scan time, fill gaps, or resolve overlapping gates into a composite value.
+- A value-composited multi-station mosaic. The map viewport overlays the selected station and up to three nearby stations only when their scans fall within six minutes of the selected scan, but it does not resample to one exact time, fill gaps, or resolve overlapping gates into a composite value.
 - NEXRAD scan history, looping, and a scrubber. The RainViewer global composite has its own two-hour history and loop, but the Level II path still shows only the newest completed volume. Side-by-side panes, warning polygons, storm tracks, storm motion, local state and city detail beyond the 1:110m country map, measurement tools, and location-permission handling are also absent.
 - A first-run location picker. There is no onboarding overlay, and none is planned. The application opens with the saved site when one exists and normal station and place controls in the left rail.
 - Colorblind-safe palette alternatives and a light theme. The current interface is dark-only.
@@ -74,7 +74,7 @@ cargo build
 cargo build --release --locked
 ```
 
-`cargo test` currently runs 113 tests. Nine use the network because the paths they cover are real services:
+`cargo test` currently runs 114 tests. Nine use the network because the paths they cover are real services:
 
 - the pinned KPAH archive download, size check, SHA-256 check, and full decode;
 - the live KPAH listing and retrieval;

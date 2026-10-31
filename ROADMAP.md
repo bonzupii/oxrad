@@ -30,7 +30,7 @@ This section describes the repository as it exists, not the target.
 | Global radar ingestion | Partial | RainViewer global reflectivity composite with two-hour history; no national Level II adapters outside the United States |
 | TDWR ingestion | Not implemented | TDWR stations are excluded from the selectable feed |
 | Viewport model | Partial | The map has Mercator pan, zoom, a global radar tile, and independently placed station meshes; the radar scene remains a centered single-site disc and no common-time values are composed |
-| Multi-station composition | Partial | Map viewport overlays the selected station and up to three nearby stations as independent meshes; no common scan time or composite values |
+| Multi-station composition | Partial | Map viewport overlays the selected station and up to three nearby stations within a six-minute scan window; no resampling, composite values, or gap fill |
 | Time history and looping | Partial | RainViewer composite has 13 ten-minute frames with scrub and loop; NEXRAD still shows only the newest completed volume |
 | Warnings | Not implemented | No alert adapter or polygon layer |
 | Map base and labels | Implemented | Offline Natural Earth 1:110m countries, borders, labels, graticule, scale, and site markers; no local detail yet |
@@ -150,7 +150,7 @@ The offline vector map, pointer-anchored Mercator zoom, drag pan, station marker
 
 ### Phase 4: multi-station acquisition and composition (in progress)
 
-Bounded independent pipelines and per-mesh transforms now render the selected station plus up to three nearby stations in the map viewport, with debounced re-query after pan or zoom and contributing-site labels. Remaining work is a common scan time, stale-candidate rejection, deterministic per-product overlap values, gap disclosure, and tests for overlap order and viewport changes during loading.
+Bounded independent pipelines and per-mesh transforms render the selected station plus up to three nearby stations in the map viewport, with debounced re-query after pan or zoom and contributing-site labels. Layers outside a six-minute window of the selected scan are withheld and named as time-excluded. Remaining work is exact-time resampling, deterministic per-product overlap values, gap disclosure, and tests for overlap order and viewport changes during loading.
 
 ### Phase 5: time history and professional inspection (in progress)
 
