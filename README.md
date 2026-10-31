@@ -68,7 +68,7 @@ Requests carry `oxrad/<version> (https://github.com/bonzupii/oxrad)` as the user
 
 ## Development
 
-`ROADMAP.md` describes the target architecture, implemented state, and remaining work. `STYLE.md` is the code and prose guide. `AGENTS.md` binds changes to the product and engineering constraints. `API.md` records the NEXRAD crate interface. `docs/DEPENDENCIES.md` records direct dependencies and their purpose. `docs/NETWORK.md` records every network path and its limits.
+`ROADMAP.md` describes the target architecture, implemented state, and remaining work. `STYLE.md` is the code and prose guide. `AGENTS.md` binds changes to the product and engineering constraints. `API.md` records the NEXRAD crate interface. `docs/DEPENDENCIES.md` records direct dependencies and their purpose. `docs/NETWORK.md` records network paths and their limits. `docs/HEADLESS.md` records the graphical verification workflow.
 
 Gates:
 
@@ -80,7 +80,7 @@ cargo build
 cargo build --release --locked
 ```
 
-`cargo test` currently runs 124 tests. Ten use the network because the paths they cover are real services:
+`cargo test` includes network tests because the paths they cover are real services:
 
 - the pinned KPAH archive download, size check, SHA-256 check, and full decode;
 - the live KPAH listing and retrieval;

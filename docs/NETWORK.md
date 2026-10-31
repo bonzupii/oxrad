@@ -28,7 +28,7 @@ The NEXRAD body limit is whole-response buffering. It is sufficient for an Archi
 
 The NWS station document is fetched at application start. A successful response is parsed, every feature must have a supported station type, and duplicate identifiers are rejected. The raw document and a save timestamp are written atomically to `~/.oxrad/stations.json`. If the cache path cannot be written, the live stations remain usable and the UI reports the cache warning. A successful feed is refreshed after six hours; a failed feed retries after fifteen minutes.
 
-On startup, the cached document is read before the network request. A missing cache is not fatal: the station list shows that discovery is in progress. If live discovery fails and a cache is already loaded, the cached metadata remains visible with a notice. If no cached metadata exists, the failure is shown in the station panel. The current feed runs once per launch; automatic periodic station refresh is planned and not implemented.
+On startup, the cached document is read before the network request. A missing cache is not fatal: the station list shows that discovery is in progress. If live discovery fails and a cache is already loaded, the cached metadata remains visible with a notice. If no cached metadata exists, the failure is shown in the station panel. The station feed refreshes after six hours and retries failed requests after fifteen minutes.
 
 The place cache is in memory only. Successful searches are cached for the session. Search requests are serialized with a one-request-per-second minimum interval.
 
@@ -42,7 +42,7 @@ The forecast request is one provider call. It does not use NWS gridpoints and is
 
 The active-alert feed is requested without coordinates; it returns the national collection of actual, non-test alerts. Each feature must have a nonempty identifier and event name, and any polygon or multipolygon geometry must be valid. A feature without geometry is retained and counted as such. A feature that fails validation is counted as unreadable and does not discard the rest of the collection; the first error is shown in the notice. Geometry coordinates are longitude then latitude and must fall in valid WGS84 ranges. Severity and urgency come from the provider's fields; an absent or unknown value is shown as unknown rather than assigned a value.
 
-The feed is parsed in a worker and superseded generations are discarded. A successful collection is refreshed after five minutes; a failed request retries after two minutes and is shown in the map status and notice. The layer draws polygons in both the Map and Radar scenes; the left rail list is shared. The most severe active alert shows its issuance time and urgency. The left rail lists up to 40 active alerts sorted by severity; selecting one centres the map on its first polygon and highlights the outline. The application does not filter the feed to the viewport or expose the full alert text. Coverage is the United States and its territories, not the rest of the world.
+The feed is parsed in a worker and superseded generations are discarded. A successful collection is refreshed after five minutes; a failed request retries after two minutes and is shown in the map status and notice. The layer draws polygons in both the Map and Radar scenes; the left rail list is shared. The most severe active alert shows its issuance time and urgency. The left rail lists up to 40 active alerts sorted by severity; selecting one centres the map on its first polygon and highlights the outline. The list and map can be restricted to the visible map, and the selected alert shows its headline, description, and instructions. The selected alert is retained by identifier across refreshes while it remains in the feed. Coverage is the United States and its territories.
 
 ## NEXRAD acquisition
 
@@ -52,7 +52,7 @@ The object is downloaded into memory and decoded in a worker. A 404 is reported 
 
 ## Global radar composite
 
-RainViewer supplies a manifest of 10-minute reflectivity frames for the previous two hours. The manifest is accepted only from an HTTPS host and only with validated frame paths and times. The manifest is cached in the worker for 90 seconds; decoded PNG bytes are cached for up to 52 tiles. Each viewport request selects the best Web Mercator zoom up to level 7 and fetches the tile containing the map centre.
+RainViewer supplies a manifest of 10-minute reflectivity frames for the previous two hours. The manifest is accepted only from an HTTPS host and only with validated frame paths and times. The manifest is cached in the worker for 90 seconds; PNG bodies are cached in memory for up to 120 tiles.
 
 The viewport is covered by a bounded grid of at most eight Web Mercator tiles at the highest zoom that fits the budget. Tile bounds travel with each frame so the renderer places every tile independently, including views that cross the antimeridian. Uncovered areas remain uncovered only where RainViewer itself has no radar coverage or the source supplied no echo.
 

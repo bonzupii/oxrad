@@ -235,6 +235,26 @@ const fn warning_colour(severity: Severity) -> Color32 {
     }
 }
 
+fn map_status_area(rect: Rect) -> Option<Rect> {
+    let width = (rect.width() - 110.0).clamp(0.0, 520.0);
+    let height = (rect.height() - 400.0).clamp(0.0, 130.0);
+    (width > 12.0 && height > 12.0).then(|| {
+        Rect::from_min_size(
+            rect.left_top() + Vec2::new(16.0, 312.0),
+            Vec2::new(width, height),
+        )
+    })
+}
+
+fn retain_warning_selection(selected: &mut Option<String>, warnings: &[Warning]) {
+    if selected
+        .as_ref()
+        .is_some_and(|id| !warnings.iter().any(|warning| &warning.id == id))
+    {
+        *selected = None;
+    }
+}
+
 fn warning_intersects(warning: &Warning, transform: &map::MapTransform, rect: Rect) -> bool {
     warning.polygons.iter().any(|ring| {
         let bounds = ring
@@ -700,7 +720,7 @@ impl OxradApp {
                 self.warnings = set.warnings;
                 self.warnings_without_geometry = set.without_geometry;
                 self.warnings_rejected = rejected.len();
-                self.selected_warning = None;
+                retain_warning_selection(&mut self.selected_warning, &self.warnings);
                 if let Some(message) = rejected.first() {
                     self.notice = Some(format!(
                         "{} active alerts could not be read. First problem: {message}",
@@ -1684,7 +1704,13 @@ impl OxradApp {
                 Err(error) => self.notice = Some(format!("Map pan failed: {error}")),
             }
         }
-        if interaction.hovered() {
+        if interaction.hovered()
+            && !ui
+                .input(|input| input.pointer.hover_pos())
+                .is_some_and(|pointer| {
+                    map_status_area(rect).is_some_and(|area| area.contains(pointer))
+                })
+        {
             let scroll = ui.input(|input| input.smooth_scroll_delta.y);
             if scroll.abs() > 0.01
                 && let Some(pointer) = ui.input(|input| input.pointer.hover_pos())
@@ -2441,43 +2467,63 @@ impl OxradApp {
         }
     }
 
-    fn map_status(&self, ui: &egui::Ui, rect: Rect) {
+    fn map_status_details(&self, ui: &mut egui::Ui, rect: Rect) {
+        let Some(area) = map_status_area(rect) else {
+            return;
+        };
+        let width = area.width();
+        let height = area.height();
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(area)
+                .layout(Layout::top_down(Align::Min)),
+            |ui| {
+                egui::Frame::new()
+                    .fill(Color32::from_black_alpha(220))
+                    .inner_margin(6.0)
+                    .show(ui, |ui| {
+                        ui.set_width(width - 12.0);
+                        egui::ScrollArea::vertical()
+                            .max_height((height - 12.0).max(0.0))
+                            .show(ui, |ui| {
+                                if let Some(layers) = self.map_layer_line() {
+                                    ui.label(
+                                        RichText::new(layers).monospace().size(10.0).color(MUTED),
+                                    );
+                                }
+                                if self.warning_layer.is_shown()
+                                    && let Some(warning) = self.most_severe_warning()
+                                {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "Most severe: {} · {} · {} · expires {}",
+                                            warning.event,
+                                            warning.area,
+                                            warning.urgency.label(),
+                                            warning.expires
+                                        ))
+                                        .monospace()
+                                        .size(10.0)
+                                        .color(ERROR),
+                                    );
+                                    if !warning.sent.is_empty() {
+                                        ui.label(
+                                            RichText::new(format!("Issued {}", warning.sent))
+                                                .monospace()
+                                                .size(10.0)
+                                                .color(MUTED),
+                                        );
+                                    }
+                                }
+                            });
+                    });
+            },
+        );
+    }
+
+    fn map_status(&self, ui: &mut egui::Ui, rect: Rect) {
         let countries = self.map.as_ref().map_or(0, WorldMap::country_count);
-        if let Some(layers) = self.map_layer_line() {
-            ui.painter().text(
-                Pos2::new(rect.left() + 16.0, rect.top() + 312.0),
-                Align2::LEFT_TOP,
-                layers,
-                FontId::monospace(10.0),
-                MUTED,
-            );
-        }
-        if self.warning_layer.is_shown()
-            && let Some(warning) = self.most_severe_warning()
-        {
-            ui.painter().text(
-                Pos2::new(rect.left() + 16.0, rect.top() + 330.0),
-                Align2::LEFT_TOP,
-                format!(
-                    "Most severe: {} · {} · {} · expires {}",
-                    warning.event,
-                    warning.area,
-                    warning.urgency.label(),
-                    warning.expires
-                ),
-                FontId::monospace(10.0),
-                ERROR,
-            );
-            if !warning.sent.is_empty() {
-                ui.painter().text(
-                    Pos2::new(rect.left() + 16.0, rect.top() + 346.0),
-                    Align2::LEFT_TOP,
-                    format!("Issued {}", warning.sent),
-                    FontId::monospace(10.0),
-                    MUTED,
-                );
-            }
-        }
+        self.map_status_details(ui, rect);
         let centre = self.map_view.center_latlon().map_or_else(
             |_| String::from("unavailable"),
             |(lat, lon)| format!("{lat:.2}, {lon:.2}"),
@@ -3257,7 +3303,9 @@ impl OxradApp {
         let Some(pointer) = ui.input(|input| input.pointer.hover_pos()) else {
             return;
         };
-        if !rect.contains(pointer) {
+        if !rect.contains(pointer)
+            || map_status_area(rect).is_some_and(|area| area.contains(pointer))
+        {
             return;
         }
         let (lat, lon) = transform.latlon_at(pointer);
@@ -4102,6 +4150,50 @@ mod tests {
                 retry_after: retry_after.map(String::from),
             },
         }
+    }
+
+    fn warning(id: &str, event: &str) -> Warning {
+        Warning {
+            id: String::from(id),
+            event: String::from(event),
+            severity: Severity::Severe,
+            urgency: crate::warnings::Urgency::Immediate,
+            headline: String::from(event),
+            description: String::from("Test warning"),
+            instruction: None,
+            area: String::from("Test area"),
+            sent: String::from("2026-10-31T12:00:00Z"),
+            expires: String::from("2026-10-31T13:00:00Z"),
+            polygons: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn warning_selection_survives_reordering_and_clears_when_removed() {
+        let mut selected = Some(String::from("alert-b"));
+        let refreshed = vec![warning("alert-b", "Updated"), warning("alert-a", "Other")];
+        retain_warning_selection(&mut selected, &refreshed);
+        assert_eq!(selected.as_deref(), Some("alert-b"));
+        assert_eq!(
+            refreshed
+                .iter()
+                .find(|warning| Some(&warning.id) == selected.as_ref())
+                .map(|warning| warning.event.as_str()),
+            Some("Updated")
+        );
+        retain_warning_selection(&mut selected, &[warning("alert-a", "Other")]);
+        assert_eq!(selected, None);
+    }
+
+    #[test]
+    fn map_status_area_stays_within_the_map() {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(410.0, 544.0));
+        let area = map_status_area(rect);
+        assert!(area.is_some_and(|area| rect.contains_rect(area)));
+        assert_eq!(
+            map_status_area(Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 100.0))),
+            None
+        );
     }
 
     #[test]
