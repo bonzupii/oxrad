@@ -34,7 +34,7 @@ This section describes the repository as it exists, not the target.
 | Time history and looping | Partial | RainViewer composite has 13 ten-minute frames with scrub and loop; NEXRAD still shows only the newest completed volume |
 | Warnings | Partial | NWS active alerts for the United States and territories, drawn by severity with area, urgency, issuance, expiration, count, unreadable-alert count, a selectable severity-sorted list, polygon focus, and feed-failure state; no viewport filtering, full alert text, or international alert feeds |
 | Map base and labels | Implemented | Offline Natural Earth 1:110m countries, borders, labels, graticule, scale, and site markers; no local detail yet |
-| Measurement tools | Partial | Pointer latitude, longitude, range, azimuth, and gate value readout |
+| Measurement tools | Partial | Pointer latitude, longitude, range, azimuth, and gate value readout; two-point map measurement with WGS84 distance and initial bearing |
 | Network cache | Partial | RainViewer manifest and tile bodies use a bounded disk cache with SHA-256 verification, atomic writes, corruption removal, and offline fallback; no HTTP validators, provider JSON, NEXRAD volumes, or forecast caching |
 | Comparison panes | Not implemented | One scene |
 | Colorblind palette options | Not implemented | One product palette per product |

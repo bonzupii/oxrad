@@ -99,6 +99,25 @@ enum GlobalPlayback {
     Playing,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeasureMode {
+    Off,
+    On,
+}
+
+impl MeasureMode {
+    const fn is_on(self) -> bool {
+        matches!(self, Self::On)
+    }
+
+    const fn toggled(self) -> Self {
+        match self {
+            Self::Off => Self::On,
+            Self::On => Self::Off,
+        }
+    }
+}
+
 enum GlobalState {
     Idle,
     Loading,
@@ -257,6 +276,9 @@ pub struct OxradApp {
     warnings_without_geometry: usize,
     warnings_rejected: usize,
     selected_warning: Option<usize>,
+    measure: MeasureMode,
+    measure_start: Option<(f64, f64)>,
+    measure_end: Option<(f64, f64)>,
     warning_layer: RadarLayer,
     warning_state: WarningState,
     warning_request_due: Option<Instant>,
@@ -327,6 +349,9 @@ impl OxradApp {
             warnings_without_geometry: 0,
             warnings_rejected: 0,
             selected_warning: None,
+            measure: MeasureMode::Off,
+            measure_start: None,
+            measure_end: None,
             warning_layer: RadarLayer::Shown,
             warning_state: WarningState::Idle,
             warning_request_due: Some(Instant::now()),
@@ -1489,7 +1514,12 @@ impl OxradApp {
         self.map_global(ui, &transform);
         let radar_visible = self.map_radar(ui, rect, &transform);
         self.map_warnings(ui, rect, &transform);
-        let clicked_site = self.map_stations(ui, rect, &transform, &interaction);
+        self.map_measure(ui, rect, &transform, &interaction);
+        let clicked_site = if self.measure.is_on() {
+            None
+        } else {
+            self.map_stations(ui, rect, &transform, &interaction)
+        };
         self.map_place(ui, &transform);
         map::draw_scale(ui.painter(), rect, &transform);
         self.map_controls(ui, rect);
@@ -1875,6 +1905,98 @@ impl OxradApp {
         }
     }
 
+    fn map_measure(
+        &mut self,
+        ui: &egui::Ui,
+        rect: Rect,
+        transform: &map::MapTransform,
+        interaction: &egui::Response,
+    ) {
+        if !self.measure.is_on() {
+            return;
+        }
+        if interaction.clicked()
+            && let Some(pointer) = ui.input(|input| input.pointer.hover_pos())
+            && rect.contains(pointer)
+        {
+            let point = transform.latlon_at(pointer);
+            if self.measure_start.is_none() || self.measure_end.is_some() {
+                self.measure_start = Some(point);
+                self.measure_end = None;
+            } else {
+                self.measure_end = Some(point);
+            }
+        }
+        let painter = ui.painter();
+        let Some(start) = self.measure_start else {
+            return;
+        };
+        let Some(start_position) = transform.screen(start.0, start.1) else {
+            return;
+        };
+        painter.circle_filled(start_position, 5.0, STALE);
+        painter.text(
+            start_position + Vec2::new(8.0, 8.0),
+            Align2::LEFT_TOP,
+            "A",
+            FontId::monospace(12.0),
+            STALE,
+        );
+        let Some(end) = self.measure_end else {
+            painter.text(
+                start_position + Vec2::new(8.0, 24.0),
+                Align2::LEFT_TOP,
+                "Click a second point",
+                FontId::monospace(10.0),
+                MUTED,
+            );
+            return;
+        };
+        let Some(end_position) = transform.screen(end.0, end.1) else {
+            return;
+        };
+        painter.line_segment([start_position, end_position], Stroke::new(2.0_f32, STALE));
+        painter.circle_filled(end_position, 5.0, STALE);
+        painter.text(
+            end_position + Vec2::new(8.0, 8.0),
+            Align2::LEFT_TOP,
+            "B",
+            FontId::monospace(12.0),
+            STALE,
+        );
+        let detail = match crate::projection::inverse(start.0, start.1, end.0, end.1) {
+            Ok((distance_km, bearing_deg)) => format!(
+                "{distance_km:.1} km · {bearing_deg:.0}° {}",
+                place::compass(bearing_deg)
+            ),
+            Err(error) => format!("Measurement unavailable: {error}"),
+        };
+        let label = format!(
+            "{detail}\nA {:.4}, {:.4}\nB {:.4}, {:.4}",
+            start.0, start.1, end.0, end.1
+        );
+        let galley = painter.layout_no_wrap(label, FontId::monospace(10.0), TEXT);
+        let padding = Vec2::splat(6.0);
+        let size = galley.size() + 2.0 * padding;
+        let midpoint = start_position.lerp(end_position, 0.5);
+        let origin = Pos2::new(
+            (midpoint.x - size.x / 2.0).clamp(
+                rect.left() + 4.0,
+                (rect.right() - size.x - 4.0).max(rect.left() + 4.0),
+            ),
+            (midpoint.y - size.y - 10.0).clamp(
+                rect.top() + 4.0,
+                (rect.bottom() - size.y - 4.0).max(rect.top() + 4.0),
+            ),
+        );
+        painter.rect_filled(
+            Rect::from_min_size(origin, size),
+            CornerRadius::same(4),
+            Color32::from_black_alpha(220),
+        );
+        painter.galley(origin + padding, galley, TEXT);
+    }
+
     fn map_basemap(&self, ui: &egui::Ui, rect: Rect) {
         match &self.map {
             Ok(world) => {
@@ -1977,7 +2099,7 @@ impl OxradApp {
     fn map_controls(&mut self, ui: &mut egui::Ui, rect: Rect) {
         let area = Rect::from_min_size(
             Pos2::new(rect.left() + 16.0, rect.top() + 70.0),
-            Vec2::new(190.0, 190.0),
+            Vec2::new(190.0, 230.0),
         );
         ui.scope_builder(
             egui::UiBuilder::new()
@@ -1985,103 +2107,135 @@ impl OxradApp {
                 .layout(Layout::top_down(Align::Min)),
             |ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
-                if ui
-                    .add_sized(
-                        [116.0, 28.0],
-                        egui::Button::new(if self.map_radar.is_shown() {
-                            "Hide radar layer"
-                        } else {
-                            "Show radar layer"
-                        }),
-                    )
-                    .clicked()
-                {
-                    self.map_radar = self.map_radar.toggled();
-                }
-                ui.horizontal(|ui| {
-                    if ui.add_sized([32.0, 30.0], egui::Button::new("+")).clicked() {
-                        match self.map_view.zoom_at(rect, rect.center(), 1.6) {
-                            Ok(()) => self.schedule_viewport_reload(),
-                            Err(error) => self.notice = Some(format!("Map zoom failed: {error}")),
-                        }
-                    }
-                    if ui.add_sized([32.0, 30.0], egui::Button::new("−")).clicked() {
-                        match self.map_view.zoom_at(rect, rect.center(), 1.0 / 1.6) {
-                            Ok(()) => self.schedule_viewport_reload(),
-                            Err(error) => self.notice = Some(format!("Map zoom failed: {error}")),
-                        }
-                    }
-                    if self.place.is_some()
-                        && ui.add_sized([58.0, 30.0], egui::Button::new("Focus")).clicked()
-                    {
-                        self.focus_map_context();
-                        self.schedule_viewport_reload();
-                    }
-                });
-                if ui
-                    .add_sized([116.0, 28.0], egui::Button::new("Reload nearby"))
-                    .on_hover_text("Find up to three stations around the current map centre.")
-                    .clicked()
-                {
-                    self.reload_viewport_radars();
-                }
-                if ui
-                    .add_sized(
-                        [116.0, 28.0],
-                        egui::Button::new(if self.warning_layer.is_shown() {
-                            "Hide warnings"
-                        } else {
-                            "Show warnings"
-                        })
-                        .fill(if self.warning_layer.is_shown() {
-                            HIGHLIGHT
-                        } else {
-                            CARD
-                        }),
-                    )
-                    .on_hover_text("Show active National Weather Service warning polygons for the United States and territories.")
-                    .clicked()
-                {
-                    self.warning_layer = self.warning_layer.toggled();
-                    if self.warning_layer.is_shown() && matches!(self.warning_state, WarningState::Idle)
-                    {
-                        self.warning_request_due = Some(Instant::now());
-                    }
-                }
-                if ui
-                    .add_sized(
-                        [158.0, 28.0],
-                        egui::Button::new(if self.global_layer.is_shown() {
-                            "Global radar: on"
-                        } else {
-                            "Global radar: off"
-                        })
-                        .fill(if self.global_layer.is_shown() {
-                            HIGHLIGHT
-                        } else {
-                            CARD
-                        }),
-                    )
-                    .on_hover_text("RainViewer global reflectivity composite with two hours of history.")
-                    .clicked()
-                {
-                    self.global_layer = self.global_layer.toggled();
-                    if !self.global_layer.is_shown() {
-                        self.global_playback = GlobalPlayback::Stopped;
-                    } else if self.global_frames.is_empty() {
-                        self.request_global_radar();
-                    }
-                }
+                self.map_layer_controls(ui, rect);
+                self.map_overlay_controls(ui);
             },
         );
         self.map_status(ui, rect);
+    }
+
+    fn map_layer_controls(&mut self, ui: &mut egui::Ui, rect: Rect) {
+        if ui
+            .add_sized(
+                [116.0, 28.0],
+                egui::Button::new(if self.map_radar.is_shown() {
+                    "Hide radar layer"
+                } else {
+                    "Show radar layer"
+                }),
+            )
+            .clicked()
+        {
+            self.map_radar = self.map_radar.toggled();
+        }
+        ui.horizontal(|ui| {
+            if ui.add_sized([32.0, 30.0], egui::Button::new("+")).clicked() {
+                match self.map_view.zoom_at(rect, rect.center(), 1.6) {
+                    Ok(()) => self.schedule_viewport_reload(),
+                    Err(error) => self.notice = Some(format!("Map zoom failed: {error}")),
+                }
+            }
+            if ui.add_sized([32.0, 30.0], egui::Button::new("−")).clicked() {
+                match self.map_view.zoom_at(rect, rect.center(), 1.0 / 1.6) {
+                    Ok(()) => self.schedule_viewport_reload(),
+                    Err(error) => self.notice = Some(format!("Map zoom failed: {error}")),
+                }
+            }
+            if self.place.is_some()
+                && ui
+                    .add_sized([58.0, 30.0], egui::Button::new("Focus"))
+                    .clicked()
+            {
+                self.focus_map_context();
+                self.schedule_viewport_reload();
+            }
+        });
+        if ui
+            .add_sized([116.0, 28.0], egui::Button::new("Reload nearby"))
+            .on_hover_text("Find up to three stations around the current map centre.")
+            .clicked()
+        {
+            self.reload_viewport_radars();
+        }
+    }
+
+    fn map_overlay_controls(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .add_sized(
+                [116.0, 28.0],
+                egui::Button::new(if self.warning_layer.is_shown() {
+                    "Hide warnings"
+                } else {
+                    "Show warnings"
+                })
+                .fill(if self.warning_layer.is_shown() {
+                    HIGHLIGHT
+                } else {
+                    CARD
+                }),
+            )
+            .on_hover_text("Show active National Weather Service warning polygons for the United States and territories.")
+            .clicked()
+        {
+            self.warning_layer = self.warning_layer.toggled();
+            if self.warning_layer.is_shown() && matches!(self.warning_state, WarningState::Idle) {
+                self.warning_request_due = Some(Instant::now());
+            }
+        }
+        if ui
+            .add_sized(
+                [158.0, 28.0],
+                egui::Button::new(if self.global_layer.is_shown() {
+                    "Global radar: on"
+                } else {
+                    "Global radar: off"
+                })
+                .fill(if self.global_layer.is_shown() {
+                    HIGHLIGHT
+                } else {
+                    CARD
+                }),
+            )
+            .on_hover_text("RainViewer global reflectivity composite with two hours of history.")
+            .clicked()
+        {
+            self.global_layer = self.global_layer.toggled();
+            if !self.global_layer.is_shown() {
+                self.global_playback = GlobalPlayback::Stopped;
+            } else if self.global_frames.is_empty() {
+                self.request_global_radar();
+            }
+        }
+        if ui
+            .add_sized(
+                [116.0, 28.0],
+                egui::Button::new(if self.measure.is_on() {
+                    "Measure: on"
+                } else {
+                    "Measure: off"
+                })
+                .fill(if self.measure.is_on() {
+                    HIGHLIGHT
+                } else {
+                    CARD
+                }),
+            )
+            .on_hover_text(
+                "Click two points on the map to measure geodesic distance and initial bearing.",
+            )
+            .clicked()
+        {
+            self.measure = self.measure.toggled();
+            self.measure_start = None;
+            self.measure_end = None;
+        }
     }
 
     fn map_status(&self, ui: &egui::Ui, rect: Rect) {
         let countries = self.map.as_ref().map_or(0, WorldMap::country_count);
         if let Some(layers) = self.map_layer_line() {
             ui.painter().text(
-                Pos2::new(rect.left() + 16.0, rect.top() + 270.0),
+                Pos2::new(rect.left() + 16.0, rect.top() + 312.0),
                 Align2::LEFT_TOP,
                 layers,
                 FontId::monospace(10.0),
@@ -2092,7 +2246,7 @@ impl OxradApp {
             && let Some(warning) = self.most_severe_warning()
         {
             ui.painter().text(
-                Pos2::new(rect.left() + 16.0, rect.top() + 288.0),
+                Pos2::new(rect.left() + 16.0, rect.top() + 330.0),
                 Align2::LEFT_TOP,
                 format!(
                     "Most severe: {} · {} · {} · expires {}",
@@ -2106,7 +2260,7 @@ impl OxradApp {
             );
             if !warning.sent.is_empty() {
                 ui.painter().text(
-                    Pos2::new(rect.left() + 16.0, rect.top() + 304.0),
+                    Pos2::new(rect.left() + 16.0, rect.top() + 346.0),
                     Align2::LEFT_TOP,
                     format!("Issued {}", warning.sent),
                     FontId::monospace(10.0),
