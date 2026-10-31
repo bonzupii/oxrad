@@ -35,7 +35,7 @@ The application is free software under GPLv3. It has no account, subscription, a
 - NEXRAD preloading and frame caching. History has a drag scrubber and loop but fetches each selected frame on demand; there is no preloaded sequence or frame cache. Side-by-side panes, storm tracks, storm motion, local state and city detail beyond the 1:110m country map, and location-permission handling are also absent.
 - International warning feeds. The warning layer covers the United States National Weather Service and its territories; national alert feeds outside the United States are not integrated.
 - A first-run location picker. There is no onboarding overlay, and none is planned. The application opens with the saved site when one exists and normal station and place controls in the left rail.
-- Persistent caching outside the RainViewer global composite. NEXRAD listings and volumes, forecast responses, place searches, station documents, and warning polygons still rely on live requests or their existing separate caches; HTTP validators and conditional revalidation are not implemented.
+- Persistent caching for NEXRAD listings, the live latest-volume pipeline, forecast responses, place searches, and warning polygons. NEXRAD history archives use the bounded cache, but live acquisition still downloads each latest volume; HTTP validators and conditional revalidation are not implemented.
 - Colorblind-safe palette alternatives and a light theme. The current interface is dark-only.
 - The required two independent full-system clean reviews. No separate reviewer process was available in this environment.
 
@@ -49,7 +49,7 @@ cargo run --release
 
 Linux needs an X11 or Wayland client library, `libxkbcommon`, and a Vulkan loader and driver for winit and wgpu. `--help` prints the command-line usage. `--site KPAH` starts with that NEXRAD site instead of the saved one.
 
-The application stores configuration and station metadata under `~/.oxrad`. Downloaded RainViewer manifests and tiles are kept in a bounded, integrity-checked cache under `~/.oxrad/cache`, so previously viewed global radar frames can be reopened when their source is unreachable.
+The application stores configuration and station metadata under `~/.oxrad`. Downloaded RainViewer manifests and tiles and NEXRAD history volumes are kept in a bounded, integrity-checked cache under `~/.oxrad/cache`, so previously viewed history frames can be reopened without fetching the same archive again.
 
 ## Data sources
 

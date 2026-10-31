@@ -72,10 +72,13 @@ pub enum HistoryEvent {
         generation: u64,
         key: String,
         volume: RadarVolume,
+        from_cache: bool,
+        cache_warning: Option<String>,
     },
     Failed {
         generation: u64,
         error: HistoryError,
+        cache_warning: Option<String>,
     },
 }
 
@@ -183,6 +186,7 @@ impl HistoryWorker {
                         Err(error) => HistoryEvent::Failed {
                             generation,
                             error: error.into(),
+                            cache_warning: None,
                         },
                     }
                 }
@@ -190,21 +194,30 @@ impl HistoryWorker {
                     generation,
                     site,
                     key,
-                } => match network::fetch_archive(&key) {
-                    Ok(bytes) => match radar::decode_volume(&site, &key, &bytes) {
+                } => match network::fetch_archive_cached(&key) {
+                    Ok(archive) => match radar::decode_volume(&site, &key, &archive.bytes) {
                         Ok(volume) => HistoryEvent::Volume {
                             generation,
                             key,
                             volume,
+                            from_cache: archive.from_cache,
+                            cache_warning: archive.cache_warning.map(|error| error.to_string()),
                         },
-                        Err(error) => HistoryEvent::Failed {
-                            generation,
-                            error: error.into(),
-                        },
+                        Err(error) => {
+                            let cache_warning = network::evict_archive(&key)
+                                .err()
+                                .map(|error| error.to_string());
+                            HistoryEvent::Failed {
+                                generation,
+                                error: error.into(),
+                                cache_warning,
+                            }
+                        }
                     },
                     Err(error) => HistoryEvent::Failed {
                         generation,
                         error: error.into(),
+                        cache_warning: None,
                     },
                 },
             };

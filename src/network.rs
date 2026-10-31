@@ -21,6 +21,7 @@ use std::time::Duration;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 
+use crate::cache::{CacheError, Store};
 use crate::error::RadarError;
 use crate::stations::SiteId;
 use crate::time::{MS_PER_DAY, civil_from_days, now_unix_ms};
@@ -277,6 +278,65 @@ pub fn fetch_archive(key: &str) -> Result<Vec<u8>, RadarError> {
         }),
         Err(other) => Err(other),
     }
+}
+
+/// A verified archive body together with the cache outcome.
+#[derive(Debug)]
+pub struct CachedArchive {
+    pub bytes: Vec<u8>,
+    pub from_cache: bool,
+    pub cache_warning: Option<CacheError>,
+}
+
+/// Retrieves a volume through the bounded persistent cache.
+///
+/// A cache miss falls back to the live object and stores it for a later
+/// history view. Cache failures do not replace usable live bytes; they travel
+/// with the response so the interface can report them.
+pub fn fetch_archive_cached(key: &str) -> Result<CachedArchive, RadarError> {
+    let mut cache_warning = None;
+    let store = match Store::default_location() {
+        Ok(store) => Some(store),
+        Err(error) => {
+            cache_warning = Some(error);
+            None
+        }
+    };
+    if let Some(store) = &store {
+        match store.load(key) {
+            Ok(Some(entry)) => {
+                return Ok(CachedArchive {
+                    bytes: entry.body,
+                    from_cache: true,
+                    cache_warning,
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                cache_warning = Some(error);
+                if let Err(remove_error) = store.remove(key) {
+                    cache_warning = Some(remove_error);
+                }
+            }
+        }
+    }
+    let bytes = fetch_archive(key)?;
+    if let Some(store) = &store
+        && let Err(error) = store.store(key, &bytes)
+    {
+        cache_warning = Some(error);
+    }
+    Ok(CachedArchive {
+        bytes,
+        from_cache: false,
+        cache_warning,
+    })
+}
+
+/// Removes a cached archive after it fails to decode, so the next attempt can
+/// fetch a fresh object instead of replaying corrupt bytes.
+pub fn evict_archive(key: &str) -> Result<(), CacheError> {
+    Store::default_location()?.remove(key)
 }
 
 #[cfg(test)]

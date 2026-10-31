@@ -2620,13 +2620,23 @@ impl OxradApp {
                 generation: event_generation,
                 key,
                 volume,
+                from_cache,
+                cache_warning,
             } if event_generation == generation => {
                 let label = history::key_label(&key);
                 self.history.key = Some(key);
                 self.history.state = HistoryState::Reviewing;
                 self.history.scrub_index = None;
                 self.display.submit(volume, self.product);
-                self.notice = Some(format!("Reviewing radar scan {label}."));
+                let mut notice = if from_cache {
+                    format!("Reviewing cached radar scan {label}.")
+                } else {
+                    format!("Reviewing radar scan {label}.")
+                };
+                if let Some(warning) = cache_warning {
+                    notice = format!("{notice} Cache warning: {warning}.");
+                }
+                self.notice = Some(notice);
                 if self.history.playback == GlobalPlayback::Playing {
                     self.history.next_frame =
                         Some(due_after(Duration::from_millis(HISTORY_FRAME_MS)));
@@ -2637,7 +2647,17 @@ impl OxradApp {
             HistoryEvent::Failed {
                 generation: event_generation,
                 error,
-            } if event_generation == generation => self.history_failure(error),
+                cache_warning,
+            } if event_generation == generation => {
+                self.history_failure(error);
+                if let Some(warning) = cache_warning {
+                    let failure = self
+                        .notice
+                        .take()
+                        .unwrap_or_else(|| String::from("Radar history failed."));
+                    self.notice = Some(format!("{failure} Cache warning: {warning}."));
+                }
+            }
             HistoryEvent::Keys { .. }
             | HistoryEvent::Volume { .. }
             | HistoryEvent::Failed { .. } => {}
