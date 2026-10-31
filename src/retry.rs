@@ -33,7 +33,11 @@ pub fn error_update(
     attempt: u32,
     jitter: &RandomState,
 ) -> FetchUpdate {
-    let FetchFailure { operation, error } = failure;
+    let FetchFailure {
+        operation,
+        error,
+        cache_warning,
+    } = failure;
     let wait = if is_decode_failure(&error) && failures >= 2 {
         None
     } else if let Some(value) = retry_after(&error) {
@@ -44,9 +48,12 @@ pub fn error_update(
                     result: Err(FetchFailure {
                         operation,
                         error: invalid,
+                        cache_warning: None,
                     }),
                     retry_in: Some(jittered(delay, attempt, jitter)),
                     waiting_for_next_volume: false,
+                    from_cache: false,
+                    cache_warning: cache_warning.map(|error| *error),
                 };
             }
         }
@@ -54,9 +61,15 @@ pub fn error_update(
         Some(jittered(delay, attempt, jitter))
     };
     FetchUpdate {
-        result: Err(FetchFailure { operation, error }),
+        result: Err(FetchFailure {
+            operation,
+            error,
+            cache_warning: None,
+        }),
         retry_in: wait,
         waiting_for_next_volume: wait.is_none(),
+        from_cache: false,
+        cache_warning: cache_warning.map(|error| *error),
     }
 }
 
@@ -259,6 +272,7 @@ mod tests {
             FetchFailure {
                 operation: Operation::Fetching,
                 error,
+                cache_warning: None,
             },
             0,
             BASE_DELAY,
@@ -283,6 +297,7 @@ mod tests {
             FetchFailure {
                 operation: Operation::Decoding,
                 error: incomplete(),
+                cache_warning: None,
             },
             1,
             BASE_DELAY,
@@ -295,6 +310,7 @@ mod tests {
             FetchFailure {
                 operation: Operation::Decoding,
                 error: incomplete(),
+                cache_warning: None,
             },
             2,
             Duration::from_secs(4),

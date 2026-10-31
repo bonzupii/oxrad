@@ -35,7 +35,7 @@ This section describes the repository as it exists, not the target.
 | Warnings | Partial | NWS active alerts for the United States and territories, drawn by severity on the map and radar scene, with area, urgency, issuance, expiration, count, unreadable-alert count, a selectable severity-sorted list, visible-map filtering, polygon focus, a selected-alert panel with headline, description, and instructions, and feed-failure state; no international alert feeds |
 | Map base and labels | Implemented | Offline Natural Earth 1:110m countries, borders, labels, graticule, scale, and site markers; no local detail yet |
 | Measurement tools | Partial | Pointer latitude, longitude, range, azimuth, and gate value readout; two-point map measurement with WGS84 distance and initial bearing |
-| Network cache | Partial | RainViewer manifest and tile bodies and NEXRAD history archives use a bounded disk cache with SHA-256 verification, atomic writes, corruption removal, and offline handling; no HTTP validators, live NEXRAD acquisition cache, provider JSON, or forecast caching |
+| Network cache | Partial | RainViewer manifest and tile bodies and NEXRAD archive bodies use a bounded disk cache with SHA-256 verification, atomic writes, corruption removal, and offline handling; no HTTP validators, NEXRAD listing cache, provider JSON, or forecast caching |
 | Comparison panes | Not implemented | One scene |
 | Colorblind palette options | Not implemented | One product palette per product |
 | Independent reviews | Not completed | No separate reviewer process has been run |

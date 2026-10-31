@@ -20,6 +20,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
+use crate::cache::CacheError;
 use crate::error::RadarError;
 use crate::network;
 use crate::radar::{self, RadarVolume};
@@ -34,6 +35,7 @@ const SHUTDOWN_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 pub struct FetchFailure {
     pub operation: Operation,
     pub error: RadarError,
+    pub cache_warning: Option<Box<CacheError>>,
 }
 
 #[derive(Debug)]
@@ -41,6 +43,8 @@ pub struct FetchUpdate {
     pub result: Result<Option<RadarVolume>, FetchFailure>,
     pub retry_in: Option<Duration>,
     pub waiting_for_next_volume: bool,
+    pub from_cache: bool,
+    pub cache_warning: Option<CacheError>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,11 +133,20 @@ struct Archive {
     bytes: Vec<u8>,
 }
 
+struct Fetched {
+    key: String,
+    volume: RadarVolume,
+    from_cache: bool,
+    cache_warning: Option<CacheError>,
+}
+
 pub struct Pipeline {
     site: SiteId,
     events: Receiver<Event>,
     retry: Sender<()>,
     pub state: PipelineState,
+    pub from_cache: bool,
+    cache_warning: Option<String>,
 }
 
 impl Pipeline {
@@ -171,6 +184,8 @@ impl Pipeline {
                 operation: Operation::Fetching,
                 last_failure: None,
             },
+            from_cache: false,
+            cache_warning: None,
         }
     }
 
@@ -199,31 +214,52 @@ impl Pipeline {
                     operation,
                     last_failure: previous.into_failure(),
                 };
+                self.from_cache = false;
                 None
             }
-            Event::Update(update) => match update.result {
-                Ok(Some(volume)) => {
-                    self.state = PipelineState::Ready;
-                    Some(volume)
+            Event::Update(update) => {
+                let FetchUpdate {
+                    result,
+                    retry_in,
+                    waiting_for_next_volume,
+                    from_cache,
+                    cache_warning,
+                } = *update;
+                if let Some(warning) = cache_warning {
+                    self.cache_warning = Some(warning.to_string());
                 }
-                Ok(None) => {
-                    let previous = std::mem::replace(&mut self.state, PipelineState::Ready);
-                    if let Some(failure) = previous.into_failure() {
-                        self.state = PipelineState::Failed(failure);
+                match result {
+                    Ok(Some(volume)) => {
+                        self.state = PipelineState::Ready;
+                        self.from_cache = from_cache;
+                        Some(volume)
                     }
-                    None
+                    Ok(None) => {
+                        self.from_cache = false;
+                        let previous = std::mem::replace(&mut self.state, PipelineState::Ready);
+                        if let Some(failure) = previous.into_failure() {
+                            self.state = PipelineState::Failed(failure);
+                        }
+                        None
+                    }
+                    Err(failure) => {
+                        self.from_cache = false;
+                        self.state = PipelineState::Failed(Failure {
+                            operation: failure.operation,
+                            error: failure.error,
+                            retry_in,
+                            waiting_for_next_volume,
+                        });
+                        None
+                    }
                 }
-                Err(failure) => {
-                    self.state = PipelineState::Failed(Failure {
-                        operation: failure.operation,
-                        error: failure.error,
-                        retry_in: update.retry_in,
-                        waiting_for_next_volume: update.waiting_for_next_volume,
-                    });
-                    None
-                }
-            },
+            }
         }
+    }
+
+    /// Takes the most recent non-fatal cache problem, if any.
+    pub const fn take_cache_warning(&mut self) -> Option<String> {
+        self.cache_warning.take()
     }
 
     /// Asks the fetch worker to try again now.
@@ -296,6 +332,7 @@ fn worker_failure(site: &SiteId, operation: Operation, error: RadarError) -> Fet
             },
             other => other,
         },
+        cache_warning: None,
     }
 }
 
@@ -305,6 +342,7 @@ fn decode_failure(site: &SiteId) -> FetchFailure {
         error: RadarError::DecoderStopped {
             site: String::from(site.as_str()),
         },
+        cache_warning: None,
     }
 }
 
@@ -314,10 +352,11 @@ fn fetch(
     events: &Sender<Event>,
     jobs: &Sender<Archive>,
     results: &Receiver<Result<RadarVolume, RadarError>>,
-) -> Result<Option<(String, RadarVolume)>, FetchFailure> {
+) -> Result<Option<Fetched>, FetchFailure> {
     let key = network::latest_volume_key(site).map_err(|error| FetchFailure {
         operation: Operation::Fetching,
         error,
+        cache_warning: None,
     })?;
     if state.last_key.as_ref() == Some(&key)
         || (state.failed_key.as_ref() == Some(&key) && state.decode_failures >= 2)
@@ -328,15 +367,18 @@ fn fetch(
         state.failed_key = None;
         state.decode_failures = 0;
     }
-    let bytes = network::fetch_archive(&key).map_err(|error| {
+    let archive = network::fetch_archive_cached(&key).map_err(|error| {
         if matches!(error, RadarError::VolumeGone { .. }) {
             state.last_key = None;
         }
         FetchFailure {
             operation: Operation::Fetching,
             error,
+            cache_warning: None,
         }
     })?;
+    let from_cache = archive.from_cache;
+    let mut cache_warning = archive.cache_warning;
     if events.send(Event::Working(Operation::Decoding)).is_err() {
         return Err(worker_failure(
             site,
@@ -348,19 +390,28 @@ fn fetch(
     }
     jobs.send(Archive {
         key: key.clone(),
-        bytes,
+        bytes: archive.bytes,
     })
     .map_err(|_| decode_failure(site))?;
     match results.recv().map_err(|_| decode_failure(site))? {
-        Ok(volume) => Ok(Some((key, volume))),
+        Ok(volume) => Ok(Some(Fetched {
+            key,
+            volume,
+            from_cache,
+            cache_warning,
+        })),
         Err(error) => {
             if retry::is_decode_failure(&error) {
-                state.failed_key = Some(key);
+                state.failed_key = Some(key.clone());
                 state.decode_failures = state.decode_failures.saturating_add(1);
+            }
+            if let Err(remove_error) = network::evict_archive(&key) {
+                cache_warning = Some(remove_error);
             }
             Err(FetchFailure {
                 operation: Operation::Decoding,
                 error,
+                cache_warning: cache_warning.map(Box::new),
             })
         }
     }
@@ -416,13 +467,15 @@ impl Fetcher {
                 fetch(state, site, events, jobs, results)
             }));
             let update = match outcome {
-                Ok(Ok(Some((key, volume)))) => {
-                    state.last_key = Some(key);
+                Ok(Ok(Some(fetched))) => {
+                    state.last_key = Some(fetched.key);
                     state.reset_retry();
                     FetchUpdate {
-                        result: Ok(Some(volume)),
+                        result: Ok(Some(fetched.volume)),
                         retry_in: None,
                         waiting_for_next_volume: false,
+                        from_cache: fetched.from_cache,
+                        cache_warning: fetched.cache_warning,
                     }
                 }
                 Ok(Ok(None)) => {
@@ -432,6 +485,8 @@ impl Fetcher {
                         result: Ok(None),
                         retry_in: None,
                         waiting_for_next_volume: false,
+                        from_cache: false,
+                        cache_warning: None,
                     }
                 }
                 Ok(Err(failure)) => error_update(
@@ -447,9 +502,12 @@ impl Fetcher {
                         error: RadarError::WorkerPanic {
                             site: String::from(site.as_str()),
                         },
+                        cache_warning: None,
                     }),
                     retry_in: Some(POLL_INTERVAL),
                     waiting_for_next_volume: false,
+                    from_cache: false,
+                    cache_warning: None,
                 },
             };
             let wait = update.retry_in;

@@ -865,12 +865,21 @@ impl OxradApp {
         }
     }
 
-    fn update_workers(&mut self, context: &egui::Context) {
-        if let Some(pipeline) = self.pipeline.as_mut()
-            && let Some(volume) = pipeline.poll()
-        {
+    fn poll_selected_pipeline(&mut self) {
+        let Some(pipeline) = self.pipeline.as_mut() else {
+            return;
+        };
+        let volume = pipeline.poll();
+        if let Some(warning) = pipeline.take_cache_warning() {
+            self.notice = Some(format!("NEXRAD cache: {warning}"));
+        }
+        if let Some(volume) = volume {
             self.display.submit(volume, self.product);
         }
+    }
+
+    fn update_workers(&mut self, context: &egui::Context) {
+        self.poll_selected_pipeline();
         self.display.poll();
         self.poll_history();
         self.advance_history_playback();
@@ -1487,6 +1496,16 @@ impl OxradApp {
         retry
     }
 
+    fn pipeline_cache_status(&self, ui: &mut egui::Ui) {
+        if self
+            .pipeline
+            .as_ref()
+            .is_some_and(|pipeline| pipeline.from_cache)
+        {
+            ui.label(RichText::new("cached volume").size(11.0).color(STALE));
+        }
+    }
+
     fn status(&mut self, ui: &mut egui::Ui) {
         let mut retry_pipeline = false;
         let mut retry_display = false;
@@ -1516,6 +1535,7 @@ impl OxradApp {
                 }
                 ui.separator();
                 ui.label(self.phase());
+                self.pipeline_cache_status(ui);
                 if matches!(
                     self.history.state,
                     HistoryState::LoadingVolume | HistoryState::Reviewing

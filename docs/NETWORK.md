@@ -48,7 +48,7 @@ The feed is parsed in a worker and superseded generations are discarded. A succe
 
 The archive client lists each UTC day under `{year}/{month}/{day}/{site}/`, filters keys ending in `_V06` with a two-digit version, and selects the lexicographically newest key. Listing XML is parsed with `quick-xml`, including nested `Contents/Key`, whitespace, entities, `IsTruncated`, and `NextContinuationToken`. Pagination is capped at 10,000 pages.
 
-The object is downloaded into memory and decoded in a worker. A 404 is reported as a stale listing (`VolumeGone`), not as an empty sky. A volume is accepted only when assembly sees volume-start and volume-end radials, complete sweep boundaries, and valid site coordinates. History scans use the shared response cache: a cached body is verified before decoding, a successful live body is stored after download, and a body that fails to decode is evicted. The live latest-volume pipeline and NEXRAD listing are still uncached.
+The object is downloaded into memory and decoded in a worker. A 404 is reported as a stale listing (`VolumeGone`), not as an empty sky. A volume is accepted only when assembly sees volume-start and volume-end radials, complete sweep boundaries, and valid site coordinates. NEXRAD volumes use the shared response cache: a cached body is verified before decoding, a successful live body is stored after download, and a body that fails to decode is evicted. The NEXRAD listing and latest-key selection are still uncached.
 
 ## Global radar composite
 
@@ -64,7 +64,7 @@ RainViewer manifest bytes and decoded-source PNG bodies are stored under `~/.oxr
 
 Writes go to a temporary file and are renamed into place, with metadata written last. A failed or interrupted write leaves no committed entry. A damaged entry is removed when it is encountered and the live request is attempted; the cache problem is surfaced in the notice area. Pruning runs after a complete viewport refresh and keeps at most 256 entries and 128 MiB, removing the oldest fetch times first. Bodies larger than 32 MiB are not cached.
 
-The in-memory tile map holds up to 120 PNG bodies and is cleared when that limit is reached. The manifest remains fresh for 90 seconds in memory. If a live manifest request fails and a cached manifest exists, the cached manifest is used and a notice says so; tiles that were never cached still require the network. HTTP ETag, Last-Modified, conditional requests, and stale-while-revalidate are not implemented. NEXRAD history archives use the same store; the live NEXRAD pipeline, NEXRAD listings, forecast, place, and warning responses are not yet cached.
+The in-memory tile map holds up to 120 PNG bodies and is cleared when that limit is reached. The manifest remains fresh for 90 seconds in memory. If a live manifest request fails and a cached manifest exists, the cached manifest is used and a notice says so; tiles that were never cached still require the network. HTTP ETag, Last-Modified, conditional requests, and stale-while-revalidate are not implemented. NEXRAD archive bodies use the same store; NEXRAD listings, latest-key metadata, forecast, place, and warning responses are not yet cached.
 
 ## Retry behavior
 
