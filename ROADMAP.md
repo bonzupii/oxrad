@@ -32,7 +32,7 @@ This section describes the repository as it exists, not the target.
 | Viewport model | Partial | The map has Mercator pan, zoom, a global radar tile, and independently placed station meshes; the radar scene remains a centered single-site disc and no common-time values are composed |
 | Multi-station composition | Partial | Map viewport overlays the selected station and up to three nearby stations within a six-minute scan window; no resampling, composite values, or gap fill |
 | Time history and looping | Partial | RainViewer composite has 13 ten-minute frames with scrub and loop; NEXRAD still shows only the newest completed volume |
-| Warnings | Not implemented | No alert adapter or polygon layer |
+| Warnings | Partial | NWS active alerts for the United States and territories, drawn by severity with area, expiration, count, and feed-failure state; no viewport filtering, issuance and urgency detail, selection, or international alert feeds |
 | Map base and labels | Implemented | Offline Natural Earth 1:110m countries, borders, labels, graticule, scale, and site markers; no local detail yet |
 | Measurement tools | Partial | Pointer latitude, longitude, range, azimuth, and gate value readout |
 | Comparison panes | Not implemented | One scene |
@@ -80,6 +80,7 @@ UI thread
   ├─ PlaceSearch   (one search worker)
   ├─ ForecastFeed  (one forecast worker)
   ├─ Pipeline      (one fetcher and one decoder per active site)
+  ├─ WarningFeed   (one active-alert worker)
   └─ Display       (one geometry worker)
 
 worker → owned message → UI thread
@@ -104,6 +105,7 @@ The current renderer draws one mesh. The multi-mesh path is a required architect
 |---|---|---|---|
 | NEXRAD Level II via Unidata S3 | United States WSR-88D | DREF, DVEL, DSW, DZDR, DRHO, DPHI, DKDP | Implemented |
 | NWS radar stations | United States metadata | WSR-88D and TDWR metadata | Implemented; TDWR selection excluded |
+| NWS active alerts | United States and territories | Warning polygons, severity, area, expiration | Implemented; no viewport filter or full alert text |
 | Open-Meteo | Global | Current, hourly, daily forecast | Implemented |
 | OpenStreetMap Nominatim | Global | Place search | Implemented |
 | DWD, ECCC, BoM, JMA, CMA, IMD, Roshydromet, SMN, MetService | National | Unknown until each interface is verified | Planned |
@@ -156,9 +158,9 @@ Bounded independent pipelines and per-mesh transforms render the selected statio
 
 The RainViewer global composite now has a 13-frame, two-hour scrubber and loop. Remaining work is NEXRAD volume history, scan comparison, product comparison panes, storm motion where the data supports it, and a crosshair measurement workflow.
 
-### Phase 6: authoritative context
+### Phase 6: authoritative context (in progress)
 
-Add warning polygons and metadata from authoritative alert feeds, base-map tiles, labels, layer toggles, and a clear distinction between observation, forecast, and warning time.
+NWS active-alert polygons, severity colors, area, expiration, layer toggle, refresh, and failure reporting are implemented for the United States and territories. Remaining work is viewport filtering, issuance and urgency fields, selectable alert detail, and authoritative alert adapters for other regions. Observation, forecast, and warning time remain distinct concepts in the interface.
 
 ### Phase 7: international radar adapters (in progress)
 
@@ -178,7 +180,7 @@ cargo build
 cargo build --release --locked
 ```
 
-`cargo test` includes live discovery, live forecast, live listing, and the pinned archive download, size, SHA-256, and decode. A network failure fails those tests. GUI behavior is exercised separately under Xvfb with software Vulkan; screenshots are evidence, not correctness proof.
+`cargo test` includes live discovery, live forecast, live active warnings, live listing, and the pinned archive download, size, SHA-256, and decode. A network failure fails those tests. GUI behavior is exercised separately under Xvfb with software Vulkan; screenshots are evidence, not correctness proof.
 
 ## Completion
 

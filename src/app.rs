@@ -19,7 +19,8 @@ use std::fmt::Write;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, Align, Align2, Color32, CornerRadius, FontId, Layout, Pos2, Rect, RichText, Stroke, Vec2,
+    self, Align, Align2, Color32, CornerRadius, FontId, Layout, Pos2, Rect, RichText, Shape,
+    Stroke, Vec2,
 };
 
 use crate::config::{self, Config};
@@ -39,6 +40,7 @@ use crate::radar::GateValue;
 use crate::render::{self, ViewTransform};
 use crate::stations::{self, SiteId, Station, StationError, StationFeed, StationOutcome};
 use crate::time;
+use crate::warnings::{Severity, Warning, WarningError, WarningEvent, WarningFeed};
 
 const BACKGROUND: Color32 = Color32::from_rgb(8, 10, 14);
 const CARD: Color32 = Color32::from_rgb(18, 22, 30);
@@ -63,6 +65,8 @@ const STATION_RETRY_SECS: u64 = 15 * 60;
 const GLOBAL_REFRESH_SECS: u64 = 5 * 60;
 const GLOBAL_RETRY_SECS: u64 = 60;
 const GLOBAL_PLAYBACK_MS: u64 = 650;
+const WARNING_REFRESH_SECS: u64 = 5 * 60;
+const WARNING_RETRY_SECS: u64 = 2 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SceneMode {
@@ -96,6 +100,14 @@ enum GlobalPlayback {
 }
 
 enum GlobalState {
+    Idle,
+    Loading,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WarningState {
     Idle,
     Loading,
     Ready,
@@ -229,6 +241,14 @@ pub struct OxradApp {
     global_request_due: Option<Instant>,
     global_refresh_due: Option<Instant>,
     global_state: GlobalState,
+    warning_feed: WarningFeed,
+    warning_generation: u64,
+    warnings: Vec<Warning>,
+    warnings_without_geometry: usize,
+    warning_layer: RadarLayer,
+    warning_state: WarningState,
+    warning_request_due: Option<Instant>,
+    warning_refresh_due: Option<Instant>,
 }
 
 impl OxradApp {
@@ -289,6 +309,14 @@ impl OxradApp {
             global_request_due: None,
             global_refresh_due: None,
             global_state: GlobalState::Idle,
+            warning_feed: WarningFeed::new(),
+            warning_generation: 0,
+            warnings: Vec::new(),
+            warnings_without_geometry: 0,
+            warning_layer: RadarLayer::Shown,
+            warning_state: WarningState::Idle,
+            warning_request_due: Some(Instant::now()),
+            warning_refresh_due: None,
         };
         if let Some(place) = &restored_place {
             match MapView::focus(place.lat, place.lon, 2_200.0) {
@@ -476,6 +504,71 @@ impl OxradApp {
             if layer.display.frame.is_some() && !layer.display.rebuild(self.product, elevation) {
                 layer.failure_reported = false;
             }
+        }
+    }
+
+    fn request_warnings(&mut self) {
+        self.warning_request_due = None;
+        let generation = self.warning_generation.wrapping_add(1);
+        match self.warning_feed.request(generation) {
+            Ok(()) => {
+                self.warning_generation = generation;
+                self.warning_state = WarningState::Loading;
+            }
+            Err(error) => self.warning_failure(&error),
+        }
+    }
+
+    fn warning_failure(&mut self, error: &WarningError) {
+        self.warning_state = WarningState::Failed;
+        self.warning_refresh_due = Some(Instant::now() + Duration::from_secs(WARNING_RETRY_SECS));
+        self.notice = Some(format!("Active warnings are unavailable: {error}"));
+    }
+
+    fn poll_warnings(&mut self) {
+        loop {
+            match self.warning_feed.poll() {
+                Ok(Some(event)) => self.apply_warning_event(event),
+                Ok(None) => break,
+                Err(error) => {
+                    self.warning_failure(&error);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn update_warnings(&mut self) {
+        let warning_due = self
+            .warning_request_due
+            .is_some_and(|due| Instant::now() >= due)
+            || self
+                .warning_refresh_due
+                .is_some_and(|due| Instant::now() >= due);
+        if self.scene_mode == SceneMode::Map
+            && (matches!(self.warning_state, WarningState::Idle) || warning_due)
+        {
+            self.request_warnings();
+        }
+        self.poll_warnings();
+    }
+
+    fn apply_warning_event(&mut self, event: WarningEvent) {
+        match event {
+            WarningEvent::Ready { generation, set } if generation == self.warning_generation => {
+                self.warnings = set.warnings;
+                self.warnings_without_geometry = set.without_geometry;
+                self.warning_state = WarningState::Ready;
+                self.warning_refresh_due =
+                    Some(Instant::now() + Duration::from_secs(WARNING_REFRESH_SECS));
+            }
+            WarningEvent::Failed { generation, error } if generation == self.warning_generation => {
+                self.warning_state = WarningState::Failed;
+                self.warning_refresh_due =
+                    Some(Instant::now() + Duration::from_secs(WARNING_RETRY_SECS));
+                self.notice = Some(format!("Active warnings are unavailable: {error}"));
+            }
+            WarningEvent::Ready { .. } | WarningEvent::Failed { .. } => {}
         }
     }
 
@@ -689,6 +782,7 @@ impl OxradApp {
         if let Some((place, attempt)) = retry {
             self.start_forecast(&place, attempt);
         }
+        self.update_warnings();
         self.poll_global_radar(context);
     }
 
@@ -1370,12 +1464,12 @@ impl OxradApp {
         self.map_basemap(ui, rect);
         self.map_global(ui, &transform);
         let radar_visible = self.map_radar(ui, rect, &transform);
+        self.map_warnings(ui, rect, &transform);
         let clicked_site = self.map_stations(ui, rect, &transform, &interaction);
         self.map_place(ui, &transform);
         map::draw_scale(ui.painter(), rect, &transform);
         self.map_controls(ui, rect);
         self.map_readout(ui, rect, &transform, radar_visible);
-        self.global_controls(ui, rect);
         if let Some(id) = clicked_site {
             self.choose_site(id);
         }
@@ -1559,37 +1653,6 @@ impl OxradApp {
         drew
     }
 
-    fn global_controls(&mut self, ui: &mut egui::Ui, rect: Rect) {
-        let toggle = Rect::from_min_size(
-            Pos2::new(rect.left() + 16.0, rect.top() + 180.0),
-            Vec2::new(158.0, 28.0),
-        );
-        if ui
-            .put(
-                toggle,
-                egui::Button::new(if self.global_layer.is_shown() {
-                    "Global radar: on"
-                } else {
-                    "Global radar: off"
-                })
-                .fill(if self.global_layer.is_shown() {
-                    HIGHLIGHT
-                } else {
-                    CARD
-                }),
-            )
-            .on_hover_text("RainViewer global reflectivity composite with two hours of history.")
-            .clicked()
-        {
-            self.global_layer = self.global_layer.toggled();
-            if !self.global_layer.is_shown() {
-                self.global_playback = GlobalPlayback::Stopped;
-            } else if self.global_frames.is_empty() {
-                self.request_global_radar();
-            }
-        }
-    }
-
     fn global_history(&mut self, ui: &mut egui::Ui) {
         let last = self.global_frames.len().saturating_sub(1);
         let index = self.global_index.min(last);
@@ -1738,6 +1801,43 @@ impl OxradApp {
         drew
     }
 
+    fn map_warnings(&self, ui: &egui::Ui, rect: Rect, transform: &map::MapTransform) {
+        if !self.warning_layer.is_shown() {
+            return;
+        }
+        for warning in &self.warnings {
+            let colour = match warning.severity {
+                Severity::Extreme => Color32::from_rgb(255, 58, 58),
+                Severity::Severe => Color32::from_rgb(255, 138, 32),
+                Severity::Moderate => Color32::from_rgb(255, 214, 64),
+                Severity::Minor => Color32::from_rgb(100, 190, 255),
+                Severity::Unknown => Color32::from_rgb(190, 198, 210),
+            };
+            for ring in &warning.polygons {
+                let points: Vec<Pos2> = ring
+                    .iter()
+                    .filter_map(|(lat, lon)| transform.screen(*lat, *lon))
+                    .collect();
+                if points.len() < 3 {
+                    continue;
+                }
+                let width = points
+                    .iter()
+                    .map(|point| point.x)
+                    .fold(f32::NEG_INFINITY, f32::max)
+                    - points
+                        .iter()
+                        .map(|point| point.x)
+                        .fold(f32::INFINITY, f32::min);
+                if width > rect.width() * 4.0 {
+                    continue;
+                }
+                ui.painter()
+                    .add(Shape::closed_line(points, Stroke::new(2.0_f32, colour)));
+            }
+        }
+    }
+
     fn map_basemap(&self, ui: &egui::Ui, rect: Rect) {
         match &self.map {
             Ok(world) => {
@@ -1838,76 +1938,172 @@ impl OxradApp {
     }
 
     fn map_controls(&mut self, ui: &mut egui::Ui, rect: Rect) {
-        let layer_rect = Rect::from_min_size(
+        let area = Rect::from_min_size(
             Pos2::new(rect.left() + 16.0, rect.top() + 70.0),
-            Vec2::new(116.0, 28.0),
+            Vec2::new(190.0, 190.0),
         );
-        let reload_rect = Rect::from_min_size(
-            Pos2::new(rect.left() + 16.0, rect.top() + 142.0),
-            Vec2::new(116.0, 28.0),
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(area)
+                .layout(Layout::top_down(Align::Min)),
+            |ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
+                if ui
+                    .add_sized(
+                        [116.0, 28.0],
+                        egui::Button::new(if self.map_radar.is_shown() {
+                            "Hide radar layer"
+                        } else {
+                            "Show radar layer"
+                        }),
+                    )
+                    .clicked()
+                {
+                    self.map_radar = self.map_radar.toggled();
+                }
+                ui.horizontal(|ui| {
+                    if ui.add_sized([32.0, 30.0], egui::Button::new("+")).clicked() {
+                        match self.map_view.zoom_at(rect, rect.center(), 1.6) {
+                            Ok(()) => self.schedule_viewport_reload(),
+                            Err(error) => self.notice = Some(format!("Map zoom failed: {error}")),
+                        }
+                    }
+                    if ui.add_sized([32.0, 30.0], egui::Button::new("−")).clicked() {
+                        match self.map_view.zoom_at(rect, rect.center(), 1.0 / 1.6) {
+                            Ok(()) => self.schedule_viewport_reload(),
+                            Err(error) => self.notice = Some(format!("Map zoom failed: {error}")),
+                        }
+                    }
+                    if self.place.is_some()
+                        && ui.add_sized([58.0, 30.0], egui::Button::new("Focus")).clicked()
+                    {
+                        self.focus_map_context();
+                        self.schedule_viewport_reload();
+                    }
+                });
+                if ui
+                    .add_sized([116.0, 28.0], egui::Button::new("Reload nearby"))
+                    .on_hover_text("Find up to three stations around the current map centre.")
+                    .clicked()
+                {
+                    self.reload_viewport_radars();
+                }
+                if ui
+                    .add_sized(
+                        [116.0, 28.0],
+                        egui::Button::new(if self.warning_layer.is_shown() {
+                            "Hide warnings"
+                        } else {
+                            "Show warnings"
+                        })
+                        .fill(if self.warning_layer.is_shown() {
+                            HIGHLIGHT
+                        } else {
+                            CARD
+                        }),
+                    )
+                    .on_hover_text("Show active National Weather Service warning polygons for the United States and territories.")
+                    .clicked()
+                {
+                    self.warning_layer = self.warning_layer.toggled();
+                    if self.warning_layer.is_shown() && matches!(self.warning_state, WarningState::Idle)
+                    {
+                        self.warning_request_due = Some(Instant::now());
+                    }
+                }
+                if ui
+                    .add_sized(
+                        [158.0, 28.0],
+                        egui::Button::new(if self.global_layer.is_shown() {
+                            "Global radar: on"
+                        } else {
+                            "Global radar: off"
+                        })
+                        .fill(if self.global_layer.is_shown() {
+                            HIGHLIGHT
+                        } else {
+                            CARD
+                        }),
+                    )
+                    .on_hover_text("RainViewer global reflectivity composite with two hours of history.")
+                    .clicked()
+                {
+                    self.global_layer = self.global_layer.toggled();
+                    if !self.global_layer.is_shown() {
+                        self.global_playback = GlobalPlayback::Stopped;
+                    } else if self.global_frames.is_empty() {
+                        self.request_global_radar();
+                    }
+                }
+            },
         );
-        if ui
-            .put(reload_rect, egui::Button::new("Reload nearby"))
-            .on_hover_text("Find up to three stations around the current map centre.")
-            .clicked()
-        {
-            self.reload_viewport_radars();
-        }
-        if ui
-            .put(
-                layer_rect,
-                egui::Button::new(if self.map_radar.is_shown() {
-                    "Hide radar layer"
-                } else {
-                    "Show radar layer"
-                }),
-            )
-            .clicked()
-        {
-            self.map_radar = self.map_radar.toggled();
-        }
-        let has_place = self.place.is_some();
-        let zoom_rect = Rect::from_min_size(
-            Pos2::new(rect.left() + 16.0, rect.top() + 104.0),
-            Vec2::new(32.0, 30.0),
-        );
-        if ui.put(zoom_rect, egui::Button::new("+")).clicked() {
-            match self.map_view.zoom_at(rect, rect.center(), 1.6) {
-                Ok(()) => self.schedule_viewport_reload(),
-                Err(error) => self.notice = Some(format!("Map zoom failed: {error}")),
-            }
-        }
-        if ui
-            .put(
-                zoom_rect.translate(Vec2::new(36.0, 0.0)),
-                egui::Button::new("−"),
-            )
-            .clicked()
-        {
-            match self.map_view.zoom_at(rect, rect.center(), 1.0 / 1.6) {
-                Ok(()) => self.schedule_viewport_reload(),
-                Err(error) => self.notice = Some(format!("Map zoom failed: {error}")),
-            }
-        }
-        if has_place
-            && ui
-                .put(
-                    Rect::from_min_size(
-                        zoom_rect.min + Vec2::new(72.0, 0.0),
-                        Vec2::new(58.0, 30.0),
-                    ),
-                    egui::Button::new("Focus"),
-                )
-                .clicked()
-        {
-            self.focus_map_context();
-            self.schedule_viewport_reload();
-        }
         self.map_status(ui, rect);
     }
 
     fn map_status(&self, ui: &egui::Ui, rect: Rect) {
         let countries = self.map.as_ref().map_or(0, WorldMap::country_count);
+        if let Some(layers) = self.map_layer_line() {
+            ui.painter().text(
+                Pos2::new(rect.left() + 16.0, rect.top() + 270.0),
+                Align2::LEFT_TOP,
+                layers,
+                FontId::monospace(10.0),
+                MUTED,
+            );
+        }
+        if self.warning_layer.is_shown()
+            && let Some(warning) = self.most_severe_warning()
+        {
+            ui.painter().text(
+                Pos2::new(rect.left() + 16.0, rect.top() + 288.0),
+                Align2::LEFT_TOP,
+                format!(
+                    "Most severe: {} · {} · expires {}",
+                    warning.event, warning.area, warning.expires
+                ),
+                FontId::monospace(10.0),
+                ERROR,
+            );
+        }
+        let centre = self.map_view.center_latlon().map_or_else(
+            |_| String::from("unavailable"),
+            |(lat, lon)| format!("{lat:.2}, {lon:.2}"),
+        );
+        ui.painter().text(
+            rect.left_top() + Vec2::new(16.0, 16.0),
+            Align2::LEFT_TOP,
+            "Geographic map",
+            FontId::proportional(15.0),
+            TEXT,
+        );
+        ui.painter().text(
+            rect.left_top() + Vec2::new(16.0, 36.0),
+            Align2::LEFT_TOP,
+            format!(
+                "Centre {centre} · {countries} countries · {:.0} km wide · {} viewport radars",
+                self.map_view.span_km(),
+                self.view_radars.len()
+            ),
+            FontId::proportional(10.0),
+            MUTED,
+        );
+        ui.painter().text(
+            Pos2::new(rect.right() - 12.0, rect.bottom() - 12.0),
+            Align2::RIGHT_BOTTOM,
+            "Natural Earth 1:110m · public domain",
+            FontId::proportional(10.0),
+            MUTED,
+        );
+        ui.painter().text(
+            rect.left_top() + Vec2::new(16.0, 52.0),
+            Align2::LEFT_TOP,
+            "Drag to pan · scroll to zoom · click a radar site",
+            FontId::proportional(10.0),
+            MUTED,
+        );
+    }
+
+    fn map_layer_line(&self) -> Option<String> {
         let reference = self.displayed_scan_reference();
         let mut contributing = Vec::new();
         let mut excluded = Vec::new();
@@ -1953,51 +2149,53 @@ impl OxradApp {
         } else {
             String::from(" · global off")
         };
-        if !contributing.is_empty() || self.global_layer.is_shown() {
-            ui.painter().text(
-                Pos2::new(rect.left() + 16.0, rect.top() + 216.0),
-                Align2::LEFT_TOP,
-                format!("Layers: {contributing}{global}{time_note}"),
-                FontId::monospace(10.0),
-                MUTED,
-            );
+        if contributing.is_empty()
+            && !self.global_layer.is_shown()
+            && !self.warning_layer.is_shown()
+        {
+            return None;
         }
-        let centre = self.map_view.center_latlon().map_or_else(
-            |_| String::from("unavailable"),
-            |(lat, lon)| format!("{lat:.2}, {lon:.2}"),
-        );
-        ui.painter().text(
-            rect.left_top() + Vec2::new(16.0, 16.0),
-            Align2::LEFT_TOP,
-            "Geographic map",
-            FontId::proportional(15.0),
-            TEXT,
-        );
-        ui.painter().text(
-            rect.left_top() + Vec2::new(16.0, 36.0),
-            Align2::LEFT_TOP,
-            format!(
-                "Centre {centre} · {countries} countries · {:.0} km wide · {} viewport radars",
-                self.map_view.span_km(),
-                self.view_radars.len()
-            ),
-            FontId::proportional(10.0),
-            MUTED,
-        );
-        ui.painter().text(
-            Pos2::new(rect.right() - 12.0, rect.bottom() - 12.0),
-            Align2::RIGHT_BOTTOM,
-            "Natural Earth 1:110m · public domain",
-            FontId::proportional(10.0),
-            MUTED,
-        );
-        ui.painter().text(
-            rect.left_top() + Vec2::new(16.0, 52.0),
-            Align2::LEFT_TOP,
-            "Drag to pan · scroll to zoom · click a radar site",
-            FontId::proportional(10.0),
-            MUTED,
-        );
+        let warnings = self.warning_layer_summary();
+        Some(format!(
+            "Layers: {contributing}{global}{warnings}{time_note}"
+        ))
+    }
+
+    fn warning_layer_summary(&self) -> String {
+        if !self.warning_layer.is_shown() {
+            return String::from(" · warnings off");
+        }
+        match self.warning_state {
+            WarningState::Idle => String::new(),
+            WarningState::Loading => String::from(" · warnings loading"),
+            WarningState::Ready => {
+                let mut text = format!(" · {} warnings", self.warnings.len());
+                if self.warnings_without_geometry > 0
+                    && write!(
+                        text,
+                        " ({} without polygons)",
+                        self.warnings_without_geometry
+                    )
+                    .is_err()
+                {
+                    text.push_str(" (geometry count unavailable)");
+                }
+                text
+            }
+            WarningState::Failed => String::from(" · warnings error"),
+        }
+    }
+
+    fn most_severe_warning(&self) -> Option<&Warning> {
+        self.warnings
+            .iter()
+            .max_by_key(|warning| match warning.severity {
+                Severity::Extreme => 4,
+                Severity::Severe => 3,
+                Severity::Moderate => 2,
+                Severity::Minor => 1,
+                Severity::Unknown => 0,
+            })
     }
 
     fn map_readout(

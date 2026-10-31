@@ -9,6 +9,7 @@ use crate::global_radar::GlobalRadarError;
 use crate::map::MapError;
 use crate::place::PlaceError;
 use crate::provider::JsonError;
+use crate::warnings::WarningError;
 
 #[derive(Debug)]
 pub enum TestError {
@@ -23,6 +24,7 @@ pub enum TestError {
     Place(PlaceError),
     Map(MapError),
     GlobalRadar(GlobalRadarError),
+    Warning(WarningError),
     ColorMap(ColorMapError),
     Time(std::time::SystemTimeError),
 }
@@ -41,6 +43,7 @@ impl Display for TestError {
             Self::Place(error) => Display::fmt(error, formatter),
             Self::Map(error) => Display::fmt(error, formatter),
             Self::GlobalRadar(error) => Display::fmt(error, formatter),
+            Self::Warning(error) => Display::fmt(error, formatter),
             Self::ColorMap(error) => Display::fmt(error, formatter),
             Self::Time(error) => Display::fmt(error, formatter),
         }
@@ -60,6 +63,7 @@ impl Error for TestError {
             Self::Place(error) => Some(error),
             Self::Map(error) => Some(error),
             Self::GlobalRadar(error) => Some(error),
+            Self::Warning(error) => Some(error),
             Self::ColorMap(error) => Some(error),
             Self::Time(error) => Some(error),
             Self::Message(_) => None,
@@ -136,6 +140,12 @@ impl From<MapError> for TestError {
 impl From<GlobalRadarError> for TestError {
     fn from(value: GlobalRadarError) -> Self {
         Self::GlobalRadar(value)
+    }
+}
+
+impl From<WarningError> for TestError {
+    fn from(value: WarningError) -> Self {
+        Self::Warning(value)
     }
 }
 

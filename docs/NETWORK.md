@@ -6,7 +6,7 @@ This document describes the network paths in the current implementation. It does
 
 | Host | Purpose | Current use |
 |---|---|---|
-| `api.weather.gov` | Radar-station discovery and NWS alerts in planned work | `GET /radar/stations` with `Accept: application/geo+json` |
+| `api.weather.gov` | Radar-station discovery and active warnings | `GET /radar/stations` and `GET /alerts/active?status=actual&message_type=alert`, both with `Accept: application/geo+json` |
 | `nominatim.openstreetmap.org` | Place search | `GET /search` with `format=jsonv2`, a result limit, and a user agent |
 | `api.open-meteo.com` | Global forecast | `GET /v1/forecast` for current, hourly, and daily data |
 | `unidata-nexrad-level2.s3.amazonaws.com` | NEXRAD Level II archive | S3 list and object GET |
@@ -38,6 +38,12 @@ Open-Meteo is requested with the selected place's latitude and longitude and `ti
 
 The forecast request is one provider call. It does not use NWS gridpoints and is not limited to the United States.
 
+## Active warnings
+
+The active-alert feed is requested without coordinates; it returns the national collection of actual, non-test alerts. Each feature must have a nonempty identifier, event name, and valid polygon or multipolygon geometry, or be retained with no geometry and counted as such. Geometry coordinates are longitude then latitude and must fall in valid WGS84 ranges. Severity comes from the provider's `severity` field; an absent or unknown value is shown as unknown rather than assigned a severity.
+
+The feed is parsed in a worker and superseded generations are discarded. A successful collection is refreshed after five minutes; a failed request retries after two minutes and is shown in the map status and notice. The layer defaults to shown only within the Map scene; the Radar scene does not draw warning polygons. The application does not filter the feed to the viewport and does not expose issuance, urgency, or full alert text yet. Coverage is the United States and its territories, not the rest of the world.
+
 ## NEXRAD acquisition
 
 The archive client lists each UTC day under `{year}/{month}/{day}/{site}/`, filters keys ending in `_V06` with a two-digit version, and selects the lexicographically newest key. Listing XML is parsed with `quick-xml`, including nested `Contents/Key`, whitespace, entities, `IsTruncated`, and `NextContinuationToken`. Pagination is capped at 10,000 pages.
@@ -58,8 +64,8 @@ Forecast retries use a 2 second base, exponential growth to 60 seconds, jitter, 
 
 ## Request cancellation
 
-The forecast, place, and global-radar workers use generation numbers so a superseded answer cannot overwrite a newer selection. The radar pipeline stops when it is dropped. There is no transfer-level cancellation: a request already in flight completes or reaches its timeout. Bounded worker shutdown and streaming cancellation are not implemented.
+The forecast, place, global-radar, and active-warning workers use generation numbers so a superseded answer cannot overwrite a newer selection. The radar pipeline stops when it is dropped. There is no transfer-level cancellation: a request already in flight completes or reaches its timeout. Bounded worker shutdown and streaming cancellation are not implemented.
 
 ## Privacy
 
-Place queries are sent to Nominatim. Forecast coordinates are sent to Open-Meteo. Global radar requests send the map-centre tile coordinates to RainViewer. NEXRAD requests send only the site and time prefix. No account, API key, or device identifier is sent.
+Place queries are sent to Nominatim. Forecast coordinates are sent to Open-Meteo. Global radar requests send the map-centre tile coordinates to RainViewer. NEXRAD requests send only the site and time prefix. Active-warning requests send no coordinates or user identity and receive the national United States collection. No account, API key, or device identifier is sent.
