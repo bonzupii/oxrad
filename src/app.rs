@@ -15,6 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 //! The application window: place search, radar map, forecast, and status.
 
+use std::fmt::Write;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
@@ -59,6 +60,25 @@ const STATION_RETRY_SECS: u64 = 15 * 60;
 enum SceneMode {
     Radar,
     Map,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RadarLayer {
+    Shown,
+    Hidden,
+}
+
+impl RadarLayer {
+    const fn is_shown(self) -> bool {
+        matches!(self, Self::Shown)
+    }
+
+    const fn toggled(self) -> Self {
+        match self {
+            Self::Shown => Self::Hidden,
+            Self::Hidden => Self::Shown,
+        }
+    }
 }
 
 fn due_after(delay: Duration) -> Instant {
@@ -129,6 +149,7 @@ pub struct OxradApp {
     scene_mode: SceneMode,
     map: Result<WorldMap, MapError>,
     map_view: MapView,
+    map_radar: RadarLayer,
 }
 
 impl OxradApp {
@@ -174,6 +195,7 @@ impl OxradApp {
             scene_mode: SceneMode::Radar,
             map: WorldMap::load(),
             map_view: MapView::default(),
+            map_radar: RadarLayer::Shown,
         };
         if let Some(id) = restored_site
             && let Ok(list) = &app.stations
@@ -1117,11 +1139,12 @@ impl OxradApp {
             }
         };
         self.map_basemap(ui, rect);
+        let radar_visible = self.map_radar(ui, rect, &transform);
         let clicked_site = self.map_stations(ui, rect, &transform, &interaction);
         self.map_place(ui, &transform);
         map::draw_scale(ui.painter(), rect, &transform);
         self.map_controls(ui, rect);
-        self.map_readout(ui, rect, &transform);
+        self.map_readout(ui, rect, &transform, radar_visible);
         if let Some(id) = clicked_site {
             self.choose_site(id);
         }
@@ -1145,6 +1168,38 @@ impl OxradApp {
                 }
             }
         }
+    }
+
+    fn map_radar(&mut self, ui: &egui::Ui, rect: Rect, transform: &map::MapTransform) -> bool {
+        if !self.map_radar.is_shown() {
+            return false;
+        }
+        let Some(frame) = &self.display.frame else {
+            return false;
+        };
+        let Some(site) = transform.screen(frame.geometry.site_lat, frame.geometry.site_lon) else {
+            return false;
+        };
+        let kilometers_per_pixel = transform.kilometers_per_pixel();
+        let span_km = self.map_view.span_km();
+        if !(span_km.is_finite() && span_km > 0.0 && rect.width() > 0.0 && rect.height() > 0.0) {
+            return false;
+        }
+        let origin = [
+            ((site.x - rect.center().x) as f64 * kilometers_per_pixel) as f32,
+            (-(site.y - rect.center().y) as f64 * kilometers_per_pixel) as f32,
+        ];
+        let scale_x = (2.0 / span_km) as f32;
+        let scale_y = (2.0 * f64::from(rect.width()) / (span_km * f64::from(rect.height()))) as f32;
+        if let Err(error) = self.display.set_map_view(scale_x, scale_y, origin) {
+            self.notice = Some(format!("Radar map transform failed: {error}"));
+            return false;
+        }
+        if let Some(shape) = frame.shape(rect) {
+            ui.painter().add(shape);
+        }
+        overlay::draw_legend(ui.painter(), rect, frame.geometry.product);
+        true
     }
 
     fn map_basemap(&self, ui: &egui::Ui, rect: Rect) {
@@ -1247,6 +1302,23 @@ impl OxradApp {
     }
 
     fn map_controls(&mut self, ui: &mut egui::Ui, rect: Rect) {
+        let layer_rect = Rect::from_min_size(
+            Pos2::new(rect.left() + 16.0, rect.top() + 70.0),
+            Vec2::new(116.0, 28.0),
+        );
+        if ui
+            .put(
+                layer_rect,
+                egui::Button::new(if self.map_radar.is_shown() {
+                    "Hide radar layer"
+                } else {
+                    "Show radar layer"
+                }),
+            )
+            .clicked()
+        {
+            self.map_radar = self.map_radar.toggled();
+        }
         let has_place = self.place.is_some();
         let start_x = rect.right() - if has_place { 140.0 } else { 86.0 };
         let zoom_rect =
@@ -1317,7 +1389,13 @@ impl OxradApp {
         );
     }
 
-    fn map_readout(&self, ui: &egui::Ui, rect: Rect, transform: &map::MapTransform) {
+    fn map_readout(
+        &self,
+        ui: &egui::Ui,
+        rect: Rect,
+        transform: &map::MapTransform,
+        radar_visible: bool,
+    ) {
         let Some(pointer) = ui.input(|input| input.pointer.hover_pos()) else {
             return;
         };
@@ -1325,13 +1403,64 @@ impl OxradApp {
             return;
         }
         let (lat, lon) = transform.latlon_at(pointer);
-        ui.painter().text(
-            pointer + Vec2::new(12.0, 12.0),
-            Align2::LEFT_TOP,
-            format!("{lat:.4}, {lon:.4}"),
-            FontId::monospace(11.0),
-            TEXT,
+        let mut label = format!("{lat:.4}, {lon:.4}");
+        if radar_visible && let Some(frame) = &self.display.frame {
+            match crate::projection::inverse(
+                frame.geometry.site_lat,
+                frame.geometry.site_lon,
+                lat,
+                lon,
+            ) {
+                Ok((range_km, azimuth_deg)) => {
+                    match frame
+                        .geometry
+                        .lookup
+                        .gate(&frame.volume, range_km, azimuth_deg)
+                    {
+                        Ok(Some(hit)) => {
+                            if write!(
+                                label,
+                                "\n{} · {:.2}° beam",
+                                gate_label(Some(hit.value), frame.geometry.product),
+                                hit.elevation_deg
+                            )
+                            .is_err()
+                            {
+                                label.push_str("\nradar readout unavailable");
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            if write!(label, "\nreadout unavailable: {error}").is_err() {
+                                label.push_str("\nreadout unavailable");
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    if write!(label, "\nreadout unavailable: {error}").is_err() {
+                        label.push_str("\nreadout unavailable");
+                    }
+                }
+            }
+        }
+        let painter = ui.painter();
+        let galley = painter.layout_no_wrap(label, FontId::monospace(11.0), TEXT);
+        let padding = Vec2::splat(6.0);
+        let size = galley.size() + 2.0 * padding;
+        let x = (pointer.x + 12.0).min((rect.right() - size.x).max(rect.left()));
+        let y = if pointer.y >= rect.center().y {
+            (pointer.y - size.y - 12.0).max(rect.top())
+        } else {
+            (pointer.y + 12.0).min((rect.bottom() - size.y).max(rect.top()))
+        };
+        let origin = Pos2::new(x, y);
+        painter.rect_filled(
+            Rect::from_min_size(origin, size),
+            CornerRadius::same(4),
+            Color32::from_black_alpha(220),
         );
+        painter.galley(origin + padding, galley, TEXT);
     }
 
     fn radar_scene(&mut self, ui: &mut egui::Ui) {

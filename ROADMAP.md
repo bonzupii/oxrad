@@ -29,7 +29,7 @@ This section describes the repository as it exists, not the target.
 | Geographic rendering | Implemented | WGS84 gate corners, Web Mercator, product palette, rings, grid, pointer readout |
 | Global radar ingestion | Not implemented | NEXRAD is the only radar format and the United States is the only radar coverage |
 | TDWR ingestion | Not implemented | TDWR stations are excluded from the selectable feed |
-| Viewport model | Partial | The separate map scene has Mercator pan and zoom; the radar scene remains a centered single-site disc |
+| Viewport model | Partial | The map has Mercator pan, zoom, and the displayed radar mesh at its true site position; the radar scene remains a centered single-site disc and no multiple stations are composed |
 | Multi-station composition | Not implemented | One station, one volume, one mesh, one pipeline |
 | Time history and looping | Not implemented | Only the newest completed volume is shown |
 | Warnings | Not implemented | No alert adapter or polygon layer |

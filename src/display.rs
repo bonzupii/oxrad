@@ -99,6 +99,24 @@ impl Display {
     }
 
     /// Drops the current frame and discards any result still in flight.
+    /// Moves the current mesh into a geographic view. A missing mesh is a
+    /// valid empty product, not an error.
+    pub fn set_map_view(
+        &self,
+        scale_x: f32,
+        scale_y: f32,
+        origin: [f32; 2],
+    ) -> Result<(), RenderError> {
+        let Some(gpu) = self.gpu.as_ref() else {
+            return Ok(());
+        };
+        let Some(mesh) = self.frame.as_ref().and_then(|frame| frame.mesh.as_ref()) else {
+            return Ok(());
+        };
+        gpu.write_view(mesh, scale_x, scale_y, origin);
+        Ok(())
+    }
+
     pub fn reset(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.frame = None;

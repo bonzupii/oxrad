@@ -28,6 +28,7 @@ use crate::render::{self, RadarGeometry};
 const SHADER: &str = r#"
 struct Frame {
     scale: vec2<f32>,
+    origin: vec2<f32>,
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -44,7 +45,7 @@ struct VertexOutput {
 
 @vertex fn vertex_main(input: VertexInput) -> VertexOutput {
     var output: VertexOutput;
-    output.position = vec4<f32>(input.offset_km * frame.scale, 0.0, 1.0);
+    output.position = vec4<f32>((input.offset_km + frame.origin) * frame.scale, 0.0, 1.0);
     output.colour = input.colour;
     return output;
 }
@@ -81,12 +82,15 @@ struct RadarDraw {
     index_count: u32,
 }
 
-/// The clip-space scale for a mesh whose vertices carry north-positive
-/// kilometre offsets. WebGPU clip space has y up, so both axes keep their
-/// sign; the screen transform in `render` applies the downward pixel flip.
-fn uniform_bytes(scale: f32) -> [u8; 8] {
-    let mut bytes = [0_u8; 8];
-    for (chunk, value) in bytes.chunks_mut(4).zip([scale, scale]) {
+/// Clip-space scale and map-space origin for a mesh whose vertices carry
+/// north-positive kilometre offsets. WebGPU clip space has y up, so both axes
+/// keep their sign; the screen transform in `render` applies the pixel flip.
+fn uniform_bytes(scale_x: f32, scale_y: f32, origin_x: f32, origin_y: f32) -> [u8; 16] {
+    let mut bytes = [0_u8; 16];
+    for (chunk, value) in bytes
+        .chunks_mut(4)
+        .zip([scale_x, scale_y, origin_x, origin_y])
+    {
         chunk.copy_from_slice(&value.to_le_bytes());
     }
     bytes
@@ -151,6 +155,7 @@ impl RadarGpu {
         }
         let scale = render::projection_scale(geometry.extent_km)
             .map_err(|source: CoordinateError| RenderError::Coordinate { source })?;
+        let uniform = uniform_bytes(scale as f32, scale as f32, 0.0, 0.0);
         let vertices = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -169,7 +174,7 @@ impl RadarGpu {
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("radar mesh uniform"),
-                contents: &uniform_bytes(scale as f32),
+                contents: &uniform,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
         let frame_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -180,8 +185,7 @@ impl RadarGpu {
                 resource: frame_uniform.as_entire_binding(),
             }],
         });
-        self.queue
-            .write_buffer(&frame_uniform, 0, &uniform_bytes(scale as f32));
+        self.queue.write_buffer(&frame_uniform, 0, &uniform);
         Ok(RadarMesh {
             pipeline: self.pipeline.clone(),
             frame_bind_group,
@@ -190,6 +194,16 @@ impl RadarGpu {
             index_count: geometry.index_count,
             _uniform: frame_uniform,
         })
+    }
+
+    /// Places an uploaded mesh in a geographic viewport. The origin is the
+    /// station offset from the viewport centre in kilometres, north-positive.
+    pub fn write_view(&self, mesh: &RadarMesh, scale_x: f32, scale_y: f32, origin: [f32; 2]) {
+        self.queue.write_buffer(
+            &mesh._uniform,
+            0,
+            &uniform_bytes(scale_x, scale_y, origin[0], origin[1]),
+        );
     }
 }
 
@@ -228,7 +242,7 @@ mod tests {
 
     use crate::test_support::TestError;
 
-    fn component(bytes: [u8; 8], offset: usize) -> Result<f32, TestError> {
+    fn component(bytes: [u8; 16], offset: usize) -> Result<f32, TestError> {
         let slice = bytes
             .get(offset..offset + 4)
             .ok_or_else(|| format!("uniform byte offset {offset}"))?;
@@ -243,9 +257,11 @@ mod tests {
     /// screen-space rings and readout stayed north-up.
     #[test]
     fn clip_space_keeps_north_positive() -> Result<(), TestError> {
-        let bytes = uniform_bytes(2.0);
+        let bytes = uniform_bytes(2.0, 3.0, -40.0, 25.0);
         assert_eq!(component(bytes, 0)?, 2.0, "x scale");
-        assert_eq!(component(bytes, 4)?, 2.0, "y scale");
+        assert_eq!(component(bytes, 4)?, 3.0, "y scale");
+        assert_eq!(component(bytes, 8)?, -40.0, "x origin");
+        assert_eq!(component(bytes, 12)?, 25.0, "y origin");
         Ok(())
     }
 }
