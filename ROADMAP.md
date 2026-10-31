@@ -31,7 +31,7 @@ This section describes the repository as it exists, not the target.
 | TDWR ingestion | Not implemented | TDWR stations are excluded from the selectable feed |
 | Viewport model | Partial | The map has Mercator pan, zoom, a global radar tile, and independently placed station meshes; the radar scene remains a centered single-site disc and no common-time values are composed |
 | Multi-station composition | Partial | Map viewport overlays the selected station and up to three nearby stations within a six-minute scan window; no resampling, composite values, or gap fill |
-| Time history and looping | Partial | RainViewer composite has 13 ten-minute frames with scrub and loop; NEXRAD still shows only the newest completed volume |
+| Time history and looping | Partial | RainViewer composite has 13 ten-minute frames with scrub and loop; NEXRAD offers on-demand review of the eight newest volumes, without a preloaded sequence, animation, or scrubber |
 | Warnings | Partial | NWS active alerts for the United States and territories, drawn by severity with area, urgency, issuance, expiration, count, unreadable-alert count, a selectable severity-sorted list, polygon focus, and feed-failure state; no viewport filtering, full alert text, or international alert feeds |
 | Map base and labels | Implemented | Offline Natural Earth 1:110m countries, borders, labels, graticule, scale, and site markers; no local detail yet |
 | Measurement tools | Partial | Pointer latitude, longitude, range, azimuth, and gate value readout; two-point map measurement with WGS84 distance and initial bearing |
@@ -157,7 +157,7 @@ Bounded independent pipelines and per-mesh transforms render the selected statio
 
 ### Phase 5: time history and professional inspection (in progress)
 
-The RainViewer global composite now has a 13-frame, two-hour scrubber and loop. Remaining work is NEXRAD volume history, scan comparison, product comparison panes, storm motion where the data supports it, and a crosshair measurement workflow.
+The RainViewer global composite has a 13-frame, two-hour scrubber and loop. NEXRAD has an on-demand list of the eight newest complete volumes from the last three days; selecting one pauses the live pipeline, fetches and decodes that volume alone, and reports its UTC scan time. Two-point geodesic measurement is implemented on the map. Remaining work is a preloaded NEXRAD sequence with animation and a scrubber, scan comparison, product comparison panes, and storm motion where the data supports it.
 
 ### Phase 6: authoritative context (in progress)
 

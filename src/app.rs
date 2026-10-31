@@ -30,6 +30,7 @@ use crate::global_radar::{
     self, DecodedTile, GlobalEvent, GlobalRadarError, GlobalRadarFeed, TileBounds, TileImage,
 };
 use crate::gpu::RadarGpu;
+use crate::history::{self, HistoryError, HistoryEvent, HistoryFeed};
 use crate::map::{self, MapError, MapView, WorldMap};
 use crate::overlay;
 use crate::pipeline::{Pipeline, PipelineState};
@@ -131,6 +132,46 @@ enum WarningState {
     Loading,
     Ready,
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryState {
+    Idle,
+    LoadingKeys,
+    Ready,
+    LoadingVolume,
+    Reviewing,
+    Failed,
+}
+
+struct HistoryView {
+    feed: HistoryFeed,
+    generation: u64,
+    keys: Vec<String>,
+    key: Option<String>,
+    state: HistoryState,
+    error: Option<HistoryError>,
+}
+
+impl HistoryView {
+    fn new() -> Self {
+        Self {
+            feed: HistoryFeed::new(),
+            generation: 0,
+            keys: Vec::new(),
+            key: None,
+            state: HistoryState::Idle,
+            error: None,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.keys.clear();
+        self.key = None;
+        self.state = HistoryState::Idle;
+        self.error = None;
+    }
 }
 
 struct GlobalTileTexture {
@@ -283,6 +324,7 @@ pub struct OxradApp {
     warning_state: WarningState,
     warning_request_due: Option<Instant>,
     warning_refresh_due: Option<Instant>,
+    history: HistoryView,
 }
 
 impl OxradApp {
@@ -356,6 +398,7 @@ impl OxradApp {
             warning_state: WarningState::Idle,
             warning_request_due: Some(Instant::now()),
             warning_refresh_due: None,
+            history: HistoryView::new(),
         };
         if let Some(place) = &restored_place {
             match MapView::focus(place.lat, place.lon, 2_200.0) {
@@ -415,6 +458,7 @@ impl OxradApp {
     }
 
     fn open_site(&mut self, id: SiteId, persist: bool) {
+        self.history.clear();
         self.display.reset();
         self.pipeline = Some(Pipeline::start(id.clone()));
         self.site = Some(id.clone());
@@ -438,6 +482,7 @@ impl OxradApp {
     fn clear_site(&mut self) {
         self.site = None;
         self.pipeline = None;
+        self.history.clear();
         self.display.reset();
         self.view_radars.clear();
         self.config.site = None;
@@ -771,6 +816,7 @@ impl OxradApp {
             self.display.submit(volume, self.product);
         }
         self.display.poll();
+        self.poll_history();
         let mut layer_failure = None;
         for layer in &mut self.view_radars {
             if let Some(volume) = layer.pipeline.poll() {
@@ -857,6 +903,10 @@ impl OxradApp {
             || matches!(self.forecast_state, ForecastState::Loading { .. })
             || matches!(self.global_state, GlobalState::Loading)
             || matches!(self.global_playback, GlobalPlayback::Playing)
+            || matches!(
+                self.history.state,
+                HistoryState::LoadingKeys | HistoryState::LoadingVolume
+            )
             || (self.site.is_some()
                 && (self.display.state.is_busy()
                     || self
@@ -868,12 +918,11 @@ impl OxradApp {
 
     fn phase(&self) -> &'static str {
         self.pipeline.as_ref().map_or_else(
-            || {
-                if self.site.is_some() {
-                    "Idle"
-                } else {
-                    "Idle · No site selected"
-                }
+            || match self.history.state {
+                HistoryState::LoadingVolume => "History loading",
+                HistoryState::Reviewing => "History review",
+                _ if self.site.is_some() => "Idle",
+                _ => "Idle · No site selected",
             },
             |pipeline| match &pipeline.state {
                 PipelineState::Failed(_) => "Error",
@@ -972,6 +1021,7 @@ impl OxradApp {
                         ui.add_space(12.0);
                         self.station_section(ui);
                         self.product_section(ui);
+                        self.history_section(ui);
                         self.warning_section(ui);
                         if let Some(notice) = &self.notice {
                             ui.add_space(12.0);
@@ -1402,6 +1452,18 @@ impl OxradApp {
                 }
                 ui.separator();
                 ui.label(self.phase());
+                if matches!(
+                    self.history.state,
+                    HistoryState::LoadingVolume | HistoryState::Reviewing
+                ) && let Some(key) = &self.history.key
+                {
+                    ui.separator();
+                    ui.label(
+                        RichText::new(format!("History {}", history::key_label(key)))
+                            .size(11.0)
+                            .color(MUTED),
+                    );
+                }
                 if let Some(frame) = &self.display.frame {
                     scan_status(ui, frame, failed);
                 }
@@ -2395,6 +2457,260 @@ impl OxradApp {
             .max_by_key(|warning| severity_rank(warning.severity))
     }
 
+    fn poll_history(&mut self) {
+        loop {
+            let event = match self.history.feed.poll() {
+                Ok(Some(event)) => event,
+                Ok(None) => return,
+                Err(error) => {
+                    if self.history.error.is_none() {
+                        self.history_failure(error);
+                    }
+                    return;
+                }
+            };
+            self.apply_history_event(event);
+        }
+    }
+
+    fn apply_history_event(&mut self, event: HistoryEvent) {
+        let generation = self.history.generation;
+        match event {
+            HistoryEvent::Keys {
+                generation: event_generation,
+                keys,
+            } if event_generation == generation => {
+                self.history.keys = keys;
+                self.history.state = HistoryState::Ready;
+            }
+            HistoryEvent::Volume {
+                generation: event_generation,
+                key,
+                volume,
+            } if event_generation == generation => {
+                let label = history::key_label(&key);
+                self.history.key = Some(key);
+                self.history.state = HistoryState::Reviewing;
+                self.display.submit(volume, self.product);
+                self.notice = Some(format!("Reviewing radar scan {label}."));
+            }
+            HistoryEvent::Failed {
+                generation: event_generation,
+                error,
+            } if event_generation == generation => self.history_failure(error),
+            HistoryEvent::Keys { .. }
+            | HistoryEvent::Volume { .. }
+            | HistoryEvent::Failed { .. } => {}
+        }
+    }
+
+    fn history_failure(&mut self, error: HistoryError) {
+        self.notice = Some(format!("Radar history: {error}"));
+        self.history.error = Some(error);
+        self.history.state = HistoryState::Failed;
+    }
+
+    fn request_history_keys(&mut self) {
+        let Some(site) = self.site.clone() else {
+            self.notice = Some(String::from(
+                "Choose a radar site before opening its history.",
+            ));
+            return;
+        };
+        self.history.keys.clear();
+        self.history.key = None;
+        self.history.error = None;
+        match self.history.feed.request_keys(&site) {
+            Ok(generation) => {
+                self.history.generation = generation;
+                self.history.state = HistoryState::LoadingKeys;
+            }
+            Err(error) => self.history_failure(error),
+        }
+    }
+
+    fn request_history_volume(&mut self, key: &str) {
+        let Some(site) = self.site.clone() else {
+            self.notice = Some(String::from(
+                "Choose a radar site before opening its history.",
+            ));
+            return;
+        };
+        self.scene_mode = SceneMode::Radar;
+        self.pipeline = None;
+        self.history.key = Some(key.to_owned());
+        self.history.error = None;
+        match self.history.feed.request_volume(&site, key) {
+            Ok(generation) => {
+                self.history.generation = generation;
+                self.history.state = HistoryState::LoadingVolume;
+            }
+            Err(error) => self.history_failure(error),
+        }
+    }
+
+    fn return_to_live(&mut self) {
+        let Some(site) = self.site.clone() else {
+            return;
+        };
+        self.open_site(site, false);
+        self.notice = Some(String::from("Returned to the live radar feed."));
+    }
+
+    fn history_section(&mut self, ui: &mut egui::Ui) {
+        if self.site.is_none() {
+            return;
+        }
+        ui.add_space(12.0);
+        ui.label(RichText::new("Recent NEXRAD scans").size(12.0).color(MUTED));
+        ui.label(
+            RichText::new("Archive II volumes · scan times in UTC")
+                .size(10.0)
+                .color(MUTED),
+        );
+        let mut load = false;
+        let mut selected = None;
+        let mut retry = None;
+        let mut resume = false;
+        match self.history.state {
+            HistoryState::Idle => {
+                ui.label(
+                    RichText::new("Load the latest scans without leaving the live feed.")
+                        .size(10.0)
+                        .color(MUTED),
+                );
+                if ui.button("Load recent scans").clicked() {
+                    load = true;
+                }
+            }
+            HistoryState::LoadingKeys => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(
+                        RichText::new("Listing recent volumes…")
+                            .size(11.0)
+                            .color(MUTED),
+                    );
+                });
+            }
+            HistoryState::Ready => {
+                if self.history.keys.is_empty() {
+                    ui.label(
+                        RichText::new("No complete volumes were listed in the last three days.")
+                            .size(10.0)
+                            .color(MUTED),
+                    );
+                } else if let Some(key) = self.history_scan_list(ui) {
+                    selected = Some(key);
+                }
+                if ui.small_button("Refresh scan list").clicked() {
+                    load = true;
+                }
+            }
+            HistoryState::LoadingVolume => {
+                let key = self
+                    .history
+                    .key
+                    .as_deref()
+                    .map_or_else(|| String::from("selected scan"), history::key_label);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(
+                        RichText::new(format!("Fetching {key}…"))
+                            .size(11.0)
+                            .color(MUTED),
+                    );
+                });
+            }
+            HistoryState::Reviewing => {
+                let key = self
+                    .history
+                    .key
+                    .as_deref()
+                    .map_or_else(|| String::from("selected scan"), history::key_label);
+                ui.label(
+                    RichText::new(format!("Reviewing {key}"))
+                        .size(11.0)
+                        .color(TEXT),
+                );
+                ui.label(
+                    RichText::new("Live radar is paused while you inspect this scan.")
+                        .size(10.0)
+                        .color(MUTED),
+                );
+                if ui.button("Return to live radar").clicked() {
+                    resume = true;
+                }
+            }
+            HistoryState::Failed => {
+                let (reload, retry_key) = self.history_failure_controls(ui);
+                load |= reload;
+                retry = retry_key;
+            }
+        }
+        self.apply_history_actions(load, selected, retry, resume);
+    }
+
+    fn history_scan_list(&self, ui: &mut egui::Ui) -> Option<String> {
+        let mut selected = None;
+        egui::ScrollArea::vertical()
+            .max_height(150.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for key in &self.history.keys {
+                    if ui
+                        .add_sized(
+                            [ui.available_width(), 32.0],
+                            egui::Button::new(RichText::new(history::key_label(key)).size(11.0))
+                                .fill(CARD),
+                        )
+                        .clicked()
+                    {
+                        selected = Some(key.clone());
+                    }
+                }
+            });
+        selected
+    }
+
+    fn history_failure_controls(&self, ui: &mut egui::Ui) -> (bool, Option<String>) {
+        let mut load = false;
+        let mut retry = None;
+        if let Some(error) = &self.history.error {
+            ui.colored_label(ERROR, format!("History failed: {error}"));
+        }
+        if let Some(key) = &self.history.key
+            && ui.button("Retry selected scan").clicked()
+        {
+            retry = Some(key.clone());
+        }
+        if ui.button("Reload scan list").clicked() {
+            load = true;
+        }
+        (load, retry)
+    }
+
+    fn apply_history_actions(
+        &mut self,
+        load: bool,
+        selected: Option<String>,
+        retry: Option<String>,
+        resume: bool,
+    ) {
+        if load {
+            self.request_history_keys();
+        }
+        if let Some(key) = retry {
+            self.request_history_volume(&key);
+        }
+        if let Some(key) = selected {
+            self.request_history_volume(&key);
+        }
+        if resume {
+            self.return_to_live();
+        }
+    }
+
     fn warning_section(&mut self, ui: &mut egui::Ui) {
         if !self.warning_layer.is_shown() || self.warnings.is_empty() {
             return;
@@ -2710,6 +3026,22 @@ impl OxradApp {
                 "Loading radar",
                 vec![format!("Starting the radar pipeline for {site}…")],
             ),
+            (Some(_), Some(site), None)
+                if matches!(
+                    self.history.state,
+                    HistoryState::LoadingVolume | HistoryState::Reviewing
+                ) =>
+            {
+                (
+                    "Reviewing radar history",
+                    vec![
+                        format!("The selected scan for {site} is being loaded."),
+                        String::from(
+                            "Use Recent NEXRAD scans to pick another scan or return to live.",
+                        ),
+                    ],
+                )
+            }
             (Some(_), Some(_), None) => (
                 "Loading radar",
                 vec![String::from("The pipeline is starting.")],

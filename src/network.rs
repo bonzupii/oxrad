@@ -241,6 +241,33 @@ pub fn latest_volume_key(site: &SiteId) -> Result<String, RadarError> {
     })
 }
 
+/// The newest volume keys for a site, oldest first.
+///
+/// Listing stops once enough keys have been collected; keys are sorted because
+/// the object store does not promise lexicographic ordering within a page.
+pub fn recent_volume_keys(site: &SiteId, limit: usize) -> Result<Vec<String>, RadarError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut keys = Vec::new();
+    for days_ago in 0..LOOKBACK_DAYS {
+        let (year, month, day) = utc_day(days_ago)?;
+        let prefix = format!("{year:04}/{month:02}/{day:02}/{site}/");
+        keys.extend(
+            list_keys(&prefix)?
+                .into_iter()
+                .filter(|key| is_volume_key(key)),
+        );
+        if keys.len() >= limit {
+            break;
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    let start = keys.len().saturating_sub(limit);
+    Ok(keys.into_iter().skip(start).collect())
+}
+
 /// Retrieves one Archive II volume. A 404 means the listing went stale.
 pub fn fetch_archive(key: &str) -> Result<Vec<u8>, RadarError> {
     match http_get(&format!("{BUCKET_URL}/{key}")) {

@@ -22,6 +22,7 @@ mod error;
 mod forecast;
 mod global_radar;
 mod gpu;
+mod history;
 mod map;
 mod network;
 mod overlay;
