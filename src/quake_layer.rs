@@ -159,6 +159,18 @@ impl QuakeLayer {
     /// The rail section. Returns a focus request when the user asks to centre
     /// the map on an event.
     pub fn rail(&mut self, ui: &mut egui::Ui, palette: &Palette) -> Option<(f64, f64)> {
+        self.rail_header(ui, palette);
+        if self.status(ui, palette) {
+            self.refresh();
+        }
+        let now = time::now_unix_ms();
+        let focus = self.events_report(ui, palette, &now);
+        self.rail_details(ui);
+        focus
+    }
+
+    /// Title, on/off control, the feed window, and the depth key.
+    fn rail_header(&mut self, ui: &mut egui::Ui, palette: &Palette) {
         ui.add_space(theme::SPACE_M);
         ui.label(RichText::new("Earthquakes").size(theme::TYPE_LABEL).weak());
         ui.label(
@@ -201,9 +213,6 @@ impl QuakeLayer {
             self.window = window;
             self.refresh();
         }
-        if self.status(ui, palette) {
-            self.refresh();
-        }
         ui.horizontal(|ui| {
             for band in BANDS {
                 ui.label(
@@ -214,28 +223,30 @@ impl QuakeLayer {
                 ui.label(RichText::new(band.label()).size(theme::TYPE_SMALL).weak());
             }
         });
-        let now = time::now_unix_ms();
-        let focus = self.events_report(ui, palette, &now);
-        if let Some(quakes) = self.view.events() {
-            let chosen = self
-                .selected
-                .as_deref()
-                .and_then(|id| quakes.events.iter().find(|quake| quake.id == id));
-            match chosen {
-                Some(quake) => details(ui, "Selected event", quake),
-                None => match quakes.strongest() {
-                    Some(quake) => details(ui, "Strongest event in this feed", quake),
-                    None => {
-                        ui.label(
-                            RichText::new("This feed holds no event with a usable magnitude.")
-                                .size(theme::TYPE_SMALL)
-                                .weak(),
-                        );
-                    }
-                },
-            }
+    }
+
+    /// The chosen event, or the strongest one the feed carries.
+    fn rail_details(&mut self, ui: &mut egui::Ui) {
+        let Some(quakes) = self.view.events() else {
+            return;
+        };
+        let chosen = self
+            .selected
+            .as_deref()
+            .and_then(|id| quakes.events.iter().find(|quake| quake.id == id));
+        match chosen {
+            Some(quake) => details(ui, "Selected event", quake),
+            None => match quakes.strongest() {
+                Some(quake) => details(ui, "Strongest event in this feed", quake),
+                None => {
+                    ui.label(
+                        RichText::new("This feed holds no event with a usable magnitude.")
+                            .size(theme::TYPE_SMALL)
+                            .weak(),
+                    );
+                }
+            },
         }
-        focus
     }
 
     /// The feed's own state, with its age and provenance. Returns whether the
