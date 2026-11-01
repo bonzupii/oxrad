@@ -26,6 +26,7 @@ use eframe::egui::{
 use crate::basemap::{BasemapError, BasemapLayers};
 use crate::colormap::ColorTable;
 use crate::config::{self, Config};
+use crate::derived::StormMotion;
 use crate::display::{Display, DisplayState, Frame};
 use crate::forecast::{Forecast, ForecastPeriod, ForecastState, ForecastView};
 use crate::global_radar::{
@@ -456,6 +457,7 @@ impl OxradApp {
         let restored_place = config.place.clone();
         let color_table = config.color_table;
         let sampling = config.sampling;
+        let motion = config.storm_motion;
         let stations = match stations::load_cache() {
             Ok(Some(cached)) => Ok(cached),
             Ok(None) => Err(StationError::NoStations),
@@ -477,7 +479,7 @@ impl OxradApp {
             place: restored_place.clone(),
             site: None,
             pipeline: None,
-            display: Display::new(gpu, color_table, sampling),
+            display: Display::new(gpu, color_table, sampling, motion),
             forecast: ForecastView::new(),
             product: RadarProduct::Reflectivity,
             station_query: String::new(),
@@ -621,6 +623,19 @@ impl OxradApp {
         }
     }
 
+    /// Stores a new storm motion and repaints every storm-relative frame.
+    ///
+    /// The number is persisted because a chaser sets it once per storm and does
+    /// not want to retype it after a restart.
+    fn apply_motion(&mut self, motion: StormMotion) {
+        self.config.storm_motion = motion;
+        self.save_config();
+        self.display.set_motion(motion);
+        for layer in &mut self.view_radars {
+            layer.display.set_motion(motion);
+        }
+    }
+
     fn apply_sampling(&mut self) {
         let sampling = self.config.sampling;
         self.display.set_sampling(sampling);
@@ -687,6 +702,7 @@ impl OxradApp {
                     Some(gpu.clone()),
                     self.config.color_table,
                     self.config.sampling,
+                    self.config.storm_motion,
                 ),
                 site,
                 failure_reported: false,
@@ -1238,6 +1254,7 @@ impl OxradApp {
             volume,
             self.product,
             self.config.sampling,
+            self.config.storm_motion,
             !self.display.state.is_busy(),
         );
         let (product, elevation) = match selection {
@@ -1249,6 +1266,10 @@ impl OxradApp {
                     self.save_config();
                     self.apply_sampling();
                 }
+                return;
+            }
+            Some(Selection::Motion(motion)) => {
+                self.apply_motion(motion);
                 return;
             }
             None => return,

@@ -285,10 +285,17 @@ pub struct DerivedLookup {
 }
 
 impl DerivedLookup {
-    fn new(volume: &RadarVolume, product: RadarProduct) -> Result<Self, DerivedError> {
+    fn new(
+        volume: &RadarVolume,
+        product: RadarProduct,
+        motion: derived::StormMotion,
+    ) -> Result<Self, DerivedError> {
+        let Some(source) = product.source_moment() else {
+            return Err(DerivedError::NotDerived { product });
+        };
         Ok(Self {
-            sweep: SweepLookup::new(volume, RadarProduct::Reflectivity),
-            field: derived::evaluate(volume, product)?,
+            sweep: SweepLookup::new(volume, source),
+            field: derived::evaluate(volume, product, motion)?,
         })
     }
 
@@ -435,6 +442,8 @@ pub struct BuildRequest {
     pub volume: RetrievedVolume,
     pub product: RadarProduct,
     pub color_table: ColorTable,
+    /// The storm motion storm-relative velocity is computed against.
+    pub motion: derived::StormMotion,
     pub generation: u64,
 }
 
@@ -458,8 +467,12 @@ pub fn start_build_thread() -> (Sender<BuildRequest>, Receiver<BuildResult>) {
     std::thread::spawn(move || {
         while let Ok(request) = request_receiver.recv() {
             let started = Instant::now();
-            let geometry =
-                build_geometry_for(&request.volume.volume, request.product, request.color_table);
+            let geometry = build_geometry_for(
+                &request.volume.volume,
+                request.product,
+                request.color_table,
+                request.motion,
+            );
             let result = BuildResult {
                 volume: request.volume,
                 geometry,
@@ -563,9 +576,10 @@ pub fn build_geometry_for(
     volume: &RadarVolume,
     product: RadarProduct,
     color_table: ColorTable,
+    motion: derived::StormMotion,
 ) -> Result<RadarGeometry, RenderError> {
     if product.is_derived() {
-        return build_derived_geometry(volume, product, color_table);
+        return build_derived_geometry(volume, product, color_table, motion);
     }
     if !volume.sweep.products.contains(&product) {
         return Err(RenderError::ProductUnavailable {
@@ -600,13 +614,14 @@ fn build_derived_geometry(
     volume: &RadarVolume,
     product: RadarProduct,
     color_table: ColorTable,
+    motion: derived::StormMotion,
 ) -> Result<RadarGeometry, RenderError> {
     let (site_x, site_y) = projection::mercator(volume.site_lat, volume.site_lon)
         .map_err(|source| RenderError::Coordinate { source })?;
-    let raster = raster::build_derived(volume, product, color_table)
+    let raster = raster::build_derived(volume, product, color_table, motion)
         .map_err(|source| RenderError::Derived { source })?;
-    let lookup =
-        DerivedLookup::new(volume, product).map_err(|source| RenderError::Derived { source })?;
+    let lookup = DerivedLookup::new(volume, product, motion)
+        .map_err(|source| RenderError::Derived { source })?;
     let (lattice, extent_km) = build_lattice(volume, raster.grid, site_x, site_y)?;
     let extent_km = if extent_km > 0.0 {
         extent_km
@@ -689,19 +704,38 @@ mod tests {
         max_ground_range_km: f64,
     ) -> Result<(RadarVolume, RadarGeometry), TestError> {
         let volume = volume(radials, max_ground_range_km)?;
-        let geometry =
-            build_geometry_for(&volume, RadarProduct::Reflectivity, ColorTable::Standard)?;
+        let geometry = build_geometry_for(
+            &volume,
+            RadarProduct::Reflectivity,
+            ColorTable::Standard,
+            derived::StormMotion::default(),
+        )?;
         Ok((volume, geometry))
     }
 
     /// A two-elevation volume of uniform echo, so a computed product has a
     /// layer to integrate and a gate to read back.
+    /// A radial that carries velocity as well as reflectivity, so the
+    /// velocity-derived product has something to read.
+    fn with_velocity(mut radial: RadialBins, velocity: f32) -> RadialBins {
+        radial.moments.push(MomentBins {
+            product: RadarProduct::Velocity,
+            first_gate_km: 74.75,
+            gate_width_km: 0.5,
+            values: vec![GateValue::Measured(velocity); 4],
+        });
+        radial
+    }
+
     fn derived_volume() -> Result<RadarVolume, TestError> {
         let base = RadarSweep {
             elevation_deg: 0.5,
             elevation_number: 1,
-            radials: vec![radial(89.5, 90.5, 0.5, vec![GateValue::Measured(45.0); 4])],
-            products: vec![RadarProduct::Reflectivity],
+            radials: vec![with_velocity(
+                radial(89.5, 90.5, 0.5, vec![GateValue::Measured(45.0); 4]),
+                -22.0,
+            )],
+            products: vec![RadarProduct::Reflectivity, RadarProduct::Velocity],
             below_threshold: 0,
             range_folded: 0,
             max_ground_range_km: 76.0,
@@ -728,7 +762,12 @@ mod tests {
     fn a_derived_product_draws_and_reads_back_its_column() -> Result<(), TestError> {
         for product in RadarProduct::DERIVED {
             let volume = derived_volume()?;
-            let geometry = build_geometry_for(&volume, product, ColorTable::Standard)?;
+            let geometry = build_geometry_for(
+                &volume,
+                product,
+                ColorTable::Standard,
+                derived::StormMotion::default(),
+            )?;
             assert!(
                 !geometry.raster.is_empty(),
                 "{} drew no gates",
@@ -741,7 +780,11 @@ mod tests {
                     reading: Reading::Derived(value),
                     ..
                 }) => {
-                    assert!(value > 0.0, "{} read back {value}", product.id());
+                    assert!(
+                        value.is_finite() && value.abs() > 0.0,
+                        "{} read back {value}",
+                        product.id()
+                    );
                 }
                 other => {
                     return Err(TestError::from(format!(
@@ -770,6 +813,7 @@ mod tests {
                 volume: retrieved,
                 product: RadarProduct::Reflectivity,
                 color_table: ColorTable::Standard,
+                motion: derived::StormMotion::default(),
                 generation: 42,
             })
             .map_err(|error| TestError::from(format!("render request failed: {error}")))?;
@@ -911,7 +955,12 @@ mod tests {
             75.0,
         )?;
         assert!(matches!(
-            build_geometry_for(&volume, RadarProduct::Velocity, ColorTable::Standard),
+            build_geometry_for(
+                &volume,
+                RadarProduct::Velocity,
+                ColorTable::Standard,
+                derived::StormMotion::default(),
+            ),
             Err(RenderError::ProductUnavailable {
                 product: RadarProduct::Velocity,
                 elevation: 1,
@@ -929,8 +978,12 @@ mod tests {
             vec![radial(89.5, 90.5, 0.0, vec![GateValue::Measured(95.0)])],
             75.0,
         )?;
-        let geometry =
-            build_geometry_for(&volume, RadarProduct::Reflectivity, ColorTable::Standard)?;
+        let geometry = build_geometry_for(
+            &volume,
+            RadarProduct::Reflectivity,
+            ColorTable::Standard,
+            derived::StormMotion::default(),
+        )?;
         assert_eq!(geometry.raster.counts.above_scale, 1);
         assert_eq!(geometry.raster.counts.drawn, 1);
         Ok(())

@@ -68,6 +68,47 @@ const ECHO_TOP_THRESHOLD_DBZ: f64 = 18.5;
 /// one used by the operational vertically integrated liquid algorithm.
 const LIQUID_COEFFICIENT: f64 = 3.44e-3;
 
+/// How the storm itself is moving, as the user estimates it.
+///
+/// Storm-relative velocity is measured velocity minus the component of this
+/// motion along each beam. The default is a still storm, which makes the
+/// product identical to base velocity and is therefore honest about the fact
+/// that no motion has been supplied.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct StormMotion {
+    /// Speed over the ground, in kilometres per hour.
+    pub speed_kmh: f64,
+    /// Direction the storm is moving toward, in degrees clockwise from north.
+    pub bearing_deg: f64,
+}
+
+impl StormMotion {
+    /// The speed along a beam, in metres per second, positive away from the
+    /// radar.
+    ///
+    /// A storm moving directly away along a beam adds to the measured velocity,
+    /// and one moving across the beam adds nothing.
+    pub fn along_beam_m_s(self, azimuth_deg: f64) -> f64 {
+        let offset = (self.bearing_deg - azimuth_deg).to_radians();
+        self.speed_kmh / 3.6 * offset.cos()
+    }
+
+    /// Whether the setting is a usable motion vector.
+    pub fn is_usable(self) -> bool {
+        self.speed_kmh.is_finite()
+            && self.speed_kmh >= 0.0
+            && self.speed_kmh <= MAX_STORM_SPEED_KMH
+            && self.bearing_deg.is_finite()
+            && (0.0..360.0).contains(&self.bearing_deg)
+    }
+}
+
+/// The fastest storm motion the interface accepts, in kilometres per hour.
+///
+/// Faster than any translating storm on Earth, so a larger value is a mistyped
+/// setting rather than a chaser report.
+pub const MAX_STORM_SPEED_KMH: f64 = 200.0;
+
 /// A volume product on the gate grid of the sweep being drawn.
 #[derive(Debug)]
 pub struct DerivedField {
@@ -242,6 +283,50 @@ fn vertically_integrated_liquid(levels: &[Level]) -> Option<f64> {
     Some(total_g_m2 / 1000.0)
 }
 
+/// The velocity of each gate with the storm's motion subtracted.
+///
+/// Only the drawn sweep is used: storm-relative velocity is a single-tilt
+/// product, and stacking tilts into it would mix times and heights that no
+/// chaser asked for.
+fn storm_relative_velocity(
+    volume: &RadarVolume,
+    motion: StormMotion,
+) -> Result<DerivedField, DerivedError> {
+    let mut gates = 0_usize;
+    for radial in &volume.sweep.radials {
+        if let Some(moment) = radial.moment(RadarProduct::Velocity) {
+            gates = gates.max(moment.values.len());
+        }
+    }
+    if gates == 0 {
+        return Err(DerivedError::NoVelocity {
+            elevation: volume.sweep.elevation_number,
+        });
+    }
+    let mut field = DerivedField::empty(volume.sweep.radials.len(), gates);
+    for (row, radial) in volume.sweep.radials.iter().enumerate() {
+        let Some(moment) = radial.moment(RadarProduct::Velocity) else {
+            continue;
+        };
+        let span = (radial.azimuth_right_deg - radial.azimuth_left_deg).rem_euclid(360.0);
+        let azimuth = (radial.azimuth_left_deg + span / 2.0).rem_euclid(360.0);
+        let along = motion.along_beam_m_s(azimuth);
+        for (gate, value) in moment.values.iter().enumerate() {
+            let GateValue::Measured(velocity) = *value else {
+                continue;
+            };
+            if let Some(slot) = row
+                .checked_mul(field.gates)
+                .and_then(|base| base.checked_add(gate))
+                && let Some(entry) = field.values.get_mut(slot)
+            {
+                *entry = Some(f64::from(velocity) - along);
+            }
+        }
+    }
+    Ok(field)
+}
+
 /// The height of the highest level at or above the echo-top threshold.
 fn echo_top(levels: &[Level]) -> Option<f64> {
     levels
@@ -258,22 +343,38 @@ fn echo_top(levels: &[Level]) -> Option<f64> {
 /// [`DerivedError::NotDerived`] for a measured moment, and
 /// [`DerivedError::NoReflectivity`] when no sweep carries reflectivity to work
 /// from.
-pub fn evaluate(volume: &RadarVolume, product: RadarProduct) -> Result<DerivedField, DerivedError> {
+pub fn evaluate(
+    volume: &RadarVolume,
+    product: RadarProduct,
+    motion: StormMotion,
+) -> Result<DerivedField, DerivedError> {
     if !product.is_derived() {
         return Err(DerivedError::NotDerived { product });
+    }
+    let Some(source) = product.source_moment() else {
+        return Err(DerivedError::NotDerived { product });
+    };
+    if product == RadarProduct::StormRelativeVelocity {
+        if !motion.is_usable() {
+            return Err(DerivedError::StormMotion {
+                speed_kmh: motion.speed_kmh,
+                bearing_deg: motion.bearing_deg,
+            });
+        }
+        return storm_relative_velocity(volume, motion);
     }
     let mut levels: Vec<&RadarSweep> = Vec::with_capacity(volume.sweeps.len() + 1);
     levels.push(&volume.sweep);
     for sweep in &volume.sweeps {
         levels.push(sweep);
     }
-    levels.retain(|sweep| sweep.products.contains(&RadarProduct::Reflectivity));
+    levels.retain(|sweep| sweep.products.contains(&source));
     if levels.is_empty() {
         return Err(DerivedError::NoReflectivity);
     }
     let mut gates = 0_usize;
     for radial in &volume.sweep.radials {
-        if let Some(moment) = radial.moment(RadarProduct::Reflectivity) {
+        if let Some(moment) = radial.moment(source) {
             gates = gates.max(moment.values.len());
         }
     }
@@ -282,7 +383,7 @@ pub fn evaluate(volume: &RadarVolume, product: RadarProduct) -> Result<DerivedFi
     }
     let mut field = DerivedField::empty(volume.sweep.radials.len(), gates);
     for (row, radial) in volume.sweep.radials.iter().enumerate() {
-        let Some(moment) = radial.moment(RadarProduct::Reflectivity) else {
+        let Some(moment) = radial.moment(source) else {
             continue;
         };
         let tilted: Vec<&RadialBins> = levels
@@ -397,7 +498,11 @@ mod tests {
     #[test]
     fn vertically_integrated_liquid_matches_the_liquid_content_formula() -> Result<(), TestError> {
         let volume = volume(sweep(1, 0.1, 40.0), vec![sweep(2, 0.3, 40.0)])?;
-        let field = evaluate(&volume, RadarProduct::VerticallyIntegratedLiquid)?;
+        let field = evaluate(
+            &volume,
+            RadarProduct::VerticallyIntegratedLiquid,
+            StormMotion::default(),
+        )?;
         let value = field
             .value(0, 0)
             .ok_or_else(|| TestError::from("the column produced no liquid"))?;
@@ -419,7 +524,11 @@ mod tests {
     #[test]
     fn a_single_elevation_reports_no_liquid() -> Result<(), TestError> {
         let volume = volume(sweep(1, 0.5, 50.0), Vec::new())?;
-        let field = evaluate(&volume, RadarProduct::VerticallyIntegratedLiquid)?;
+        let field = evaluate(
+            &volume,
+            RadarProduct::VerticallyIntegratedLiquid,
+            StormMotion::default(),
+        )?;
         assert_eq!(field.value(0, 0), None);
         Ok(())
     }
@@ -432,7 +541,7 @@ mod tests {
             sweep(1, 0.5, 50.0),
             vec![sweep(2, 3.0, 20.0), sweep(3, 9.0, 10.0)],
         )?;
-        let field = evaluate(&volume, RadarProduct::EchoTops)?;
+        let field = evaluate(&volume, RadarProduct::EchoTops, StormMotion::default())?;
         let value = field
             .value(0, 0)
             .ok_or_else(|| TestError::from("the column produced no echo top"))?;
@@ -450,7 +559,7 @@ mod tests {
     #[test]
     fn a_measured_moment_is_not_a_derived_product() -> Result<(), TestError> {
         let volume = volume(sweep(1, 0.5, 50.0), Vec::new())?;
-        match evaluate(&volume, RadarProduct::Reflectivity) {
+        match evaluate(&volume, RadarProduct::Reflectivity, StormMotion::default()) {
             Err(DerivedError::NotDerived { product }) => {
                 assert_eq!(product, RadarProduct::Reflectivity);
                 Ok(())
@@ -476,6 +585,137 @@ mod tests {
         assert_eq!(far.len(), 0, "a gate no elevation reaches has none");
         assert_eq!(radial_at(&low, 42).map(|r| r.azimuth_number), None);
         Ok(())
+    }
+
+    /// A storm moving due east at 36 km/h is ten metres per second away along
+    /// an east beam, across a north beam, and ten metres per second toward along
+    /// a west beam.
+    #[test]
+    fn storm_motion_projects_onto_each_beam() -> Result<(), TestError> {
+        let east = StormMotion {
+            speed_kmh: 36.0,
+            bearing_deg: 90.0,
+        };
+        assert!((east.along_beam_m_s(90.0) - 10.0).abs() < 1e-9);
+        assert!(east.along_beam_m_s(0.0).abs() < 1e-9);
+        assert!((east.along_beam_m_s(270.0) + 10.0).abs() < 1e-9);
+        let back = StormMotion {
+            speed_kmh: 36.0,
+            bearing_deg: 270.0,
+        };
+        assert!((back.along_beam_m_s(90.0) + 10.0).abs() < 1e-9);
+        assert!(east.is_usable());
+        Ok(())
+    }
+
+    /// A storm motion the interface cannot use is refused, not silently
+    /// approximated.
+    #[test]
+    fn unusable_storm_motions_are_rejected() {
+        for motion in [
+            StormMotion {
+                speed_kmh: -5.0,
+                bearing_deg: 90.0,
+            },
+            StormMotion {
+                speed_kmh: 5.0,
+                bearing_deg: 360.0,
+            },
+            StormMotion {
+                speed_kmh: f64::NAN,
+                bearing_deg: 90.0,
+            },
+            StormMotion {
+                speed_kmh: MAX_STORM_SPEED_KMH + 1.0,
+                bearing_deg: 90.0,
+            },
+        ] {
+            assert!(!motion.is_usable(), "{motion:?} should be refused");
+        }
+        assert!(StormMotion::default().is_usable());
+    }
+
+    fn velocity_radial(azimuth_deg: f64, velocity: f32) -> RadialBins {
+        let mut radial = radial(1, 0.5, vec![GateValue::Measured(50.0); 3]);
+        radial.azimuth_left_deg = azimuth_deg - 0.5;
+        radial.azimuth_right_deg = azimuth_deg + 0.5;
+        radial.moments.push(MomentBins {
+            product: RadarProduct::Velocity,
+            first_gate_km: 10.0,
+            gate_width_km: 1.0,
+            values: vec![GateValue::Measured(velocity); 3],
+        });
+        radial
+    }
+
+    /// Measured velocity is relative to the radar; subtracting the storm's own
+    /// motion along each beam is what turns a broad inbound/outbound field into
+    /// a couplet a chaser can read.
+    #[test]
+    fn storm_relative_velocity_removes_the_storm_motion() -> Result<(), TestError> {
+        let mut base = sweep(1, 0.5, 50.0);
+        base.radials = vec![velocity_radial(90.0, 10.0)];
+        base.products = vec![RadarProduct::Reflectivity, RadarProduct::Velocity];
+        let volume = volume(base, Vec::new())?;
+        let help = StormMotion {
+            speed_kmh: 36.0,
+            bearing_deg: 90.0,
+        };
+        let field = evaluate(&volume, RadarProduct::StormRelativeVelocity, help)?;
+        let value = field
+            .value(0, 0)
+            .ok_or_else(|| TestError::from("the column produced no storm-relative value"))?;
+        assert!((value - 0.0).abs() < 1e-9, "storm-relative was {value} m/s");
+
+        let still = evaluate(
+            &volume,
+            RadarProduct::StormRelativeVelocity,
+            StormMotion::default(),
+        )?;
+        let measured = still
+            .value(0, 0)
+            .ok_or_else(|| TestError::from("a still storm should report the measured value"))?;
+        assert!((measured - 10.0).abs() < 1e-9);
+        Ok(())
+    }
+
+    #[test]
+    fn storm_relative_velocity_needs_a_velocity_sweep() -> Result<(), TestError> {
+        let volume = volume(sweep(1, 0.5, 50.0), Vec::new())?;
+        match evaluate(
+            &volume,
+            RadarProduct::StormRelativeVelocity,
+            StormMotion::default(),
+        ) {
+            Err(DerivedError::NoVelocity { elevation }) => {
+                assert_eq!(elevation, 1);
+                Ok(())
+            }
+            other => Err(TestError::from(format!(
+                "expected a missing velocity error, got {other:?}"
+            ))),
+        }
+    }
+
+    #[test]
+    fn storm_relative_velocity_refuses_an_unusable_motion() -> Result<(), TestError> {
+        let mut base = sweep(1, 0.5, 50.0);
+        base.radials = vec![velocity_radial(90.0, 10.0)];
+        base.products = vec![RadarProduct::Reflectivity, RadarProduct::Velocity];
+        let volume = volume(base, Vec::new())?;
+        let bad = StormMotion {
+            speed_kmh: 400.0,
+            bearing_deg: 90.0,
+        };
+        match evaluate(&volume, RadarProduct::StormRelativeVelocity, bad) {
+            Err(DerivedError::StormMotion { speed_kmh, .. }) => {
+                assert!((speed_kmh - 400.0).abs() < 1e-9);
+                Ok(())
+            }
+            other => Err(TestError::from(format!(
+                "expected a motion error, got {other:?}"
+            ))),
+        }
     }
 
     /// The same ground range on a higher beam takes a longer path along the
@@ -517,7 +757,7 @@ mod tests {
         base.products.clear();
         base.radials.clear();
         let volume = volume(base, Vec::new())?;
-        match evaluate(&volume, RadarProduct::EchoTops) {
+        match evaluate(&volume, RadarProduct::EchoTops, StormMotion::default()) {
             Err(DerivedError::NoReflectivity) => Ok(()),
             other => Err(TestError::from(format!(
                 "expected a missing reflectivity error, got {other:?}"

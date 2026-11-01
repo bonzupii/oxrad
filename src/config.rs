@@ -20,6 +20,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use crate::colormap::ColorTable;
+use crate::derived::StormMotion;
 use crate::error::ConfigError;
 use crate::paths;
 use crate::place::{Place, PlaceError};
@@ -44,6 +45,8 @@ pub struct Config {
     pub color_table: ColorTable,
     /// How radar gates are sampled onto the screen.
     pub sampling: Sampling,
+    /// The storm motion storm-relative velocity is computed against.
+    pub storm_motion: StormMotion,
 }
 
 fn strip_quotes(value: &str) -> Option<&str> {
@@ -130,6 +133,24 @@ fn finish_place(path: &Path, fields: PlaceFields) -> Result<Option<Place>, Confi
             line: fields.line,
             source,
         })
+}
+
+fn parse_motion_number(
+    path: &Path,
+    line: usize,
+    field: &'static str,
+    value: &str,
+) -> Result<f64, ConfigError> {
+    let text = strip_quotes(value).ok_or_else(|| ConfigError::Syntax {
+        path: path.to_path_buf(),
+        line,
+    })?;
+    text.parse::<f64>().map_err(|_| ConfigError::PlaceNumber {
+        path: path.to_path_buf(),
+        line,
+        field,
+        value: String::from(text),
+    })
 }
 
 fn parse_text_line(path: &Path, text: &str) -> Result<Config, ConfigError> {
@@ -224,6 +245,30 @@ fn apply_field(
                     value: String::from(text),
                 })?;
         }
+        "storm_speed_kmh" => {
+            let speed = parse_motion_number(path, number, "storm speed", value)?;
+            config.storm_motion.speed_kmh = speed;
+            if !config.storm_motion.is_usable() {
+                return Err(ConfigError::StormMotion {
+                    path: at(),
+                    line: number,
+                    speed_kmh: config.storm_motion.speed_kmh,
+                    bearing_deg: config.storm_motion.bearing_deg,
+                });
+            }
+        }
+        "storm_bearing_deg" => {
+            let bearing = parse_motion_number(path, number, "storm bearing", value)?;
+            config.storm_motion.bearing_deg = bearing;
+            if !config.storm_motion.is_usable() {
+                return Err(ConfigError::StormMotion {
+                    path: at(),
+                    line: number,
+                    speed_kmh: config.storm_motion.speed_kmh,
+                    bearing_deg: config.storm_motion.bearing_deg,
+                });
+            }
+        }
         "place_name" => record_place(&mut place.name, &mut place.line, path, number, value)?,
         "place_region" => record_place(&mut place.region, &mut place.line, path, number, value)?,
         "place_country" => record_place(&mut place.country, &mut place.line, path, number, value)?,
@@ -279,6 +324,14 @@ pub fn save(config: &Config, path: &Path) -> Result<(), ConfigError> {
     lines.push(format!("theme = \"{}\"", config.theme.token()));
     lines.push(format!("palette = \"{}\"", config.color_table.token()));
     lines.push(format!("interpolation = \"{}\"", config.sampling.token()));
+    lines.push(format!(
+        "storm_speed_kmh = \"{:.1}\"",
+        config.storm_motion.speed_kmh
+    ));
+    lines.push(format!(
+        "storm_bearing_deg = \"{:.1}\"",
+        config.storm_motion.bearing_deg
+    ));
     if let Some(place) = &config.place {
         lines.push(format!("place_name = \"{}\"", place.name));
         lines.push(format!("place_region = \"{}\"", place.region));
@@ -320,6 +373,31 @@ mod tests {
         let config = parse("# oxrad configuration.\nsite = \"KTWX\"\n")?;
         assert_eq!(config.site.as_ref().map(SiteId::as_str), Some("KTWX"));
         Ok(())
+    }
+
+    #[test]
+    fn a_saved_storm_motion_is_restored() -> Result<(), ConfigError> {
+        let config = parse("storm_speed_kmh = \"83.5\"\nstorm_bearing_deg = \"245.0\"\n")?;
+        assert!((config.storm_motion.speed_kmh - 83.5).abs() < 1e-9);
+        assert!((config.storm_motion.bearing_deg - 245.0).abs() < 1e-9);
+        assert!(config.storm_motion.is_usable());
+        Ok(())
+    }
+
+    #[test]
+    fn an_unusable_storm_motion_names_the_line() {
+        assert!(matches!(
+            parse("storm_bearing_deg = \"400\"\n"),
+            Err(ConfigError::StormMotion { line: 1, .. })
+        ));
+        assert!(matches!(
+            parse("storm_speed_kmh = \"-4\"\n"),
+            Err(ConfigError::StormMotion { line: 1, .. })
+        ));
+        assert!(matches!(
+            parse("storm_speed_kmh = \"fast\"\n"),
+            Err(ConfigError::PlaceNumber { line: 1, .. })
+        ));
     }
 
     #[test]
@@ -367,6 +445,7 @@ mod tests {
                 theme: Theme::Dark,
                 color_table: ColorTable::Standard,
                 sampling: Sampling::Nearest,
+                storm_motion: StormMotion::default(),
             },
             &path,
         )?;
@@ -409,6 +488,7 @@ mod tests {
                 theme: Theme::Dark,
                 color_table: ColorTable::Deuteranopia,
                 sampling: Sampling::Bilinear,
+                storm_motion: StormMotion::default(),
             },
             &path,
         )?;

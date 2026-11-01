@@ -17,6 +17,7 @@
 
 use eframe::egui::{self, RichText};
 
+use crate::derived::{MAX_STORM_SPEED_KMH, StormMotion};
 use crate::product::RadarProduct;
 use crate::radar::RadarVolume;
 use crate::render::Sampling;
@@ -26,6 +27,61 @@ pub enum Selection {
     Product(RadarProduct),
     Elevation(u8),
     Sampling(Sampling),
+    Motion(StormMotion),
+}
+
+/// The storm motion that storm-relative velocity is computed against.
+///
+/// The product is only meaningful against a motion the chaser supplies, so the
+/// two numbers sit directly under the product choice rather than in a settings
+/// panel somewhere else.
+fn motion_controls(ui: &mut egui::Ui, motion: StormMotion) -> Option<StormMotion> {
+    ui.add_space(theme::SPACE_S);
+    ui.label(
+        RichText::new("Storm motion")
+            .size(theme::TYPE_BODY)
+            .strong(),
+    );
+    ui.label(
+        RichText::new("Direction the storm is moving toward, and how fast.")
+            .size(theme::TYPE_SMALL)
+            .weak(),
+    );
+    let mut speed = motion.speed_kmh;
+    let mut bearing = motion.bearing_deg;
+    // The value sits above its slider rather than in a value box: the rail is
+    // narrow, and a box wide enough for "km/h" squeezes the track to nothing.
+    ui.label(
+        RichText::new(format!("{speed:.0} km/h"))
+            .size(theme::TYPE_BODY)
+            .strong(),
+    );
+    ui.spacing_mut().slider_width = ui.available_width() - theme::SPACE_M;
+    let speed_changed = ui
+        .add(egui::Slider::new(&mut speed, 0.0..=MAX_STORM_SPEED_KMH).show_value(false))
+        .changed();
+    ui.label(
+        RichText::new(format!(
+            "Toward {bearing:.0}° · {}",
+            crate::place::compass(bearing)
+        ))
+        .size(theme::TYPE_BODY)
+        .strong(),
+    );
+    ui.spacing_mut().slider_width = ui.available_width() - theme::SPACE_M;
+    let bearing_changed = ui
+        .add(egui::Slider::new(&mut bearing, 0.0..=359.0).show_value(false))
+        .changed();
+    if speed_changed || bearing_changed {
+        let updated = StormMotion {
+            speed_kmh: speed,
+            bearing_deg: bearing,
+        };
+        if updated.is_usable() {
+            return Some(updated);
+        }
+    }
+    None
 }
 
 /// One selectable product, or the reason it cannot be chosen.
@@ -70,6 +126,7 @@ pub fn show(
     volume: &RadarVolume,
     selected: RadarProduct,
     sampling: Sampling,
+    motion: StormMotion,
     enabled: bool,
 ) -> Option<Selection> {
     let mut selection = None;
@@ -136,6 +193,11 @@ pub fn show(
                 });
         } else {
             ui.label("This volume does not contain the selected product.");
+        }
+        if selected == RadarProduct::StormRelativeVelocity
+            && let Some(updated) = motion_controls(ui, motion)
+        {
+            selection = Some(Selection::Motion(updated));
         }
     });
     ui.add_space(theme::SPACE_S);

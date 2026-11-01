@@ -33,6 +33,7 @@ pub enum RadarProduct {
     SpecificDifferentialPhase,
     VerticallyIntegratedLiquid,
     EchoTops,
+    StormRelativeVelocity,
 }
 
 impl RadarProduct {
@@ -47,12 +48,31 @@ impl RadarProduct {
         Self::SpecificDifferentialPhase,
     ];
 
-    /// The products computed from a volume rather than measured by it.
-    pub const DERIVED: [Self; 2] = [Self::VerticallyIntegratedLiquid, Self::EchoTops];
+    /// The products computed from decoded data rather than decoded themselves.
+    pub const DERIVED: [Self; 3] = [
+        Self::VerticallyIntegratedLiquid,
+        Self::EchoTops,
+        Self::StormRelativeVelocity,
+    ];
 
-    /// Whether this product is computed from a volume instead of decoded.
+    /// Whether this product is computed instead of decoded.
     pub const fn is_derived(self) -> bool {
-        matches!(self, Self::VerticallyIntegratedLiquid | Self::EchoTops)
+        matches!(
+            self,
+            Self::VerticallyIntegratedLiquid | Self::EchoTops | Self::StormRelativeVelocity
+        )
+    }
+
+    /// The measured moment a computed product is built from.
+    ///
+    /// Liquid and echo tops stack the elevations' reflectivity; storm-relative
+    /// velocity removes the storm's own motion from the drawn sweep's velocity.
+    pub const fn source_moment(self) -> Option<Self> {
+        match self {
+            Self::VerticallyIntegratedLiquid | Self::EchoTops => Some(Self::Reflectivity),
+            Self::StormRelativeVelocity => Some(Self::Velocity),
+            _ => None,
+        }
     }
 
     pub const fn id(self) -> &'static str {
@@ -66,6 +86,7 @@ impl RadarProduct {
             Self::SpecificDifferentialPhase => "DKDP",
             Self::VerticallyIntegratedLiquid => "VIL",
             Self::EchoTops => "ETOP",
+            Self::StormRelativeVelocity => "SRV",
         }
     }
 
@@ -80,6 +101,7 @@ impl RadarProduct {
             Self::SpecificDifferentialPhase => "Specific differential phase",
             Self::VerticallyIntegratedLiquid => "Vertically integrated liquid",
             Self::EchoTops => "Echo tops above the radar",
+            Self::StormRelativeVelocity => "Storm-relative velocity",
         }
     }
 
@@ -93,6 +115,7 @@ impl RadarProduct {
             Self::SpecificDifferentialPhase => "deg/km",
             Self::VerticallyIntegratedLiquid => "kg/m²",
             Self::EchoTops => "km",
+            Self::StormRelativeVelocity => "m/s",
         }
     }
 
@@ -109,6 +132,9 @@ impl RadarProduct {
                 "Liquid water in the column, integrated from every elevation of this volume."
             }
             Self::EchoTops => "Height above the radar of the highest gate at or above 18.5 dBZ.",
+            Self::StormRelativeVelocity => {
+                "Velocity with the storm's own motion removed, so rotation shows as a couplet."
+            }
         }
     }
 
@@ -150,6 +176,7 @@ impl RadarProduct {
             Self::SpecificDifferentialPhase => (-32.0, 32.0),
             Self::VerticallyIntegratedLiquid => (1.0, 80.0),
             Self::EchoTops => (0.0, 18.0),
+            Self::StormRelativeVelocity => (-64.0, 64.0),
         }
     }
 
@@ -165,6 +192,7 @@ impl RadarProduct {
             Self::SpecificDifferentialPhase => "-32 to 32",
             Self::VerticallyIntegratedLiquid => "1 to 80",
             Self::EchoTops => "0 to 18",
+            Self::StormRelativeVelocity => "-64 to 64",
         }
     }
 }
@@ -199,7 +227,7 @@ mod tests {
     #[test]
     fn derived_products_are_not_moments() {
         let identifiers: Vec<&str> = RadarProduct::DERIVED.iter().map(|p| p.id()).collect();
-        assert_eq!(identifiers, vec!["VIL", "ETOP"]);
+        assert_eq!(identifiers, vec!["VIL", "ETOP", "SRV"]);
         assert!(RadarProduct::VerticallyIntegratedLiquid.is_derived());
         assert!(RadarProduct::EchoTops.is_derived());
         for product in RadarProduct::ALL {

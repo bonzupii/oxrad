@@ -206,9 +206,9 @@ fn fill_rows(
 
 /// Builds the raster for a product computed from the whole volume.
 ///
-/// The texels land on the reflectivity gate grid of the sweep being drawn, so
-/// the lattice that places them and the pointer lookup over them stay the same
-/// as for a measured moment.
+/// The texels land on the gate grid of the moment the product is computed from,
+/// so the lattice that places them and the pointer lookup over them stay the
+/// same as for a measured moment.
 ///
 /// # Errors
 ///
@@ -218,9 +218,13 @@ pub fn build_derived(
     volume: &RadarVolume,
     product: RadarProduct,
     table: ColorTable,
+    motion: derived::StormMotion,
 ) -> Result<RadarRaster, DerivedError> {
-    let field = derived::evaluate(volume, product)?;
-    let grid = grid_for(volume, RadarProduct::Reflectivity);
+    let field = derived::evaluate(volume, product, motion)?;
+    let Some(source) = product.source_moment() else {
+        return Err(DerivedError::NotDerived { product });
+    };
+    let grid = grid_for(volume, source);
     let gates = grid.gate_count.max(field.gates);
     let radials = field.radials;
     let (Ok(gates_u32), Ok(radials_u32)) = (u32::try_from(gates), u32::try_from(radials)) else {

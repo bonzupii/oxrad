@@ -28,6 +28,8 @@ use crate::product::RadarProduct;
 pub enum DerivedError {
     NotDerived { product: RadarProduct },
     NoReflectivity,
+    NoVelocity { elevation: u8 },
+    StormMotion { speed_kmh: f64, bearing_deg: f64 },
     BeamHeight { slant_km: f64, elevation_deg: f64 },
     GridSize { gates: usize, radials: usize },
 }
@@ -47,6 +49,15 @@ impl DerivedError {
                 elevation_deg,
             } => format!(
                 "A {slant_km} km gate on the {elevation_deg} degree beam has no usable height."
+            ),
+            Self::NoVelocity { elevation } => {
+                format!("Radar sweep {elevation} carries no velocity to make storm-relative.")
+            }
+            Self::StormMotion {
+                speed_kmh,
+                bearing_deg,
+            } => format!(
+                "Storm motion of {speed_kmh} km/h toward {bearing_deg} degrees is not a usable vector."
             ),
             Self::GridSize { gates, radials } => format!(
                 "A derived product grid of {gates} gates by {radials} radials is too large to draw."
@@ -210,6 +221,12 @@ pub enum ConfigError {
         line: usize,
         value: String,
     },
+    StormMotion {
+        path: PathBuf,
+        line: usize,
+        speed_kmh: f64,
+        bearing_deg: f64,
+    },
     UnknownKey {
         path: PathBuf,
         line: usize,
@@ -268,6 +285,15 @@ impl ConfigError {
                 "{} line {line} sets the interpolation to {value:?}, which is neither nearest nor bilinear.",
                 path.display()
             ),
+            Self::StormMotion {
+                path,
+                line,
+                speed_kmh,
+                bearing_deg,
+            } => format!(
+                "{} line {line} sets a storm motion of {speed_kmh} km/h toward {bearing_deg} degrees, which is not a usable vector.",
+                path.display()
+            ),
             Self::UnknownKey { path, line, key } => format!(
                 "{} line {line} sets the unrecognized key {key}.",
                 path.display()
@@ -318,6 +344,7 @@ impl Error for ConfigError {
             | Self::InvalidTheme { .. }
             | Self::InvalidPalette { .. }
             | Self::InvalidSampling { .. }
+            | Self::StormMotion { .. }
             | Self::UnknownKey { .. }
             | Self::IncompletePlaceEntry { .. }
             | Self::PlaceNumber { .. } => None,

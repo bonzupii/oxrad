@@ -163,8 +163,8 @@ impl RadarVolume {
 
     /// The lowest other sweep that carries a product.
     pub fn elevation_for_product(&self, product: RadarProduct) -> Option<u8> {
-        if product.is_derived() {
-            return self.lowest_reflectivity_sweep();
+        if let Some(source) = product.source_moment() {
+            return self.lowest_sweep_carrying(source);
         }
         self.sweeps
             .iter()
@@ -173,20 +173,22 @@ impl RadarVolume {
             .map(|sweep| sweep.elevation_number)
     }
 
-    /// The number of the lowest sweep that carries reflectivity.
+    /// The number of the lowest sweep that carries a moment.
     ///
-    /// A volume product is computed from every elevation, so it is drawn on the
-    /// geometry of the lowest one, where the column meets the ground.
-    fn lowest_reflectivity_sweep(&self) -> Option<u8> {
+    /// A computed product is drawn on the geometry of the lowest sweep carrying
+    /// the moment it is built from: the lowest elevation for a stacked product,
+    /// where the column meets the ground, and the lowest velocity cut for a
+    /// single-tilt one.
+    fn lowest_sweep_carrying(&self, moment: RadarProduct) -> Option<u8> {
         let others = self
             .sweeps
             .iter()
-            .filter(|sweep| sweep.products.contains(&RadarProduct::Reflectivity))
+            .filter(|sweep| sweep.products.contains(&moment))
             .map(|sweep| (sweep.elevation_number, sweep.elevation_deg));
         let display = self
             .sweep
             .products
-            .contains(&RadarProduct::Reflectivity)
+            .contains(&moment)
             .then_some((self.sweep.elevation_number, self.sweep.elevation_deg));
         display
             .into_iter()
@@ -197,41 +199,46 @@ impl RadarVolume {
 
     /// Whether the volume can produce this product.
     ///
-    /// A derived product needs reflectivity on at least two elevations: one
+    /// A stacked product needs reflectivity on at least two elevations: one
     /// elevation cannot define a layer, so reporting liquid from it would be a
-    /// guess dressed as a measurement.
+    /// guess dressed as a measurement. A single-tilt product needs one sweep
+    /// carrying its source moment.
     pub fn supports_product(&self, product: RadarProduct) -> bool {
-        if product.is_derived() {
-            return self.reflectivity_sweep_count() >= 2;
+        let Some(source) = product.source_moment() else {
+            return self.sweep.products.contains(&product)
+                || self
+                    .sweeps
+                    .iter()
+                    .any(|sweep| sweep.products.contains(&product));
+        };
+        let sweeps = self.sweeps_carrying(source);
+        if product == RadarProduct::StormRelativeVelocity {
+            return sweeps > 0;
         }
-        self.sweep.products.contains(&product)
-            || self
-                .sweeps
-                .iter()
-                .any(|sweep| sweep.products.contains(&product))
+        sweeps >= 2
     }
 
-    fn reflectivity_sweep_count(&self) -> usize {
+    fn sweeps_carrying(&self, moment: RadarProduct) -> usize {
         let mut count = 0;
-        if self.sweep.products.contains(&RadarProduct::Reflectivity) {
+        if self.sweep.products.contains(&moment) {
             count += 1;
         }
         count
             + self
                 .sweeps
                 .iter()
-                .filter(|sweep| sweep.products.contains(&RadarProduct::Reflectivity))
+                .filter(|sweep| sweep.products.contains(&moment))
                 .count()
     }
 
     /// Tilts that carry the selected product; a tilt without it is not offered.
     ///
-    /// A volume product has one entry: the lowest reflectivity sweep it is drawn
-    /// on. Offering a tilt per elevation would suggest the product exists at one
-    /// tilt on its own, which is exactly what it does not do.
+    /// A computed product has one entry: the lowest sweep carrying the moment it
+    /// is built from. Offering a tilt per elevation would suggest the product
+    /// exists at one tilt on its own, which is exactly what it does not do.
     pub fn tilt_options_for(&self, product: RadarProduct) -> Vec<(u8, f64, bool)> {
-        if product.is_derived() {
-            let Some(lowest) = self.lowest_reflectivity_sweep() else {
+        if let Some(source) = product.source_moment() {
+            let Some(lowest) = self.lowest_sweep_carrying(source) else {
                 return Vec::new();
             };
             if lowest == self.sweep.elevation_number {
@@ -1944,6 +1951,7 @@ mod tests {
             &volume,
             RadarProduct::Reflectivity,
             crate::colormap::ColorTable::Standard,
+            crate::derived::StormMotion::default(),
         )?;
         assert!(geometry.lattice.index_count > 0, "lattice has triangles");
         assert_eq!(geometry.raster.counts.mismatched_radials, 0, "gate grid");

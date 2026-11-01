@@ -333,6 +333,9 @@ pub fn color_for_product(product: RadarProduct, value: f32) -> Result<[u8; 4], C
         RadarProduct::SpecificDifferentialPhase => &KDP_RAMP,
         RadarProduct::VerticallyIntegratedLiquid => &VIL_RAMP,
         RadarProduct::EchoTops => &ECHO_TOP_RAMP,
+        // Storm-relative velocity keeps the velocity palette: the colours mean
+        // toward and away from the radar there too.
+        RadarProduct::StormRelativeVelocity => &VELOCITY_RAMP,
         RadarProduct::Reflectivity => &KEYPOINTS,
     };
     ramp_color(ramp, product.id(), value, minimum, maximum)

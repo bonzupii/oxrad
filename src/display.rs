@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{Rect, Shape};
 
 use crate::colormap::ColorTable;
+use crate::derived::StormMotion;
 use crate::error::RenderError;
 use crate::gpu::{RadarGpu, RadarMesh};
 use crate::product::RadarProduct;
@@ -122,10 +123,16 @@ pub struct Display {
     elevation: Option<u8>,
     color_table: ColorTable,
     sampling: Sampling,
+    motion: StormMotion,
 }
 
 impl Display {
-    pub fn new(gpu: Option<RadarGpu>, color_table: ColorTable, sampling: Sampling) -> Self {
+    pub fn new(
+        gpu: Option<RadarGpu>,
+        color_table: ColorTable,
+        sampling: Sampling,
+        motion: StormMotion,
+    ) -> Self {
         let (sender, receiver) = render::start_build_thread();
         let state = if gpu.is_some() {
             DisplayState::Waiting
@@ -145,7 +152,23 @@ impl Display {
             elevation: None,
             color_table,
             sampling,
+            motion,
         }
+    }
+
+    /// Changes the storm motion storm-relative velocity is computed against.
+    ///
+    /// The displayed frame is rebuilt only when the product actually depends on
+    /// it; every other product would repaint identically.
+    pub fn set_motion(&mut self, motion: StormMotion) -> bool {
+        if self.motion == motion {
+            return false;
+        }
+        self.motion = motion;
+        if self.product != RadarProduct::StormRelativeVelocity {
+            return false;
+        }
+        self.rebuild(self.product, self.elevation)
     }
 
     /// Recolors the displayed volume without changing its product or tilt.
@@ -291,6 +314,7 @@ impl Display {
             volume,
             product,
             color_table: self.color_table,
+            motion: self.motion,
             generation,
         }) {
             Ok(()) => {
@@ -459,6 +483,7 @@ mod tests {
             elevation: Some(1),
             color_table: ColorTable::Standard,
             sampling: Sampling::Nearest,
+            motion: StormMotion::default(),
         };
         let volume = display.selection_volume().ok_or("failed volume missing")?;
         assert_eq!(volume.scan_unix_ms, 200);
@@ -483,12 +508,14 @@ mod tests {
             elevation: None,
             color_table: ColorTable::Tritanopia,
             sampling: Sampling::Nearest,
+            motion: StormMotion::default(),
         };
         let volume = retrieved(100)?;
         let geometry = render::build_geometry_for(
             &volume.volume,
             RadarProduct::Reflectivity,
             ColorTable::Standard,
+            StormMotion::default(),
         )?;
         display.complete(render::BuildResult {
             volume,
@@ -522,6 +549,7 @@ mod tests {
             elevation: None,
             color_table: ColorTable::Tritanopia,
             sampling: Sampling::Nearest,
+            motion: StormMotion::default(),
         };
         display.complete(render::BuildResult {
             volume: retrieved(100)?,
