@@ -412,6 +412,8 @@ struct ViewRadar {
     failure_reported: bool,
 }
 
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(600);
+
 pub struct OxradApp {
     gpu: Option<RadarGpu>,
     view_radars: Vec<ViewRadar>,
@@ -426,6 +428,8 @@ pub struct OxradApp {
     query: String,
     search: PlaceSearch,
     search_state: SearchState,
+    search_due: Option<Instant>,
+    last_search_query: String,
     place: Option<Place>,
     site: Option<SiteId>,
     pipeline: Option<Pipeline>,
@@ -503,6 +507,8 @@ impl OxradApp {
             query: String::new(),
             search: PlaceSearch::new(),
             search_state: SearchState::Idle,
+            search_due: None,
+            last_search_query: String::new(),
             place: restored_place.clone(),
             site: None,
             pipeline: None,
@@ -620,6 +626,7 @@ impl OxradApp {
 
     fn choose_site(&mut self, id: SiteId) {
         self.search_state = SearchState::Idle;
+        self.last_search_query.clear();
         self.search.cancel();
         self.open_site(id, true);
     }
@@ -648,12 +655,33 @@ impl OxradApp {
             self.notice = Some(String::from("Type a town or place name first."));
             return;
         }
+        self.search_due = None;
+        self.start_search(query);
+    }
+
+    fn start_search(&mut self, query: String) {
+        self.last_search_query = query.clone();
         self.notice = None;
         self.station_picker_open = false;
         match self.search.start(query.clone()) {
             Ok(()) => self.search_state = SearchState::Working { query },
             Err(error) => self.search_state = SearchState::Failed { query, error },
         }
+    }
+
+    fn tick_search(&mut self) {
+        let Some(due) = self.search_due else {
+            return;
+        };
+        if Instant::now() < due {
+            return;
+        }
+        self.search_due = None;
+        let query = self.query.trim().to_owned();
+        if query.len() < 2 || query == self.last_search_query {
+            return;
+        }
+        self.start_search(query);
     }
 
     fn focus_map_context(&mut self) {
@@ -1013,6 +1041,7 @@ impl OxradApp {
         while let Some(outcome) = self.search.poll() {
             self.apply_search(outcome);
         }
+        self.tick_search();
         if let Some(outcome) = self.forecast.poll() {
             self.apply_forecast(outcome);
         }
@@ -1236,6 +1265,7 @@ impl OxradApp {
 
     fn search_section(&mut self, ui: &mut egui::Ui) {
         let mut submit = false;
+        let mut edited = false;
         ui.horizontal(|ui| {
             let width = (ui.available_width() - 82.0).max(80.0);
             let response = ui.add_sized(
@@ -1244,6 +1274,7 @@ impl OxradApp {
                     .hint_text("Town or place")
                     .margin(Vec2::new(10.0, 7.0)),
             );
+            edited = response.changed();
             let shortcut = ui.input(|input| input.key_pressed(egui::Key::Slash));
             if self.first_run || shortcut {
                 response.request_focus();
@@ -1259,6 +1290,16 @@ impl OxradApp {
                 submit = true;
             }
         });
+        if edited {
+            if self.query.trim().is_empty() {
+                self.search_due = None;
+                self.search.cancel();
+                self.search_state = SearchState::Idle;
+                self.last_search_query.clear();
+            } else {
+                self.search_due = Some(Instant::now() + SEARCH_DEBOUNCE);
+            }
+        }
         if submit {
             self.submit_search();
         }
@@ -1267,9 +1308,9 @@ impl OxradApp {
         match &self.search_state {
             SearchState::Idle => {
                 let hint = if self.place.is_some() {
-                    "Search another town to change the forecast."
+                    "Type to search for another town."
                 } else {
-                    "Type a town, then press Enter."
+                    "Type a town or place; matches appear as you type."
                 };
                 ui.label(RichText::new(hint).size(theme::TYPE_SMALL).weak());
             }
