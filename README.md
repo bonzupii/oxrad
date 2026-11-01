@@ -1,74 +1,130 @@
 # oxrad
 
-Free desktop weather and radar workstation.
+A free desktop weather, radar, and environmental observation workstation, written in Rust.
 
 ![Historical screenshot](screenshot.png)
 
-The screenshot is historical and does not verify the current build.
+The screenshot is historical and does not show the current build.
 
-oxrad is built for ordinary people and for storm spotters, chasers, meteorologists, and scientists. It has two separate jobs that share one window. A place search answers where the user is and what the weather will do there. A radar station answers what the radar is observing. The town and the station are separate identities throughout the data model and the interface.
+oxrad runs on Linux, macOS, and Windows through `eframe` and `wgpu`. It has no account, subscription, advertisement, or paid tier. It is licensed under GPLv3.
 
-The application is free software under GPLv3. It has no account, subscription, advertisement, or paid tier.
+## Status
 
-## What works today
+This is a pre-release build. The radar display works. The product around it does not yet meet the standard of a professional workstation.
 
-- Ordinary place-name search through OpenStreetMap Nominatim, with international names and Unicode. Results show the resolved place and its nearest supported radar station. The place and station remain separate: changing the station never changes the forecast point.
-- A global current, hourly, and daily forecast from Open-Meteo for the searched place. The panel shows current conditions, 24 hourly periods, seven daily periods, local timezone, units, provider, and source time. A failed refresh preserves the last good forecast and labels it as last received.
-- Runtime radar-station discovery from the National Weather Service GeoJSON endpoint. No TSV or TOML site catalog ships with the application. Successful discovery is cached at `~/.oxrad/stations.json`; a later network failure keeps the cached metadata and reports that it is cached. A saved site is opened after discovery completes.
-- Live NEXRAD Level II acquisition from the public Unidata AWS archive, bzip2 record framing, Type 31 parsing, complete volume assembly, and Archive II validation.
-- Every complete elevation sweep in a volume is retained. The tilt selector offers only sweeps that carry the selected product and moves the selected sweep into the display without cloning it.
-- All seven NEXRAD moments are decoded: base reflectivity (`DREF`), base velocity (`DVEL`), spectrum width (`DSW`), differential reflectivity (`DZDR`), correlation coefficient (`DRHO`), differential phase (`DPHI`), and specific differential phase (`DKDP`). A product is offered only when the source and the loaded volume carry it. Selecting velocity from a split-cut surveillance sweep moves to the lowest sweep that actually carries velocity.
-- Product-specific color scales and legends, radial velocity units, readouts with the selected product's units and beam elevation, scan time and age, grid, range rings, station marker, and pointer latitude/longitude/range/azimuth.
-- An offline Natural Earth 1:110m vector map with country fills, borders, labels, a graticule, a scale bar, coordinates, and runtime radar-site markers. The map pans by dragging, zooms under the pointer, and selects a radar site by clicking its marker. It has no tile account or network dependency.
-- Map-view radar overlays. The selected station and up to three nearby stations load through independent pipelines and render as independent meshes at their true geographic positions, farthest first so the selected site is on top. Each layer has its own fetch, decode, render, and failure state. Layers whose scans differ from the selected station by more than six minutes are withheld and named as time-excluded in the map status, so a stale station cannot be mistaken for a simultaneous observation. Pan and zoom schedule a debounced re-query around the new centre, and the contributing site identifiers are shown on the map. This is a time-bounded station overlay, not a value-composited mosaic.
-- A two-point map measurement tool. With Measure on, clicking two map positions draws a geodesic line and reports WGS84 distance, initial bearing, compass direction, and both coordinates. A second pair replaces the first; leaving measure mode clears the line.
-- On-demand NEXRAD scan review and loop. The left rail lists the eight newest complete Archive II volumes from the last three days. Selecting a scan pauses live acquisition, fetches and decodes only that volume, and shows its scan time in UTC. Play history advances through the listed scans in order and loops, and a drag scrubber fetches the chosen frame on demand; returning to live starts a fresh acquisition. Frames are not preloaded.
-- A live global radar composite from RainViewer, covering more than 1,200 radars in over 150 countries. It renders at Web Mercator tile bounds, carries ten-minute frames for the previous two hours, and provides a timestamp scrubber and loop. RainViewer attribution is shown on the map. This is a global composite source, not a national Level II feed and not a substitute for the seven NEXRAD moments.
-- Active National Weather Service warning polygons for the United States and its territories. The map and radar scene draw each polygon by severity, report the active count, name alerts whose geometry is unavailable instead of silently dropping them, and show the most severe active event, area, urgency, issuance time, and expiration. Malformed alerts are counted as unreadable instead of discarding the whole collection. The layer can be hidden, refreshes every five minutes, and reports feed failures and retries. The left rail lists the most severe active alerts, can restrict that list and the map layer to polygons intersecting the visible map, and opens the selected alert's headline, description, and instructions. This is a United States alert feed, not a global warning system.
-- Honest failure states for configuration, station discovery, place search, forecast, fetch, decode, and rendering. The last good radar frame stays visible with its age; a failed refresh does not become a current-data indicator.
-- Saved town and radar restoration from `~/.oxrad/config.toml`, and `--site KPAH` for an explicit radar start. The town’s forecast point and the radar station are stored as separate identities.
+| Area | State |
+|---|---|
+| NEXRAD Level II decode and display | Working |
+| Radar products and tilts | Working: seven moment products, every complete sweep |
+| Radar history and playback | Working: eight recent volumes, loop, scrub |
+| Offline vector basemap | Working at country scale only |
+| Global radar composite | Working: RainViewer, two-hour loop |
+| Forecast | Working: Open-Meteo, global |
+| Place search | Working with exact names; live and fuzzy matching are not implemented |
+| Warnings | United States only |
+| Radar outside the United States | RainViewer composite only; no national Level II adapter |
+| Units selection | Not implemented |
+| Light theme | Not implemented |
+| Layer management | Not implemented |
+| Colourblind-safe palettes | Not implemented |
+| Performance measurement | Not taken |
 
-## What is not implemented
+Do not use this build for safety decisions. Coverage, warnings, and geographic detail are incomplete.
 
-- National Level II or Level III adapters outside the United States. The RainViewer composite provides global reflectivity, but there is no DWD, ECCC, BoM, JMA, CMA, IMD, Roshydromet, SMN, MetService, OPERA, or ODIM_H5 decoder yet. The station list excludes TDWR because no TDWR Level II acquisition path exists.
-- A value-composited multi-station mosaic. The map viewport overlays the selected station and up to three nearby stations only when their scans fall within six minutes of the selected scan, but it does not resample to one exact time, fill gaps, or resolve overlapping gates into a composite value.
-- NEXRAD preloading and frame caching. History has a drag scrubber and loop but fetches each selected frame on demand; there is no preloaded sequence or frame cache. Side-by-side panes, storm tracks, storm motion, local state and city detail beyond the 1:110m country map, and location-permission handling are also absent.
-- International warning feeds. The warning layer covers the United States National Weather Service and its territories; national alert feeds outside the United States are not integrated.
-- A first-run location picker. There is no onboarding overlay, and none is planned. The application opens with the saved site when one exists and normal station and place controls in the left rail.
-- Persistent caching for NEXRAD listings and latest-key metadata, forecast responses, place searches, and warning polygons. NEXRAD archive bodies use the bounded cache; HTTP validators and conditional revalidation are not implemented.
-- Colorblind-safe palette alternatives and a light theme. The current interface is dark-only.
-- The required two independent full-system clean reviews. No separate reviewer process was available in this environment.
+The authoritative status record is [ROADMAP.md](ROADMAP.md). Requirements are in [docs/PRODUCT_REQUIREMENTS.md](docs/PRODUCT_REQUIREMENTS.md). Architecture is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-Do not use this build for safety decisions. Radar coverage, warnings, and geographic products are incomplete.
+## Build
 
-## Running
+```
+cargo build --release --locked
+```
+
+Linux needs an X11 or Wayland client library, `libxkbcommon`, and a Vulkan loader and driver.
+
+## Run
 
 ```
 cargo run --release
+oxrad --site KPAH
 ```
 
-Linux needs an X11 or Wayland client library, `libxkbcommon`, and a Vulkan loader and driver for winit and wgpu. `--help` prints the command-line usage. `--site KPAH` starts with that NEXRAD site instead of the saved one.
+`--site` starts with that NEXRAD station instead of the saved one. `--help` prints usage.
 
-The application stores configuration and station metadata under `~/.oxrad`. Downloaded RainViewer manifests and tiles and NEXRAD archive volumes are kept in a bounded, integrity-checked cache under `~/.oxrad/cache`, so previously viewed scans can be reopened without fetching the same archive again.
+## Use
+
+The window has three regions.
+
+The left rail holds place search, station selection, product and tilt, radar history, and active warnings. The centre is the workspace, switched between Radar and Map. The right panel holds the forecast for the selected place and the selected alert detail. The status bar names the station, product, scan time, scan age, gate counts, and provenance.
+
+A town and a radar station are separate selections. Searching a town sets the forecast point. It also selects the nearest supported radar station, and changing the station afterwards leaves the forecast point unchanged.
+
+Radar history pauses live acquisition while a scan is reviewed. Returning to live starts a fresh acquisition.
+
+Map view overlays the selected station and up to three nearby stations when their scans fall within six minutes of the selected scan. Stations outside that window are withheld and named. This is a time-bounded overlay, not a value-composited mosaic.
+
+## Configuration and stored data
+
+| Path | Contents |
+|---|---|
+| `~/.oxrad/config.toml` | Selected site and saved place |
+| `~/.oxrad/stations.json` | Last station directory and its save time |
+| `~/.oxrad/cache/responses/v1` | Bounded, integrity-checked response cache |
+
+The cache holds up to 256 entries and 128 MiB. Every body is verified against its SHA-256 digest before use.
 
 ## Data sources
 
-| Source | Use | Coverage | Status |
+| Source | Use | Coverage | Licence |
 |---|---|---|---|
-| Unidata NEXRAD Level II S3 archive | Radar volumes | United States WSR-88D | Implemented |
-| RainViewer Weather Maps API | Global reflectivity composite and two-hour history | 1,200+ radars in 150+ countries | Implemented; free personal/community terms, visible attribution |
-| NWS `api.weather.gov/radar/stations` | Runtime station discovery | United States WSR-88D and TDWR metadata | Implemented; TDWR excluded from selection |
-| NWS `api.weather.gov/alerts/active` | Active warning polygons and metadata | United States and territories | Implemented; severity, area, and expiration shown |
-| Open-Meteo forecast API | Current, hourly, daily forecast | Global | Implemented |
-| OpenStreetMap Nominatim | Place search | Global | Implemented |
+| Unidata NEXRAD Level II archive | Radar volumes | United States WSR-88D | Public domain |
+| National Weather Service station directory | Station discovery | United States and territories | Public domain |
+| National Weather Service active alerts | Warnings | United States and territories | Public domain |
+| Open-Meteo | Forecast | Global | CC BY 4.0 |
+| OpenStreetMap Nominatim | Place search | Global | ODbL |
+| RainViewer | Reflectivity composite | 1,200 or more radars, 150 or more countries | Free terms, attribution required |
 
-Live station discovery is refreshed every six hours. A failed refresh keeps the cached list and retries after fifteen minutes. A failed discovery with no cache is reported in the station panel.
+Attribution is displayed in the application. Details and researched but unintegrated sources are in [docs/DATA_SOURCES.md](docs/DATA_SOURCES.md).
 
-Requests carry `oxrad/<version> (https://github.com/bonzupii/oxrad)` as the user agent. Place-search text and forecast coordinates are not written to logs.
+Requests identify the client as `oxrad/<version> (https://github.com/bonzupii/oxrad)`. Place queries and forecast coordinates are not written to logs.
+
+## Limitations
+
+- Radar moments outside the United States are not decoded. No DWD, ECCC, BoM, JMA, CMA, IMD, OPERA, or ODIM reader exists.
+- The basemap has no roads, streets, terrain, hydrography, or settlement detail.
+- Radar range rings and the grid are not drawn in map view.
+- Units cannot be switched. Forecast units are whatever the provider returns.
+- There is one dark palette per product. No colourblind-safe alternative exists.
+- Search requires Enter or the Search button and matches names rather than accepting partial or misspelled input.
+- Warnings cover the United States and its territories only.
+- Layers cannot be reordered, grouped, or made partially transparent. Warnings, global radar, and station overlays each have an independent toggle and nothing else.
+- Pan and zoom performance has not been measured.
+
+## Troubleshooting
+
+| Symptom | Cause |
+|---|---|
+| Window fails to open | No Vulkan driver, or no X11 or Wayland client library |
+| Station list empty | Discovery failed and no cached directory exists; the rail shows the error |
+| Radar stays on an old scan | The feed failed; the status bar shows the failure and the scan age |
+| Forecast missing | The place has no forecast from the provider; the panel shows the provider error |
+| Cache warnings | The cache directory is not writable; live data still loads |
 
 ## Development
 
-`ROADMAP.md` describes the target architecture, implemented state, and remaining work. `STYLE.md` is the code and prose guide. `AGENTS.md` binds changes to the product and engineering constraints. `API.md` records the NEXRAD crate interface. `docs/DEPENDENCIES.md` records direct dependencies and their purpose. `docs/NETWORK.md` records network paths and their limits. `docs/HEADLESS.md` records the graphical verification workflow.
+`STYLE.md` governs code and prose. `AGENTS.md` binds changes to the engineering constraints. `ROADMAP.md` records state and phases. `API.md` records the NEXRAD crate interface.
+
+| Document | Contents |
+|---|---|
+| [docs/PRODUCT_REQUIREMENTS.md](docs/PRODUCT_REQUIREMENTS.md) | Personas, requirements, acceptance |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Current structure, defects, target contracts |
+| [docs/UI_DESIGN.md](docs/UI_DESIGN.md) | Tokens, layout, themes, QA matrix |
+| [docs/DATA_SOURCES.md](docs/DATA_SOURCES.md) | Provider inventory and admission protocol |
+| [docs/CACHING.md](docs/CACHING.md) | Cache classes and policy |
+| [docs/TESTING.md](docs/TESTING.md) | Suite, gaps, verification layers |
+| [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | Targets, method, known costs |
+| [docs/NETWORK.md](docs/NETWORK.md) | Network paths and limits |
+| [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md) | Direct dependencies |
+| [docs/HEADLESS.md](docs/HEADLESS.md) | Headless graphical verification |
 
 Gates:
 
@@ -80,17 +136,6 @@ cargo build
 cargo build --release --locked
 ```
 
-`cargo test` includes network tests because the paths they cover are real services:
+`cargo test` includes live network tests. A network failure fails the suite.
 
-- the pinned KPAH archive download, size check, SHA-256 check, and full decode;
-- the live KPAH listing and retrieval;
-- the missing-volume 404 path;
-- live place search;
-- live Open-Meteo forecasts for a United States place and a place outside the United States;
-- live NWS station discovery and the cache round trip;
-- live active-warning parsing;
-- the live RainViewer manifest and a real 512-pixel global tile decode.
-
-A network failure fails those tests; they are not replaced with synthetic data. No radar archive is stored in the repository.
-
-Licensed under GPLv3. Copyright (C) 2026 Micah Ostrow <bonzupii@protonmail.com>.
+Copyright (C) 2026 Micah Ostrow <bonzupii@protonmail.com>. GPLv3.
