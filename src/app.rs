@@ -294,15 +294,32 @@ fn action_button(palette: &Palette, label: &str) -> egui::Button<'static> {
     .stroke(Stroke::new(1.0_f32, palette.border))
 }
 
-fn map_status_area(rect: Rect) -> Option<Rect> {
-    let width = (rect.width() - 110.0).clamp(0.0, 520.0);
-    let height = (rect.height() - 400.0).clamp(0.0, 130.0);
-    (width > 12.0 && height > 12.0).then(|| {
-        Rect::from_min_size(
-            rect.left_top() + Vec2::new(16.0, 312.0),
-            Vec2::new(width, height),
-        )
-    })
+/// The map's title panel, pinned to the canvas's top-left corner.
+fn map_header_rect(rect: Rect) -> Rect {
+    Rect::from_min_size(
+        rect.left_top() + Vec2::new(8.0, 8.0),
+        Vec2::new((rect.width() - 24.0).clamp(0.0, 470.0), 58.0),
+    )
+}
+
+/// The layer and warning detail block, stacked directly under the title so the
+/// centre of the map keeps showing terrain instead of text.
+fn map_status_area(rect: Rect) -> Rect {
+    let header = map_header_rect(rect);
+    let top = (header.bottom() + 6.0).min((rect.bottom() - 8.0).max(rect.top()));
+    let height = (rect.bottom() - top - 8.0).clamp(0.0, 110.0);
+    Rect::from_min_size(
+        Pos2::new(header.left(), top),
+        Vec2::new(header.width(), height),
+    )
+}
+
+/// The band the scale bar occupies, bottom-left of the canvas.
+fn scale_band(rect: Rect) -> Rect {
+    Rect::from_min_size(
+        Pos2::new(rect.left() + 8.0, rect.bottom() - 54.0),
+        Vec2::new(190.0, 52.0),
+    )
 }
 
 fn retain_warning_selection(selected: &mut Option<String>, warnings: &[Warning]) {
@@ -1086,9 +1103,20 @@ impl OxradApp {
                         }
                         ui.separator();
                         ui.add_space(theme::SPACE_M);
-                        self.station_section(ui);
-                        self.product_section(ui);
-                        self.history_section(ui);
+                        // Each workspace owns its own controls: the radar
+                        // workspace is for the selected radar, the geographic
+                        // one is for layers over the terrain.
+                        match self.scene_mode {
+                            SceneMode::Radar => {
+                                self.station_section(ui);
+                                self.product_section(ui);
+                                self.history_section(ui);
+                            }
+                            SceneMode::Map => {
+                                self.map_layer_controls(ui);
+                                self.map_overlay_controls(ui);
+                            }
+                        }
                         self.warning_section(ui);
                         if let Some(notice) = &self.notice {
                             ui.add_space(theme::SPACE_M);
@@ -1650,7 +1678,7 @@ impl OxradApp {
                 &palette,
             );
         }
-        self.map_controls(ui, rect);
+        self.map_status(ui, rect);
         if let Some(id) = clicked_site {
             self.choose_site(id);
         }
@@ -2319,26 +2347,7 @@ impl OxradApp {
         );
     }
 
-    fn map_controls(&mut self, ui: &mut egui::Ui, rect: Rect) {
-        let area = Rect::from_min_size(
-            Pos2::new(rect.left() + 16.0, rect.top() + 70.0),
-            Vec2::new(190.0, 230.0),
-        );
-        ui.scope_builder(
-            egui::UiBuilder::new()
-                .max_rect(area)
-                .layout(Layout::top_down(Align::Min)),
-            |ui| {
-                ui.style_mut().visuals = self.config.theme.visuals();
-                ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
-                self.map_layer_controls(ui, rect);
-                self.map_overlay_controls(ui);
-            },
-        );
-        self.map_status(ui, rect);
-    }
-
-    fn map_layer_controls(&mut self, ui: &mut egui::Ui, rect: Rect) {
+    fn map_layer_controls(&mut self, ui: &mut egui::Ui) {
         let palette = self.config.theme.palette();
         if ui
             .add_sized(
@@ -2361,7 +2370,7 @@ impl OxradApp {
                 .add_sized([34.0, 30.0], action_button(&palette, "+"))
                 .clicked()
             {
-                match self.map_view.zoom_at(rect, rect.center(), 1.6) {
+                match self.map_view.zoom_center(1.6) {
                     Ok(()) => self.schedule_viewport_reload(),
                     Err(error) => self.notice = Some(format!("Map zoom failed: {error}")),
                 }
@@ -2370,7 +2379,7 @@ impl OxradApp {
                 .add_sized([34.0, 30.0], action_button(&palette, "−"))
                 .clicked()
             {
-                match self.map_view.zoom_at(rect, rect.center(), 1.0 / 1.6) {
+                match self.map_view.zoom_center(1.0 / 1.6) {
                     Ok(()) => self.schedule_viewport_reload(),
                     Err(error) => self.notice = Some(format!("Map zoom failed: {error}")),
                 }
@@ -2464,9 +2473,10 @@ impl OxradApp {
     }
 
     fn map_status_details(&self, ui: &mut egui::Ui, rect: Rect) {
-        let Some(area) = map_status_area(rect) else {
+        let area = map_status_area(rect);
+        if area.width() < 12.0 || area.height() < 12.0 {
             return;
-        };
+        }
         let palette = self.config.theme.palette();
         let width = area.width();
         let height = area.height();
@@ -2540,10 +2550,7 @@ impl OxradApp {
             |_| String::from("unavailable"),
             |(lat, lon)| format!("{lat:.2}, {lon:.2}"),
         );
-        let panel = Rect::from_min_size(
-            rect.left_top() + Vec2::new(8.0, 8.0),
-            Vec2::new(470.0, 62.0),
-        );
+        let panel = map_header_rect(rect);
         ui.painter().rect_filled(
             panel,
             CornerRadius::same(6),
@@ -3332,9 +3339,7 @@ impl OxradApp {
         let Some(pointer) = ui.input(|input| input.pointer.hover_pos()) else {
             return;
         };
-        if !rect.contains(pointer)
-            || map_status_area(rect).is_some_and(|area| area.contains(pointer))
-        {
+        if !rect.contains(pointer) || map_status_area(rect).contains(pointer) {
             return;
         }
         let (lat, lon) = match transform.latlon_at(pointer) {
@@ -3522,7 +3527,7 @@ impl OxradApp {
         let radar_visible = self.radars(ui, rect, transform, span_km, include_viewport);
         let ring_labels = self.draw_rings(ui, rect, transform);
         self.map_warnings(ui, rect, transform);
-        let mut occupied: Vec<Rect> = chrome_obstacles(rect).to_vec();
+        let mut occupied: Vec<Rect> = chrome_obstacles(rect, canvas).to_vec();
         self.map_supplemental_places(ui, rect, transform, span_km, &mut occupied);
         self.draw_ring_labels(ui, rect, transform, &ring_labels, &mut occupied);
         self.map_measure(ui, rect, transform, interaction);
@@ -4114,19 +4119,20 @@ fn forecast_period(ui: &mut egui::Ui, period: &ForecastPeriod, units: crate::uni
 }
 
 /// The bands the canvas's own chrome occupies, top-left and bottom-left, so
-/// place labels do not print through the scan caption or the scale bar.
-fn chrome_obstacles(rect: Rect) -> [Rect; 2] {
-    let caption_width = (rect.width().min(470.0) - 8.0).max(0.0);
-    [
-        Rect::from_min_size(
-            Pos2::new(rect.left() + 8.0, rect.top() + 2.0),
-            Vec2::new(caption_width, 20.0),
-        ),
-        Rect::from_min_size(
-            Pos2::new(rect.left() + 8.0, rect.bottom() - 54.0),
-            Vec2::new(190.0, 52.0),
-        ),
-    ]
+/// place labels do not print through the scan caption, the map's status panel,
+/// or the scale bar.
+fn chrome_obstacles(rect: Rect, canvas: Canvas) -> [Rect; 2] {
+    match canvas {
+        Canvas::Map => [map_header_rect(rect), map_status_area(rect)],
+        Canvas::Radar => {
+            let caption_width = (rect.width().min(470.0) - 8.0).max(0.0);
+            let caption = Rect::from_min_size(
+                Pos2::new(rect.left() + 8.0, rect.top() + 2.0),
+                Vec2::new(caption_width, 20.0),
+            );
+            [caption, scale_band(rect)]
+        }
+    }
 }
 
 /// Splits a canvas into the map and a strip for the colour legend.
@@ -4359,12 +4365,15 @@ mod tests {
     #[test]
     fn map_status_area_stays_within_the_map() {
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(410.0, 544.0));
-        let area = map_status_area(rect);
-        assert!(area.is_some_and(|area| rect.contains_rect(area)));
-        assert_eq!(
-            map_status_area(Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 100.0))),
-            None
+        assert!(rect.contains_rect(map_status_area(rect)));
+        let short = Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 40.0));
+        let area = map_status_area(short);
+        assert!(
+            area.height() < 12.0,
+            "a 40 px canvas got {} px of detail",
+            area.height()
         );
+        assert!(short.contains_rect(area));
     }
 
     #[test]

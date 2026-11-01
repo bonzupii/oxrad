@@ -809,6 +809,21 @@ impl MapView {
         Ok(())
     }
 
+    /// Zooms about the view's own centre, for controls that are not drawn on
+    /// the canvas and so have no pointer to anchor to.
+    pub fn zoom_center(&mut self, factor: f64) -> Result<(), MapError> {
+        if !factor.is_finite() || factor <= 0.0 {
+            return Err(MapError::Coordinate {
+                source: CoordinateError::ZoomFactor { factor },
+            });
+        }
+        let mut next = *self;
+        next.span_km = (next.span_km / factor).clamp(MIN_SPAN_KM, MAX_SPAN_KM);
+        next.clamp_center()?;
+        *self = next;
+        Ok(())
+    }
+
     pub fn zoom_at(&mut self, rect: Rect, pointer: Pos2, factor: f64) -> Result<(), MapError> {
         if !factor.is_finite() || factor <= 0.0 {
             return Err(MapError::Coordinate {
@@ -1111,6 +1126,26 @@ mod tests {
         view.pan(rect, Vec2::new(100.0, 0.0))?;
         let after = view.center_latlon()?;
         assert!(after.1 < before.1, "drag east must move the map west");
+        Ok(())
+    }
+
+    /// A zoom button that is not on the canvas has no pointer to anchor to, so
+    /// it has to keep the centre fixed and change only the span.
+    #[test]
+    fn zooming_about_the_centre_keeps_the_centre() -> Result<(), TestError> {
+        let mut view = MapView::focus(38.997, -96.232, 950.0)?;
+        let before = view.center_latlon()?;
+        view.zoom_center(2.0)?;
+        let after = view.center_latlon()?;
+        assert!(
+            (after.0 - before.0).abs() < 1e-9 && (after.1 - before.1).abs() < 1e-9,
+            "zoomed from {before:?} to {after:?}"
+        );
+        assert!(
+            (view.span_km() - 475.0).abs() < 1e-6,
+            "span is {}",
+            view.span_km()
+        );
         Ok(())
     }
 
