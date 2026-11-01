@@ -3397,7 +3397,7 @@ impl OxradApp {
                             if write!(
                                 label,
                                 "\n{} · {:.2}° beam",
-                                gate_label(Some(hit.value), frame.geometry.product),
+                                gate_label(Some(hit.reading), frame.geometry.product),
                                 hit.elevation_deg
                             )
                             .is_err()
@@ -3500,7 +3500,7 @@ impl OxradApp {
                 ui.painter().text(
                     rect.center(),
                     Align2::CENTER_CENTER,
-                    "No measured echo in this sweep. This does not establish clear weather.",
+                    empty_frame_notice(frame.geometry.product),
                     FontId::proportional(15.0),
                     TEXT,
                 );
@@ -4312,11 +4312,28 @@ fn diagnostics(ui: &mut egui::Ui, frame: &Frame, catalog: Option<&Station>) {
     }
 }
 
-fn gate_label(value: Option<GateValue>, product: RadarProduct) -> String {
-    match value {
-        Some(GateValue::Measured(value)) => format!("{value:.2} {}", product.unit()),
-        Some(GateValue::BelowThreshold) => String::from("below threshold"),
-        Some(GateValue::RangeFolded) => String::from("range folded"),
+/// What an empty frame means for the product that was drawn.
+///
+/// A measured sweep with no gate above the scale says nothing about the weather
+/// in the gaps, and a computed column below the scale says the same about the
+/// sky. Either way an empty frame is not a clear-weather report.
+const fn empty_frame_notice(product: RadarProduct) -> &'static str {
+    if product.is_derived() {
+        return "No column reaches this product's scale. This does not establish clear weather.";
+    }
+    "No measured echo in this sweep. This does not establish clear weather."
+}
+
+fn gate_label(reading: Option<render::Reading>, product: RadarProduct) -> String {
+    match reading {
+        Some(render::Reading::Measured(GateValue::Measured(value))) => {
+            format!("{value:.2} {}", product.unit())
+        }
+        Some(render::Reading::Measured(GateValue::BelowThreshold)) => {
+            String::from("below threshold")
+        }
+        Some(render::Reading::Measured(GateValue::RangeFolded)) => String::from("range folded"),
+        Some(render::Reading::Derived(value)) => format!("{value:.2} {}", product.unit()),
         None => String::from("no radar data"),
     }
 }
@@ -4428,6 +4445,32 @@ mod tests {
         );
         retain_warning_selection(&mut selected, &[warning("alert-a", "Other")]);
         assert_eq!(selected, None);
+    }
+
+    #[test]
+    fn a_computed_gate_reads_in_its_own_unit() {
+        let label = gate_label(
+            Some(render::Reading::Derived(12.345)),
+            RadarProduct::EchoTops,
+        );
+        assert_eq!(label, "12.35 km");
+        let liquid = gate_label(
+            Some(render::Reading::Derived(3.5)),
+            RadarProduct::VerticallyIntegratedLiquid,
+        );
+        assert_eq!(liquid, "3.50 kg/m²");
+    }
+
+    #[test]
+    fn an_empty_frame_is_never_reported_as_clear_weather() {
+        for product in RadarProduct::ALL.iter().chain(RadarProduct::DERIVED.iter()) {
+            let notice = empty_frame_notice(*product);
+            assert!(notice.contains("does not establish"), "{notice}");
+        }
+        assert!(
+            empty_frame_notice(RadarProduct::VerticallyIntegratedLiquid).contains("scale"),
+            "a computed product talks about its scale, not about measured echo"
+        );
     }
 
     #[test]

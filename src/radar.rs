@@ -163,6 +163,9 @@ impl RadarVolume {
 
     /// The lowest other sweep that carries a product.
     pub fn elevation_for_product(&self, product: RadarProduct) -> Option<u8> {
+        if product.is_derived() {
+            return self.lowest_reflectivity_sweep();
+        }
         self.sweeps
             .iter()
             .filter(|sweep| sweep.products.contains(&product))
@@ -170,7 +173,37 @@ impl RadarVolume {
             .map(|sweep| sweep.elevation_number)
     }
 
+    /// The number of the lowest sweep that carries reflectivity.
+    ///
+    /// A volume product is computed from every elevation, so it is drawn on the
+    /// geometry of the lowest one, where the column meets the ground.
+    fn lowest_reflectivity_sweep(&self) -> Option<u8> {
+        let others = self
+            .sweeps
+            .iter()
+            .filter(|sweep| sweep.products.contains(&RadarProduct::Reflectivity))
+            .map(|sweep| (sweep.elevation_number, sweep.elevation_deg));
+        let display = self
+            .sweep
+            .products
+            .contains(&RadarProduct::Reflectivity)
+            .then_some((self.sweep.elevation_number, self.sweep.elevation_deg));
+        display
+            .into_iter()
+            .chain(others)
+            .min_by(|left, right| left.1.total_cmp(&right.1))
+            .map(|(number, _)| number)
+    }
+
+    /// Whether the volume can produce this product.
+    ///
+    /// A derived product needs reflectivity on at least two elevations: one
+    /// elevation cannot define a layer, so reporting liquid from it would be a
+    /// guess dressed as a measurement.
     pub fn supports_product(&self, product: RadarProduct) -> bool {
+        if product.is_derived() {
+            return self.reflectivity_sweep_count() >= 2;
+        }
         self.sweep.products.contains(&product)
             || self
                 .sweeps
@@ -178,8 +211,39 @@ impl RadarVolume {
                 .any(|sweep| sweep.products.contains(&product))
     }
 
+    fn reflectivity_sweep_count(&self) -> usize {
+        let mut count = 0;
+        if self.sweep.products.contains(&RadarProduct::Reflectivity) {
+            count += 1;
+        }
+        count
+            + self
+                .sweeps
+                .iter()
+                .filter(|sweep| sweep.products.contains(&RadarProduct::Reflectivity))
+                .count()
+    }
+
     /// Tilts that carry the selected product; a tilt without it is not offered.
+    ///
+    /// A volume product has one entry: the lowest reflectivity sweep it is drawn
+    /// on. Offering a tilt per elevation would suggest the product exists at one
+    /// tilt on its own, which is exactly what it does not do.
     pub fn tilt_options_for(&self, product: RadarProduct) -> Vec<(u8, f64, bool)> {
+        if product.is_derived() {
+            let Some(lowest) = self.lowest_reflectivity_sweep() else {
+                return Vec::new();
+            };
+            if lowest == self.sweep.elevation_number {
+                return vec![(lowest, self.sweep.elevation_deg, true)];
+            }
+            return self
+                .sweeps
+                .iter()
+                .find(|sweep| sweep.elevation_number == lowest)
+                .map(|sweep| vec![(lowest, sweep.elevation_deg, false)])
+                .unwrap_or_default();
+        }
         let mut options: Vec<(u8, f64, bool)> = self
             .sweeps
             .iter()

@@ -4,7 +4,7 @@ use std::fmt::{self, Display, Formatter};
 use crate::basemap::BasemapError;
 use crate::cache::CacheError;
 use crate::error::{
-    ColorMapError, CoordinateError, MomentError, RadarError, RenderError, SiteIdError,
+    ColorMapError, CoordinateError, DerivedError, MomentError, RadarError, RenderError, SiteIdError,
 };
 use crate::forecast::ForecastError;
 use crate::global_radar::GlobalRadarError;
@@ -30,6 +30,7 @@ pub enum TestError {
     Warning(WarningError),
     Cache(CacheError),
     ColorMap(ColorMapError),
+    Derived(DerivedError),
     Time(std::time::SystemTimeError),
 }
 
@@ -51,6 +52,7 @@ impl Display for TestError {
             Self::Warning(error) => Display::fmt(error, formatter),
             Self::Cache(error) => Display::fmt(error, formatter),
             Self::ColorMap(error) => Display::fmt(error, formatter),
+            Self::Derived(error) => Display::fmt(error, formatter),
             Self::Time(error) => Display::fmt(error, formatter),
         }
     }
@@ -73,6 +75,7 @@ impl Error for TestError {
             Self::Warning(error) => Some(error),
             Self::Cache(error) => Some(error),
             Self::ColorMap(error) => Some(error),
+            Self::Derived(error) => Some(error),
             Self::Time(error) => Some(error),
             Self::Message(_) => None,
         }
@@ -100,6 +103,12 @@ impl From<BasemapError> for TestError {
 impl From<SiteIdError> for TestError {
     fn from(value: SiteIdError) -> Self {
         Self::SiteId(value)
+    }
+}
+
+impl From<DerivedError> for TestError {
+    fn from(value: DerivedError) -> Self {
+        Self::Derived(value)
     }
 }
 

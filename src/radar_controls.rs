@@ -28,6 +28,42 @@ pub enum Selection {
     Sampling(Sampling),
 }
 
+/// One selectable product, or the reason it cannot be chosen.
+///
+/// A measured moment is missing from a volume; a computed product is missing
+/// when the volume has too few elevations to compute it, which is a different
+/// sentence for the user.
+fn product_button(
+    ui: &mut egui::Ui,
+    volume: &RadarVolume,
+    product: RadarProduct,
+    selected: RadarProduct,
+    measured: bool,
+) -> Option<RadarProduct> {
+    let available = volume.supports_product(product);
+    let response = ui.add_enabled(
+        available,
+        egui::Button::selectable(
+            product == selected,
+            RichText::new(format!("{} · {}", product.label(), product.unit()))
+                .size(theme::TYPE_BODY),
+        ),
+    );
+    let response = if available {
+        response.on_hover_text(product.description())
+    } else if measured {
+        response.on_disabled_hover_text("This volume does not contain this product.")
+    } else {
+        response.on_disabled_hover_text(
+            "This volume needs reflectivity on two or more elevations to compute this product.",
+        )
+    };
+    if response.clicked() && product != selected {
+        return Some(product);
+    }
+    None
+}
+
 pub fn show(
     ui: &mut egui::Ui,
     capabilities: &[RadarProduct],
@@ -52,25 +88,26 @@ pub fn show(
                     .size(theme::TYPE_BODY),
             )
             .width(ui.available_width() - theme::SPACE_L)
+            // The suite plus the computed products is taller than the default
+            // popup, and a product the user cannot see is a product they do not
+            // have.
+            .height(460.0)
             .show_ui(ui, |ui| {
                 for product in capabilities {
-                    let available = volume.supports_product(*product);
-                    let response = ui.add_enabled(
-                        available,
-                        egui::Button::selectable(
-                            *product == selected,
-                            RichText::new(format!("{} · {}", product.label(), product.unit()))
-                                .size(theme::TYPE_BODY),
-                        ),
-                    );
-                    let response = if available {
-                        response.on_hover_text(product.description())
-                    } else {
-                        response
-                            .on_disabled_hover_text("This volume does not contain this product.")
-                    };
-                    if response.clicked() && *product != selected {
-                        selection = Some(Selection::Product(*product));
+                    if let Some(chosen) = product_button(ui, volume, *product, selected, true) {
+                        selection = Some(Selection::Product(chosen));
+                    }
+                }
+                ui.add_space(theme::SPACE_S);
+                ui.separator();
+                ui.label(
+                    RichText::new("Computed from this volume")
+                        .size(theme::TYPE_SMALL)
+                        .weak(),
+                );
+                for product in RadarProduct::DERIVED {
+                    if let Some(chosen) = product_button(ui, volume, product, selected, false) {
+                        selection = Some(Selection::Product(chosen));
                     }
                 }
             });

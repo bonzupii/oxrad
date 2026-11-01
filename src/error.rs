@@ -23,6 +23,46 @@ use std::path::PathBuf;
 use crate::place::PlaceError;
 use crate::product::RadarProduct;
 
+/// A volume product that could not be computed from the decoded sweeps.
+#[derive(Debug)]
+pub enum DerivedError {
+    NotDerived { product: RadarProduct },
+    NoReflectivity,
+    BeamHeight { slant_km: f64, elevation_deg: f64 },
+    GridSize { gates: usize, radials: usize },
+}
+
+impl DerivedError {
+    fn message(&self) -> String {
+        match self {
+            Self::NotDerived { product } => format!(
+                "{} is a measured moment, not a product computed from a volume.",
+                product.label()
+            ),
+            Self::NoReflectivity => String::from(
+                "This volume carries no reflectivity to compute a derived product from.",
+            ),
+            Self::BeamHeight {
+                slant_km,
+                elevation_deg,
+            } => format!(
+                "A {slant_km} km gate on the {elevation_deg} degree beam has no usable height."
+            ),
+            Self::GridSize { gates, radials } => format!(
+                "A derived product grid of {gates} gates by {radials} radials is too large to draw."
+            ),
+        }
+    }
+}
+
+impl Display for DerivedError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message())
+    }
+}
+
+impl Error for DerivedError {}
+
 /// A value that cannot be placed on the ellipsoid or in the view.
 #[derive(Debug)]
 pub enum CoordinateError {
@@ -807,6 +847,9 @@ pub enum RenderError {
     MeshSize {
         vertices: usize,
     },
+    Derived {
+        source: DerivedError,
+    },
 }
 
 impl RenderError {
@@ -830,6 +873,7 @@ impl RenderError {
             Self::MeshSize { vertices } => {
                 format!("The radar mesh has {vertices} vertices, too many to draw.")
             }
+            Self::Derived { source } => format!("Derived radar product failed: {source}"),
         }
     }
 }
@@ -844,6 +888,7 @@ impl Error for RenderError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Coordinate { source } => Some(source),
+            Self::Derived { source } => Some(source),
             Self::WorkerStopped
             | Self::GpuUnavailable
             | Self::ProductUnavailable { .. }

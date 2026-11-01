@@ -18,6 +18,7 @@ mod basemap;
 mod cache;
 mod colormap;
 mod config;
+mod derived;
 mod display;
 mod error;
 mod forecast;

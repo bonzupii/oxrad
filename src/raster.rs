@@ -29,6 +29,8 @@
 //! radial against the next one and sheared the whole sweep into spirals.
 
 use crate::colormap::{ColorTable, MappedColor, map_display_color, range_folded_color};
+use crate::derived;
+use crate::error::DerivedError;
 use crate::product::RadarProduct;
 use crate::radar::{GateValue, MomentBins, RadarVolume};
 
@@ -200,6 +202,60 @@ fn fill_rows(
         }
         fill_row(row, moment, product, table, &mut raster.counts);
     }
+}
+
+/// Builds the raster for a product computed from the whole volume.
+///
+/// The texels land on the reflectivity gate grid of the sweep being drawn, so
+/// the lattice that places them and the pointer lookup over them stay the same
+/// as for a measured moment.
+///
+/// # Errors
+///
+/// [`DerivedError`] from the computation, which the caller reports rather than
+/// drawing an empty product as though the sky were clear.
+pub fn build_derived(
+    volume: &RadarVolume,
+    product: RadarProduct,
+    table: ColorTable,
+) -> Result<RadarRaster, DerivedError> {
+    let field = derived::evaluate(volume, product)?;
+    let grid = grid_for(volume, RadarProduct::Reflectivity);
+    let gates = grid.gate_count.max(field.gates);
+    let radials = field.radials;
+    let (Ok(gates_u32), Ok(radials_u32)) = (u32::try_from(gates), u32::try_from(radials)) else {
+        return Err(DerivedError::GridSize { gates, radials });
+    };
+    let row_length = gates.max(1);
+    let mut raster = RadarRaster {
+        gates: gates_u32,
+        radials: radials_u32,
+        grid: GateGrid {
+            first_gate_km: grid.first_gate_km,
+            gate_width_km: grid.gate_width_km,
+            gate_count: gates,
+        },
+        texels: vec![0; radials.saturating_mul(row_length).saturating_mul(4)],
+        counts: GateCounts::default(),
+    };
+    let row_bytes = row_length * 4;
+    for (index, row) in raster.texels.chunks_exact_mut(row_bytes).enumerate() {
+        let (texels, _) = row.as_chunks_mut::<4>();
+        for (gate, texel) in texels.iter_mut().enumerate() {
+            let Some(value) = field.value(index, gate) else {
+                continue;
+            };
+            if !value.is_finite() || value.abs() > f64::from(f32::MAX) {
+                raster.counts.not_finite += 1;
+                continue;
+            }
+            let value = value as f32;
+            if let Some(colour) = measured_colour(table, product, value, &mut raster.counts) {
+                texel.copy_from_slice(&colour);
+            }
+        }
+    }
+    Ok(raster)
 }
 
 fn fill_row(

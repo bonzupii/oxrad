@@ -95,7 +95,12 @@ fn select_product(
             }
         },
     };
-    if !volume.sweep_has_product(number, product) || !volume.select_sweep(number) {
+    // A computed product lives on the geometry of the lowest sweep, not in any
+    // sweep's product list, so the sweep check applies only to measured
+    // moments. The check runs before the sweep is moved: a rejected request
+    // must leave the displayed sweep where it was.
+    let available = product.is_derived() || volume.sweep_has_product(number, product);
+    if !available || !volume.select_sweep(number) {
         return Err(RenderError::ProductUnavailable {
             product,
             elevation: number,

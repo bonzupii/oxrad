@@ -256,6 +256,29 @@ const PHI_RAMP: [(f32, [u8; 3]); 3] = [
     (180.0, [235, 235, 235]),
     (360.0, [150, 40, 160]),
 ];
+/// Vertically integrated liquid, in kilograms per square metre. The stops
+/// follow the operational scale: light green for a shallow column, magenta for
+/// the eighty-plus columns that carry large hail.
+const VIL_RAMP: [(f32, [u8; 3]); 7] = [
+    (1.0, [30, 122, 70]),
+    (5.0, [64, 176, 88]),
+    (15.0, [196, 200, 60]),
+    (30.0, [226, 138, 40]),
+    (45.0, [206, 52, 40]),
+    (60.0, [176, 44, 128]),
+    (80.0, [238, 232, 250]),
+];
+/// Echo tops, in kilometres above the radar: low cloud stays blue, and the
+/// deep convection that carries hail and tornadoes reaches white and red.
+const ECHO_TOP_RAMP: [(f32, [u8; 3]); 6] = [
+    (0.0, [54, 112, 176]),
+    (3.0, [86, 168, 226]),
+    (6.0, [92, 196, 196]),
+    (9.0, [196, 214, 120]),
+    (12.0, [226, 140, 60]),
+    (18.0, [236, 236, 244]),
+];
+
 const KDP_RAMP: [(f32, [u8; 3]); 3] = [
     (-32.0, [40, 80, 170]),
     (0.0, [225, 225, 225]),
@@ -308,6 +331,8 @@ pub fn color_for_product(product: RadarProduct, value: f32) -> Result<[u8; 4], C
         RadarProduct::CorrelationCoefficient => &CC_RAMP,
         RadarProduct::DifferentialPhase => &PHI_RAMP,
         RadarProduct::SpecificDifferentialPhase => &KDP_RAMP,
+        RadarProduct::VerticallyIntegratedLiquid => &VIL_RAMP,
+        RadarProduct::EchoTops => &ECHO_TOP_RAMP,
         RadarProduct::Reflectivity => &KEYPOINTS,
     };
     ramp_color(ramp, product.id(), value, minimum, maximum)

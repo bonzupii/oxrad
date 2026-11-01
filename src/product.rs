@@ -15,7 +15,13 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 //! Radar products independent of any one source's data format.
 
-/// A base or dual-polarization radar product.
+/// A radar product.
+///
+/// The first seven are the moments the radar measures and sends; the last two
+/// are computed from a whole volume by [`crate::derived`] and are never read
+/// out of a message. They share this type because they share everything a
+/// product needs to be selected, drawn, labelled and read out; [`Self::is_derived`]
+/// keeps the two kinds apart wherever that difference matters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum RadarProduct {
     Reflectivity,
@@ -25,9 +31,12 @@ pub enum RadarProduct {
     CorrelationCoefficient,
     DifferentialPhase,
     SpecificDifferentialPhase,
+    VerticallyIntegratedLiquid,
+    EchoTops,
 }
 
 impl RadarProduct {
+    /// The moments a radar measures, in the order the suite is listed.
     pub const ALL: [Self; 7] = [
         Self::Reflectivity,
         Self::Velocity,
@@ -38,6 +47,14 @@ impl RadarProduct {
         Self::SpecificDifferentialPhase,
     ];
 
+    /// The products computed from a volume rather than measured by it.
+    pub const DERIVED: [Self; 2] = [Self::VerticallyIntegratedLiquid, Self::EchoTops];
+
+    /// Whether this product is computed from a volume instead of decoded.
+    pub const fn is_derived(self) -> bool {
+        matches!(self, Self::VerticallyIntegratedLiquid | Self::EchoTops)
+    }
+
     pub const fn id(self) -> &'static str {
         match self {
             Self::Reflectivity => "DREF",
@@ -47,6 +64,8 @@ impl RadarProduct {
             Self::CorrelationCoefficient => "DRHO",
             Self::DifferentialPhase => "DPHI",
             Self::SpecificDifferentialPhase => "DKDP",
+            Self::VerticallyIntegratedLiquid => "VIL",
+            Self::EchoTops => "ETOP",
         }
     }
 
@@ -59,6 +78,8 @@ impl RadarProduct {
             Self::CorrelationCoefficient => "Correlation coefficient",
             Self::DifferentialPhase => "Differential phase",
             Self::SpecificDifferentialPhase => "Specific differential phase",
+            Self::VerticallyIntegratedLiquid => "Vertically integrated liquid",
+            Self::EchoTops => "Echo tops above the radar",
         }
     }
 
@@ -70,6 +91,8 @@ impl RadarProduct {
             Self::CorrelationCoefficient => "ratio",
             Self::DifferentialPhase => "deg",
             Self::SpecificDifferentialPhase => "deg/km",
+            Self::VerticallyIntegratedLiquid => "kg/m²",
+            Self::EchoTops => "km",
         }
     }
 
@@ -82,6 +105,10 @@ impl RadarProduct {
             Self::CorrelationCoefficient => "Similarity of horizontal and vertical returns.",
             Self::DifferentialPhase => "Phase shift between horizontal and vertical returns.",
             Self::SpecificDifferentialPhase => "Range derivative of differential phase.",
+            Self::VerticallyIntegratedLiquid => {
+                "Liquid water in the column, integrated from every elevation of this volume."
+            }
+            Self::EchoTops => "Height above the radar of the highest gate at or above 18.5 dBZ.",
         }
     }
 
@@ -107,7 +134,11 @@ impl RadarProduct {
     /// top is the end of the two-decibel code. Velocity and spectrum width
     /// cover the unambiguous-plus-folded span of a two-decibel code at a 129
     /// offset, and the dual-polarization products use their meteorological
-    /// ranges.
+    /// ranges. Vertically integrated liquid starts at one kilogram per square
+    /// metre: below that a column holds less water than a millimetre of rain
+    /// spread over a square metre, which is not worth painting over the map.
+    /// Echo tops start at the ground and stop at eighteen kilometres, above
+    /// which a thunderstorm top no longer exists.
     pub const fn value_range(self) -> (f32, f32) {
         match self {
             Self::Reflectivity => (5.0, 94.5),
@@ -117,6 +148,8 @@ impl RadarProduct {
             Self::CorrelationCoefficient => (0.0, 1.1),
             Self::DifferentialPhase => (0.0, 360.0),
             Self::SpecificDifferentialPhase => (-32.0, 32.0),
+            Self::VerticallyIntegratedLiquid => (1.0, 80.0),
+            Self::EchoTops => (0.0, 18.0),
         }
     }
 
@@ -130,6 +163,8 @@ impl RadarProduct {
             Self::DifferentialReflectivity => "-8 to 8",
             Self::DifferentialPhase => "0 to 360",
             Self::SpecificDifferentialPhase => "-32 to 32",
+            Self::VerticallyIntegratedLiquid => "1 to 80",
+            Self::EchoTops => "0 to 18",
         }
     }
 }
@@ -154,10 +189,21 @@ mod tests {
 
     #[test]
     fn every_product_has_a_usable_range() {
-        for product in RadarProduct::ALL {
+        for product in RadarProduct::ALL.iter().chain(RadarProduct::DERIVED.iter()) {
             let (minimum, maximum) = product.value_range();
             assert!(minimum < maximum, "{} range", product.id());
             assert!(!product.unit().is_empty(), "{} unit", product.id());
+        }
+    }
+
+    #[test]
+    fn derived_products_are_not_moments() {
+        let identifiers: Vec<&str> = RadarProduct::DERIVED.iter().map(|p| p.id()).collect();
+        assert_eq!(identifiers, vec!["VIL", "ETOP"]);
+        assert!(RadarProduct::VerticallyIntegratedLiquid.is_derived());
+        assert!(RadarProduct::EchoTops.is_derived());
+        for product in RadarProduct::ALL {
+            assert!(!product.is_derived(), "{}", product.id());
         }
     }
 }

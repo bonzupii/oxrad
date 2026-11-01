@@ -32,6 +32,8 @@ use std::time::{Duration, Instant};
 use eframe::egui::{Pos2, Rect};
 
 use crate::colormap::ColorTable;
+use crate::derived;
+use crate::error::DerivedError;
 use crate::error::{CoordinateError, RenderError};
 use crate::product::RadarProduct;
 use crate::projection;
@@ -140,11 +142,20 @@ impl Placement {
     }
 }
 
+/// What a gate holds, as the interface reads it back.
+#[derive(Debug, Clone, Copy)]
+pub enum Reading {
+    /// A gate the radar measured, including its own "nothing here" reports.
+    Measured(GateValue),
+    /// A value computed from the column at this gate.
+    Derived(f64),
+}
+
 /// The gate under a map point.
 #[derive(Debug, Clone, Copy)]
 pub struct GateHit {
-    /// The gate's value as the radar reported it.
-    pub value: GateValue,
+    /// What the gate holds.
+    pub reading: Reading,
     /// The elevation angle of the radial that carries it.
     pub elevation_deg: f64,
 }
@@ -252,9 +263,78 @@ impl SweepLookup {
             return Ok(None);
         };
         Ok(Some(GateHit {
-            value,
+            reading: Reading::Measured(value),
             elevation_deg: radial.elevation_deg,
         }))
+    }
+
+    /// The radials the lookup was built from, for a derived reader that has to
+    /// apply the same azimuth and gate geometry.
+    fn geometry(&self) -> &[RadialLookup] {
+        &self.radials
+    }
+}
+
+/// Azimuth and gate lookup for a product computed from the volume.
+///
+/// The column values are held on the same grid the raster was built on, so the
+/// gate a pointer lands on is the gate the readout reports.
+pub struct DerivedLookup {
+    sweep: SweepLookup,
+    field: derived::DerivedField,
+}
+
+impl DerivedLookup {
+    fn new(volume: &RadarVolume, product: RadarProduct) -> Result<Self, DerivedError> {
+        Ok(Self {
+            sweep: SweepLookup::new(volume, RadarProduct::Reflectivity),
+            field: derived::evaluate(volume, product)?,
+        })
+    }
+
+    /// The gate under a ground range and azimuth, with its column value.
+    pub fn gate(
+        &self,
+        range_km: f64,
+        azimuth_deg: f64,
+    ) -> Result<Option<GateHit>, CoordinateError> {
+        let Some(index) = self.sweep.radial_at(azimuth_deg) else {
+            return Ok(None);
+        };
+        let Some(lookup) = self.sweep.geometry().get(index) else {
+            return Ok(None);
+        };
+        let Some(gate) = lookup.gate_at(range_km)? else {
+            return Ok(None);
+        };
+        let Some(value) = self.field.value(index, gate) else {
+            return Ok(None);
+        };
+        Ok(Some(GateHit {
+            reading: Reading::Derived(value),
+            elevation_deg: lookup.elevation_deg,
+        }))
+    }
+}
+
+/// The gate lookup for whichever kind of product is drawn.
+pub enum Lookup {
+    Measured(SweepLookup),
+    Derived(DerivedLookup),
+}
+
+impl Lookup {
+    /// The gate under a map point, for the product that was drawn.
+    pub fn gate(
+        &self,
+        volume: &RadarVolume,
+        range_km: f64,
+        azimuth_deg: f64,
+    ) -> Result<Option<GateHit>, CoordinateError> {
+        match self {
+            Self::Measured(lookup) => lookup.gate(volume, range_km, azimuth_deg),
+            Self::Derived(lookup) => lookup.gate(range_km, azimuth_deg),
+        }
     }
 }
 
@@ -339,8 +419,8 @@ pub struct RadarGeometry {
     pub raster: RadarRaster,
     /// The mesh that samples the raster.
     pub lattice: Lattice,
-    /// Pointer lookup into the drawn sweep.
-    pub lookup: SweepLookup,
+    /// Pointer lookup into what was drawn.
+    pub lookup: Lookup,
     /// The product the raster was coloured for.
     pub product: RadarProduct,
     /// The table the raster was coloured with.
@@ -484,6 +564,9 @@ pub fn build_geometry_for(
     product: RadarProduct,
     color_table: ColorTable,
 ) -> Result<RadarGeometry, RenderError> {
+    if product.is_derived() {
+        return build_derived_geometry(volume, product, color_table);
+    }
     if !volume.sweep.products.contains(&product) {
         return Err(RenderError::ProductUnavailable {
             product,
@@ -501,7 +584,38 @@ pub fn build_geometry_for(
     };
     Ok(RadarGeometry {
         extent_km,
-        lookup: SweepLookup::new(volume, product),
+        lookup: Lookup::Measured(SweepLookup::new(volume, product)),
+        raster,
+        lattice,
+        product,
+        color_table,
+        site_lat: volume.site_lat,
+        site_lon: volume.site_lon,
+    })
+}
+
+/// Builds a volume product's raster on the drawn sweep's grid, with the lookup
+/// that reads the same computed columns back.
+fn build_derived_geometry(
+    volume: &RadarVolume,
+    product: RadarProduct,
+    color_table: ColorTable,
+) -> Result<RadarGeometry, RenderError> {
+    let (site_x, site_y) = projection::mercator(volume.site_lat, volume.site_lon)
+        .map_err(|source| RenderError::Coordinate { source })?;
+    let raster = raster::build_derived(volume, product, color_table)
+        .map_err(|source| RenderError::Derived { source })?;
+    let lookup =
+        DerivedLookup::new(volume, product).map_err(|source| RenderError::Derived { source })?;
+    let (lattice, extent_km) = build_lattice(volume, raster.grid, site_x, site_y)?;
+    let extent_km = if extent_km > 0.0 {
+        extent_km
+    } else {
+        volume.sweep.max_ground_range_km.max(1.0)
+    };
+    Ok(RadarGeometry {
+        extent_km,
+        lookup: Lookup::Derived(lookup),
         raster,
         lattice,
         product,
@@ -517,7 +631,7 @@ mod tests {
 
     use eframe::egui::Vec2;
 
-    use crate::radar::{MomentBins, RadarSweep};
+    use crate::radar::{MomentBins, RadarSweep, RadialBins};
     use crate::stations::SiteId;
     use crate::test_support::TestError;
 
@@ -578,6 +692,66 @@ mod tests {
         let geometry =
             build_geometry_for(&volume, RadarProduct::Reflectivity, ColorTable::Standard)?;
         Ok((volume, geometry))
+    }
+
+    /// A two-elevation volume of uniform echo, so a computed product has a
+    /// layer to integrate and a gate to read back.
+    fn derived_volume() -> Result<RadarVolume, TestError> {
+        let base = RadarSweep {
+            elevation_deg: 0.5,
+            elevation_number: 1,
+            radials: vec![radial(89.5, 90.5, 0.5, vec![GateValue::Measured(45.0); 4])],
+            products: vec![RadarProduct::Reflectivity],
+            below_threshold: 0,
+            range_folded: 0,
+            max_ground_range_km: 76.0,
+        };
+        let upper = RadarSweep {
+            elevation_deg: 5.0,
+            elevation_number: 2,
+            radials: vec![radial(89.5, 90.5, 5.0, vec![GateValue::Measured(30.0); 4])],
+            products: vec![RadarProduct::Reflectivity],
+            below_threshold: 0,
+            range_folded: 0,
+            max_ground_range_km: 76.0,
+        };
+        let mut volume = volume(
+            vec![radial(89.5, 90.5, 0.5, vec![GateValue::Measured(45.0); 4])],
+            76.0,
+        )?;
+        volume.sweep = base;
+        volume.sweeps = vec![upper];
+        Ok(volume)
+    }
+
+    #[test]
+    fn a_derived_product_draws_and_reads_back_its_column() -> Result<(), TestError> {
+        for product in RadarProduct::DERIVED {
+            let volume = derived_volume()?;
+            let geometry = build_geometry_for(&volume, product, ColorTable::Standard)?;
+            assert!(
+                !geometry.raster.is_empty(),
+                "{} drew no gates",
+                product.id()
+            );
+            let ground = projection::ground_range(74.75, 0.5)?;
+            let hit = geometry.lookup.gate(&volume, ground, 90.0)?;
+            match hit {
+                Some(GateHit {
+                    reading: Reading::Derived(value),
+                    ..
+                }) => {
+                    assert!(value > 0.0, "{} read back {value}", product.id());
+                }
+                other => {
+                    return Err(TestError::from(format!(
+                        "{} read back nothing at a gate with echo: {other:?}",
+                        product.id()
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -659,7 +833,7 @@ mod tests {
         let hit = geometry.lookup.gate(&volume, ground, 90.0)?;
         match hit {
             Some(GateHit {
-                value: GateValue::Measured(dbz),
+                reading: Reading::Measured(GateValue::Measured(dbz)),
                 elevation_deg,
             }) => {
                 assert!((dbz - 41.0).abs() < 1e-6, "gate value {dbz}");
@@ -703,7 +877,7 @@ mod tests {
         let hit = geometry.lookup.gate(&volume, ground, 90.0)?;
         match hit {
             Some(GateHit {
-                value: GateValue::BelowThreshold,
+                reading: Reading::Measured(GateValue::BelowThreshold),
                 ..
             }) => Ok(()),
             other => Err(TestError::from(format!(

@@ -15,7 +15,7 @@ This is a pre-release build. The radar display works. The product around it does
 | Area | State |
 |---|---|
 | NEXRAD Level II decode and display | Working |
-| Radar products and tilts | Working: seven moment products, every complete sweep |
+| Radar products and tilts | Working: seven moment products, every complete sweep, plus vertically integrated liquid and echo tops computed from the whole volume |
 | Radar history and playback | Working: eight recent volumes, loop, scrub |
 | Offline vector basemap | Working: countries, settlements, admin-1 boundaries, rivers, major highways |
 | Global radar composite | Working: RainViewer, two-hour loop |
@@ -97,6 +97,8 @@ Requests identify the client as `oxrad/<version> (https://github.com/bonzupii/ox
 - Range rings and spokes render in map view; the product grid remains radar-canvas only.
 - Units selection covers distance and temperature; wind speed, precipitation, pressure, and elevation still use provider units.
 - Radar color-table selection covers the seven decoded products; the global RainViewer raster keeps its provider palette.
+- The two computed products are derived from the reflectivity of the decoded volume. Vertically integrated liquid is the trapezoidal integral of `3.44e-3 Z^(4/7)` between neighbouring elevations, in kilograms per square metre, and is not drawn below one kilogram per square metre. Echo tops are the highest gate at or above 18.5 dBZ, reported as height above the radar because the archive record carries no site elevation. Column matching uses ground range, so a higher tilt reads the gate above the same ground point rather than the gate at the same slant range.
+- A computed product needs reflectivity on at least two elevations; a volume with one elevation offers neither.
 - Search ranks by name match only; results are not biased toward the current map centre.
 - Warnings cover the United States and its territories only.
 - Layers cannot be reordered, grouped, or made partially transparent. Warnings, global radar, and station overlays each have an independent toggle and nothing else.
