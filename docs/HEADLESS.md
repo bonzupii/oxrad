@@ -40,4 +40,22 @@ set -o pipefail
 
 Inspect the resulting PNG and application log. A framebuffer capture is the whole virtual screen, so a resized window occupies only part of the image. Stop only the recorded application and Xvfb processes after the test.
 
-The current run inspected the radar and map scenes at 1280×800 and the map at 1040×640, including scrolling the map status. It did not establish full coverage of warning refresh, offline operation, history playback, keyboard navigation, every panel, or end-to-end user journeys.
+## Assertion harness
+
+`scripts/gui.sh <scenario>` performs the launch, input, capture, and checks above and exits non-zero when any of them fail. It finds its tools on `PATH` and then under `.tools/root/usr/bin`, and reports a missing tool as a failure rather than skipping.
+
+Scenarios: `radar`, `map`, `pan`, `zoom`, `small`. Each one asserts that the window appeared, that the process was still alive after the input, that the log contains no panic, and that the captured frame holds at least 16 distinct colours after downscaling to 200×125. A blank or single-colour frame fails. Screenshots and logs land in `target/gui/`.
+
+```sh
+cargo build --release --locked
+scripts/gui.sh radar
+scripts/gui.sh map
+scripts/gui.sh pan
+scripts/gui.sh small
+```
+
+The colour count rejects an empty frame without a golden image, whose contents depend on live provider data. It does not establish that any particular element is drawn in the right place; georeferencing is covered by the placement tests, including the shader test that parses the WGSL the pipeline compiles.
+
+The harness was verified to fail as intended: pointing `OXRAD_GUI_BINARY` at a binary that exits immediately yields `gui: the application never opened a window` and exit status 1.
+
+Coverage still missing: warning refresh, history playback, keyboard navigation, every panel, offline operation, and end-to-end user journeys.
