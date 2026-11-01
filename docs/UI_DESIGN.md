@@ -167,7 +167,7 @@ Every cell is inspected in dark and light themes. The matrix is 80 combinations.
 | Panel collapse | Absent |
 | Focus ring | Absent |
 | Accessible names | Not provided |
-| Keyboard navigation | Search focus and Enter only |
+| Keyboard navigation | Search focus, live results, Enter, and slash shortcut |
 | Scale setting | Absent |
 
 The interface reported as cramped, undersized, and misaligned is a direct result of these absences. Correcting individual spacings without the token layer reproduces the defect.

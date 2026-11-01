@@ -7,7 +7,7 @@ This document describes the network paths in the current implementation. It does
 | Host | Purpose | Current use |
 |---|---|---|
 | `api.weather.gov` | Radar-station discovery and active warnings | `GET /radar/stations` and `GET /alerts/active?status=actual&message_type=alert`, both with `Accept: application/geo+json` |
-| `nominatim.openstreetmap.org` | Place search | `GET /search` with `format=jsonv2`, a result limit, and a user agent |
+| `photon.komoot.io` | Place search | `GET /api/` with `q`, `limit`, and a user agent |
 | `api.open-meteo.com` | Global forecast | `GET /v1/forecast` for current, hourly, and daily data |
 | `unidata-nexrad-level2.s3.amazonaws.com` | NEXRAD Level II archive | S3 list and object GET |
 | `api.rainviewer.com` | Global radar manifest | `GET /public/weather-maps.json` |
@@ -30,7 +30,7 @@ The NWS station document is fetched at application start. A successful response 
 
 On startup, the cached document is read before the network request. A missing cache is not fatal: the station list shows that discovery is in progress. If live discovery fails and a cache is already loaded, the cached metadata remains visible with a notice. If no cached metadata exists, the failure is shown in the station panel. The station feed refreshes after six hours and retries failed requests after fifteen minutes.
 
-The place cache is in memory only. Successful searches are cached for the session. Search requests are serialized with a one-request-per-second minimum interval.
+The place cache is in memory only. Successful searches are cached for the session. Search requests are serialized with a one-request-per-second minimum interval; a query with no close name match issues at most one adjacent-transposition retry.
 
 ## Forecast
 
@@ -76,4 +76,4 @@ The forecast, place, global-radar, and active-warning workers use generation num
 
 ## Privacy
 
-Place queries are sent to Nominatim. Forecast coordinates are sent to Open-Meteo. Global radar requests send the map-centre tile coordinates to RainViewer. NEXRAD requests send only the site and time prefix. Active-warning requests send no coordinates or user identity and receive the national United States collection. No account, API key, or device identifier is sent.
+Place queries are sent to Photon (OpenStreetMap data). Forecast coordinates are sent to Open-Meteo. Global radar requests send the map-centre tile coordinates to RainViewer. NEXRAD requests send only the site and time prefix. Active-warning requests send no coordinates or user identity and receive the national United States collection. No account, API key, or device identifier is sent.

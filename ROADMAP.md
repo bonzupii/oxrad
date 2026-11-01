@@ -17,7 +17,7 @@ Only behavior observed in the running binary is listed as verified.
 | Products and tilts | Verified | DREF, DVEL, DSW, DZDR, DRHO, DPHI, DKDP; sweeps filtered by product |
 | Radar rendering | Verified | WGS84 gate corners, product palette, rings, grid, pointer readout |
 | Radar history | Verified | Eight recent volumes, loop, scrub, UTC label, cached-volume label |
-| Global place search | Implemented | Exact names through Nominatim; live matching absent |
+| Global place search | Verified | Photon live results; partial and transposed names, ranked; proximity bias absent |
 | Global forecast | Verified | Open-Meteo current, hourly, daily, retry, stale labeling |
 | Station discovery | Verified | Runtime NWS directory, disk cache, six-hour refresh |
 | Map basemap | Verified | Natural Earth 1:110m countries, borders, labels, graticule, scale |

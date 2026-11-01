@@ -37,17 +37,17 @@ Each requirement is testable. A requirement marked implemented was observed in t
 
 | ID | Requirement | State |
 |---|---|---|
-| UX-1 | Search returns results while the user types, without a submit action | Not implemented |
-| UX-2 | Partial names match: `Chicag` returns Chicago | Not implemented |
-| UX-3 | Transposed or misspelled names match: `cihcago` returns Chicago | Not implemented |
-| UX-4 | Exact name matches rank above partial matches | Not implemented |
+| UX-1 | Search returns results while the user types, without a submit action | Implemented |
+| UX-2 | Partial names match: `Chicag` returns Chicago | Implemented |
+| UX-3 | Transposed or misspelled names match: `cihcago` returns Chicago | Implemented |
+| UX-4 | Exact name matches rank above partial matches | Implemented |
 | UX-5 | Results nearer the current map centre rank above distant matches | Not implemented |
 | UX-6 | Each result shows country, region, and coordinates | Implemented |
 | UX-7 | Obsolete searches are cancelled and their results discarded | Implemented |
 | UX-8 | A place selection and a radar station selection are independent | Implemented |
 | UX-9 | Every control has a keyboard path and a visible focus state | Not implemented |
 
-Typing currently requires Enter or the Search button. Requirement UX-1 reverses that.
+Live search is debounced and superseded queries are discarded. Relevance is ordered by name match only; proximity to the map centre is not yet part of ranking.
 
 ### Map and geography
 

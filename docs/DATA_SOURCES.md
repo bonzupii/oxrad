@@ -20,10 +20,12 @@ A source is never listed as available because an organisation publishes somethin
 | Radar station directory | National Weather Service | United States and territories | Station identity, coordinates, type, capability text | `api.weather.gov/radar/stations`, GeoJSON | Continuous | United States Government work, public domain | Verified |
 | Active alerts | National Weather Service | United States and territories | Warning polygons, event, severity, urgency, area, headline, description, instruction, expiry | `api.weather.gov/alerts/active`, GeoJSON | Continuous | United States Government work, public domain | Verified |
 | Global forecast | Open-Meteo | Global | Current, hourly, daily | `api.open-meteo.com/v1/forecast` | Hourly model updates | CC BY 4.0, attribution required | Verified |
-| Place search | OpenStreetMap contributors, Nominatim instance | Global | Place name, region, country, coordinates | `nominatim.openstreetmap.org/search` | Live | ODbL 1.0 for data, attribution required | Verified |
+| Place search | OpenStreetMap contributors, Photon | Global | Place name, region, country, coordinates | `photon.komoot.io/api/`, GeoJSON | Live, fair use | ODbL 1.0 for data, attribution required | Verified |
 | Global radar composite | RainViewer | 1,200 or more radars in 150 or more countries | Reflectivity composite tiles, two hours of ten-minute frames | `api.rainviewer.com` manifest, `tilecache.rainviewer.com` tiles | 10 minutes | Free personal and community terms, visible attribution required | Verified |
 
 RainViewer is a processed composite. It is not Level II and cannot supply moment-level products. Attribution is displayed in map view.
+
+Photon is used for live type-ahead place search. It supports partial and many misspelled queries; a single adjacent transposition is retried locally when the first answer has no close match. Its public instance is offered under fair use without an availability guarantee, so search errors are surfaced rather than hidden.
 
 ## Researched, not implemented
 
