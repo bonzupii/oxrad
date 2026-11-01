@@ -164,6 +164,7 @@ Every cell is inspected in dark and light themes. The matrix is 80 combinations.
 | Tokens | Partial. `src/theme.rs` holds both palettes, the type scale, and spacing; residual literals remain |
 | Type scale | Partial. Sizes route through `TYPE_*`; 10 to 17 point literals remain |
 | Themes | Implemented: dark and light, persisted. Two map chrome elements still draw dark fills in light mode |
+| Map radar geometry | Implemented: geodesic 50 km rings, eight spokes, unit-aware labels, adaptive graticule |
 | Panel collapse | Absent |
 | Focus ring | Absent |
 | Accessible names | Not provided |

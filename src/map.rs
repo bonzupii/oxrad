@@ -28,11 +28,16 @@ use eframe::egui::{
 use crate::error::CoordinateError;
 use crate::projection;
 use crate::theme::Palette;
+use crate::units::{self, UnitSystem};
 
 const COUNTRIES: &str = include_str!("../assets/ne_110m_admin_0_countries.geojson");
 const MIN_SPAN_KM: f64 = 80.0;
 const MAX_SPAN_KM: f64 = 40_075.0;
 const MERCATOR_LIMIT_DEG: f64 = 85.0;
+const MAP_RING_STEP_KM: f64 = 50.0;
+const MAP_RING_MAX_KM: f64 = 400.0;
+const MAP_RING_SAMPLES: u32 = 128;
+const MAP_SPOKES: u32 = 8;
 
 #[derive(Debug)]
 pub enum MapError {
@@ -258,7 +263,7 @@ impl WorldMap {
     ) -> Result<(), MapError> {
         let transform = view.transform(rect)?;
         painter.rect_filled(rect, CornerRadius::ZERO, palette.ocean);
-        draw_graticule(painter, &transform, rect, palette);
+        draw_graticule(painter, &transform, rect, view.span_km, palette);
         let mut labels = Vec::new();
         for country in &self.countries {
             for ring in &country.rings {
@@ -398,20 +403,32 @@ fn triangulate(points: &[Pos2]) -> Option<Vec<[u32; 3]>> {
     Some(triangles)
 }
 
+fn graticule_step_degrees(span_km: f64) -> f64 {
+    if span_km < 1_500.0 {
+        1.0
+    } else if span_km < 5_000.0 {
+        5.0
+    } else {
+        15.0
+    }
+}
+
 fn draw_graticule(
     painter: &egui::Painter,
     transform: &MapTransform,
     rect: Rect,
+    span_km: f64,
     palette: &Palette,
 ) {
     let stroke = Stroke::new(0.5_f32, palette.graticule);
+    let step = graticule_step_degrees(span_km);
     let (north, _) = transform.latlon_at(Pos2::new(rect.center().x, rect.top()));
     let (south, _) = transform.latlon_at(Pos2::new(rect.center().x, rect.bottom()));
-    let mut latitude = (south / 15.0).floor() * 15.0;
+    let mut latitude = (south / step).floor() * step;
     while latitude <= north {
         let mut points = Vec::new();
-        for step in 0..=72 {
-            let lon = -180.0 + f64::from(step) * 5.0;
+        for sample in 0..=72 {
+            let lon = -180.0 + f64::from(sample) * 5.0;
             if let Some(point) = transform.screen(latitude, lon) {
                 points.push(point);
             }
@@ -419,22 +436,128 @@ fn draw_graticule(
         if points.len() > 1 {
             painter.add(Shape::line(points, stroke));
         }
-        latitude += 15.0;
+        latitude += step;
     }
     let mut longitude = -180.0;
     while longitude <= 180.0 {
-        let mut points = Vec::new();
-        for step in 0..=36 {
-            let lat = -80.0 + f64::from(step) * 80.0 / 18.0;
-            if let Some(point) = transform.screen(lat, longitude) {
-                points.push(point);
+        let visible = transform
+            .screen(0.0, longitude)
+            .is_some_and(|point| point.x >= rect.left() - 1.0 && point.x <= rect.right() + 1.0);
+        if visible {
+            let mut points = Vec::new();
+            for sample in 0..=36 {
+                let lat = -80.0 + f64::from(sample) * 80.0 / 18.0;
+                if let Some(point) = transform.screen(lat, longitude) {
+                    points.push(point);
+                }
+            }
+            if points.len() > 1 {
+                painter.add(Shape::line(points, stroke));
             }
         }
-        if points.len() > 1 {
-            painter.add(Shape::line(points, stroke));
-        }
-        longitude += 15.0;
+        longitude += step;
     }
+}
+
+fn ring_points(
+    transform: &MapTransform,
+    site_lat: f64,
+    site_lon: f64,
+    range_km: f64,
+) -> Result<Vec<Pos2>, MapError> {
+    let mut points = Vec::with_capacity(MAP_RING_SAMPLES as usize + 1);
+    for sample in 0..=MAP_RING_SAMPLES {
+        let azimuth_deg = f64::from(sample) * 360.0 / f64::from(MAP_RING_SAMPLES);
+        let (lat, lon) = projection::forward(range_km, azimuth_deg, site_lat, site_lon)
+            .map_err(|source| MapError::Coordinate { source })?;
+        if let Some(point) = transform.screen(lat, lon) {
+            points.push(point);
+        }
+    }
+    Ok(points)
+}
+
+fn ring_label(
+    painter: &egui::Painter,
+    transform: &MapTransform,
+    site_lat: f64,
+    site_lon: f64,
+    range_km: f64,
+    units: UnitSystem,
+    palette: &Palette,
+) -> Result<(), MapError> {
+    let (lat, lon) = projection::forward(range_km, 180.0, site_lat, site_lon)
+        .map_err(|source| MapError::Coordinate { source })?;
+    let Some(point) = transform.screen(lat, lon) else {
+        return Ok(());
+    };
+    let galley = painter.layout_no_wrap(
+        units::distance_whole(range_km, units),
+        FontId::monospace(10.0),
+        palette.map_text,
+    );
+    let origin = Pos2::new(point.x - galley.size().x / 2.0, point.y + 4.0);
+    painter.rect_filled(
+        Rect::from_min_size(origin - Vec2::splat(2.0), galley.size() + Vec2::splat(4.0)),
+        CornerRadius::same(2),
+        Color32::from_rgba_unmultiplied(
+            palette.surface.r(),
+            palette.surface.g(),
+            palette.surface.b(),
+            215,
+        ),
+    );
+    painter.galley(origin, galley, palette.map_text);
+    Ok(())
+}
+
+pub fn draw_range_rings(
+    painter: &egui::Painter,
+    rect: Rect,
+    transform: &MapTransform,
+    site_lat: f64,
+    site_lon: f64,
+    units: UnitSystem,
+    palette: &Palette,
+) -> Result<(), MapError> {
+    let Some(site) = transform.screen(site_lat, site_lon) else {
+        return Ok(());
+    };
+    let max_jump = rect.width().max(rect.height()) * 0.5;
+    let ring_stroke = Stroke::new(
+        1.0_f32,
+        Color32::from_rgba_unmultiplied(palette.ring.r(), palette.ring.g(), palette.ring.b(), 185),
+    );
+    let spoke_stroke = Stroke::new(
+        1.0_f32,
+        Color32::from_rgba_unmultiplied(palette.ring.r(), palette.ring.g(), palette.ring.b(), 95),
+    );
+    for sample in 0..MAP_SPOKES {
+        let azimuth_deg = f64::from(sample) * 360.0 / f64::from(MAP_SPOKES);
+        let (lat, lon) = projection::forward(MAP_RING_MAX_KM, azimuth_deg, site_lat, site_lon)
+            .map_err(|source| MapError::Coordinate { source })?;
+        if let Some(point) = transform.screen(lat, lon)
+            && site.distance(point) <= max_jump
+        {
+            painter.line_segment([site, point], spoke_stroke);
+        }
+    }
+    let mut range_km = MAP_RING_STEP_KM;
+    while range_km <= MAP_RING_MAX_KM {
+        let points = ring_points(transform, site_lat, site_lon, range_km)?;
+        for pair in points.windows(2) {
+            if let [a, b] = pair
+                && a.distance(*b) <= max_jump
+            {
+                painter.line_segment([*a, *b], ring_stroke);
+            }
+        }
+        ring_label(
+            painter, transform, site_lat, site_lon, range_km, units, palette,
+        )?;
+        range_km += MAP_RING_STEP_KM;
+    }
+    Ok(())
 }
 
 fn draw_labels(
@@ -732,6 +855,33 @@ mod tests {
         view.pan(rect, Vec2::new(100.0, 0.0))?;
         let after = view.center_latlon()?;
         assert!(after.1 < before.1, "drag east must move the map west");
+        Ok(())
+    }
+
+    #[test]
+    fn graticule_densifies_at_radar_zoom() {
+        assert_eq!(graticule_step_degrees(950.0), 1.0);
+        assert_eq!(graticule_step_degrees(2_200.0), 5.0);
+        assert_eq!(graticule_step_degrees(18_000.0), 15.0);
+    }
+
+    #[test]
+    fn range_ring_is_closed_and_scaled_to_the_map() -> Result<(), TestError> {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let view = MapView::focus(37.068, -88.772, 950.0)?;
+        let transform = view.transform(rect)?;
+        let points = ring_points(&transform, 37.068, -88.772, 50.0)?;
+        assert_eq!(points.len(), MAP_RING_SAMPLES as usize + 1);
+        let first = points.first().ok_or("ring has no first point")?;
+        let last = points.last().ok_or("ring has no last point")?;
+        assert!(first.distance(*last) < 0.01, "ring is not closed");
+        let site = transform
+            .screen(37.068, -88.772)
+            .ok_or("site is outside the projection")?;
+        for point in &points {
+            let radius = point.distance(site);
+            assert!((40.0..=65.0).contains(&radius), "ring radius {radius}");
+        }
         Ok(())
     }
 }

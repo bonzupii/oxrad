@@ -1861,6 +1861,22 @@ impl OxradApp {
         self.map_basemap(ui, rect);
         self.map_global(ui, &transform);
         let radar_visible = self.map_radar(ui, rect, &transform);
+        let ring_origin = self
+            .site_station()
+            .map(|station| (station.lat, station.lon));
+        if let Some((lat, lon)) = ring_origin
+            && let Err(error) = map::draw_range_rings(
+                ui.painter(),
+                rect,
+                &transform,
+                lat,
+                lon,
+                self.config.units,
+                &self.config.theme.palette(),
+            )
+        {
+            self.notice = Some(format!("Map range rings could not be drawn: {error}"));
+        }
         self.map_warnings(ui, rect, &transform);
         self.map_measure(ui, rect, &transform, &interaction);
         let clicked_site = if self.measure.is_on() {

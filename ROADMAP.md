@@ -21,6 +21,7 @@ Only behavior observed in the running binary is listed as verified.
 | Global forecast | Verified | Open-Meteo current, hourly, daily, retry, stale labeling |
 | Station discovery | Verified | Runtime NWS directory, disk cache, six-hour refresh |
 | Map basemap | Verified | Natural Earth 1:110m countries, borders, labels, graticule, scale |
+| Map radar geometry | Verified | Geodesic 50 km rings, eight spokes, unit-aware labels, 1/5/15 degree adaptive graticule |
 | Map station overlays | Verified | Selected plus three nearby stations within a six-minute window |
 | Map measurement | Partially verified | Two-point geodesic distance and bearing; no area |
 | Global radar composite | Verified | RainViewer manifest, tiles, scrub, loop, attribution |

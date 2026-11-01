@@ -2,14 +2,14 @@
 
 ## Current suite
 
-143 tests run under `cargo test`. Last recorded run in this repository: 143 passed, 0 failed.
+145 tests run under `cargo test`. Last recorded run in this repository: 145 passed, 0 failed.
 
 | Area | Coverage |
 |---|---|
 | Projection | Direct and inverse geodesics against the roadmap reference table, eight azimuths at 75 km, antimeridian, polar, Mercator limits, rejection paths |
 | Radar decode | Archive framing, Type 31 sizes, moment sentinels, missing radials, seam width, azimuth bisection, truncation |
 | Render | Gate corner placement, ring geometry, pointer lookup, threshold classification, north orientation |
-| Map | Pan, pointer-anchored zoom, triangulation, country labels, embedded dataset |
+| Map | Pan, pointer-anchored zoom, triangulation, country labels, projected range rings, adaptive graticule, embedded dataset |
 | Pipeline | Failure context, cache provenance ownership, retry channel closure |
 | Display | Frame provenance, retry, rebuild |
 | Cache | Round trip, digest mismatch, eviction order |
@@ -64,7 +64,7 @@ The headless workflow is recorded in [HEADLESS.md](HEADLESS.md). It runs the rel
 
 The state matrix in [UI_DESIGN.md](UI_DESIGN.md) defines what must be inspected. Each capture is inspected, defects are recorded, fixed, and recaptured.
 
-Current GUI evidence covers the radar and map scenes at 1280x800 in dark and light themes, 1040x640 in light mode, live search results for partial and transposed queries, and the resizable shell. It does not cover collapsed panels, street-scale map, multi-layer composition, playback, or the empty, loading, and error states.
+Current GUI evidence covers the radar and map scenes at 1280x800 in dark and light themes, 1040x640 in light mode, live search results for partial and transposed queries, map range rings and adaptive graticule at 1280x800, and the resizable shell. It does not cover collapsed panels, street-scale map, multi-layer composition, playback, or the empty, loading, and error states.
 
 ## Adding a source
 

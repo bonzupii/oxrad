@@ -61,7 +61,7 @@ Live search is debounced and superseded queries are discarded. Relevance is orde
 | MAP-6 | Hydrography renders as a selectable layer | Not implemented |
 | MAP-7 | Pan and zoom keep the point under the pointer fixed | Implemented |
 | MAP-8 | Coordinates are readable at every zoom level | Implemented |
-| MAP-9 | Range rings, azimuth spokes, and the station marker render in map view | Not implemented |
+| MAP-9 | Range rings, azimuth spokes, and the station marker render in map view | Implemented |
 | MAP-10 | Radar geometry and the basemap share one projection and stay aligned under zoom | Partially implemented |
 | MAP-11 | Distance, bearing, and area measurement work in map view | Partially implemented |
 | MAP-12 | A legend states what each visible layer encodes | Partially implemented |
