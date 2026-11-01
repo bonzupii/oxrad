@@ -22,6 +22,7 @@ This is a pre-release build. The radar display works. The product around it does
 | Forecast | Working: Open-Meteo, global |
 | Place search | Working: live partial and transposed names via Photon; proximity ranking absent |
 | Warnings | United States only |
+| Earthquakes | Working: USGS global feeds by hour, day, and week, with depth and magnitude-scaled symbols, list, and provider event pages |
 | Radar outside the United States | RainViewer composite only; no national Level II adapter |
 | Units selection | Partial: distance and temperature convert; other quantities do not |
 | Light theme | Implemented for chrome, basemap, and radar canvas; two map controls keep their dark fill |
@@ -84,6 +85,7 @@ The cache holds up to 256 entries and 128 MiB. Every body is verified against it
 | Open-Meteo | Forecast | Global | CC BY 4.0 |
 | OpenStreetMap contributors, Photon | Place search | Global | ODbL |
 | Natural Earth | Offline basemap | Global | Public domain |
+| USGS Earthquake Hazards Program | Earthquakes | Global | Public domain |
 | RainViewer | Reflectivity composite | 1,200 or more radars, 150 or more countries | Free terms, attribution required |
 
 Attribution is displayed in the application. Details and researched but unintegrated sources are in [docs/DATA_SOURCES.md](docs/DATA_SOURCES.md).
@@ -95,6 +97,7 @@ Requests identify the client as `oxrad/<version> (https://github.com/bonzupii/ox
 - Radar moments outside the United States are not decoded. No DWD, ECCC, BoM, JMA, CMA, IMD, OPERA, or ODIM reader exists.
 - The basemap has no street-level roads or terrain. Settlements, admin-1 boundaries, major rivers, and major highways are embedded Natural Earth layers.
 - Range rings and spokes render in map view; the product grid remains radar-canvas only.
+- The earthquake layer shows what the USGS summary feeds publish, which is not the same as every earthquake: the day feed starts at M2.5 and the week feed at M4.5, so small events are absent by the provider's own cut. Events the feed lists without a usable magnitude, position, or origin time are counted in the rail instead of being placed at a guessed coordinate.
 - Units selection covers distance and temperature; wind speed, precipitation, pressure, and elevation still use provider units.
 - Radar color-table selection covers the seven decoded products; the global RainViewer raster keeps its provider palette.
 - The two computed products are derived from the reflectivity of the decoded volume. Vertically integrated liquid is the trapezoidal integral of `3.44e-3 Z^(4/7)` between neighbouring elevations, in kilograms per square metre, and is not drawn below one kilogram per square metre. Echo tops are the highest gate at or above 18.5 dBZ, reported as height above the radar because the archive record carries no site elevation. Column matching uses ground range, so a higher tilt reads the gate above the same ground point rather than the gate at the same slant range.

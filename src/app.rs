@@ -40,6 +40,7 @@ use crate::pipeline::{Pipeline, PipelineState};
 use crate::place::{self, Place, SearchInteraction, SearchState};
 use crate::product::RadarProduct;
 use crate::provider::timestamp_label;
+use crate::quake_layer::QuakeLayer;
 use crate::radar::{ArchiveOrigin, GateValue, RetrievedVolume};
 use crate::radar_controls::{self, Selection};
 use crate::render;
@@ -253,7 +254,11 @@ const fn warning_colour(severity: Severity) -> Color32 {
     }
 }
 
-fn toggle_button(palette: &Palette, label: &str, selected: bool) -> egui::Button<'static> {
+pub(crate) fn toggle_button(
+    palette: &Palette,
+    label: &str,
+    selected: bool,
+) -> egui::Button<'static> {
     let fill = if selected {
         palette.accent
     } else {
@@ -286,7 +291,7 @@ fn color_table_selector(ui: &mut egui::Ui, selected: ColorTable) -> ColorTable {
     chosen
 }
 
-fn action_button(palette: &Palette, label: &str) -> egui::Button<'static> {
+pub(crate) fn action_button(palette: &Palette, label: &str) -> egui::Button<'static> {
     egui::Button::new(
         RichText::new(label)
             .size(theme::TYPE_BODY)
@@ -437,6 +442,7 @@ pub struct OxradApp {
     warning_state: WarningState,
     warning_request_due: Option<Instant>,
     warning_refresh_due: Option<Instant>,
+    quakes: QuakeLayer,
     history: HistoryView,
 }
 
@@ -517,6 +523,7 @@ impl OxradApp {
             warning_state: WarningState::Idle,
             warning_request_due: Some(Instant::now()),
             warning_refresh_due: None,
+            quakes: QuakeLayer::new(),
             history: HistoryView::new(),
         };
         if let Some(place) = &restored_place {
@@ -917,6 +924,7 @@ impl OxradApp {
         self.search.update(Instant::now());
         self.forecast.update(Instant::now());
         self.update_warnings();
+        self.quakes.update(Instant::now());
         self.poll_global_radar(context);
     }
 
@@ -1130,6 +1138,7 @@ impl OxradApp {
                             SceneMode::Map => {
                                 self.map_layer_controls(ui);
                                 self.map_overlay_controls(ui);
+                                self.quake_rail(ui);
                             }
                         }
                         self.warning_section(ui);
@@ -1735,6 +1744,14 @@ impl OxradApp {
                 &palette,
             );
         }
+        let pointer = ui.input(|input| input.pointer.hover_pos());
+        self.quakes.draw(
+            ui.painter(),
+            rect,
+            &transform,
+            pointer,
+            interaction.clicked(),
+        );
         self.map_status(ui, rect);
         if let Some(id) = clicked_site {
             self.choose_site(id);
@@ -2388,6 +2405,20 @@ impl OxradApp {
             FontId::proportional(theme::TYPE_SMALL),
             palette.map_text,
         );
+    }
+
+    fn quake_rail(&mut self, ui: &mut egui::Ui) {
+        let palette = self.config.theme.palette();
+        let Some((lat, lon)) = self.quakes.rail(ui, &palette) else {
+            return;
+        };
+        match MapView::focus(lat, lon, 1_200.0) {
+            Ok(view) => {
+                self.map_view = view;
+                self.schedule_viewport_reload();
+            }
+            Err(error) => self.notice = Some(format!("Map centre unavailable: {error}")),
+        }
     }
 
     fn map_layer_controls(&mut self, ui: &mut egui::Ui) {

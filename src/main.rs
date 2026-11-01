@@ -34,6 +34,8 @@ mod place;
 mod product;
 mod projection;
 mod provider;
+mod quake;
+mod quake_layer;
 mod radar;
 mod radar_controls;
 mod raster;

@@ -23,6 +23,7 @@ A source is never listed as available because an organisation publishes somethin
 | Place search | OpenStreetMap contributors, Photon | Global | Place name, region, country, coordinates | `photon.komoot.io/api/`, GeoJSON | Live, fair use | ODbL 1.0 for data, attribution required | Verified |
 | Global radar composite | RainViewer | 1,200 or more radars in 150 or more countries | Reflectivity composite tiles, two hours of ten-minute frames | `api.rainviewer.com` manifest, `tilecache.rainviewer.com` tiles | 10 minutes | Free personal and community terms, visible attribution required | Verified |
 | Basemap | Natural Earth | Global | Countries, settlements, admin-1 boundaries, rivers, major highways | Embedded GeoJSON | Static release | Public domain | Verified |
+| Earthquakes | USGS Earthquake Hazards Program | Global | Epicentre, magnitude and scale, depth, origin time, review status, tsunami flag, PAGER alert level, felt reports, event page | `earthquake.usgs.gov/earthquakes/feed/v1.0/summary/`, GeoJSON | Minute-scale, feeds summarise the past hour, day, week | United States Government work, public domain | Verified |
 
 RainViewer is a processed composite. It is not Level II and cannot supply moment-level products. Attribution is displayed in map view.
 
@@ -70,7 +71,6 @@ Coverage claims for these networks stay out of the interface until an adapter wo
 
 | Domain | Service | Status |
 |---|---|---|
-| Earthquakes | USGS earthquake feeds | Candidate |
 | Wildfire hotspots | NASA FIRMS | Candidate |
 | Satellite imagery | EUMETSAT, NOAA nowCOAST and GOES products | Candidate |
 | Air quality | OpenAQ | Candidate |
@@ -78,6 +78,8 @@ Coverage claims for these networks stay out of the interface until an adapter wo
 | Lightning | Regional detection networks | Candidate |
 
 These are research targets. None has an adapter, and none appears as a layer.
+
+The USGS feeds are admitted: the layer requests `all_hour`, `2.5_day`, or `4.5_week`, keeps each event's own magnitude scale and review status, and counts events the provider listed without a usable magnitude, position, or time instead of plotting them at an invented value. The magnitude floor is part of the feed, so the interface states the floor beside the count: a quiet hour under a floor is not a quiet planet.
 
 ## Admission protocol
 
