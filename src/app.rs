@@ -1513,12 +1513,35 @@ impl OxradApp {
 
     fn status(&mut self, ui: &mut egui::Ui) {
         let mut retry_pipeline = false;
-        let mut retry_display = false;
+        let mut refresh_now = false;
         let failed = self.failed();
         egui::Panel::bottom("status").show_inside(ui, |ui| {
             ui.style_mut().visuals = self.config.theme.visuals();
             ui.add_space(6.0);
-            ui.horizontal_wrapped(|ui| {
+            refresh_now = self.status_row(ui, failed);
+            retry_pipeline = self.status_failures(ui);
+            if let Some(frame) = &self.display.frame {
+                diagnostics(ui, frame, self.site_station());
+            }
+            ui.add_space(6.0);
+        });
+        if (retry_pipeline || refresh_now)
+            && let Some(pipeline) = self.pipeline.as_mut()
+        {
+            match pipeline.retry() {
+                Ok(()) => {
+                    self.notice = Some(String::from("Asking for the newest volume now."));
+                }
+                Err(error) => self.notice = Some(format!("Refresh unavailable: {error}")),
+            }
+        }
+    }
+
+    /// The identity and freshness row: which radar, which moment, how old, and
+    /// the manual refresh. Returns whether a refresh was requested.
+    fn status_row(&self, ui: &mut egui::Ui, failed: bool) -> bool {
+        let mut refresh_now = false;
+        ui.horizontal_wrapped(|ui| {
                 match (&self.site, self.site_station()) {
                     (Some(site), Some(station)) => {
                         ui.strong(format!(
@@ -1553,59 +1576,73 @@ impl OxradApp {
                     }
                     scan_status(ui, frame, failed);
                 }
+                if self.site.is_some() {
+                    ui.separator();
+                    let working = self
+                        .pipeline
+                        .as_ref()
+                        .is_some_and(|pipeline| pipeline.state.is_working());
+                    if ui
+                        .add_enabled(!working, egui::Button::new("Refresh now"))
+                        .on_hover_text(
+                            "Fetch the newest volume for this site instead of waiting for the next poll.",
+                        )
+                        .clicked()
+                    {
+                        refresh_now = true;
+                    }
+                }
             });
-            if let Some(failure) = self
-                .pipeline
-                .as_ref()
-                .and_then(|pipeline| pipeline.state.failure())
-            {
-                ui.horizontal_wrapped(|ui| {
-                    ui.colored_label(
-                        ERROR,
-                        format!(
-                            "{} failed for {}: {}",
-                            failure.operation.description(),
-                            self.site.as_ref().map_or("no site", |site| site.as_str()),
-                            failure.error
-                        ),
-                    );
-                    if let Some(wait) = failure.retry_in {
-                        ui.label(format!("Retry in {} s", wait.as_secs()));
-                    }
-                    if failure.waiting_for_next_volume {
-                        ui.label("Waiting for a new volume or a manual retry.");
-                    }
-                    retry_pipeline = ui.button("Retry now").clicked();
-                });
-            }
-            if let Some(error) = self.display.state.error() {
-                ui.horizontal_wrapped(|ui| {
-                    ui.colored_label(
-                        ERROR,
-                        format!(
-                            "Radar image for {} failed: {error}",
-                            self.site.as_ref().map_or("no site", |site| site.as_str())
-                        ),
-                    );
-                    if self.display.state.retryable() {
-                        retry_display = ui.button("Retry render").clicked();
-                    }
-                });
-            }
-            if let Some(frame) = &self.display.frame {
-                diagnostics(ui, frame, self.site_station());
-            }
-            ui.add_space(6.0);
-        });
-        if retry_pipeline
-            && let Some(pipeline) = self.pipeline.as_mut()
-            && let Err(error) = pipeline.retry()
+        refresh_now
+    }
+
+    /// The failure rows of the status bar, with their retry controls. Returns
+    /// whether a pipeline retry was requested.
+    fn status_failures(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut retry_pipeline = false;
+        let mut retry_display = false;
+        if let Some(failure) = self
+            .pipeline
+            .as_ref()
+            .and_then(|pipeline| pipeline.state.failure())
         {
-            self.notice = Some(format!("Retry unavailable: {error}"));
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(
+                    ERROR,
+                    format!(
+                        "{} failed for {}: {}",
+                        failure.operation.description(),
+                        self.site.as_ref().map_or("no site", |site| site.as_str()),
+                        failure.error
+                    ),
+                );
+                if let Some(wait) = failure.retry_in {
+                    ui.label(format!("Retry in {} s", wait.as_secs()));
+                }
+                if failure.waiting_for_next_volume {
+                    ui.label("Waiting for a new volume or a manual retry.");
+                }
+                retry_pipeline = ui.button("Retry now").clicked();
+            });
+        }
+        if let Some(error) = self.display.state.error() {
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(
+                    ERROR,
+                    format!(
+                        "Radar image for {} failed: {error}",
+                        self.site.as_ref().map_or("no site", |site| site.as_str())
+                    ),
+                );
+                if self.display.state.retryable() {
+                    retry_display = ui.button("Retry render").clicked();
+                }
+            });
         }
         if retry_display {
             self.display.retry();
         }
+        retry_pipeline
     }
 
     fn scene(&mut self, ui: &mut egui::Ui) {
