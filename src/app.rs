@@ -1634,67 +1634,64 @@ impl OxradApp {
                 return;
             }
         };
-        let palette = self.config.theme.palette();
-        // The stack is drawn bottom-up in one place so a layer's position is
-        // deliberate: the basemap, then its roads, then the radar over the
-        // roads, then warnings, then the map's own text. Roads used to be drawn
-        // after the radar, which buried the echo under the highway lines a
-        // chaser is trying to read it against.
-        self.draw_basemap(ui, rect, &palette);
-        self.map_supplemental_lines(ui, rect, &transform);
-        self.map_supplemental_roads(ui, rect, &transform);
-        self.map_global(ui, &transform);
-        let span_km = self.map_view.span_km();
-        let radar_visible = self.radars(ui, rect, &transform, span_km, true);
-        self.draw_rings(ui, rect, &transform);
-        self.map_warnings(ui, rect, &transform);
-        self.map_supplemental_places(ui, rect, &transform);
-        self.map_measure(ui, rect, &transform, &interaction);
-        let clicked_site = if self.measure.is_on() {
-            None
-        } else {
-            self.map_stations(ui, rect, &transform, &interaction)
-        };
-        self.map_place(ui, &transform);
-        map::draw_scale(ui.painter(), rect, &transform, &palette);
+        let view = self.map_view;
+        let (_, clicked_site) =
+            self.draw_geographic_stack(ui, rect, &view, &transform, &interaction, Canvas::Map);
         self.map_controls(ui, rect);
-        self.map_readout(ui, rect, &transform, radar_visible);
         if let Some(id) = clicked_site {
             self.choose_site(id);
         }
     }
 
-    fn map_supplemental_lines(&self, ui: &egui::Ui, rect: Rect, transform: &map::MapTransform) {
+    fn map_supplemental_lines(
+        &self,
+        ui: &egui::Ui,
+        rect: Rect,
+        transform: &map::MapTransform,
+        span_km: f64,
+    ) {
         if let Ok(layers) = &self.basemap_layers {
             layers.draw_lines(
                 ui.painter(),
                 transform,
                 rect,
-                self.map_view.span_km(),
+                span_km,
                 &self.config.theme.palette(),
             );
         }
     }
 
-    fn map_supplemental_roads(&self, ui: &egui::Ui, rect: Rect, transform: &map::MapTransform) {
+    fn map_supplemental_roads(
+        &self,
+        ui: &egui::Ui,
+        rect: Rect,
+        transform: &map::MapTransform,
+        span_km: f64,
+    ) {
         if let Ok(layers) = &self.basemap_layers {
             layers.draw_roads(
                 ui.painter(),
                 transform,
                 rect,
-                self.map_view.span_km(),
+                span_km,
                 &self.config.theme.palette(),
             );
         }
     }
 
-    fn map_supplemental_places(&self, ui: &egui::Ui, rect: Rect, transform: &map::MapTransform) {
+    fn map_supplemental_places(
+        &self,
+        ui: &egui::Ui,
+        rect: Rect,
+        transform: &map::MapTransform,
+        span_km: f64,
+    ) {
         if let Ok(layers) = &self.basemap_layers {
             layers.draw_places(
                 ui.painter(),
                 transform,
                 rect,
-                self.map_view.span_km(),
+                span_km,
                 &self.config.theme.palette(),
             );
         }
@@ -3428,17 +3425,9 @@ impl OxradApp {
                 return;
             }
         };
-        self.draw_basemap(ui, rect, &palette);
-        let radar_visible = self.radars(ui, rect, &transform, self.radar_view.span_km(), false);
-        self.draw_rings(ui, rect, &transform);
-        self.map_warnings(ui, rect, &transform);
-        let clicked_site = if self.measure.is_on() {
-            None
-        } else {
-            self.map_stations(ui, rect, &transform, &interaction)
-        };
-        self.map_place(ui, &transform);
-        map::draw_scale(ui.painter(), rect, &transform, &palette);
+        let view = self.radar_view;
+        let (radar_visible, clicked_site) =
+            self.draw_geographic_stack(ui, rect, &view, &transform, &interaction, Canvas::Radar);
         north_marker(ui.painter(), rect);
         if let Some(frame) = self.display.frame.as_ref() {
             map_caption(ui.painter(), rect, frame);
@@ -3458,12 +3447,66 @@ impl OxradApp {
         }
     }
 
+    /// Draws every geographic layer, bottom to top, for whichever workspace is
+    /// asking.
+    ///
+    /// One stack, in one place, so a layer's position is deliberate rather than
+    /// an accident of which scene drew it: the basemap and its lines, then roads
+    /// and water, then the radar over them, then warnings, then the labels and
+    /// markers that have to stay readable above the echo. Both workspaces get
+    /// the same geography; only which radars they include differs.
+    fn draw_geographic_stack(
+        &mut self,
+        ui: &egui::Ui,
+        rect: Rect,
+        view: &map::MapView,
+        transform: &map::MapTransform,
+        interaction: &egui::Response,
+        canvas: Canvas,
+    ) -> (bool, Option<SiteId>) {
+        let palette = self.config.theme.palette();
+        let span_km = view.span_km();
+        self.draw_basemap(ui, rect, view, &palette);
+        if let Err(error) = &self.basemap_layers {
+            ui.painter().text(
+                Pos2::new(rect.left() + 16.0, rect.top() + 34.0),
+                Align2::LEFT_TOP,
+                format!("Roads, water, and place names could not be loaded: {error}"),
+                FontId::proportional(12.0),
+                ERROR,
+            );
+        }
+        self.map_supplemental_lines(ui, rect, transform, span_km);
+        self.map_supplemental_roads(ui, rect, transform, span_km);
+        self.map_global(ui, transform);
+        let include_viewport = canvas == Canvas::Map;
+        let radar_visible = self.radars(ui, rect, transform, span_km, include_viewport);
+        self.draw_rings(ui, rect, transform);
+        self.map_warnings(ui, rect, transform);
+        self.map_supplemental_places(ui, rect, transform, span_km);
+        self.map_measure(ui, rect, transform, interaction);
+        let clicked_site = if self.measure.is_on() {
+            None
+        } else {
+            self.map_stations(ui, rect, transform, interaction)
+        };
+        self.map_place(ui, transform);
+        map::draw_scale(ui.painter(), rect, transform, &palette);
+        self.map_readout(ui, rect, transform, radar_visible);
+        (radar_visible, clicked_site)
+    }
+
     /// Draws the basemap under everything else, reporting its failure where the
     /// map would have been rather than in a corner.
-    fn draw_basemap(&self, ui: &egui::Ui, rect: Rect, palette: &Palette) {
+    ///
+    /// The view is passed in because each workspace keeps its own: the radar
+    /// canvas is fitted to its station while the geographic one is wherever the
+    /// user left it, and a basemap drawn from the wrong view puts an ocean under
+    /// a Kansas supercell.
+    fn draw_basemap(&self, ui: &egui::Ui, rect: Rect, view: &map::MapView, palette: &Palette) {
         match &self.map {
             Ok(world) => {
-                if let Err(error) = world.draw(ui.painter(), &self.map_view, rect, palette) {
+                if let Err(error) = world.draw(ui.painter(), view, rect, palette) {
                     ui.painter().text(
                         rect.center(),
                         Align2::CENTER_CENTER,
