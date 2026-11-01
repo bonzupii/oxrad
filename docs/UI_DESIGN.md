@@ -165,7 +165,7 @@ Every cell is inspected in dark and light themes. The matrix is 80 combinations.
 | Type scale | Partial. Sizes route through `TYPE_*`; 10 to 17 point literals remain |
 | Themes | Implemented: dark and light, persisted. Two map chrome elements still draw dark fills in light mode |
 | Map radar geometry | Implemented: geodesic 50 km rings, eight spokes, unit-aware labels, adaptive graticule |
-| Map detail | Implemented: 1:10m settlements, 1:50m admin-1 boundaries and rivers, span-filtered |
+| Map detail | Implemented: 1:10m settlements and major highways, 1:50m admin-1 boundaries and rivers, span-filtered |
 | Panel collapse | Absent |
 | Focus ring | Absent |
 | Accessible names | Not provided |

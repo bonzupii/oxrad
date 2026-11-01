@@ -1894,6 +1894,7 @@ impl OxradApp {
         {
             self.notice = Some(format!("Map range rings could not be drawn: {error}"));
         }
+        self.map_supplemental_roads(ui, rect, &transform);
         self.map_warnings(ui, rect, &transform);
         self.map_supplemental_places(ui, rect, &transform);
         self.map_measure(ui, rect, &transform, &interaction);
@@ -1914,6 +1915,18 @@ impl OxradApp {
     fn map_supplemental_lines(&self, ui: &egui::Ui, rect: Rect, transform: &map::MapTransform) {
         if let Ok(layers) = &self.basemap_layers {
             layers.draw_lines(
+                ui.painter(),
+                transform,
+                rect,
+                self.map_view.span_km(),
+                &self.config.theme.palette(),
+            );
+        }
+    }
+
+    fn map_supplemental_roads(&self, ui: &egui::Ui, rect: Rect, transform: &map::MapTransform) {
+        if let Ok(layers) = &self.basemap_layers {
+            layers.draw_roads(
                 ui.painter(),
                 transform,
                 rect,

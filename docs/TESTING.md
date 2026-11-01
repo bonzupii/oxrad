@@ -9,7 +9,7 @@
 | Projection | Direct and inverse geodesics against the roadmap reference table, eight azimuths at 75 km, antimeridian, polar, Mercator limits, rejection paths |
 | Radar decode | Archive framing, Type 31 sizes, moment sentinels, missing radials, seam width, azimuth bisection, truncation |
 | Render | Gate corner placement, ring geometry, pointer lookup, threshold classification, north orientation |
-| Map | Pan, pointer-anchored zoom, triangulation, country labels, settlement labels, admin-1 boundaries, rivers, projected range rings, adaptive graticule, embedded datasets |
+| Map | Pan, pointer-anchored zoom, triangulation, country labels, settlement labels, admin-1 boundaries, rivers, major highways, projected range rings, adaptive graticule, embedded datasets |
 | Pipeline | Failure context, cache provenance ownership, retry channel closure |
 | Display | Frame provenance, retry, rebuild |
 | Cache | Round trip, digest mismatch, eviction order |

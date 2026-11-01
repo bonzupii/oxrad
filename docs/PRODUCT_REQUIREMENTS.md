@@ -56,7 +56,7 @@ Live search is debounced and superseded queries are discarded. Relevance is orde
 | MAP-1 | Global, continental, regional, local, and street scales render distinct content | Not implemented |
 | MAP-2 | Country and coastline geometry renders from a real dataset | Implemented |
 | MAP-3 | Settlements and labels render with collision avoidance | Implemented |
-| MAP-4 | Roads and streets render at street scale | Not implemented |
+| MAP-4 | Roads and streets render at street scale | Partially implemented |
 | MAP-5 | Terrain or elevation renders as a selectable layer | Not implemented |
 | MAP-6 | Hydrography renders as a selectable layer | Partially implemented |
 | MAP-7 | Pan and zoom keep the point under the pointer fixed | Implemented |
@@ -66,7 +66,7 @@ Live search is debounced and superseded queries are discarded. Relevance is orde
 | MAP-11 | Distance, bearing, and area measurement work in map view | Partially implemented |
 | MAP-12 | A legend states what each visible layer encodes | Partially implemented |
 
-Only two-point distance and bearing are implemented. Area measurement is not. Rivers and admin-1 boundaries are embedded vector layers; they are not yet individually selectable.
+Only two-point distance and bearing are implemented. Area measurement is not. Rivers, admin-1 boundaries, and major highways are embedded vector layers; they are not yet individually selectable, and street-level roads are not embedded.
 
 ### Radar observation
 

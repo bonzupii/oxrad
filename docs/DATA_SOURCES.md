@@ -22,7 +22,7 @@ A source is never listed as available because an organisation publishes somethin
 | Global forecast | Open-Meteo | Global | Current, hourly, daily | `api.open-meteo.com/v1/forecast` | Hourly model updates | CC BY 4.0, attribution required | Verified |
 | Place search | OpenStreetMap contributors, Photon | Global | Place name, region, country, coordinates | `photon.komoot.io/api/`, GeoJSON | Live, fair use | ODbL 1.0 for data, attribution required | Verified |
 | Global radar composite | RainViewer | 1,200 or more radars in 150 or more countries | Reflectivity composite tiles, two hours of ten-minute frames | `api.rainviewer.com` manifest, `tilecache.rainviewer.com` tiles | 10 minutes | Free personal and community terms, visible attribution required | Verified |
-| Basemap | Natural Earth | Global | Countries, settlements, admin-1 boundaries, rivers | Embedded GeoJSON | Static release | Public domain | Verified |
+| Basemap | Natural Earth | Global | Countries, settlements, admin-1 boundaries, rivers, major highways | Embedded GeoJSON | Static release | Public domain | Verified |
 
 RainViewer is a processed composite. It is not Level II and cannot supply moment-level products. Attribution is displayed in map view.
 

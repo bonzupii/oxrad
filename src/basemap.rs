@@ -32,9 +32,11 @@ use crate::theme::Palette;
 const PLACES: &str = include_str!("../assets/ne_10m_populated_places_simple.geojson");
 const ADMIN_LINES: &str = include_str!("../assets/ne_50m_admin_1_states_provinces_lines.geojson");
 const RIVERS: &str = include_str!("../assets/ne_50m_rivers_lake_centerlines.geojson");
+const ROADS: &str = include_str!("../assets/ne_10m_roads_major.geojson");
 const MAX_PLACE_LABELS: usize = 70;
 const ADMIN_SPAN_LIMIT_KM: f64 = 6_000.0;
 const RIVER_SPAN_LIMIT_KM: f64 = 3_000.0;
+const ROAD_SPAN_LIMIT_KM: f64 = 2_000.0;
 const LABEL_GAP: f32 = 4.0;
 const CULL_MARGIN: f32 = 80.0;
 
@@ -112,6 +114,7 @@ pub struct BasemapLayers {
     places: Vec<Place>,
     admin: Vec<Polyline>,
     rivers: Vec<Polyline>,
+    roads: Vec<Polyline>,
 }
 
 impl BasemapLayers {
@@ -125,10 +128,12 @@ impl BasemapLayers {
         let places = parse_places()?;
         let admin = parse_lines(ADMIN_LINES, "admin-1 boundaries")?;
         let rivers = parse_lines(RIVERS, "rivers")?;
+        let roads = parse_lines(ROADS, "major roads")?;
         Ok(Self {
             places,
             admin,
             rivers,
+            roads,
         })
     }
 
@@ -155,6 +160,28 @@ impl BasemapLayers {
                 if visible(line, transform, rect) {
                     draw_polyline(painter, transform, rect, line, stroke);
                 }
+            }
+        }
+    }
+
+    /// Draws major highways above the radar so they remain usable at storm scale.
+    pub fn draw_roads(
+        &self,
+        painter: &egui::Painter,
+        transform: &MapTransform,
+        rect: Rect,
+        span_km: f64,
+        _palette: &Palette,
+    ) {
+        if span_km > ROAD_SPAN_LIMIT_KM {
+            return;
+        }
+        let casing = Stroke::new(2.4_f32, with_alpha(Color32::from_rgb(18, 18, 18), 150));
+        let fill = Stroke::new(1.2_f32, Color32::from_rgb(240, 200, 110));
+        for line in &self.roads {
+            if visible(line, transform, rect) {
+                draw_polyline(painter, transform, rect, line, casing);
+                draw_polyline(painter, transform, rect, line, fill);
             }
         }
     }
@@ -502,6 +529,7 @@ mod tests {
             layers.admin.len()
         );
         assert!(layers.rivers.len() > 300, "rivers {}", layers.rivers.len());
+        assert!(layers.roads.len() > 5_000, "roads {}", layers.roads.len());
         Ok(())
     }
 

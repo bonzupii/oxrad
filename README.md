@@ -17,7 +17,7 @@ This is a pre-release build. The radar display works. The product around it does
 | NEXRAD Level II decode and display | Working |
 | Radar products and tilts | Working: seven moment products, every complete sweep |
 | Radar history and playback | Working: eight recent volumes, loop, scrub |
-| Offline vector basemap | Working: countries, settlements, admin-1 boundaries, rivers |
+| Offline vector basemap | Working: countries, settlements, admin-1 boundaries, rivers, major highways |
 | Global radar composite | Working: RainViewer, two-hour loop |
 | Forecast | Working: Open-Meteo, global |
 | Place search | Working: live partial and transposed names via Photon; proximity ranking absent |
@@ -91,7 +91,7 @@ Requests identify the client as `oxrad/<version> (https://github.com/bonzupii/ox
 ## Limitations
 
 - Radar moments outside the United States are not decoded. No DWD, ECCC, BoM, JMA, CMA, IMD, OPERA, or ODIM reader exists.
-- The basemap has no roads, streets, or terrain. Settlements, admin-1 boundaries, and major rivers are embedded Natural Earth layers.
+- The basemap has no street-level roads or terrain. Settlements, admin-1 boundaries, major rivers, and major highways are embedded Natural Earth layers.
 - Range rings and spokes render in map view; the product grid remains radar-canvas only.
 - Units selection covers distance and temperature; wind speed, precipitation, pressure, and elevation still use provider units.
 - There is one dark palette per product. No colourblind-safe alternative exists.
