@@ -1601,6 +1601,8 @@ impl OxradApp {
         if rect.width() <= 0.0 || rect.height() <= 0.0 {
             return;
         }
+        let palette = self.config.theme.palette();
+        let (rect, legend_rect) = legend_split(rect, self.legend_expected());
         self.map_viewport = Some(rect);
         let interaction = ui.interact(
             rect,
@@ -1635,8 +1637,19 @@ impl OxradApp {
             }
         };
         let view = self.map_view;
-        let (_, clicked_site) =
+        let (radar_visible, clicked_site) =
             self.draw_geographic_stack(ui, rect, &view, &transform, &interaction, Canvas::Map);
+        if radar_visible && let Some(legend) = legend_rect {
+            ui.painter()
+                .rect_filled(legend, CornerRadius::ZERO, palette.canvas);
+            overlay::draw_legend(
+                ui.painter(),
+                legend,
+                self.product,
+                self.config.color_table,
+                &palette,
+            );
+        }
         self.map_controls(ui, rect);
         if let Some(id) = clicked_site {
             self.choose_site(id);
@@ -1685,6 +1698,7 @@ impl OxradApp {
         rect: Rect,
         transform: &map::MapTransform,
         span_km: f64,
+        occupied: &mut Vec<Rect>,
     ) {
         if let Ok(layers) = &self.basemap_layers {
             layers.draw_places(
@@ -1693,6 +1707,7 @@ impl OxradApp {
                 rect,
                 span_km,
                 &self.config.theme.palette(),
+                occupied,
             );
         }
     }
@@ -2055,16 +2070,28 @@ impl OxradApp {
         if let Some(message) = failure {
             self.notice = Some(message);
         }
-        if drew {
-            overlay::draw_legend(
-                ui.painter(),
-                rect,
-                self.product,
-                self.config.color_table,
-                &self.config.theme.palette(),
-            );
-        }
         drew
+    }
+
+    /// Whether this workspace will draw a radar legend this frame.
+    ///
+    /// The scenes reserve the legend's strip before they know what the stack
+    /// will draw, so the question is answered here from the same conditions the
+    /// stack uses rather than from its result.
+    fn legend_expected(&self) -> bool {
+        let selected = self
+            .display
+            .frame
+            .as_ref()
+            .is_some_and(|frame| frame.geometry.product == self.product);
+        let viewport = self.view_radars.iter().any(|layer| {
+            layer
+                .display
+                .frame
+                .as_ref()
+                .is_some_and(|frame| frame.geometry.product == self.product)
+        });
+        self.gpu.is_some() && (selected || viewport)
     }
 
     fn map_warnings(&self, ui: &egui::Ui, rect: Rect, transform: &map::MapTransform) {
@@ -3394,13 +3421,14 @@ impl OxradApp {
     /// storm-chaser view that cannot pan or zoom is a view that cannot be used
     /// to find a road under the storm.
     fn radar_scene(&mut self, ui: &mut egui::Ui) {
-        let rect = ui.max_rect();
+        let full_rect = ui.max_rect();
         let palette = self.config.theme.palette();
         ui.painter()
-            .rect_filled(rect, CornerRadius::ZERO, palette.canvas);
-        if rect.width() <= 0.0 || rect.height() <= 0.0 {
+            .rect_filled(full_rect, CornerRadius::ZERO, palette.canvas);
+        if full_rect.width() <= 0.0 || full_rect.height() <= 0.0 {
             return;
         }
+        let (rect, legend_rect) = legend_split(full_rect, self.legend_expected());
         let interaction = ui.interact(
             rect,
             ui.id().with("radar-canvas"),
@@ -3428,6 +3456,17 @@ impl OxradApp {
         let view = self.radar_view;
         let (radar_visible, clicked_site) =
             self.draw_geographic_stack(ui, rect, &view, &transform, &interaction, Canvas::Radar);
+        if radar_visible && let Some(legend) = legend_rect {
+            ui.painter()
+                .rect_filled(legend, CornerRadius::ZERO, palette.canvas);
+            overlay::draw_legend(
+                ui.painter(),
+                legend,
+                self.product,
+                self.config.color_table,
+                &palette,
+            );
+        }
         north_marker(ui.painter(), rect);
         if let Some(frame) = self.display.frame.as_ref() {
             map_caption(ui.painter(), rect, frame);
@@ -3481,9 +3520,11 @@ impl OxradApp {
         self.map_global(ui, transform);
         let include_viewport = canvas == Canvas::Map;
         let radar_visible = self.radars(ui, rect, transform, span_km, include_viewport);
-        self.draw_rings(ui, rect, transform);
+        let ring_labels = self.draw_rings(ui, rect, transform);
         self.map_warnings(ui, rect, transform);
-        self.map_supplemental_places(ui, rect, transform, span_km);
+        let mut occupied: Vec<Rect> = chrome_obstacles(rect).to_vec();
+        self.map_supplemental_places(ui, rect, transform, span_km, &mut occupied);
+        self.draw_ring_labels(ui, rect, transform, &ring_labels, &mut occupied);
         self.map_measure(ui, rect, transform, interaction);
         let clicked_site = if self.measure.is_on() {
             None
@@ -3528,11 +3569,59 @@ impl OxradApp {
         }
     }
 
-    fn draw_rings(&self, ui: &egui::Ui, rect: Rect, transform: &map::MapTransform) {
+    fn draw_rings(
+        &self,
+        ui: &egui::Ui,
+        rect: Rect,
+        transform: &map::MapTransform,
+    ) -> Vec<map::RingLabel> {
         let Some(station) = self.site_station() else {
-            return;
+            return Vec::new();
         };
         let Some(coverage_km) = self.radar_coverage_km() else {
+            return Vec::new();
+        };
+        let palette = self.config.theme.palette();
+        let context = map::RingContext {
+            painter: ui.painter(),
+            rect,
+            transform,
+            site_lat: station.lat,
+            site_lon: station.lon,
+            coverage_km,
+            units: self.config.units,
+            palette: &palette,
+        };
+        match map::draw_range_rings(&context) {
+            Ok(labels) => labels,
+            Err(error) => {
+                ui.painter().text(
+                    Pos2::new(rect.left() + 16.0, rect.bottom() - 20.0),
+                    Align2::LEFT_CENTER,
+                    format!("Range rings could not be drawn: {error}"),
+                    FontId::proportional(12.0),
+                    ERROR,
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// Places the ring distances after the place names, so a label never lands
+    /// on top of a town.
+    fn draw_ring_labels(
+        &self,
+        ui: &egui::Ui,
+        rect: Rect,
+        transform: &map::MapTransform,
+        labels: &[map::RingLabel],
+        occupied: &mut Vec<Rect>,
+    ) {
+        if labels.is_empty() {
+            return;
+        }
+        let (Some(station), Some(coverage_km)) = (self.site_station(), self.radar_coverage_km())
+        else {
             return;
         };
         let palette = self.config.theme.palette();
@@ -3546,11 +3635,11 @@ impl OxradApp {
             units: self.config.units,
             palette: &palette,
         };
-        if let Err(error) = map::draw_range_rings(&context) {
+        if let Err(error) = map::draw_ring_labels(&context, labels, occupied) {
             ui.painter().text(
-                Pos2::new(rect.left() + 16.0, rect.bottom() - 20.0),
+                Pos2::new(rect.left() + 16.0, rect.bottom() - 36.0),
                 Align2::LEFT_CENTER,
-                format!("Range rings could not be drawn: {error}"),
+                format!("Range ring labels could not be drawn: {error}"),
                 FontId::proportional(12.0),
                 ERROR,
             );
@@ -4022,6 +4111,41 @@ fn forecast_period(ui: &mut egui::Ui, period: &ForecastPeriod, units: crate::uni
     );
     ui.add_space(6.0);
     ui.separator();
+}
+
+/// The bands the canvas's own chrome occupies, top-left and bottom-left, so
+/// place labels do not print through the scan caption or the scale bar.
+fn chrome_obstacles(rect: Rect) -> [Rect; 2] {
+    let caption_width = (rect.width().min(470.0) - 8.0).max(0.0);
+    [
+        Rect::from_min_size(
+            Pos2::new(rect.left() + 8.0, rect.top() + 2.0),
+            Vec2::new(caption_width, 20.0),
+        ),
+        Rect::from_min_size(
+            Pos2::new(rect.left() + 8.0, rect.bottom() - 54.0),
+            Vec2::new(190.0, 52.0),
+        ),
+    ]
+}
+
+/// Splits a canvas into the map and a strip for the colour legend.
+///
+/// The legend used to be painted over the map's right edge, where it covered
+/// the echo and the place names beside it. The strip is wide enough for the
+/// legend's backing panel and is filled separately, so neither the map nor its
+/// labels can end up underneath it.
+const LEGEND_STRIP: f32 = 92.0;
+
+fn legend_split(rect: Rect, reserved: bool) -> (Rect, Option<Rect>) {
+    let width = LEGEND_STRIP.min(rect.width() / 3.0);
+    if !reserved || rect.width() <= width {
+        return (rect, None);
+    }
+    let divide = rect.right() - width;
+    let map = Rect::from_min_max(rect.min, Pos2::new(divide, rect.bottom()));
+    let legend = Rect::from_min_max(Pos2::new(divide, rect.top()), rect.max);
+    (map, Some(legend))
 }
 
 fn map_caption(painter: &egui::Painter, rect: Rect, frame: &Frame) {

@@ -194,8 +194,8 @@ impl BasemapLayers {
         rect: Rect,
         span_km: f64,
         palette: &Palette,
+        occupied: &mut Vec<Rect>,
     ) {
-        let mut labels: Vec<Rect> = Vec::new();
         for place in &self.places {
             if !place_visible(place, span_km) {
                 continue;
@@ -207,7 +207,7 @@ impl BasemapLayers {
                 continue;
             }
             painter.circle_filled(position, 2.5_f32, palette.map_text);
-            if labels.len() >= MAX_PLACE_LABELS {
+            if occupied.len() >= MAX_PLACE_LABELS {
                 continue;
             }
             let galley = painter.layout_no_wrap(
@@ -215,12 +215,22 @@ impl BasemapLayers {
                 FontId::proportional(11.0),
                 palette.map_text,
             );
-            let origin = position + Vec2::new(6.0, -galley.size().y / 2.0);
-            let label = Rect::from_min_size(origin, galley.size() + Vec2::splat(LABEL_GAP));
-            if labels.iter().any(|other| other.intersects(label)) {
+            let mut origin = position + Vec2::new(6.0, -galley.size().y / 2.0);
+            let mut label = Rect::from_min_size(origin, galley.size() + Vec2::splat(LABEL_GAP));
+            // A name near the map's edge used to be cut mid-word. It is mirrored
+            // to the other side of its dot, and dropped only when neither side
+            // fits inside the canvas.
+            if !rect.shrink(2.0).contains_rect(label) {
+                origin = position - Vec2::new(galley.size().x + 6.0, galley.size().y / 2.0);
+                label = Rect::from_min_size(origin, galley.size() + Vec2::splat(LABEL_GAP));
+                if !rect.shrink(2.0).contains_rect(label) {
+                    continue;
+                }
+            }
+            if occupied.iter().any(|other| other.intersects(label)) {
                 continue;
             }
-            labels.push(label);
+            occupied.push(label);
             painter.rect_filled(
                 label,
                 egui::CornerRadius::same(2),

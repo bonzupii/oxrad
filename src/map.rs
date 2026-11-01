@@ -532,46 +532,68 @@ impl RingPlan {
     }
 }
 
-/// Place one ring's distance label.
+/// A ring whose distance still needs a label.
+#[derive(Debug, Clone, Copy)]
+pub struct RingLabel {
+    pub range_km: f64,
+    pub index: u32,
+}
+
+/// Place one ring's distance label clear of everything already labelled.
 ///
 /// Labels alternate between the south-east and north-west diagonals of the
 /// site, so successive rings never stack their labels down one spoke through
-/// the middle of the echo, and consecutive labels are separated vertically as
-/// well as horizontally.
-fn ring_label(context: &RingContext<'_>, range_km: f64, index: u32) -> Result<(), MapError> {
-    // Odd rings carry their label south-east of the site and even rings
-    // north-west, so no two labels share a line through the echo.
-    let azimuth_deg = if index.is_multiple_of(2) {
+/// the middle of the echo. A label that would print over an existing one walks
+/// along its own arc until it finds room.
+fn ring_label(
+    context: &RingContext<'_>,
+    label: RingLabel,
+    occupied: &mut Vec<Rect>,
+) -> Result<(), MapError> {
+    let base_azimuth = if label.index.is_multiple_of(2) {
         315.0
     } else {
         135.0
     };
-    let (lat, lon) = projection::forward(range_km, azimuth_deg, context.site_lat, context.site_lon)
-        .map_err(|source| MapError::Coordinate { source })?;
-    let Some(point) = context.transform.screen(lat, lon) else {
-        return Ok(());
-    };
-    if !context.rect.shrink(14.0).contains(point) {
-        return Ok(());
-    }
     let galley = context.painter.layout_no_wrap(
-        units::distance_whole(range_km, context.units),
+        units::distance_whole(label.range_km, context.units),
         FontId::monospace(10.0),
         context.palette.map_text,
     );
     let palette = context.palette;
-    let origin = Pos2::new(point.x - galley.size().x / 2.0, point.y + 4.0);
-    context.painter.rect_filled(
-        Rect::from_min_size(origin - Vec2::splat(2.0), galley.size() + Vec2::splat(4.0)),
-        CornerRadius::same(2),
-        Color32::from_rgba_unmultiplied(
-            palette.surface.r(),
-            palette.surface.g(),
-            palette.surface.b(),
-            215,
-        ),
-    );
-    context.painter.galley(origin, galley, palette.map_text);
+    for offset in [0.0, 6.0, -6.0, 12.0, -12.0, 18.0, -18.0] {
+        let (lat, lon) = projection::forward(
+            label.range_km,
+            base_azimuth + offset,
+            context.site_lat,
+            context.site_lon,
+        )
+        .map_err(|source| MapError::Coordinate { source })?;
+        let Some(point) = context.transform.screen(lat, lon) else {
+            continue;
+        };
+        let origin = Pos2::new(point.x - galley.size().x / 2.0, point.y + 4.0);
+        let box_rect =
+            Rect::from_min_size(origin - Vec2::splat(2.0), galley.size() + Vec2::splat(4.0));
+        if !context.rect.shrink(14.0).contains_rect(box_rect)
+            || occupied.iter().any(|other| other.intersects(box_rect))
+        {
+            continue;
+        }
+        occupied.push(box_rect);
+        context.painter.rect_filled(
+            box_rect,
+            CornerRadius::same(2),
+            Color32::from_rgba_unmultiplied(
+                palette.surface.r(),
+                palette.surface.g(),
+                palette.surface.b(),
+                215,
+            ),
+        );
+        context.painter.galley(origin, galley, palette.map_text);
+        return Ok(());
+    }
     Ok(())
 }
 
@@ -588,13 +610,18 @@ pub struct RingContext<'a> {
     pub palette: &'a Palette,
 }
 
-pub fn draw_range_rings(context: &RingContext<'_>) -> Result<(), MapError> {
+/// Draws the rings and returns the labels that still need placing.
+///
+/// The arcs belong under the echo, but their labels have to dodge the place
+/// names drawn above it, so the two are separate passes over one plan.
+pub fn draw_range_rings(context: &RingContext<'_>) -> Result<Vec<RingLabel>, MapError> {
     let Some(site) = context.transform.screen(context.site_lat, context.site_lon) else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let span_km = context.transform.kilometers_per_pixel()
         * f64::from(context.rect.width().max(context.rect.height()));
     let plan = RingPlan::for_view(span_km, context.coverage_km);
+    let mut labels = Vec::new();
     let max_jump = context.rect.width().max(context.rect.height()) * 0.5;
     let palette = context.palette;
     let ring_stroke = Stroke::new(
@@ -635,7 +662,23 @@ pub fn draw_range_rings(context: &RingContext<'_>) -> Result<(), MapError> {
                 context.painter.line_segment([*a, *b], ring_stroke);
             }
         }
-        ring_label(context, range_km, index)?;
+        labels.push(RingLabel { range_km, index });
+    }
+    Ok(labels)
+}
+
+/// Places the ring labels, avoiding any rectangle already carrying text.
+///
+/// # Errors
+///
+/// Returns [`MapError::Coordinate`] when a label's position cannot be projected.
+pub fn draw_ring_labels(
+    context: &RingContext<'_>,
+    labels: &[RingLabel],
+    occupied: &mut Vec<Rect>,
+) -> Result<(), MapError> {
+    for label in labels {
+        ring_label(context, *label, occupied)?;
     }
     Ok(())
 }
