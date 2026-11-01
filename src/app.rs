@@ -3532,15 +3532,21 @@ impl OxradApp {
         let Some(station) = self.site_station() else {
             return;
         };
-        if let Err(error) = map::draw_range_rings(
-            ui.painter(),
+        let Some(coverage_km) = self.radar_coverage_km() else {
+            return;
+        };
+        let palette = self.config.theme.palette();
+        let context = map::RingContext {
+            painter: ui.painter(),
             rect,
             transform,
-            station.lat,
-            station.lon,
-            self.config.units,
-            &self.config.theme.palette(),
-        ) {
+            site_lat: station.lat,
+            site_lon: station.lon,
+            coverage_km,
+            units: self.config.units,
+            palette: &palette,
+        };
+        if let Err(error) = map::draw_range_rings(&context) {
             ui.painter().text(
                 Pos2::new(rect.left() + 16.0, rect.bottom() - 20.0),
                 Align2::LEFT_CENTER,
@@ -3549,6 +3555,24 @@ impl OxradApp {
                 ERROR,
             );
         }
+    }
+
+    /// How far the loaded product reaches, or nothing when no volume says.
+    ///
+    /// Range rings have to stop somewhere, and the honest place is the range of
+    /// the product actually decoded. When nothing is loaded there is no
+    /// evidence for any particular reach, so rings are not drawn at all rather
+    /// than at an assumed 400 km.
+    fn radar_coverage_km(&self) -> Option<f64> {
+        // The sweep's own maximum ground range, not the geometry extent: extent
+        // is the radius of the lattice's corners, which reaches past the last
+        // gate and would space rings over coverage that carries no data.
+        let volume = match &self.display.frame {
+            Some(frame) => &frame.volume,
+            None => self.display.selection_volume()?,
+        };
+        let range_km = volume.sweep.max_ground_range_km;
+        (range_km.is_finite() && range_km > 0.0).then_some(range_km)
     }
 
     /// Fits the radar view to the selected station the first time its frame

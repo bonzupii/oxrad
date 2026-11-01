@@ -34,8 +34,14 @@ const COUNTRIES: &str = include_str!("../assets/ne_110m_admin_0_countries.geojso
 const MIN_SPAN_KM: f64 = 80.0;
 const MAX_SPAN_KM: f64 = 40_075.0;
 const MERCATOR_LIMIT_DEG: f64 = 85.0;
-const MAP_RING_STEP_KM: f64 = 50.0;
-const MAP_RING_MAX_KM: f64 = 400.0;
+/// The coarsest spacing, used when even that is dense for the view.
+const RING_COARSEST_KM: f64 = 300.0;
+/// Ring spacings offered, finest first.
+const RING_STEPS_KM: [f64; 6] = [10.0, 25.0, 50.0, 100.0, 200.0, RING_COARSEST_KM];
+/// Rings to aim for before the spacing is coarsened.
+const RINGS_PER_VIEW: f64 = 5.0;
+/// The most rings any view may carry.
+const RING_LIMIT: u32 = 6;
 const MAP_RING_SAMPLES: u32 = 128;
 const MAP_SPOKES: u32 = 8;
 
@@ -480,27 +486,82 @@ fn ring_points(
     Ok(points)
 }
 
-fn ring_label(
-    painter: &egui::Painter,
-    transform: &MapTransform,
-    site_lat: f64,
-    site_lon: f64,
-    range_km: f64,
-    units: UnitSystem,
-    palette: &Palette,
-) -> Result<(), MapError> {
-    let (lat, lon) = projection::forward(range_km, 180.0, site_lat, site_lon)
+/// Which rings a view carries, from the ground it shows and the range the radar
+/// product actually reaches.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RingPlan {
+    pub step_km: f64,
+    pub count: u32,
+}
+
+impl RingPlan {
+    /// Rings for a view span and a radar coverage.
+    ///
+    /// A fixed 50 km ladder drew seven rings whether the view was a 100 km
+    /// street window or a whole continent, and carried on to 400 km for a
+    /// product whose range stops well short of that. Scale the spacing to the
+    /// ground actually on screen and stop at the coverage the product has.
+    pub fn for_view(span_km: f64, coverage_km: f64) -> Self {
+        let span_km = if span_km.is_finite() && span_km > 0.0 {
+            span_km
+        } else {
+            RING_STEPS_KM[0]
+        };
+        let coverage_km = if coverage_km.is_finite() && coverage_km > 0.0 {
+            coverage_km
+        } else {
+            span_km
+        };
+        let reach_km = coverage_km.min(span_km * 0.75);
+        let mut step_km = RING_COARSEST_KM;
+        for candidate in RING_STEPS_KM {
+            if reach_km / candidate <= RINGS_PER_VIEW {
+                step_km = candidate;
+                break;
+            }
+        }
+        let count = (reach_km / step_km)
+            .floor()
+            .max(1.0)
+            .min(f64::from(RING_LIMIT)) as u32;
+        Self { step_km, count }
+    }
+
+    pub fn outermost_km(&self) -> f64 {
+        self.step_km * f64::from(self.count)
+    }
+}
+
+/// Place one ring's distance label.
+///
+/// Labels alternate between the south-east and north-west diagonals of the
+/// site, so successive rings never stack their labels down one spoke through
+/// the middle of the echo, and consecutive labels are separated vertically as
+/// well as horizontally.
+fn ring_label(context: &RingContext<'_>, range_km: f64, index: u32) -> Result<(), MapError> {
+    // Odd rings carry their label south-east of the site and even rings
+    // north-west, so no two labels share a line through the echo.
+    let azimuth_deg = if index.is_multiple_of(2) {
+        315.0
+    } else {
+        135.0
+    };
+    let (lat, lon) = projection::forward(range_km, azimuth_deg, context.site_lat, context.site_lon)
         .map_err(|source| MapError::Coordinate { source })?;
-    let Some(point) = transform.screen(lat, lon) else {
+    let Some(point) = context.transform.screen(lat, lon) else {
         return Ok(());
     };
-    let galley = painter.layout_no_wrap(
-        units::distance_whole(range_km, units),
+    if !context.rect.shrink(14.0).contains(point) {
+        return Ok(());
+    }
+    let galley = context.painter.layout_no_wrap(
+        units::distance_whole(range_km, context.units),
         FontId::monospace(10.0),
-        palette.map_text,
+        context.palette.map_text,
     );
+    let palette = context.palette;
     let origin = Pos2::new(point.x - galley.size().x / 2.0, point.y + 4.0);
-    painter.rect_filled(
+    context.painter.rect_filled(
         Rect::from_min_size(origin - Vec2::splat(2.0), galley.size() + Vec2::splat(4.0)),
         CornerRadius::same(2),
         Color32::from_rgba_unmultiplied(
@@ -510,23 +571,32 @@ fn ring_label(
             215,
         ),
     );
-    painter.galley(origin, galley, palette.map_text);
+    context.painter.galley(origin, galley, palette.map_text);
     Ok(())
 }
 
-pub fn draw_range_rings(
-    painter: &egui::Painter,
-    rect: Rect,
-    transform: &MapTransform,
-    site_lat: f64,
-    site_lon: f64,
-    units: UnitSystem,
-    palette: &Palette,
-) -> Result<(), MapError> {
-    let Some(site) = transform.screen(site_lat, site_lon) else {
+/// One ring pass: the painter, the view it lands in, the site it centres on,
+/// the range the product reaches, and the presentation preferences.
+pub struct RingContext<'a> {
+    pub painter: &'a egui::Painter,
+    pub rect: Rect,
+    pub transform: &'a MapTransform,
+    pub site_lat: f64,
+    pub site_lon: f64,
+    pub coverage_km: f64,
+    pub units: UnitSystem,
+    pub palette: &'a Palette,
+}
+
+pub fn draw_range_rings(context: &RingContext<'_>) -> Result<(), MapError> {
+    let Some(site) = context.transform.screen(context.site_lat, context.site_lon) else {
         return Ok(());
     };
-    let max_jump = rect.width().max(rect.height()) * 0.5;
+    let span_km = context.transform.kilometers_per_pixel()
+        * f64::from(context.rect.width().max(context.rect.height()));
+    let plan = RingPlan::for_view(span_km, context.coverage_km);
+    let max_jump = context.rect.width().max(context.rect.height()) * 0.5;
+    let palette = context.palette;
     let ring_stroke = Stroke::new(
         1.0_f32,
         Color32::from_rgba_unmultiplied(palette.ring.r(), palette.ring.g(), palette.ring.b(), 185),
@@ -537,28 +607,35 @@ pub fn draw_range_rings(
     );
     for sample in 0..MAP_SPOKES {
         let azimuth_deg = f64::from(sample) * 360.0 / f64::from(MAP_SPOKES);
-        let (lat, lon) = projection::forward(MAP_RING_MAX_KM, azimuth_deg, site_lat, site_lon)
-            .map_err(|source| MapError::Coordinate { source })?;
-        if let Some(point) = transform.screen(lat, lon)
+        let (lat, lon) = projection::forward(
+            plan.outermost_km(),
+            azimuth_deg,
+            context.site_lat,
+            context.site_lon,
+        )
+        .map_err(|source| MapError::Coordinate { source })?;
+        if let Some(point) = context.transform.screen(lat, lon)
             && site.distance(point) <= max_jump
         {
-            painter.line_segment([site, point], spoke_stroke);
+            context.painter.line_segment([site, point], spoke_stroke);
         }
     }
-    let mut range_km = MAP_RING_STEP_KM;
-    while range_km <= MAP_RING_MAX_KM {
-        let points = ring_points(transform, site_lat, site_lon, range_km)?;
+    for index in 1..=plan.count {
+        let range_km = plan.step_km * f64::from(index);
+        let points = ring_points(
+            context.transform,
+            context.site_lat,
+            context.site_lon,
+            range_km,
+        )?;
         for pair in points.windows(2) {
             if let [a, b] = pair
                 && a.distance(*b) <= max_jump
             {
-                painter.line_segment([*a, *b], ring_stroke);
+                context.painter.line_segment([*a, *b], ring_stroke);
             }
         }
-        ring_label(
-            painter, transform, site_lat, site_lon, range_km, units, palette,
-        )?;
-        range_km += MAP_RING_STEP_KM;
+        ring_label(context, range_km, index)?;
     }
     Ok(())
 }
@@ -626,10 +703,13 @@ pub struct MapView {
 
 impl Default for MapView {
     fn default() -> Self {
-        let (center_x, center_y) = projection::mercator(25.0, -20.0).unwrap_or((0.0, 0.0));
+        // The Mercator origin is zero by definition: zero longitude and the
+        // equator both project to zero, so the default view needs no fallible
+        // projection and no invented centre. The application focuses the view
+        // on a searched place or a radar site as soon as it has one.
         Self {
-            center_x,
-            center_y,
+            center_x: 0.0,
+            center_y: 0.0,
             span_km: 18_000.0,
         }
     }
@@ -739,9 +819,19 @@ pub struct MapTransform {
 }
 
 impl MapTransform {
+    /// Where a coordinate lands in this view, or nothing when it cannot be
+    /// placed at all.
+    ///
+    /// The latitude is clamped into the Mercator domain first, so the only
+    /// rejection left is a longitude the projection refuses — and there is no
+    /// position to report for one. That is an unplottable coordinate, not a
+    /// failure of this view, and callers treat it like a point off screen.
     pub fn screen(&self, lat: f64, lon: f64) -> Option<Pos2> {
         let lat = lat.clamp(-MERCATOR_LIMIT_DEG, MERCATOR_LIMIT_DEG);
-        let (x, y) = projection::mercator(lat, lon).ok()?;
+        let (x, y) = match projection::mercator(lat, lon) {
+            Ok(point) => point,
+            Err(_) => return None,
+        };
         let dx = projection::mercator_wrap_delta(x - self.center_x) / self.km_per_pixel;
         let dy = (y - self.center_y) / self.km_per_pixel;
         Some(Pos2::new(
@@ -779,12 +869,16 @@ pub fn draw_scale(
     let target_pixels = 110.0_f32;
     let raw_km = f64::from(target_pixels) * transform.kilometers_per_pixel();
     let power = 10_f64.powf(raw_km.log10().floor());
-    let candidates = [1.0, 2.0, 5.0, 10.0];
-    let kilometers = candidates
-        .iter()
-        .map(|factor| factor * power)
-        .find(|value| *value >= raw_km * 0.5)
-        .unwrap_or(power * 10.0);
+    // A 1-2-5 ladder: the first rung that fills at least half the target is the
+    // roundest number that still reaches a usable length on screen. The coarsest
+    // rung always qualifies, because power is within a decade of raw_km.
+    let mut kilometers = 10.0 * power;
+    for factor in [1.0, 2.0, 5.0, 10.0] {
+        if factor * power >= raw_km * 0.5 {
+            kilometers = factor * power;
+            break;
+        }
+    }
     let pixels = (kilometers / transform.kilometers_per_pixel()) as f32;
     let start = Pos2::new(rect.left() + 16.0, rect.bottom() - 30.0);
     painter.rect_filled(
@@ -830,6 +924,60 @@ pub fn draw_scale(
 mod tests {
     use super::*;
     use crate::test_support::TestError;
+
+    #[test]
+    fn rings_stop_where_the_product_stops() {
+        // KTWX base reflectivity reaches about 460 km. A view fitted to the
+        // whole sweep must not carry a ring past that, whatever the view holds.
+        let plan = RingPlan::for_view(1_250.0, 460.0);
+        assert!(
+            plan.outermost_km() <= 460.0,
+            "rings reached {} km on a 460 km product",
+            plan.outermost_km()
+        );
+        assert!(
+            plan.count >= 2,
+            "a fitted radar view needs more than one ring"
+        );
+    }
+
+    #[test]
+    fn rings_keep_five_or_fewer_on_screen() {
+        for span_km in [40.0, 120.0, 400.0, 1_250.0, 6_000.0, 18_000.0] {
+            let plan = RingPlan::for_view(span_km, 460.0);
+            assert!(
+                plan.count <= RING_LIMIT,
+                "{span_km} km view drew {} rings",
+                plan.count
+            );
+            assert!(plan.count >= 1, "{span_km} km view drew no rings");
+            assert!(
+                plan.outermost_km() <= span_km * 0.75 + plan.step_km,
+                "{span_km} km view drew rings out to {} km",
+                plan.outermost_km()
+            );
+        }
+    }
+
+    #[test]
+    fn zooming_in_tightens_the_ring_spacing() {
+        let wide = RingPlan::for_view(1_250.0, 460.0);
+        let close = RingPlan::for_view(60.0, 460.0);
+        assert!(
+            close.step_km < wide.step_km,
+            "a 60 km view used {} km rings, a 1,250 km view used {} km",
+            close.step_km,
+            wide.step_km
+        );
+    }
+
+    #[test]
+    fn a_short_range_radar_gets_rings_inside_its_own_reach() {
+        // Terminal and short-range products can stop at 150 km; a 400 km ring
+        // would draw coverage that does not exist.
+        let plan = RingPlan::for_view(1_250.0, 150.0);
+        assert!(plan.outermost_km() <= 150.0);
+    }
 
     #[test]
     fn embedded_world_has_the_natural_earth_countries() -> Result<(), TestError> {
