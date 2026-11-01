@@ -32,8 +32,8 @@ use crate::projection;
 use crate::provider::{self, JsonError};
 use crate::stations::Station;
 
-const NOMINATIM_SEARCH: &str = "https://nominatim.openstreetmap.org/search";
-const SEARCH_LIMIT: usize = 6;
+const PHOTON_SEARCH: &str = "https://photon.komoot.io/api/";
+const SEARCH_LIMIT: usize = 10;
 
 /// The town or place whose weather the user asked for.
 #[derive(Debug, Clone, PartialEq)]
@@ -226,68 +226,40 @@ fn address_field(address: &Value, keys: &[&str]) -> Option<String> {
     None
 }
 
-fn parse_coordinate(value: &Value, key: &str, url: &str) -> Result<Option<f64>, JsonError> {
-    let Some(raw) = value.get(key) else {
+fn parse_feature(feature: &Value, url: &str) -> Result<Option<Place>, JsonError> {
+    let Some(properties) = feature.get("properties") else {
         return Ok(None);
     };
-    let text = raw.as_str().ok_or_else(|| JsonError::Shape {
-        url: String::from(url),
-        field: "place coordinate text",
-    })?;
-    let number = text.parse::<f64>().map_err(|_| JsonError::Shape {
-        url: String::from(url),
-        field: "place coordinate",
-    })?;
-    if number.is_finite() {
-        Ok(Some(number))
-    } else {
-        Err(JsonError::Shape {
-            url: String::from(url),
-            field: "place coordinate",
-        })
-    }
-}
-
-fn parse_place(item: &Value, url: &str) -> Result<Option<Place>, JsonError> {
-    let (Some(lat), Some(lon)) = (
-        parse_coordinate(item, "lat", url)?,
-        parse_coordinate(item, "lon", url)?,
+    let Some(coordinates) = feature
+        .get("geometry")
+        .and_then(|geometry| geometry.get("coordinates"))
+        .and_then(Value::as_array)
+    else {
+        return Ok(None);
+    };
+    let (Some(lon), Some(lat)) = (
+        coordinates.first().and_then(Value::as_f64),
+        coordinates.get(1).and_then(Value::as_f64),
     ) else {
         return Ok(None);
     };
-    let Some(address) = item.get("address") else {
-        return Ok(None);
-    };
-    let name = text_field(item, "name")
-        .or_else(|| {
-            address_field(
-                address,
-                &[
-                    "city",
-                    "town",
-                    "village",
-                    "hamlet",
-                    "municipality",
-                    "county",
-                ],
-            )
-        })
-        .or_else(|| {
-            text_field(item, "display_name")
-                .and_then(|text| text.split(',').next().map(str::trim).map(String::from))
-        });
+    let name = text_field(properties, "name").or_else(|| {
+        address_field(
+            properties,
+            &[
+                "city", "town", "village", "hamlet", "locality", "district", "county",
+            ],
+        )
+    });
     let Some(name) = name else {
         return Ok(None);
     };
-    let region = address_field(address, &["state", "county"]);
-    let country = text_field(address, "country").ok_or_else(|| JsonError::Shape {
+    let region = address_field(properties, &["state", "county"]);
+    let country = text_field(properties, "country").ok_or_else(|| JsonError::Shape {
         url: String::from(url),
         field: "place country",
     })?;
-    let country_code = address
-        .get("country_code")
-        .and_then(Value::as_str)
-        .map_or_else(String::new, str::to_lowercase);
+    let country_code = text_field(properties, "countrycode").unwrap_or_default();
     Place::new(
         &name,
         region.as_deref().unwrap_or(""),
@@ -310,29 +282,110 @@ fn parse_place(item: &Value, url: &str) -> Result<Option<Place>, JsonError> {
 }
 
 /// Searches the geocoder for towns and places by name.
+///
+/// When the first answer contains no exact, prefix, or word-prefix match, one
+/// adjacent transposition of the query is retried (for example `cihcago` for
+/// `chicago`). The original answer is kept if the correction does not produce
+/// a closer match, so a failed retry never hides usable results.
 pub fn search(query: &str) -> Result<Vec<Place>, JsonError> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return Ok(Vec::new());
     }
+    let places = fetch_places(trimmed)?;
+    if places.iter().any(|place| match_rank(place, trimmed) <= 2) {
+        return Ok(places);
+    }
+    let Some(corrected) = first_inversion_variant(trimmed) else {
+        return Ok(places);
+    };
+    let Ok(mut corrected_places) = fetch_places(&corrected) else {
+        return Ok(places);
+    };
+    if corrected_places
+        .iter()
+        .any(|place| match_rank(place, &corrected) <= 2)
+    {
+        rank_places(&mut corrected_places, &corrected);
+        Ok(corrected_places)
+    } else {
+        Ok(places)
+    }
+}
+
+fn fetch_places(query: &str) -> Result<Vec<Place>, JsonError> {
     let url = format!(
-        "{NOMINATIM_SEARCH}?format=jsonv2&addressdetails=1&limit={SEARCH_LIMIT}&q={}",
-        provider::encode_query(trimmed)
+        "{PHOTON_SEARCH}?q={}&limit={SEARCH_LIMIT}",
+        provider::encode_query(query)
     );
     let document = provider::get_json(&url, "application/json")?;
-    let items = document.as_array().ok_or_else(|| JsonError::Shape {
-        url: url.clone(),
-        field: "place results",
-    })?;
+    let features = document
+        .get("features")
+        .and_then(Value::as_array)
+        .ok_or_else(|| JsonError::Shape {
+            url: url.clone(),
+            field: "place results",
+        })?;
     let mut places: Vec<Place> = Vec::new();
-    for item in items {
-        if let Some(place) = parse_place(item, &url)?
-            && !places.iter().any(|existing| existing.same_place(&place))
-        {
-            places.push(place);
+    for feature in features {
+        if let Some(place) = parse_feature(feature, &url)? {
+            merge_place(&mut places, place);
         }
     }
+    rank_places(&mut places, query);
     Ok(places)
+}
+
+/// The query with its first descending letter pair swapped.
+fn first_inversion_variant(query: &str) -> Option<String> {
+    if query.chars().count() < 4 || !query.is_ascii() {
+        return None;
+    }
+    let mut characters: Vec<char> = query.chars().collect();
+    let index = characters
+        .windows(2)
+        .position(|pair| match (pair.first(), pair.get(1)) {
+            (Some(left), Some(right)) => left.to_ascii_lowercase() > right.to_ascii_lowercase(),
+            _ => false,
+        })?;
+    characters.swap(index, index + 1);
+    Some(characters.into_iter().collect())
+}
+
+/// Orders results so exact names precede prefix matches and unrelated names.
+fn rank_places(places: &mut [Place], query: &str) {
+    places.sort_by_key(|place| match_rank(place, query));
+}
+
+fn match_rank(place: &Place, query: &str) -> u8 {
+    let query = query.trim().to_lowercase();
+    let name = place.name.to_lowercase();
+    if name == query {
+        0
+    } else if name.starts_with(&query) {
+        1
+    } else if name
+        .split(|character: char| !character.is_alphanumeric())
+        .any(|word| word.starts_with(&query))
+    {
+        2
+    } else {
+        3
+    }
+}
+
+/// Drops results with the same name, country, and region so the picker does
+/// not repeat indistinguishable labels.
+fn merge_place(places: &mut Vec<Place>, place: Place) {
+    let duplicate = places.iter().any(|existing| {
+        existing.same_place(&place)
+            || (existing.name.eq_ignore_ascii_case(&place.name)
+                && existing.country_code == place.country_code
+                && existing.region.eq_ignore_ascii_case(&place.region))
+    });
+    if !duplicate {
+        places.push(place);
+    }
 }
 
 struct SearchRequest {
@@ -354,9 +407,10 @@ pub enum SearchOutcome {
 
 /// Runs place searches off the UI thread, one at a time.
 ///
-/// The worker enforces Nominatim's one-request-per-second policy and caches
-/// successful answers for this session. Results from superseded queries are
-/// delivered with their generation and discarded by `poll`.
+/// The worker spaces requests to stay within the public geocoder's fair-use
+/// expectations and caches successful answers for this session. Results from
+/// superseded queries are delivered with their generation and discarded by
+/// `poll`.
 pub struct PlaceSearch {
     requests: Sender<SearchRequest>,
     results: Receiver<SearchMessage>,
@@ -592,19 +646,77 @@ mod tests {
     }
 
     #[test]
-    fn malformed_provider_coordinates_are_an_error_not_a_missing_place() {
-        let item = serde_json::json!({
-            "lat": "not-a-number",
-            "lon": "-86.44",
-            "display_name": "Nowhere"
+    fn features_without_usable_coordinates_are_skipped() {
+        let feature = serde_json::json!({
+            "properties": {"name": "Nowhere", "country": "United States"},
+            "geometry": {"type": "Point", "coordinates": ["not-a-number"]}
         });
         assert!(matches!(
-            parse_place(&item, "https://example.invalid"),
-            Err(JsonError::Shape {
-                field: "place coordinate",
-                ..
-            })
+            parse_feature(&feature, "https://example.invalid"),
+            Ok(None)
         ));
+    }
+
+    #[test]
+    fn photon_features_carry_identity_and_region() -> Result<(), TestError> {
+        let feature = serde_json::json!({
+            "properties": {
+                "name": "Paducah",
+                "state": "Kentucky",
+                "country": "United States",
+                "countrycode": "US"
+            },
+            "geometry": {"type": "Point", "coordinates": [-88.6, 37.08]}
+        });
+        let place = parse_feature(&feature, "https://example.invalid")?.ok_or("no place")?;
+        assert_eq!(place.name, "Paducah");
+        assert_eq!(place.region, "Kentucky");
+        assert!(place.in_united_states());
+        Ok(())
+    }
+
+    #[test]
+    fn ranking_prefers_exact_then_prefix_matches() {
+        let place = |name: &str| Place {
+            name: String::from(name),
+            region: String::new(),
+            country: String::new(),
+            country_code: String::new(),
+            lat: 0.0,
+            lon: 0.0,
+        };
+        let mut places = vec![place("Chic"), place("Cislago"), place("Chicago")];
+        rank_places(&mut places, "chic");
+        assert_eq!(places[0].name, "Chic");
+        assert_eq!(places[1].name, "Chicago");
+        assert_eq!(places[2].name, "Cislago");
+    }
+
+    #[test]
+    fn a_transposed_query_gains_one_corrected_variant() {
+        assert_eq!(
+            first_inversion_variant("cihcago").as_deref(),
+            Some("chicago")
+        );
+        assert_eq!(first_inversion_variant("abcdef"), None);
+        assert_eq!(first_inversion_variant("abc"), None);
+    }
+
+    #[test]
+    fn duplicate_display_labels_collapse() {
+        let place = |region: &str, lat: f64| Place {
+            name: String::from("Chic"),
+            region: String::from(region),
+            country: String::from("France"),
+            country_code: String::from("fr"),
+            lat,
+            lon: 1.0,
+        };
+        let mut places = Vec::new();
+        merge_place(&mut places, place("Occitanie", 43.0));
+        merge_place(&mut places, place("Occitanie", 43.0));
+        merge_place(&mut places, place("Nouvelle-Aquitaine", 44.0));
+        assert_eq!(places.len(), 2);
     }
 
     #[test]

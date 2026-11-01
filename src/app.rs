@@ -1339,7 +1339,7 @@ impl OxradApp {
         }
         ui.add_space(theme::SPACE_XS);
         ui.label(
-            RichText::new("Place search data © OpenStreetMap contributors.")
+            RichText::new("Place search © OpenStreetMap contributors, via Photon.")
                 .size(theme::TYPE_SMALL)
                 .weak(),
         );
