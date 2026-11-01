@@ -89,7 +89,6 @@ pub const fn is_decode_failure(error: &RadarError) -> bool {
             | RadarError::SiteCoordinates { .. }
             | RadarError::GateRange { .. }
             | RadarError::IncompleteVolume { .. }
-            | RadarError::DecoderPanic { .. }
     )
 }
 

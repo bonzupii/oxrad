@@ -54,7 +54,6 @@ pub enum JsonError {
         field: &'static str,
     },
     WorkerStopped,
-    WorkerPanic,
 }
 
 impl JsonError {
@@ -107,7 +106,6 @@ impl JsonError {
                 format!("The response from {url} has no usable {field}.")
             }
             Self::WorkerStopped => String::from("The provider worker stopped before answering."),
-            Self::WorkerPanic => String::from("The provider worker panicked while answering."),
         }
     }
 }
@@ -123,9 +121,7 @@ impl Error for JsonError {
         match self {
             Self::Request { source, .. } | Self::Body { source, .. } => Some(source),
             Self::Json { source, .. } => Some(source),
-            Self::Status { .. } | Self::Shape { .. } | Self::WorkerStopped | Self::WorkerPanic => {
-                None
-            }
+            Self::Status { .. } | Self::Shape { .. } | Self::WorkerStopped => None,
         }
     }
 }

@@ -21,7 +21,6 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -540,15 +539,11 @@ impl PlaceSearch {
                         std::thread::sleep(policy - elapsed);
                     }
                 }
-                let outcome = match catch_unwind(AssertUnwindSafe(|| search(&request.query))) {
-                    Ok(Ok(places)) => SearchOutcome::Results { places },
-                    Ok(Err(error)) => SearchOutcome::Failed {
+                let outcome = match search(&request.query) {
+                    Ok(places) => SearchOutcome::Results { places },
+                    Err(error) => SearchOutcome::Failed {
                         query: request.query,
                         error,
-                    },
-                    Err(_) => SearchOutcome::Failed {
-                        query: request.query,
-                        error: JsonError::WorkerPanic,
                     },
                 };
                 last_request = Some(Instant::now());

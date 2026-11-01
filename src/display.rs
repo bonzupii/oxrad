@@ -520,7 +520,7 @@ mod tests {
         };
         display.complete(render::BuildResult {
             volume: retrieved(100)?,
-            geometry: Err(RenderError::Panic),
+            geometry: Err(RenderError::WorkerStopped),
             generation: 1,
             elapsed: Duration::from_millis(7),
         });

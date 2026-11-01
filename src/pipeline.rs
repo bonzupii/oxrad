@@ -16,7 +16,6 @@
 //! The fetch and decode workers for one site, and the state they report.
 
 use std::collections::hash_map::RandomState;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -277,14 +276,7 @@ struct Decoder {
 impl Decoder {
     fn run(self) {
         for archive in self.jobs {
-            let result = catch_unwind(AssertUnwindSafe(|| {
-                radar::decode_volume(&self.site, &archive.key, &archive.bytes)
-            }))
-            .unwrap_or_else(|_| {
-                Err(RadarError::DecoderPanic {
-                    site: String::from(self.site.as_str()),
-                })
-            });
+            let result = radar::decode_volume(&self.site, &archive.key, &archive.bytes);
             if self.results.send(result).is_err() {
                 return;
             }
@@ -461,11 +453,8 @@ impl Fetcher {
             if events.send(Event::Working(Operation::Fetching)).is_err() {
                 return;
             }
-            let outcome = catch_unwind(AssertUnwindSafe(|| {
-                fetch(state, site, events, jobs, results)
-            }));
-            let update = match outcome {
-                Ok(Ok(Some(fetched))) => {
+            let update = match fetch(state, site, events, jobs, results) {
+                Ok(Some(fetched)) => {
                     state.last_key = Some(fetched.key);
                     state.reset_retry();
                     FetchUpdate {
@@ -476,7 +465,7 @@ impl Fetcher {
                         cache_warning: fetched.cache_warning,
                     }
                 }
-                Ok(Ok(None)) => {
+                Ok(None) => {
                     state.delay = BASE_DELAY;
                     state.attempt = 0;
                     FetchUpdate {
@@ -487,26 +476,13 @@ impl Fetcher {
                         cache_warning: None,
                     }
                 }
-                Ok(Err(failure)) => error_update(
+                Err(failure) => error_update(
                     failure,
                     state.decode_failures,
                     state.delay,
                     state.attempt,
                     &state.jitter,
                 ),
-                Err(_) => FetchUpdate {
-                    result: Err(FetchFailure {
-                        operation: Operation::Fetching,
-                        error: RadarError::WorkerPanic {
-                            site: String::from(site.as_str()),
-                        },
-                        cache_warning: None,
-                    }),
-                    retry_in: Some(POLL_INTERVAL),
-                    waiting_for_next_volume: false,
-                    from_cache: false,
-                    cache_warning: None,
-                },
             };
             let wait = update.retry_in;
             if events.send(Event::Update(Box::new(update))).is_err() {

@@ -621,13 +621,7 @@ pub enum RadarError {
     DecoderStopped {
         site: String,
     },
-    DecoderPanic {
-        site: String,
-    },
     WorkerStopped {
-        site: String,
-    },
-    WorkerPanic {
         site: String,
     },
     Clock {
@@ -724,14 +718,8 @@ impl RadarError {
             Self::DecoderStopped { site } => {
                 format!("The {site} decoder stopped; no volume arrived.")
             }
-            Self::DecoderPanic { site } => {
-                format!("The {site} decoder panicked; no volume arrived.")
-            }
             Self::WorkerStopped { site } => {
-                format!("The {site} fetch worker stopped; updates stopped.")
-            }
-            Self::WorkerPanic { site } => {
-                format!("The {site} fetch worker panicked; no volume arrived.")
+                format!("The {site} radar worker stopped; updates stopped.")
             }
             Self::Clock { source } => format!("The clock is before the Unix epoch: {source}"),
             Self::DateRange { source } => {
@@ -774,9 +762,7 @@ impl Error for RadarError {
             | Self::RecordTooLarge { .. }
             | Self::SiteMismatch { .. }
             | Self::DecoderStopped { .. }
-            | Self::DecoderPanic { .. }
-            | Self::WorkerStopped { .. }
-            | Self::WorkerPanic { .. } => None,
+            | Self::WorkerStopped { .. } => None,
         }
     }
 }
@@ -807,7 +793,6 @@ impl Error for ColorMapError {}
 pub enum RenderError {
     WorkerStopped,
     GpuUnavailable,
-    Panic,
     Coordinate {
         source: CoordinateError,
     },
@@ -828,9 +813,6 @@ impl RenderError {
             }
             Self::GpuUnavailable => {
                 String::from("The WGPU renderer is unavailable; radar cannot be displayed.")
-            }
-            Self::Panic => {
-                String::from("The render worker panicked while preparing the radar frame.")
             }
             Self::Coordinate { source } => {
                 format!("Radar geographic placement failed: {source}")
@@ -860,7 +842,6 @@ impl Error for RenderError {
             Self::Coordinate { source } => Some(source),
             Self::WorkerStopped
             | Self::GpuUnavailable
-            | Self::Panic
             | Self::ProductUnavailable { .. }
             | Self::MeshSize { .. } => None,
         }

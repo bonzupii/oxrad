@@ -21,7 +21,6 @@
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -84,7 +83,6 @@ pub enum ForecastError {
     Shape { field: &'static str },
     Units { field: &'static str, value: String },
     WorkerStopped,
-    WorkerPanic,
 }
 
 impl ForecastError {
@@ -92,11 +90,9 @@ impl ForecastError {
     pub const fn is_transient(&self) -> bool {
         match self {
             Self::Provider { source } => source.is_transient(),
-            Self::NoPeriods
-            | Self::Shape { .. }
-            | Self::Units { .. }
-            | Self::WorkerStopped
-            | Self::WorkerPanic => false,
+            Self::NoPeriods | Self::Shape { .. } | Self::Units { .. } | Self::WorkerStopped => {
+                false
+            }
         }
     }
 
@@ -104,11 +100,7 @@ impl ForecastError {
     pub const fn retry_after(&self) -> Option<&str> {
         match self {
             Self::Provider { source } => source.retry_after(),
-            Self::NoPeriods
-            | Self::Shape { .. }
-            | Self::Units { .. }
-            | Self::WorkerStopped
-            | Self::WorkerPanic => None,
+            Self::NoPeriods | Self::Shape { .. } | Self::Units { .. } | Self::WorkerStopped => None,
         }
     }
 
@@ -123,7 +115,6 @@ impl ForecastError {
                 format!("The forecast has unsupported {field} units: {value}.")
             }
             Self::WorkerStopped => String::from("The forecast worker stopped before answering."),
-            Self::WorkerPanic => String::from("The forecast worker panicked while answering."),
         }
     }
 }
@@ -138,11 +129,7 @@ impl Error for ForecastError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Provider { source } => Some(source),
-            Self::NoPeriods
-            | Self::Shape { .. }
-            | Self::Units { .. }
-            | Self::WorkerStopped
-            | Self::WorkerPanic => None,
+            Self::NoPeriods | Self::Shape { .. } | Self::Units { .. } | Self::WorkerStopped => None,
         }
     }
 }
@@ -618,8 +605,7 @@ impl ForecastFeed {
         std::thread::spawn(move || {
             while let Ok(request) = request_receiver.recv() {
                 let place = request.place;
-                let result = catch_unwind(AssertUnwindSafe(|| fetch(&place)))
-                    .unwrap_or_else(|_| Err(ForecastError::WorkerPanic));
+                let result = fetch(&place);
                 let message = ForecastMessage {
                     generation: request.generation,
                     place,

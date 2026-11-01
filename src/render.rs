@@ -26,7 +26,6 @@
 //! scales into the viewport, so one frame serves every window size. The pointer
 //! lookup inverts the same model.
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -367,18 +366,20 @@ pub struct BuildResult {
     pub elapsed: Duration,
 }
 
-/// Runs geometry construction on its own thread; a panic is reported, not fatal.
+/// Runs geometry construction on its own thread.
+///
+/// A thread that dies without answering leaves the receiver disconnected, which
+/// the display reports as `WorkerStopped`. Nothing catches a panic here: a panic
+/// in this code is a defect, and dressing it as a frame error would let a broken
+/// build keep drawing stale frames as though it were healthy.
 pub fn start_build_thread() -> (Sender<BuildRequest>, Receiver<BuildResult>) {
     let (request_sender, request_receiver) = mpsc::channel::<BuildRequest>();
     let (result_sender, result_receiver) = mpsc::channel::<BuildResult>();
     std::thread::spawn(move || {
         while let Ok(request) = request_receiver.recv() {
             let started = Instant::now();
-            let geometry = catch_unwind(AssertUnwindSafe(|| {
-                build_geometry_for(&request.volume.volume, request.product, request.color_table)
-            }))
-            .map_err(|_| RenderError::Panic)
-            .and_then(std::convert::identity);
+            let geometry =
+                build_geometry_for(&request.volume.volume, request.product, request.color_table);
             let result = BuildResult {
                 volume: request.volume,
                 geometry,
