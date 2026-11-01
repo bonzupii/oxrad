@@ -206,7 +206,7 @@ mod tests {
 
     fn incomplete() -> RadarError {
         RadarError::IncompleteVolume {
-            site: String::from("KPAH"),
+            site: String::from("KTWX"),
             defect: VolumeDefect::MissingEnd,
         }
     }
@@ -321,7 +321,7 @@ mod tests {
         assert!(second.waiting_for_next_volume);
         assert!(is_decode_failure(&incomplete()));
         assert!(!is_decode_failure(&RadarError::VolumeGone {
-            key: String::from("2026/10/30/KPAH/KPAH20261030_023529_V06"),
+            key: String::from("2026/10/31/KTWX/KTWX20261031_003109_V06"),
         }));
     }
 }

@@ -346,15 +346,15 @@ mod tests {
     use crate::test_support::TestError;
 
     fn site() -> Result<SiteId, TestError> {
-        Ok(SiteId::parse("KPAH")?)
+        Ok(SiteId::parse("KTWX")?)
     }
 
     #[test]
     fn volume_listing_excludes_metadata() {
-        assert!(is_volume_key("2026/10/29/KPAH/KPAH20261029_000115_V06"));
-        assert!(!is_volume_key("2026/10/29/KPAH/KPAH20261029_000115_MDM"));
+        assert!(is_volume_key("2026/10/29/KTWX/KTWX20261029_000115_V06"));
+        assert!(!is_volume_key("2026/10/29/KTWX/KTWX20261029_000115_MDM"));
         assert!(!is_volume_key(
-            "2026/10/29/KPAH/KPAH20261029_000115_V06_MDM"
+            "2026/10/29/KTWX/KTWX20261029_000115_V06_MDM"
         ));
     }
 
@@ -362,16 +362,16 @@ mod tests {
     fn listing_xml_tolerates_whitespace_and_nesting() -> Result<(), TestError> {
         let xml = "<?xml version=\"1.0\"?>\n<ListBucketResult>\n\
                    <IsTruncated>\n true \n</IsTruncated>\n\
-                   <Contents><Key> 2026/10/30/KPAH/KPAH20261030_023529_V06 </Key></Contents>\n\
-                   <Contents><Key>2026/10/30/KPAH/KPAH20261030_024005_V06</Key></Contents>\n\
+                   <Contents><Key> 2026/10/31/KTWX/KTWX20261031_003109_V06 </Key></Contents>\n\
+                   <Contents><Key>2026/10/31/KTWX/KTWX20261030_024005_V06</Key></Contents>\n\
                    <NextContinuationToken>\n abc \n</NextContinuationToken>\n\
                    </ListBucketResult>";
         let page = listing_xml("prefix", xml)?;
         assert_eq!(
             page.keys,
             vec![
-                "2026/10/30/KPAH/KPAH20261030_023529_V06",
-                "2026/10/30/KPAH/KPAH20261030_024005_V06"
+                "2026/10/31/KTWX/KTWX20261031_003109_V06",
+                "2026/10/31/KTWX/KTWX20261030_024005_V06"
             ]
         );
         assert_eq!(page.truncated, Some(true));
@@ -390,7 +390,7 @@ mod tests {
 
     #[test]
     fn query_values_keep_path_separators() {
-        assert_eq!(encode_query_value("2026/10/30/KPAH/"), "2026/10/30/KPAH/");
+        assert_eq!(encode_query_value("2026/10/31/KTWX/"), "2026/10/31/KTWX/");
         assert_eq!(encode_query_value("a b+c"), "a%20b%2Bc");
     }
 
@@ -406,10 +406,10 @@ mod tests {
             .rsplit('/')
             .next()
             .ok_or("listed key has no file name")?;
-        assert!(name.starts_with("KPAH"), "listed key {key}");
+        assert!(name.starts_with("KTWX"), "listed key {key}");
         assert_eq!(
             name.len(),
-            "KPAH20261030_023529_V06".len(),
+            "KTWX20261031_003109_V06".len(),
             "volume file name {name}"
         );
         assert!(name.ends_with("_V06"), "volume file name {name}");
@@ -438,9 +438,9 @@ mod tests {
 
     #[test]
     fn a_missing_volume_is_reported_as_a_stale_listing() -> Result<(), TestError> {
-        match fetch_archive("2026/10/30/KPAH/KPAH20261030_999999_V06") {
+        match fetch_archive("2026/10/31/KTWX/KTWX20261030_999999_V06") {
             Err(RadarError::VolumeGone { key }) => {
-                assert_eq!(key, "2026/10/30/KPAH/KPAH20261030_999999_V06");
+                assert_eq!(key, "2026/10/31/KTWX/KTWX20261030_999999_V06");
                 Ok(())
             }
             other => Err(TestError::from(format!(

@@ -410,7 +410,7 @@ impl Site {
     ) -> Self
     
     pub fn identifier(&self) -> &[u8; 4]
-    pub fn identifier_string(&self) -> String   // e.g. "KPAH"
+    pub fn identifier_string(&self) -> String   // e.g. "KTWX"
     pub fn latitude(&self) -> f32
     pub fn longitude(&self) -> f32
     pub fn height_meters(&self) -> i16

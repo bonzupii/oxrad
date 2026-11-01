@@ -187,22 +187,22 @@ pub fn inverse(
 mod tests {
     use super::*;
 
-    const SITE_LAT: f64 = 37.06833;
-    const SITE_LON: f64 = -88.77194;
+    const SITE_LAT: f64 = 38.99694;
+    const SITE_LON: f64 = -96.23249;
     const RANGE_KM: f64 = 75.0;
     const LAT_TOLERANCE_DEG: f64 = 5e-7;
     const ROUND_TRIP_DISTANCE_TOLERANCE_M: f64 = 1e-3;
     const ROUND_TRIP_AZIMUTH_TOLERANCE_DEG: f64 = 1e-9;
 
     const REFERENCE: [(f64, f64, f64); 8] = [
-        (0.0, 37.744095, -88.771940),
-        (45.0, 37.544662, -88.171837),
-        (90.0, 37.065332, -87.928621),
-        (135.0, 36.588961, -88.179319),
-        (180.0, 36.392487, -88.771940),
-        (225.0, 36.588961, -89.364561),
-        (270.0, 37.065332, -89.615259),
-        (315.0, 37.544662, -89.372043),
+        (0.0, 39.672483, -96.232490),
+        (45.0, 39.473007, -95.616164),
+        (90.0, 38.993728, -95.366767),
+        (135.0, 38.517622, -95.624396),
+        (180.0, 38.321319, -96.232490),
+        (225.0, 38.517622, -96.840584),
+        (270.0, 38.993728, -97.098213),
+        (315.0, 39.473007, -96.848816),
     ];
 
     fn angular_difference_deg(a: f64, b: f64) -> f64 {
@@ -293,7 +293,7 @@ mod tests {
     fn mercator_matches_reference_tile_coordinates() -> Result<(), TestFailure> {
         let (x, y) = mercator(SITE_LAT, SITE_LON)?;
         for (zoom, expected_x, expected_y) in
-            [(4, 4.054580, 6.223877), (10, 259.493148, 398.328116)]
+            [(4, 3.723000, 6.115042), (10, 238.272028, 391.362674)]
         {
             let n = f64::from(1_u32 << zoom);
             let tile_x = n * (0.5 + x / (2.0 * std::f64::consts::PI * MERCATOR_RADIUS_KM));

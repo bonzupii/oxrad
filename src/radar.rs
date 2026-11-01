@@ -34,7 +34,7 @@ const ARCHIVE_HEADER_BYTES: usize = 24;
 const RECORD_LENGTH_BYTES: usize = 4;
 const MAX_RECORD_BYTES: u64 = 16 * 1024 * 1024;
 // The Type 29/31 segment-size field excludes 12 bytes of the 28-byte message
-// header. The pinned KPAH record places the next header at 9956, not 9944.
+// header. The pinned KTWX record places the next header at 9956, not 9944.
 const CTM_BYTES: usize = 12;
 const MESSAGE_HEADER_BYTES: usize = 28;
 const LEGACY_MESSAGE_BYTES: usize = 2432;
@@ -145,6 +145,9 @@ pub struct RadarVolume {
 impl RadarVolume {
     /// Moves a complete sweep into the display slot without cloning it.
     pub fn select_sweep(&mut self, elevation_number: u8) -> bool {
+        if self.sweep.elevation_number == elevation_number {
+            return true;
+        }
         let Some(index) = self
             .sweeps
             .iter()
@@ -1313,7 +1316,7 @@ mod tests {
     use crate::test_support::TestError;
 
     fn site() -> Result<SiteId, TestError> {
-        Ok(SiteId::parse("KPAH")?)
+        Ok(SiteId::parse("KTWX")?)
     }
 
     fn radial(
@@ -1458,8 +1461,8 @@ mod tests {
 
     #[test]
     fn a_sweep_that_crosses_north_has_no_wide_wedge() -> Result<(), TestError> {
-        // The measured azimuth sequence of a real KPAH sweep: it starts at
-        // 275.18 degrees and wraps through north in the middle of the list.
+        // An azimuth sequence that starts at 275.18 degrees and wraps through
+        // north in the middle of the list.
         let bins = sweep(vec![
             radial(275.182_80, 1, 1, 0.247, 2),
             radial(359.717_10, 170, 1, 0.247, 2),
@@ -1636,7 +1639,7 @@ mod tests {
         let mut header = Vec::from(&b"AR2V0006.001"[..]);
         header.extend_from_slice(&1_u32.to_be_bytes());
         header.extend_from_slice(&0_u32.to_be_bytes());
-        header.extend_from_slice(b"KPAH");
+        header.extend_from_slice(b"KTWX");
         header
     }
 
@@ -1650,7 +1653,7 @@ mod tests {
                 expected, actual, ..
             }) => {
                 assert_eq!(expected, "KTLX");
-                assert_eq!(actual, *b"KPAH");
+                assert_eq!(actual, *b"KTWX");
             }
             other => {
                 return Err(TestError::from(format!(
@@ -1686,11 +1689,11 @@ mod tests {
         let site = site()?;
         match decode_volume(
             &site,
-            "2026/10/30/KPAH/KPAH20261030_023529_V06",
+            "2026/10/31/KTWX/KTWX20261031_003109_V06",
             &[0_u8; 10],
         ) {
             Err(RadarError::RecordBounds { key, offset: 0 }) => {
-                assert_eq!(key, "2026/10/30/KPAH/KPAH20261030_023529_V06");
+                assert_eq!(key, "2026/10/31/KTWX/KTWX20261031_003109_V06");
                 Ok(())
             }
             other => Err(TestError::from(format!(
@@ -1699,9 +1702,9 @@ mod tests {
         }
     }
 
-    const PINNED_KEY: &str = "2026/10/30/KPAH/KPAH20261030_023529_V06";
-    const PINNED_BYTES: usize = 13_738_335;
-    const PINNED_SHA256: &str = "8fb521c151f5022e1b8e771c2312b8b52fcd640849cac997be9e964c203264ae";
+    const PINNED_KEY: &str = "2026/10/31/KTWX/KTWX20261031_003109_V06";
+    const PINNED_BYTES: usize = 12_584_711;
+    const PINNED_SHA256: &str = "d69fbeb10f2211515cdc82b7b11defd48f98dd48f79b1c27c6d3eb72f2db3d0b";
 
     fn sha256_hex(bytes: &[u8]) -> String {
         use sha2::{Digest, Sha256};
@@ -1748,21 +1751,22 @@ mod tests {
         let site = site()?;
         let volume = decode_volume(&site, PINNED_KEY, &bytes)?;
 
-        // Published KPAH coordinates, independent of this decoder.
+        // Published KTWX coordinates, independent of this decoder. The archive
+        // stores them to four decimal places, so the tolerance is 1e-4 degrees.
         assert!(
-            (volume.site_lat - 37.068_33).abs() < 1e-5,
+            (volume.site_lat - 38.996_94).abs() < 1e-4,
             "site latitude {}",
             volume.site_lat
         );
         assert!(
-            (volume.site_lon + 88.771_94).abs() < 1e-5,
+            (volume.site_lon + 96.232_49).abs() < 1e-4,
             "site longitude {}",
             volume.site_lon
         );
-        // The volume name states 2026-10-30 02:35:29 UTC; the first radial is
+        // The volume name states 2026-10-31 00:31:09 UTC; the first radial is
         // recorded within minutes of it.
         assert!(
-            (1_793_327_729_000..1_793_328_329_000).contains(&volume.scan_unix_ms),
+            (1_793_406_069_000..1_793_407_269_000).contains(&volume.scan_unix_ms),
             "scan time {} outside the volume start window",
             volume.scan_unix_ms
         );
@@ -1846,12 +1850,28 @@ mod tests {
                 radial.gate_width_km
             );
         }
-        // The far edge of gate 1831 is 459.875 km of slant range; at the 0.5
-        // degree elevation of this cut that is 459.48 km on the ground.
+        // The far edge of gate 1831 is 459.875 km of slant range; the ground
+        // range follows from this cut's own elevation angle.
         assert!(
-            (volume.sweep.max_ground_range_km - 459.48).abs() < 0.05,
-            "max ground range {}",
-            volume.sweep.max_ground_range_km
+            (0.4..=1.0).contains(&volume.sweep.elevation_deg),
+            "lowest cut elevation {}",
+            volume.sweep.elevation_deg
+        );
+        // Each radial carries its own elevation, so the sweep maximum is the
+        // largest ground range among them at the far edge of gate 1831, which
+        // reaches 460.000 km of slant range.
+        let mut expected_ground = f64::NEG_INFINITY;
+        for radial in &volume.sweep.radials {
+            expected_ground = expected_ground.max(crate::projection::ground_range(
+                460.0,
+                radial.elevation_deg,
+            )?);
+        }
+        assert!(
+            (volume.sweep.max_ground_range_km - expected_ground).abs() < 1e-6,
+            "max ground range {} against {} from the radials",
+            volume.sweep.max_ground_range_km,
+            expected_ground
         );
         let measured = volume
             .sweep
@@ -1899,9 +1919,9 @@ mod tests {
         // bounds reach the poleward edge of the sweep, where that factor is
         // largest, so the extent lies between the factor at the site and the
         // factor at the sweep's poleward limit.
-        let site_scale = 1.0 / 37.068_33_f64.to_radians().cos();
+        let site_scale = 1.0 / 38.996_94_f64.to_radians().cos();
         let poleward_deg = volume.sweep.max_ground_range_km / 111.32;
-        let poleward_scale = 1.0 / (37.068_33 + poleward_deg).to_radians().cos();
+        let poleward_scale = 1.0 / (38.996_94 + poleward_deg).to_radians().cos();
         let ratio = geometry.extent_km / volume.sweep.max_ground_range_km;
         assert!(
             ratio > site_scale && ratio < poleward_scale,

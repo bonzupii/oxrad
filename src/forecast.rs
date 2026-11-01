@@ -23,6 +23,7 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -33,6 +34,8 @@ const OPEN_METEO: &str = "https://api.open-meteo.com/v1/forecast";
 const FORECAST_DAYS: u8 = 7;
 const HOURLY_LIMIT: usize = 24;
 const PROVIDER: &str = "Open-Meteo";
+const RETRY_BASE_SECS: u64 = 2;
+const RETRY_MAX_SECS: u64 = 60;
 
 /// Current conditions at the selected place.
 #[derive(Debug, Clone)]
@@ -42,7 +45,8 @@ pub struct CurrentWeather {
     pub apparent: f64,
     pub humidity: f64,
     pub precipitation: f64,
-    pub wind: String,
+    pub wind_speed_kmh: f64,
+    pub wind_direction_deg: f64,
     pub short: String,
     pub unit: String,
 }
@@ -55,7 +59,7 @@ pub struct ForecastPeriod {
     pub temperature: f64,
     pub minimum: Option<f64>,
     pub unit: String,
-    pub wind: String,
+    pub wind_speed_kmh: Option<f64>,
     pub short: String,
     pub precipitation: Option<u8>,
 }
@@ -78,6 +82,7 @@ pub enum ForecastError {
     Provider { source: JsonError },
     NoPeriods,
     Shape { field: &'static str },
+    Units { field: &'static str, value: String },
     WorkerStopped,
     WorkerPanic,
 }
@@ -87,7 +92,11 @@ impl ForecastError {
     pub const fn is_transient(&self) -> bool {
         match self {
             Self::Provider { source } => source.is_transient(),
-            Self::NoPeriods | Self::Shape { .. } | Self::WorkerStopped | Self::WorkerPanic => false,
+            Self::NoPeriods
+            | Self::Shape { .. }
+            | Self::Units { .. }
+            | Self::WorkerStopped
+            | Self::WorkerPanic => false,
         }
     }
 
@@ -95,7 +104,11 @@ impl ForecastError {
     pub const fn retry_after(&self) -> Option<&str> {
         match self {
             Self::Provider { source } => source.retry_after(),
-            Self::NoPeriods | Self::Shape { .. } | Self::WorkerStopped | Self::WorkerPanic => None,
+            Self::NoPeriods
+            | Self::Shape { .. }
+            | Self::Units { .. }
+            | Self::WorkerStopped
+            | Self::WorkerPanic => None,
         }
     }
 
@@ -105,6 +118,9 @@ impl ForecastError {
             Self::NoPeriods => String::from("Open-Meteo returned no forecast periods."),
             Self::Shape { field } => {
                 format!("The forecast response has no usable {field}.")
+            }
+            Self::Units { field, value } => {
+                format!("The forecast has unsupported {field} units: {value}.")
             }
             Self::WorkerStopped => String::from("The forecast worker stopped before answering."),
             Self::WorkerPanic => String::from("The forecast worker panicked while answering."),
@@ -122,7 +138,11 @@ impl Error for ForecastError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Provider { source } => Some(source),
-            Self::NoPeriods | Self::Shape { .. } | Self::WorkerStopped | Self::WorkerPanic => None,
+            Self::NoPeriods
+            | Self::Shape { .. }
+            | Self::Units { .. }
+            | Self::WorkerStopped
+            | Self::WorkerPanic => None,
         }
     }
 }
@@ -144,6 +164,7 @@ pub fn request_url(place: &Place) -> Result<String, ForecastError> {
          &current=temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,weather_code,wind_speed_10m,wind_direction_10m\
          &hourly=temperature_2m,precipitation_probability,weather_code,wind_speed_10m\
          &daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max\
+         &temperature_unit=celsius&wind_speed_unit=kmh&precipitation_unit=mm\
          &timezone=auto&forecast_days={FORECAST_DAYS}",
         place.lat, place.lon
     ))
@@ -219,7 +240,7 @@ fn array_probability(
         .map_err(|_| shape(field))
 }
 
-fn wind(degrees: f64, speed: f64, unit: &str) -> String {
+pub fn wind(degrees: f64, speed: f64, units: crate::units::UnitSystem) -> String {
     let direction = if !degrees.is_finite() {
         String::from("direction unavailable")
     } else {
@@ -238,7 +259,10 @@ fn wind(degrees: f64, speed: f64, unit: &str) -> String {
             .get(index)
             .map_or_else(|| String::from("unknown"), |heading| String::from(*heading))
     };
-    format!("{speed:.0} {unit} from the {direction}")
+    format!(
+        "{} from the {direction}",
+        crate::units::wind_speed(speed, units)
+    )
 }
 
 const fn weather_text(code: u64) -> &'static str {
@@ -269,7 +293,7 @@ fn weather_code(codes: &[Value], index: usize, field: &'static str) -> Result<u6
         .ok_or_else(|| shape(field))
 }
 
-fn current(document: &Value, unit: &str, wind_unit: &str) -> Result<CurrentWeather, ForecastError> {
+fn current(document: &Value, unit: &str) -> Result<CurrentWeather, ForecastError> {
     let current = object(document, "current")?;
     let degrees = number(current, "wind_direction_10m")?;
     let speed = number(current, "wind_speed_10m")?;
@@ -279,7 +303,8 @@ fn current(document: &Value, unit: &str, wind_unit: &str) -> Result<CurrentWeath
         apparent: number(current, "apparent_temperature")?,
         humidity: number(current, "relative_humidity_2m")?,
         precipitation: number(current, "precipitation")?,
-        wind: wind(degrees, speed, wind_unit),
+        wind_speed_kmh: speed,
+        wind_direction_deg: degrees,
         short: String::from(weather_text(
             current
                 .get("weather_code")
@@ -290,11 +315,7 @@ fn current(document: &Value, unit: &str, wind_unit: &str) -> Result<CurrentWeath
     })
 }
 
-fn hourly(
-    document: &Value,
-    unit: &str,
-    wind_unit: &str,
-) -> Result<Vec<ForecastPeriod>, ForecastError> {
+fn hourly(document: &Value, unit: &str) -> Result<Vec<ForecastPeriod>, ForecastError> {
     let hourly = object(document, "hourly")?;
     let times = array(hourly, "time")?;
     let temperatures = array(hourly, "temperature_2m")?;
@@ -324,10 +345,7 @@ fn hourly(
             temperature: array_number(temperatures, index, "hourly temperature")?,
             minimum: None,
             unit: String::from(unit),
-            wind: format!(
-                "{:.0} {wind_unit}",
-                array_number(winds, index, "hourly wind")?
-            ),
+            wind_speed_kmh: Some(array_number(winds, index, "hourly wind")?),
             short: String::from(weather_text(weather_code(
                 codes,
                 index,
@@ -370,7 +388,7 @@ fn daily(document: &Value, unit: &str) -> Result<Vec<ForecastPeriod>, ForecastEr
             temperature: array_number(maximums, index, "daily high")?,
             minimum: Some(array_number(minimums, index, "daily low")?),
             unit: String::from(unit),
-            wind: String::new(),
+            wind_speed_kmh: None,
             short: String::from(weather_text(weather_code(
                 codes,
                 index,
@@ -381,22 +399,35 @@ fn daily(document: &Value, unit: &str) -> Result<Vec<ForecastPeriod>, ForecastEr
     Ok(periods)
 }
 
+fn require_unit(units: &Value, field: &'static str, expected: &str) -> Result<(), ForecastError> {
+    let value = text(units, field)?;
+    if value != expected {
+        return Err(ForecastError::Units { field, value });
+    }
+    Ok(())
+}
+
 fn parse_document(place: &Place, document: &Value) -> Result<Forecast, ForecastError> {
     let timezone = text(document, "timezone")?;
     let timezone_abbreviation = text(document, "timezone_abbreviation")?;
     let current_units = object(document, "current_units")?;
     let hourly_units = object(document, "hourly_units")?;
-    let unit = current_units
-        .get("temperature_2m")
-        .and_then(Value::as_str)
-        .ok_or_else(|| shape("temperature unit"))?;
-    let wind_unit = hourly_units
-        .get("wind_speed_10m")
-        .and_then(Value::as_str)
-        .ok_or_else(|| shape("wind unit"))?;
-    let current = current(document, unit, wind_unit)?;
-    let hourly = hourly(document, unit, wind_unit)?;
-    let daily = daily(document, unit)?;
+    let daily_units = object(document, "daily_units")?;
+    for (units, field, expected) in [
+        (current_units, "temperature_2m", "°C"),
+        (current_units, "apparent_temperature", "°C"),
+        (hourly_units, "temperature_2m", "°C"),
+        (daily_units, "temperature_2m_max", "°C"),
+        (daily_units, "temperature_2m_min", "°C"),
+        (current_units, "wind_speed_10m", "km/h"),
+        (hourly_units, "wind_speed_10m", "km/h"),
+        (current_units, "precipitation", "mm"),
+    ] {
+        require_unit(units, field, expected)?;
+    }
+    let current = current(document, "°C")?;
+    let hourly = hourly(document, "°C")?;
+    let daily = daily(document, "°C")?;
     if hourly.is_empty() && daily.is_empty() {
         return Err(ForecastError::NoPeriods);
     }
@@ -417,6 +448,140 @@ pub fn fetch(place: &Place) -> Result<Forecast, ForecastError> {
     let document = provider::get_json(&url, "application/json")
         .map_err(|source| ForecastError::Provider { source })?;
     parse_document(place, &document)
+}
+
+pub enum ForecastState {
+    Empty,
+    Loading {
+        place: Place,
+        last: Option<Forecast>,
+        attempt: u32,
+    },
+    Ready {
+        forecast: Forecast,
+    },
+    Failed {
+        place: Place,
+        error: ForecastError,
+        last: Option<Forecast>,
+        retry_at: Option<Instant>,
+        attempt: u32,
+    },
+}
+
+pub struct ForecastView {
+    feed: ForecastFeed,
+    state: ForecastState,
+}
+
+impl ForecastView {
+    pub fn new() -> Self {
+        Self {
+            feed: ForecastFeed::new(),
+            state: ForecastState::Empty,
+        }
+    }
+
+    pub const fn state(&self) -> &ForecastState {
+        &self.state
+    }
+
+    pub fn start(&mut self, place: &Place, attempt: u32) {
+        let previous = std::mem::replace(&mut self.state, ForecastState::Empty);
+        let last = previous.into_last_for(place);
+        self.state = match self.feed.start(place) {
+            Ok(()) => ForecastState::Loading {
+                place: place.clone(),
+                last,
+                attempt,
+            },
+            Err(error) => ForecastState::Failed {
+                place: place.clone(),
+                error,
+                last,
+                retry_at: None,
+                attempt,
+            },
+        };
+    }
+
+    pub fn update(&mut self, now: Instant) {
+        if let Some(outcome) = self.feed.poll() {
+            self.apply(outcome, now);
+        }
+        let retry = match &self.state {
+            ForecastState::Failed {
+                place,
+                retry_at: Some(due),
+                attempt,
+                ..
+            } if now >= *due => Some((place.clone(), attempt.saturating_add(1))),
+            ForecastState::Failed { .. }
+            | ForecastState::Empty
+            | ForecastState::Loading { .. }
+            | ForecastState::Ready { .. } => None,
+        };
+        if let Some((place, attempt)) = retry {
+            self.start(&place, attempt);
+        }
+    }
+
+    fn apply(&mut self, outcome: ForecastOutcome, now: Instant) {
+        let ForecastState::Loading { place, .. } = &self.state else {
+            return;
+        };
+        let outcome_place = match &outcome {
+            ForecastOutcome::Ready(forecast) => &forecast.place,
+            ForecastOutcome::Failed { place, .. } => place,
+        };
+        if !outcome_place.same_place(place) {
+            return;
+        }
+        let previous = std::mem::replace(&mut self.state, ForecastState::Empty);
+        let ForecastState::Loading { last, attempt, .. } = previous else {
+            self.state = previous;
+            return;
+        };
+        self.state = match outcome {
+            ForecastOutcome::Ready(forecast) => ForecastState::Ready { forecast },
+            ForecastOutcome::Failed { place, error } => {
+                let retry_at = if error.is_transient() {
+                    now.checked_add(forecast_retry_delay(&error, attempt))
+                } else {
+                    None
+                };
+                ForecastState::Failed {
+                    place,
+                    error,
+                    last,
+                    retry_at,
+                    attempt,
+                }
+            }
+        };
+    }
+}
+
+impl ForecastState {
+    fn into_last_for(self, place: &Place) -> Option<Forecast> {
+        let previous = match self {
+            Self::Ready { forecast } => Some(forecast),
+            Self::Loading { last, .. } | Self::Failed { last, .. } => last,
+            Self::Empty => None,
+        };
+        previous.filter(|forecast| forecast.place.same_place(place))
+    }
+}
+
+fn forecast_retry_delay(error: &ForecastError, attempt: u32) -> Duration {
+    if let Some(value) = error.retry_after()
+        && let Ok(delay) = crate::retry::retry_after_delay(value)
+    {
+        return delay;
+    }
+    let factor = 2_u64.saturating_pow(attempt.min(5));
+    let seconds = RETRY_BASE_SECS.saturating_mul(factor).min(RETRY_MAX_SECS);
+    Duration::from_secs(seconds) + Duration::from_millis(u64::from(attempt).wrapping_mul(137) % 500)
 }
 
 struct ForecastRequest {
@@ -526,30 +691,77 @@ mod tests {
 
     use crate::test_support::TestError;
 
-    fn bowling_green() -> Result<Place, TestError> {
+    fn emporia() -> Result<Place, TestError> {
         Ok(Place::new(
-            "Bowling Green",
-            "Kentucky",
+            "Emporia",
+            "Kansas",
             "United States",
             "us",
-            36.990_3,
-            -86.443_6,
+            38.403_9,
+            -96.181_7,
         )?)
+    }
+
+    fn throttled(retry_after: Option<&str>) -> ForecastError {
+        ForecastError::Provider {
+            source: JsonError::Status {
+                url: String::from("https://api.open-meteo.com/v1/forecast"),
+                status: 503,
+                retry_after: retry_after.map(String::from),
+            },
+        }
+    }
+
+    #[test]
+    fn forecast_retry_honors_retry_after_and_grows_exponentially() {
+        assert_eq!(
+            forecast_retry_delay(&throttled(Some("17")), 0),
+            Duration::from_secs(17)
+        );
+        let first = forecast_retry_delay(&throttled(None), 0);
+        let second = forecast_retry_delay(&throttled(None), 1);
+        assert_eq!(first, Duration::from_secs(2));
+        assert!(second > first, "{second:?} must exceed {first:?}");
+        assert!(second <= Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_failure_for_an_old_place_cannot_replace_the_current_forecast() -> Result<(), TestError> {
+        let current = emporia()?;
+        let old = Place::new("Dublin", "Leinster", "Ireland", "ie", 53.35, -6.26)?;
+        let mut forecast = ForecastView::new();
+        forecast.state = ForecastState::Loading {
+            place: current,
+            last: None,
+            attempt: 0,
+        };
+        forecast.apply(
+            ForecastOutcome::Failed {
+                place: old,
+                error: ForecastError::WorkerStopped,
+            },
+            Instant::now(),
+        );
+        assert!(matches!(
+            forecast.state(),
+            ForecastState::Loading { place, .. } if place.name == "Emporia"
+        ));
+        Ok(())
     }
 
     #[test]
     fn the_forecast_request_uses_the_town_coordinates() -> Result<(), TestError> {
-        let place = bowling_green()?;
+        let place = emporia()?;
         let url = request_url(&place)?;
-        assert!(url.contains("36.9903"), "request URL {url}");
-        assert!(url.contains("-86.4436"), "request URL {url}");
+        assert!(url.contains("38.4039"), "request URL {url}");
+        assert!(url.contains("-96.1817"), "request URL {url}");
         assert!(
-            !url.contains("37.0683"),
-            "the request must not use the KPAH station latitude"
+            !url.contains("38.9969"),
+            "the request must not use the KTWX station latitude"
         );
         assert!(
-            !url.contains("-88.7719"),
-            "the request must not use the KPAH station longitude"
+            !url.contains("-96.2325"),
+            "the request must not use the KTWX station longitude"
         );
         Ok(())
     }
@@ -558,8 +770,23 @@ mod tests {
     fn weather_codes_and_wind_directions_are_readable() {
         assert_eq!(weather_text(0), "clear sky");
         assert_eq!(weather_text(95), "thunderstorm");
-        assert_eq!(wind(0.0, 10.0, "km/h"), "10 km/h from the north");
-        assert_eq!(wind(90.0, 10.0, "km/h"), "10 km/h from the east");
+        assert_eq!(
+            wind(0.0, 10.0, crate::units::UnitSystem::Metric),
+            "10 km/h from the north"
+        );
+        assert_eq!(
+            wind(90.0, 10.0, crate::units::UnitSystem::Metric),
+            "10 km/h from the east"
+        );
+    }
+
+    #[test]
+    fn unsupported_forecast_units_preserve_the_field_and_value() {
+        let units = serde_json::json!({"wind_speed_10m": "mph"});
+        assert!(matches!(
+            require_unit(&units, "wind_speed_10m", "km/h"),
+            Err(ForecastError::Units { field: "wind_speed_10m", value }) if value == "mph"
+        ));
     }
 
     #[test]
@@ -579,7 +806,7 @@ mod tests {
     /// Exercises the real global provider with the searched town's coordinates.
     #[test]
     fn the_live_forecast_belongs_to_the_searched_town() -> Result<(), TestError> {
-        let place = bowling_green()?;
+        let place = emporia()?;
         let forecast = fetch(&place)?;
         assert_eq!(forecast.place, place, "the forecast carries its place");
         assert_eq!(forecast.provider, "Open-Meteo");

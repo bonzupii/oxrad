@@ -138,7 +138,7 @@ Establish expected behavior from the architecture and source-format contracts be
 
 Coverage includes:
 - Coordinate transforms against the architecture document's reference values.
-- Direct/inverse round trips at eight azimuths and 75 km from the KPAH origin.
+- Direct/inverse round trips at eight azimuths and 75 km from the KTWX origin.
 - Every error variant and its relevant carried context.
 - Tile transforms at two zoom levels.
 - Colormap keypoints and out-of-range paths.

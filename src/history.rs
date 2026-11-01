@@ -124,14 +124,14 @@ impl HistoryFeed {
         }
     }
 
-    pub fn request_keys(&mut self, site: &SiteId) -> Result<u64, HistoryError> {
+    pub fn request_keys(&mut self, site: &SiteId) -> Result<(), HistoryError> {
         self.send(HistoryRequest::Keys {
             generation: 0,
             site: site.clone(),
         })
     }
 
-    pub fn request_volume(&mut self, site: &SiteId, key: &str) -> Result<u64, HistoryError> {
+    pub fn request_volume(&mut self, site: &SiteId, key: &str) -> Result<(), HistoryError> {
         self.send(HistoryRequest::Volume {
             generation: 0,
             site: site.clone(),
@@ -139,19 +139,23 @@ impl HistoryFeed {
         })
     }
 
+    pub const fn cancel(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+
     pub fn poll(&self) -> Result<Option<HistoryEvent>, HistoryError> {
-        match self.events.try_recv() {
-            Ok(event) => Ok(Some(event)),
-            Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => Err(HistoryError::WorkerStopped),
+        loop {
+            match self.events.try_recv() {
+                Ok(event) if event.generation() == self.generation => return Ok(Some(event)),
+                Ok(_) => continue,
+                Err(TryRecvError::Empty) => return Ok(None),
+                Err(TryRecvError::Disconnected) => return Err(HistoryError::WorkerStopped),
+            }
         }
     }
 
-    fn send(&mut self, mut request: HistoryRequest) -> Result<u64, HistoryError> {
-        self.generation = self.generation.wrapping_add(1);
-        if self.generation == 0 {
-            self.generation = 1;
-        }
+    fn send(&mut self, mut request: HistoryRequest) -> Result<(), HistoryError> {
+        self.cancel();
         let generation = self.generation;
         match &mut request {
             HistoryRequest::Keys {
@@ -166,7 +170,17 @@ impl HistoryFeed {
         self.requests
             .send(request)
             .map_err(|_| HistoryError::WorkerStopped)?;
-        Ok(generation)
+        Ok(())
+    }
+}
+
+impl HistoryEvent {
+    const fn generation(&self) -> u64 {
+        match self {
+            Self::Keys { generation, .. }
+            | Self::Volume { generation, .. }
+            | Self::Failed { generation, .. } => *generation,
+        }
     }
 }
 
@@ -275,10 +289,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cancelled_results_cannot_match_a_later_request() -> Result<(), crate::test_support::TestError>
+    {
+        let (requests, _request_receiver) = mpsc::channel();
+        let (events, receiver) = mpsc::channel();
+        let mut feed = HistoryFeed {
+            requests,
+            events: receiver,
+            generation: 0,
+        };
+        let site = SiteId::parse("KTWX")?;
+        feed.request_keys(&site)
+            .map_err(|error| format!("first request failed: {error}"))?;
+        feed.cancel();
+        feed.request_keys(&site)
+            .map_err(|error| format!("second request failed: {error}"))?;
+        events
+            .send(HistoryEvent::Keys {
+                generation: 1,
+                keys: vec![String::from("old")],
+            })
+            .map_err(|error| format!("old result could not be sent: {error}"))?;
+        events
+            .send(HistoryEvent::Keys {
+                generation: 3,
+                keys: vec![String::from("current")],
+            })
+            .map_err(|error| format!("current result could not be sent: {error}"))?;
+        assert!(matches!(
+            feed.poll().map_err(|error| format!("history poll failed: {error}"))?,
+            Some(HistoryEvent::Keys { keys, .. }) if keys == ["current"]
+        ));
+        assert!(
+            feed.poll()
+                .map_err(|error| format!("history poll failed: {error}"))?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn volume_keys_render_their_utc_scan_time() {
         assert_eq!(
-            key_label("2026/10/30/KPAH/KPAH20261030_023529_V06"),
-            "2026-10-30 02:35:29 UTC"
+            key_label("2026/10/31/KTWX/KTWX20261031_003109_V06"),
+            "2026-10-31 00:31:09 UTC"
         );
     }
 
@@ -298,10 +352,10 @@ mod tests {
 
     #[test]
     fn malformed_volume_keys_keep_their_file_name() {
-        assert_eq!(key_label("2026/10/30/KPAH/not-a-volume"), "not-a-volume");
+        assert_eq!(key_label("2026/10/31/KTWX/not-a-volume"), "not-a-volume");
         assert_eq!(
-            key_label("2026/10/30/KPAH/KPAH20261030-023529_V06"),
-            "KPAH20261030-023529_V06"
+            key_label("2026/10/31/KTWX/KTWX20261030-023529_V06"),
+            "KTWX20261030-023529_V06"
         );
     }
 }

@@ -263,7 +263,7 @@ impl WorldMap {
     ) -> Result<(), MapError> {
         let transform = view.transform(rect)?;
         painter.rect_filled(rect, CornerRadius::ZERO, palette.ocean);
-        draw_graticule(painter, &transform, rect, view.span_km, palette);
+        draw_graticule(painter, &transform, rect, view.span_km, palette)?;
         let mut labels = Vec::new();
         for country in &self.countries {
             for ring in &country.rings {
@@ -421,11 +421,11 @@ fn draw_graticule(
     rect: Rect,
     span_km: f64,
     palette: &Palette,
-) {
+) -> Result<(), MapError> {
     let stroke = Stroke::new(0.5_f32, palette.graticule);
     let step = graticule_step_degrees(span_km);
-    let (north, _) = transform.latlon_at(Pos2::new(rect.center().x, rect.top()));
-    let (south, _) = transform.latlon_at(Pos2::new(rect.center().x, rect.bottom()));
+    let (north, _) = transform.clipped_latlon_at(Pos2::new(rect.center().x, rect.top()))?;
+    let (south, _) = transform.clipped_latlon_at(Pos2::new(rect.center().x, rect.bottom()))?;
     let mut latitude = (south / step).floor() * step;
     while latitude <= north {
         let mut points = Vec::new();
@@ -459,6 +459,7 @@ fn draw_graticule(
         }
         longitude += step;
     }
+    Ok(())
 }
 
 fn ring_points(
@@ -655,7 +656,11 @@ impl MapView {
     }
 
     pub fn transform(&self, rect: Rect) -> Result<MapTransform, MapError> {
-        if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        if !rect.width().is_finite()
+            || !rect.height().is_finite()
+            || rect.width() <= 0.0
+            || rect.height() <= 0.0
+        {
             return Err(MapError::Coordinate {
                 source: CoordinateError::Viewport {
                     width: rect.width(),
@@ -673,38 +678,54 @@ impl MapView {
 
     pub fn pan(&mut self, rect: Rect, pixels: Vec2) -> Result<(), MapError> {
         let transform = self.transform(rect)?;
-        self.center_x -= f64::from(pixels.x) * transform.km_per_pixel;
-        self.center_y += f64::from(pixels.y) * transform.km_per_pixel;
-        self.clamp_center()?;
+        let mut next = *self;
+        next.center_x -= f64::from(pixels.x) * transform.km_per_pixel;
+        next.center_y += f64::from(pixels.y) * transform.km_per_pixel;
+        next.clamp_center()?;
+        *self = next;
         Ok(())
     }
 
     pub fn zoom_at(&mut self, rect: Rect, pointer: Pos2, factor: f64) -> Result<(), MapError> {
         if !factor.is_finite() || factor <= 0.0 {
-            return Ok(());
+            return Err(MapError::Coordinate {
+                source: CoordinateError::ZoomFactor { factor },
+            });
         }
-        let before = self.transform(rect)?.latlon_at(pointer);
-        let Ok((target_x, target_y)) = projection::mercator(before.0, before.1) else {
-            return Ok(());
-        };
-        self.span_km = (self.span_km / factor).clamp(MIN_SPAN_KM, MAX_SPAN_KM);
-        let transform = self.transform(rect)?;
+        let before = self.transform(rect)?.latlon_at(pointer)?;
+        let (target_x, target_y) = projection::mercator(before.0, before.1)
+            .map_err(|source| MapError::Coordinate { source })?;
+        let mut next = *self;
+        next.span_km = (next.span_km / factor).clamp(MIN_SPAN_KM, MAX_SPAN_KM);
+        let transform = next.transform(rect)?;
         let offset = pointer - rect.center();
-        self.center_x = target_x - f64::from(offset.x) * transform.km_per_pixel;
-        self.center_y = target_y + f64::from(offset.y) * transform.km_per_pixel;
-        self.clamp_center()
+        next.center_x = target_x - f64::from(offset.x) * transform.km_per_pixel;
+        next.center_y = target_y + f64::from(offset.y) * transform.km_per_pixel;
+        next.clamp_center()?;
+        *self = next;
+        Ok(())
     }
 
     fn clamp_center(&mut self) -> Result<(), MapError> {
+        if !(self.center_x.is_finite() && self.center_y.is_finite()) {
+            return Err(MapError::Coordinate {
+                source: CoordinateError::MapPosition {
+                    x: self.center_x,
+                    y: self.center_y,
+                },
+            });
+        }
+        if !self.span_km.is_finite() || self.span_km <= 0.0 {
+            return Err(MapError::Coordinate {
+                source: CoordinateError::ViewExtent {
+                    extent_km: self.span_km,
+                },
+            });
+        }
         self.center_x = projection::mercator_wrap_delta(self.center_x);
         let (_, limit_y) = projection::mercator(MERCATOR_LIMIT_DEG, 0.0)
             .map_err(|source| MapError::Coordinate { source })?;
         self.center_y = self.center_y.clamp(-limit_y, limit_y);
-        if !(self.center_x.is_finite() && self.center_y.is_finite() && self.span_km.is_finite()) {
-            self.center_x = 0.0;
-            self.center_y = 0.0;
-            self.span_km = 9_000.0;
-        }
         Ok(())
     }
 }
@@ -729,10 +750,19 @@ impl MapTransform {
         ))
     }
 
-    pub fn latlon_at(&self, position: Pos2) -> (f64, f64) {
+    pub fn latlon_at(&self, position: Pos2) -> Result<(f64, f64), MapError> {
         let x = self.center_x + f64::from(position.x - self.rect.center().x) * self.km_per_pixel;
         let y = self.center_y - f64::from(position.y - self.rect.center().y) * self.km_per_pixel;
-        projection::mercator_inverse(x, y).unwrap_or((0.0, 0.0))
+        projection::mercator_inverse(x, y).map_err(|source| MapError::Coordinate { source })
+    }
+
+    fn clipped_latlon_at(&self, position: Pos2) -> Result<(f64, f64), MapError> {
+        let x = self.center_x + f64::from(position.x - self.rect.center().x) * self.km_per_pixel;
+        let y = self.center_y - f64::from(position.y - self.rect.center().y) * self.km_per_pixel;
+        let (_, limit) = projection::mercator(MERCATOR_LIMIT_DEG, 0.0)
+            .map_err(|source| MapError::Coordinate { source })?;
+        projection::mercator_inverse(x, y.clamp(-limit, limit))
+            .map_err(|source| MapError::Coordinate { source })
     }
 
     pub const fn kilometers_per_pixel(&self) -> f64 {
@@ -841,11 +871,44 @@ mod tests {
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
         let mut view = MapView::focus(37.0, -88.0, 2_000.0)?;
         let pointer = Pos2::new(620.0, 210.0);
-        let before = view.transform(rect)?.latlon_at(pointer);
+        let before = view.transform(rect)?.latlon_at(pointer)?;
         view.zoom_at(rect, pointer, 2.0)?;
-        let after = view.transform(rect)?.latlon_at(pointer);
+        let after = view.transform(rect)?.latlon_at(pointer)?;
         assert!((before.0 - after.0).abs() < 1e-6, "latitude moved");
         assert!((before.1 - after.1).abs() < 1e-6, "longitude moved");
+        Ok(())
+    }
+
+    #[test]
+    fn map_readout_rejects_coordinates_outside_mercator() -> Result<(), TestError> {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let view = MapView::focus(80.0, 0.0, 18_000.0)?;
+        let transform = view.transform(rect)?;
+        assert!(matches!(
+            transform.latlon_at(rect.left_top()),
+            Err(MapError::Coordinate {
+                source: CoordinateError::MercatorLatitude { .. }
+            })
+        ));
+        let (latitude, _) = transform.clipped_latlon_at(rect.left_top())?;
+        assert!((latitude - MERCATOR_LIMIT_DEG).abs() < 1e-6);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_pan_preserves_the_previous_view() -> Result<(), TestError> {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let mut view = MapView::focus(37.0, -88.0, 2_000.0)?;
+        let before = view.center_latlon()?;
+        assert!(matches!(
+            view.pan(rect, Vec2::new(f32::NAN, 0.0)),
+            Err(MapError::Coordinate {
+                source: CoordinateError::MapPosition { .. }
+            })
+        ));
+        let after = view.center_latlon()?;
+        assert!((before.0 - after.0).abs() < 1e-12);
+        assert!((before.1 - after.1).abs() < 1e-12);
         Ok(())
     }
 
@@ -870,15 +933,15 @@ mod tests {
     #[test]
     fn range_ring_is_closed_and_scaled_to_the_map() -> Result<(), TestError> {
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
-        let view = MapView::focus(37.068, -88.772, 950.0)?;
+        let view = MapView::focus(38.997, -96.232, 950.0)?;
         let transform = view.transform(rect)?;
-        let points = ring_points(&transform, 37.068, -88.772, 50.0)?;
+        let points = ring_points(&transform, 38.997, -96.232, 50.0)?;
         assert_eq!(points.len(), MAP_RING_SAMPLES as usize + 1);
         let first = points.first().ok_or("ring has no first point")?;
         let last = points.last().ok_or("ring has no last point")?;
         assert!(first.distance(*last) < 0.01, "ring is not closed");
         let site = transform
-            .screen(37.068, -88.772)
+            .screen(38.997, -96.232)
             .ok_or("site is outside the projection")?;
         for point in &points {
             let radius = point.distance(site);

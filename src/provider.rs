@@ -230,7 +230,7 @@ mod tests {
 
     #[test]
     fn query_values_are_percent_encoded() {
-        assert_eq!(encode_query("Bowling Green, KY"), "Bowling%20Green%2C%20KY");
+        assert_eq!(encode_query("Emporia, KS"), "Emporia%2C%20KS");
         assert_eq!(encode_query("a-b_c.d~e"), "a-b_c.d~e");
     }
 

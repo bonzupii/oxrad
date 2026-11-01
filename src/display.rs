@@ -70,6 +70,33 @@ impl DisplayState {
     }
 }
 
+fn select_product(
+    volume: &mut RadarVolume,
+    product: RadarProduct,
+    elevation: Option<u8>,
+) -> Result<(), RenderError> {
+    let number = match elevation {
+        Some(number) => number,
+        None if volume.sweep.products.contains(&product) => volume.sweep.elevation_number,
+        None => match volume.elevation_for_product(product) {
+            Some(number) => number,
+            None => {
+                return Err(RenderError::ProductUnavailable {
+                    product,
+                    elevation: volume.sweep.elevation_number,
+                });
+            }
+        },
+    };
+    if !volume.sweep_has_product(number, product) || !volume.select_sweep(number) {
+        return Err(RenderError::ProductUnavailable {
+            product,
+            elevation: number,
+        });
+    }
+    Ok(())
+}
+
 pub struct Display {
     gpu: Option<RadarGpu>,
     sender: Sender<render::BuildRequest>,
@@ -77,8 +104,10 @@ pub struct Display {
     pub state: DisplayState,
     pub frame: Option<Frame>,
     queued: Option<(u64, RetrievedVolume, RadarProduct)>,
+    in_flight: Option<u64>,
     generation: u64,
     product: RadarProduct,
+    elevation: Option<u8>,
     color_table: ColorTable,
 }
 
@@ -97,8 +126,10 @@ impl Display {
             state,
             frame: None,
             queued: None,
+            in_flight: None,
             generation: 0,
             product: RadarProduct::Reflectivity,
+            elevation: None,
             color_table,
         }
     }
@@ -106,10 +137,12 @@ impl Display {
     /// Recolors the displayed volume without changing its product or tilt.
     pub fn set_color_table(&mut self, color_table: ColorTable) -> bool {
         self.color_table = color_table;
-        self.rebuild(self.product, None)
+        if self.in_flight.is_some() {
+            return true;
+        }
+        self.rebuild(self.product, self.elevation)
     }
 
-    /// Drops the current frame and discards any result still in flight.
     /// Moves the current mesh into a geographic view. A missing mesh is a
     /// valid empty product, not an error.
     pub fn set_map_view(
@@ -132,6 +165,7 @@ impl Display {
         self.generation = self.generation.wrapping_add(1);
         self.frame = None;
         self.queued = None;
+        self.elevation = None;
         self.state = if self.gpu.is_some() {
             DisplayState::Waiting
         } else {
@@ -139,17 +173,36 @@ impl Display {
         };
     }
 
-    pub fn submit(&mut self, volume: RetrievedVolume, product: RadarProduct) {
+    pub fn submit(&mut self, mut volume: RetrievedVolume, product: RadarProduct) {
         if self.gpu.is_none() {
             return;
         }
         self.product = product;
         self.generation = self.generation.wrapping_add(1);
+        self.queued = None;
+        if let Err(error) = select_product(&mut volume.volume, product, self.elevation) {
+            self.state = DisplayState::Failed {
+                error,
+                volume: Box::new(volume),
+            };
+            return;
+        }
         let generation = self.generation;
-        if matches!(self.state, DisplayState::Building) {
+        if self.in_flight.is_some() {
             self.queued = Some((generation, volume, product));
+            self.state = DisplayState::Building;
         } else {
             self.send(generation, volume, product);
+        }
+    }
+
+    pub fn selection_volume(&self) -> Option<&RadarVolume> {
+        match &self.state {
+            DisplayState::Failed { volume, .. } => Some(&volume.volume),
+            DisplayState::Waiting
+            | DisplayState::Building
+            | DisplayState::Ready
+            | DisplayState::Unavailable(_) => self.frame.as_ref().map(|frame| &frame.volume),
         }
     }
 
@@ -158,23 +211,28 @@ impl Display {
         if self.gpu.is_none() {
             return false;
         }
+        if matches!(self.state, DisplayState::Failed { .. }) {
+            return self.rebuild_failed(product, elevation);
+        }
+        if self.in_flight.is_some() {
+            return false;
+        }
         let Some(mut frame) = self.frame.take() else {
-            self.product = product;
             return false;
         };
-        let selected_elevation = elevation.or_else(|| {
-            (!frame.volume.sweep.products.contains(&product))
-                .then(|| frame.volume.elevation_for_product(product))
-                .flatten()
-        });
-        if let Some(number) = selected_elevation
-            && (!frame.volume.sweep_has_product(number, product)
-                || !frame.volume.select_sweep(number))
-        {
-            self.frame = Some(frame);
+        if let Err(error) = select_product(&mut frame.volume, product, elevation) {
+            self.state = DisplayState::Failed {
+                error,
+                volume: Box::new(RetrievedVolume {
+                    volume: frame.volume,
+                    origin: frame.origin,
+                    history_key: frame.history_key,
+                }),
+            };
             return false;
         }
         self.product = product;
+        self.elevation = elevation;
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         self.send(
@@ -186,7 +244,26 @@ impl Display {
             },
             product,
         );
-        true
+        !matches!(self.state, DisplayState::Unavailable(_))
+    }
+
+    fn rebuild_failed(&mut self, product: RadarProduct, elevation: Option<u8>) -> bool {
+        let state = std::mem::replace(&mut self.state, DisplayState::Waiting);
+        let DisplayState::Failed { mut volume, .. } = state else {
+            self.state = state;
+            return false;
+        };
+        if let Err(selection_error) = select_product(&mut volume.volume, product, elevation) {
+            self.state = DisplayState::Failed {
+                error: selection_error,
+                volume,
+            };
+            return false;
+        }
+        self.product = product;
+        self.elevation = elevation;
+        self.submit(*volume, product);
+        !matches!(self.state, DisplayState::Unavailable(_))
     }
 
     fn send(&mut self, generation: u64, volume: RetrievedVolume, product: RadarProduct) {
@@ -196,7 +273,10 @@ impl Display {
             color_table: self.color_table,
             generation,
         }) {
-            Ok(()) => self.state = DisplayState::Building,
+            Ok(()) => {
+                self.in_flight = Some(generation);
+                self.state = DisplayState::Building;
+            }
             Err(_) => self.state = DisplayState::Unavailable(RenderError::WorkerStopped),
         }
     }
@@ -204,7 +284,7 @@ impl Display {
     pub fn retry(&mut self) {
         let state = std::mem::replace(&mut self.state, DisplayState::Waiting);
         if let DisplayState::Failed { volume, .. } = state {
-            self.send(self.generation, *volume, self.product);
+            self.submit(*volume, self.product);
         } else {
             self.state = state;
         }
@@ -221,9 +301,10 @@ impl Display {
     }
 
     fn complete(&mut self, result: render::BuildResult) {
-        // A queued volume waits for the worker to finish whatever it was doing,
-        // including work that this frame has already superseded. Sending it here
-        // is what keeps the display from waiting on a build that never starts.
+        if self.in_flight != Some(result.generation) {
+            return;
+        }
+        self.in_flight = None;
         if let Some((generation, volume, product)) = self.queued.take() {
             self.send(generation, volume, product);
             return;
@@ -271,5 +352,162 @@ impl Display {
             return Ok(None);
         }
         gpu.upload(geometry).map(Some)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+
+    use super::*;
+    use crate::radar::RadarSweep;
+    use crate::stations::SiteId;
+    use crate::test_support::TestError;
+
+    fn sweep(number: u8, products: Vec<RadarProduct>) -> RadarSweep {
+        RadarSweep {
+            elevation_deg: f64::from(number),
+            elevation_number: number,
+            radials: Vec::new(),
+            products,
+            below_threshold: 0,
+            range_folded: 0,
+            max_ground_range_km: 100.0,
+        }
+    }
+
+    fn retrieved(scan: u64) -> Result<RetrievedVolume, TestError> {
+        Ok(RetrievedVolume {
+            volume: RadarVolume {
+                site: SiteId::parse("KTWX")?,
+                site_lat: 38.996_94,
+                site_lon: -96.232_49,
+                scan_unix_ms: scan,
+                sweep: sweep(1, vec![RadarProduct::Reflectivity]),
+                sweeps: vec![sweep(2, vec![RadarProduct::Velocity])],
+                skipped_radials: 0,
+                skipped_non_data: 0,
+                moment_error: None,
+            },
+            origin: ArchiveOrigin::Downloaded,
+            history_key: None,
+        })
+    }
+
+    #[test]
+    fn product_selection_uses_a_sweep_that_contains_the_product() -> Result<(), TestError> {
+        let mut volume = retrieved(1)?.volume;
+        select_product(&mut volume, RadarProduct::Velocity, None)?;
+        assert_eq!(volume.sweep.elevation_number, 2);
+        select_product(&mut volume, RadarProduct::Velocity, Some(2))?;
+        assert_eq!(volume.sweep.elevation_number, 2);
+        assert!(matches!(
+            select_product(&mut volume, RadarProduct::Velocity, Some(1)),
+            Err(RenderError::ProductUnavailable {
+                product: RadarProduct::Velocity,
+                elevation: 1,
+            })
+        ));
+        assert_eq!(volume.sweep.elevation_number, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_volume_supplies_the_available_product_choices() -> Result<(), TestError> {
+        let (sender, _requests) = mpsc::channel();
+        let (_results, receiver) = mpsc::channel();
+        let display = Display {
+            gpu: None,
+            sender,
+            receiver,
+            state: DisplayState::Failed {
+                error: RenderError::ProductUnavailable {
+                    product: RadarProduct::Velocity,
+                    elevation: 1,
+                },
+                volume: Box::new(retrieved(200)?),
+            },
+            frame: None,
+            queued: None,
+            in_flight: None,
+            generation: 1,
+            product: RadarProduct::Velocity,
+            elevation: Some(1),
+            color_table: ColorTable::Standard,
+        };
+        let volume = display.selection_volume().ok_or("failed volume missing")?;
+        assert_eq!(volume.scan_unix_ms, 200);
+        assert!(volume.supports_product(RadarProduct::Reflectivity));
+        Ok(())
+    }
+
+    #[test]
+    fn a_palette_change_rebuilds_the_in_flight_volume() -> Result<(), TestError> {
+        let (sender, requests) = mpsc::channel();
+        let (_results, receiver) = mpsc::channel();
+        let mut display = Display {
+            gpu: None,
+            sender,
+            receiver,
+            state: DisplayState::Building,
+            frame: None,
+            queued: None,
+            in_flight: Some(1),
+            generation: 1,
+            product: RadarProduct::Reflectivity,
+            elevation: None,
+            color_table: ColorTable::Tritanopia,
+        };
+        let volume = retrieved(100)?;
+        let geometry = render::build_geometry_for(
+            &volume.volume,
+            RadarProduct::Reflectivity,
+            ColorTable::Standard,
+        )?;
+        display.complete(render::BuildResult {
+            volume,
+            geometry: Ok(geometry),
+            generation: 1,
+        });
+        let request = requests
+            .try_recv()
+            .map_err(|error| TestError::from(format!("rebuild was not sent: {error}")))?;
+        assert_eq!(request.volume.volume.scan_unix_ms, 100);
+        assert_eq!(request.color_table, ColorTable::Tritanopia);
+        assert!(matches!(display.state, DisplayState::Building));
+        Ok(())
+    }
+
+    #[test]
+    fn superseded_build_starts_the_latest_queued_volume() -> Result<(), TestError> {
+        let (sender, requests) = mpsc::channel();
+        let (_results, receiver) = mpsc::channel();
+        let mut display = Display {
+            gpu: None,
+            sender,
+            receiver,
+            state: DisplayState::Building,
+            frame: None,
+            queued: Some((2, retrieved(200)?, RadarProduct::Reflectivity)),
+            in_flight: Some(1),
+            generation: 2,
+            product: RadarProduct::Reflectivity,
+            elevation: None,
+            color_table: ColorTable::Tritanopia,
+        };
+        display.complete(render::BuildResult {
+            volume: retrieved(100)?,
+            geometry: Err(RenderError::Panic),
+            generation: 1,
+        });
+        let request = requests
+            .try_recv()
+            .map_err(|error| TestError::from(format!("queued build was not sent: {error}")))?;
+        assert_eq!(request.generation, 2);
+        assert_eq!(request.volume.volume.scan_unix_ms, 200);
+        assert_eq!(request.color_table, ColorTable::Tritanopia);
+        assert!(display.frame.is_none());
+        assert!(matches!(display.state, DisplayState::Building));
+        Ok(())
     }
 }

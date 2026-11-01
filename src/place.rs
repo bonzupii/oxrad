@@ -34,6 +34,7 @@ use crate::stations::Station;
 
 const PHOTON_SEARCH: &str = "https://photon.komoot.io/api/";
 const SEARCH_LIMIT: usize = 10;
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(600);
 
 /// The town or place whose weather the user asked for.
 #[derive(Debug, Clone, PartialEq)]
@@ -254,31 +255,30 @@ fn parse_feature(feature: &Value, url: &str) -> Result<Option<Place>, JsonError>
     let Some(name) = name else {
         return Ok(None);
     };
-    let region = address_field(properties, &["state", "county"]);
+    let mut region = String::new();
+    if let Some(administrative_region) = address_field(properties, &["state", "county"]) {
+        region = administrative_region;
+    }
     let country = text_field(properties, "country").ok_or_else(|| JsonError::Shape {
         url: String::from(url),
         field: "place country",
     })?;
-    let country_code = text_field(properties, "countrycode").unwrap_or_default();
-    Place::new(
-        &name,
-        region.as_deref().unwrap_or(""),
-        &country,
-        &country_code,
-        lat,
-        lon,
-    )
-    .map(Some)
-    .map_err(|source| JsonError::Shape {
+    let country_code = text_field(properties, "countrycode").ok_or_else(|| JsonError::Shape {
         url: String::from(url),
-        field: match source {
-            PlaceError::Name => "place name",
-            PlaceError::Text { .. } => "place text",
-            PlaceError::Latitude { .. } => "place latitude",
-            PlaceError::Longitude { .. } => "place longitude",
-            PlaceError::Coordinate { .. } => "place coordinates",
-        },
-    })
+        field: "place country code",
+    })?;
+    Place::new(&name, &region, &country, &country_code, lat, lon)
+        .map(Some)
+        .map_err(|source| JsonError::Shape {
+            url: String::from(url),
+            field: match source {
+                PlaceError::Name => "place name",
+                PlaceError::Text { .. } => "place text",
+                PlaceError::Latitude { .. } => "place latitude",
+                PlaceError::Longitude { .. } => "place longitude",
+                PlaceError::Coordinate { .. } => "place coordinates",
+            },
+        })
 }
 
 /// Searches the geocoder for towns and places by name.
@@ -319,16 +319,21 @@ fn fetch_places(query: &str) -> Result<Vec<Place>, JsonError> {
         provider::encode_query(query)
     );
     let document = provider::get_json(&url, "application/json")?;
+    places_from_document(&document, &url, query)
+}
+
+/// Parses and ranks a Photon feature collection for one query.
+fn places_from_document(document: &Value, url: &str, query: &str) -> Result<Vec<Place>, JsonError> {
     let features = document
         .get("features")
         .and_then(Value::as_array)
         .ok_or_else(|| JsonError::Shape {
-            url: url.clone(),
+            url: String::from(url),
             field: "place results",
         })?;
     let mut places: Vec<Place> = Vec::new();
     for feature in features {
-        if let Some(place) = parse_feature(feature, &url)? {
+        if let Some(place) = parse_feature(feature, url)? {
             merge_place(&mut places, place);
         }
     }
@@ -385,6 +390,94 @@ fn merge_place(places: &mut Vec<Place>, place: Place) {
     });
     if !duplicate {
         places.push(place);
+    }
+}
+
+pub enum SearchState {
+    Idle,
+    Working { query: String },
+    Ready { places: Vec<Place> },
+    Failed { query: String, error: JsonError },
+}
+
+pub struct SearchInteraction {
+    query: String,
+    feed: PlaceSearch,
+    state: SearchState,
+    due: Option<Instant>,
+    last_query: String,
+}
+
+impl SearchInteraction {
+    pub fn new() -> Self {
+        Self {
+            query: String::new(),
+            feed: PlaceSearch::new(),
+            state: SearchState::Idle,
+            due: None,
+            last_query: String::new(),
+        }
+    }
+
+    pub const fn query_mut(&mut self) -> &mut String {
+        &mut self.query
+    }
+
+    pub const fn state(&self) -> &SearchState {
+        &self.state
+    }
+
+    pub fn edited(&mut self, now: Instant) {
+        self.feed.cancel();
+        self.state = SearchState::Idle;
+        self.last_query.clear();
+        self.due = if self.query.trim().len() >= 2 {
+            now.checked_add(SEARCH_DEBOUNCE)
+        } else {
+            None
+        };
+    }
+
+    pub fn clear(&mut self) {
+        self.query.clear();
+        self.feed.cancel();
+        self.state = SearchState::Idle;
+        self.last_query.clear();
+        self.due = None;
+    }
+
+    pub fn submit(&mut self) -> bool {
+        let query = self.query.trim().to_owned();
+        if query.is_empty() {
+            return false;
+        }
+        self.due = None;
+        self.start(query);
+        true
+    }
+
+    pub fn update(&mut self, now: Instant) {
+        while let Some(outcome) = self.feed.poll() {
+            self.state = match outcome {
+                SearchOutcome::Results { places } => SearchState::Ready { places },
+                SearchOutcome::Failed { query, error } => SearchState::Failed { query, error },
+            };
+        }
+        if self.due.is_some_and(|due| now >= due) {
+            self.due = None;
+            let query = self.query.trim().to_owned();
+            if query.len() >= 2 && query != self.last_query {
+                self.start(query);
+            }
+        }
+    }
+
+    fn start(&mut self, query: String) {
+        self.last_query.clone_from(&query);
+        self.state = match self.feed.start(query.clone()) {
+            Ok(()) => SearchState::Working { query },
+            Err(error) => SearchState::Failed { query, error },
+        };
     }
 }
 
@@ -532,10 +625,12 @@ mod tests {
     use crate::stations::{RadarSource, SiteId, Station, StationKind};
     use crate::test_support::TestError;
 
-    const PADUCAH_LAT: f64 = 37.083_4;
-    const PADUCAH_LON: f64 = -88.6;
-    const BOWLING_GREEN_LAT: f64 = 36.990_3;
-    const BOWLING_GREEN_LON: f64 = -86.443_6;
+    const TOPEKA_LAT: f64 = 39.047_3;
+    const TOPEKA_LON: f64 = -95.675_2;
+    const EMPORIA_LAT: f64 = 38.403_9;
+    const EMPORIA_LON: f64 = -96.181_7;
+    const WICHITA_LAT: f64 = 37.687_2;
+    const WICHITA_LON: f64 = -97.330_1;
 
     fn station(id: &str, name: &str, lat: f64, lon: f64) -> Result<Station, TestError> {
         Ok(Station {
@@ -554,9 +649,9 @@ mod tests {
     fn catalog() -> Result<Vec<Station>, TestError> {
         assert_eq!(RadarProduct::ALL.len(), 7);
         Ok(vec![
-            station("KPAH", "Paducah", 37.068_33, -88.771_94)?,
-            station("KHPX", "Fort Campbell", 36.736_9, -87.285_0)?,
-            station("KOHX", "Nashville", 36.247_2, -86.562_5)?,
+            station("KTWX", "Topeka", 38.996_94, -96.232_49)?,
+            station("KICT", "Wichita", 37.654_44, -97.443_05)?,
+            station("KEAX", "Pleasant Hill", 38.810_49, -94.264_45)?,
         ])
     }
 
@@ -582,6 +677,44 @@ mod tests {
     }
 
     #[test]
+    fn editing_invalidates_an_in_flight_search_before_debounce() -> Result<(), TestError> {
+        let (requests, _request_receiver) = mpsc::channel();
+        let (results, receiver) = mpsc::channel();
+        let mut interaction = SearchInteraction {
+            query: String::from("Chicago"),
+            feed: PlaceSearch {
+                requests,
+                results: receiver,
+                generation: 1,
+                latest_query: String::from("Chicago"),
+                stopped: false,
+            },
+            state: SearchState::Working {
+                query: String::from("Chicago"),
+            },
+            due: None,
+            last_query: String::from("Chicago"),
+        };
+        *interaction.query_mut() = String::from("Dublin");
+        let now = Instant::now();
+        interaction.edited(now);
+        results
+            .send(SearchMessage {
+                generation: 1,
+                outcome: SearchOutcome::Results {
+                    places: vec![Place::new(
+                        "Chicago", "Illinois", "USA", "us", 41.88, -87.63,
+                    )?],
+                },
+            })
+            .map_err(|error| format!("could not send search result: {error}"))?;
+        interaction.update(now);
+        assert!(matches!(interaction.state(), SearchState::Idle));
+        assert_eq!(interaction.query, "Dublin");
+        Ok(())
+    }
+
+    #[test]
     fn cancelling_invalidates_a_pending_search_generation() {
         let mut search = PlaceSearch::new();
         let generation = search.generation;
@@ -593,27 +726,41 @@ mod tests {
     fn a_town_with_a_station_selects_that_station() -> Result<(), TestError> {
         let stations = catalog()?;
         let nearest =
-            nearest_station(&stations, PADUCAH_LAT, PADUCAH_LON)?.ok_or("no station selected")?;
-        assert_eq!(nearest.station.id, id("KPAH")?);
+            nearest_station(&stations, TOPEKA_LAT, TOPEKA_LON)?.ok_or("no station selected")?;
+        assert_eq!(nearest.station.id, id("KTWX")?);
         assert!(
-            (10.0..20.0).contains(&nearest.distance_km),
-            "KPAH distance {} km",
+            (40.0..60.0).contains(&nearest.distance_km),
+            "KTWX distance {} km",
             nearest.distance_km
         );
         Ok(())
     }
 
-    /// Bowling Green has no radar of its own. Fort Campbell's KHPX is at
-    /// 36.7369 N 87.2850 W and Old Hickory's KOHX is farther away.
+    /// Emporia has no radar of its own. Topeka's KTWX is 66 km northeast and
+    /// Wichita's KICT is twice that.
     #[test]
     fn a_town_without_a_station_selects_the_nearest_one_outside_it() -> Result<(), TestError> {
         let stations = catalog()?;
-        let nearest = nearest_station(&stations, BOWLING_GREEN_LAT, BOWLING_GREEN_LON)?
-            .ok_or("no station selected")?;
-        assert_eq!(nearest.station.id, id("KHPX")?);
+        let nearest =
+            nearest_station(&stations, EMPORIA_LAT, EMPORIA_LON)?.ok_or("no station selected")?;
+        assert_eq!(nearest.station.id, id("KTWX")?);
         assert!(
-            (60.0..100.0).contains(&nearest.distance_km),
-            "KHPX distance {} km",
+            (55.0..80.0).contains(&nearest.distance_km),
+            "KTWX distance {} km",
+            nearest.distance_km
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_western_town_selects_the_wichita_station() -> Result<(), TestError> {
+        let stations = catalog()?;
+        let nearest =
+            nearest_station(&stations, WICHITA_LAT, WICHITA_LON)?.ok_or("no station selected")?;
+        assert_eq!(nearest.station.id, id("KICT")?);
+        assert!(
+            (5.0..20.0).contains(&nearest.distance_km),
+            "KICT distance {} km",
             nearest.distance_km
         );
         Ok(())
@@ -621,7 +768,7 @@ mod tests {
 
     #[test]
     fn an_empty_catalog_selects_no_station() -> Result<(), TestError> {
-        assert!(nearest_station(&[], BOWLING_GREEN_LAT, BOWLING_GREEN_LON)?.is_none());
+        assert!(nearest_station(&[], EMPORIA_LAT, EMPORIA_LON)?.is_none());
         Ok(())
     }
 
@@ -629,14 +776,15 @@ mod tests {
     fn place_identity_normalizes_country_and_rejects_config_breaking_text() -> Result<(), TestError>
     {
         let place = Place::new(
-            "  Bowling Green  ",
-            " Kentucky ",
+            "  Emporia  ",
+            " Kansas ",
             "United States",
             "US",
-            36.99,
-            -86.44,
+            38.403_9,
+            -96.181_7,
         )?;
-        assert_eq!(place.name, "Bowling Green");
+        assert_eq!(place.name, "Emporia");
+        assert_eq!(place.region, "Kansas");
         assert_eq!(place.country_code, "us");
         assert!(matches!(
             Place::new("Bad\"Name", "", "", "us", 0.0, 0.0),
@@ -661,17 +809,44 @@ mod tests {
     fn photon_features_carry_identity_and_region() -> Result<(), TestError> {
         let feature = serde_json::json!({
             "properties": {
-                "name": "Paducah",
-                "state": "Kentucky",
+                "name": "Emporia",
+                "state": "Kansas",
                 "country": "United States",
                 "countrycode": "US"
             },
-            "geometry": {"type": "Point", "coordinates": [-88.6, 37.08]}
+            "geometry": {"type": "Point", "coordinates": [-96.1817, 38.4039]}
         });
         let place = parse_feature(&feature, "https://example.invalid")?.ok_or("no place")?;
-        assert_eq!(place.name, "Paducah");
-        assert_eq!(place.region, "Kentucky");
+        assert_eq!(place.name, "Emporia");
+        assert_eq!(place.region, "Kansas");
         assert!(place.in_united_states());
+        Ok(())
+    }
+
+    #[test]
+    fn missing_country_code_cannot_be_treated_as_a_non_us_place() {
+        let feature = serde_json::json!({
+            "properties": {"name": "Emporia", "country": "United States"},
+            "geometry": {"type": "Point", "coordinates": [-96.1817, 38.4039]}
+        });
+        assert!(matches!(
+            parse_feature(&feature, "https://example.invalid"),
+            Err(JsonError::Shape {
+                field: "place country code",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn region_is_optional_when_the_country_is_identified() -> Result<(), TestError> {
+        let feature = serde_json::json!({
+            "properties": {"name": "Dublin", "country": "Ireland", "countrycode": "IE"},
+            "geometry": {"type": "Point", "coordinates": [-6.26, 53.35]}
+        });
+        let place = parse_feature(&feature, "https://example.invalid")?.ok_or("no place")?;
+        assert_eq!(place.label(), "Dublin, Ireland");
+        assert!(!place.in_united_states());
         Ok(())
     }
 
@@ -735,65 +910,83 @@ mod tests {
         ));
     }
 
-    /// Exercises the real geocoder: a town with its own radar, a town without
-    /// one, an ambiguous name, and a query with no match. Requests are spaced
-    /// by the geocoder's one-per-second policy, so this test is serial.
-    #[test]
-    fn place_search_resolves_towns_and_reports_ambiguity() -> Result<(), TestError> {
-        let stations = catalog()?;
+    const PHOTON_RESPONSE: &str = include_str!("../tests/fixtures/photon_kansas.json");
+    const PHOTON_URL: &str = "https://photon.komoot.io/api/?q=fixture";
 
-        let paducah = search("Paducah, Kentucky")?;
-        let first = paducah.first().ok_or("Paducah returned no place")?;
+    fn fixture_places(query: &str) -> Result<Vec<Place>, TestError> {
+        let document = serde_json::from_str(PHOTON_RESPONSE)
+            .map_err(|error| TestError::from(format!("fixture is not JSON: {error}")))?;
+        Ok(places_from_document(&document, PHOTON_URL, query)?)
+    }
+
+    /// Asserts the geocoder's parse, rank, and station resolution against a
+    /// document in Photon's response shape, so the gate never depends on the
+    /// provider being reachable.
+    #[test]
+    fn a_place_search_resolves_towns_against_the_provider_document() -> Result<(), TestError> {
+        let stations = catalog()?;
+        let places = fixture_places("Emporia")?;
+        let first = places.first().ok_or("Emporia returned no place")?;
+        assert_eq!(first.name, "Emporia");
+        assert_eq!(first.region, "Kansas");
+        assert_eq!(first.country_code, "us");
         assert!(
-            first.name.to_lowercase().contains("paducah"),
-            "resolved {}",
-            first.name
-        );
-        assert!(
-            first.in_united_states(),
-            "country code {}",
-            first.country_code
+            (first.lat - EMPORIA_LAT).abs() < 1e-4 && (first.lon - EMPORIA_LON).abs() < 1e-4,
+            "fixture coordinates {}, {}",
+            first.lat,
+            first.lon
         );
         let nearest = nearest_station(&stations, first.lat, first.lon)?
-            .ok_or("Paducah has no nearest station")?;
-        assert_eq!(nearest.station.id, id("KPAH")?);
-
-        std::thread::sleep(std::time::Duration::from_millis(1_100));
-        let bowling_green = search("Bowling Green, Kentucky")?;
-        let town = bowling_green
-            .first()
-            .ok_or("Bowling Green returned no place")?;
+            .ok_or("Emporia has no nearest station")?;
+        assert_eq!(nearest.station.id, id("KTWX")?);
         assert!(
-            town.name.to_lowercase().contains("bowling green"),
-            "resolved {}",
-            town.name
-        );
-        let nearest = nearest_station(&stations, town.lat, town.lon)?
-            .ok_or("Bowling Green has no nearest station")?;
-        assert_eq!(nearest.station.id, id("KHPX")?);
-        assert!(
-            nearest.distance_km > 30.0,
-            "KHPX is outside the town: {} km",
+            (55.0..80.0).contains(&nearest.distance_km),
+            "KTWX distance {} km",
             nearest.distance_km
         );
+        Ok(())
+    }
 
-        std::thread::sleep(std::time::Duration::from_millis(1_100));
-        let springfield = search("Springfield")?;
-        let regions: Vec<&str> = springfield
+    #[test]
+    fn ambiguous_names_rank_every_region_first() -> Result<(), TestError> {
+        let springfield = fixture_places("Springfield")?;
+        let ranked: Vec<&str> = springfield
             .iter()
+            .take(2)
             .map(|place| place.region.as_str())
             .collect();
-        let mut unique: Vec<&str> = regions.clone();
-        unique.sort_unstable();
-        unique.dedup();
+        assert_eq!(ranked, vec!["Missouri", "Illinois"], "{ranked:?}");
         assert!(
-            unique.len() >= 2,
-            "Springfield resolved to one region: {regions:?}"
+            springfield
+                .iter()
+                .skip(2)
+                .all(|place| match_rank(place, "Springfield") == 3),
+            "an unrelated name must rank below both Springfields"
         );
+        Ok(())
+    }
 
-        std::thread::sleep(std::time::Duration::from_millis(1_100));
-        let none = search("zzzzqqqqxxyy")?;
-        assert!(none.is_empty(), "unexpected match {none:?}");
+    #[test]
+    fn duplicate_names_in_different_regions_stay_distinct() -> Result<(), TestError> {
+        let emporia = fixture_places("Emporia")?;
+        let matching: Vec<&str> = emporia
+            .iter()
+            .filter(|place| place.name == "Emporia")
+            .map(|place| place.region.as_str())
+            .collect();
+        assert_eq!(matching, vec!["Kansas", "Virginia"], "{matching:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_unrelated_query_ranks_below_every_match() -> Result<(), TestError> {
+        let places = fixture_places("zzzzqqqqxxyy")?;
+        assert!(
+            places
+                .iter()
+                .all(|place| match_rank(place, "zzzzqqqqxxyy") == 3),
+            "an unrelated query must not rank as a match"
+        );
         Ok(())
     }
 }

@@ -121,6 +121,22 @@ pub fn temperature_whole(celsius: f64, units: UnitSystem) -> String {
     )
 }
 
+/// Formats a wind speed supplied in kilometres per hour.
+pub fn wind_speed(kilometres_per_hour: f64, units: UnitSystem) -> String {
+    match units {
+        UnitSystem::Metric => format!("{kilometres_per_hour:.0} km/h"),
+        UnitSystem::Imperial => format!("{:.0} mph", kilometres_per_hour * MILES_PER_KM),
+    }
+}
+
+/// Formats a precipitation depth supplied in millimetres.
+pub fn precipitation(millimetres: f64, units: UnitSystem) -> String {
+    match units {
+        UnitSystem::Metric => format!("{millimetres:.1} mm"),
+        UnitSystem::Imperial => format!("{:.2} in", millimetres / 25.4),
+    }
+}
+
 /// Converts a provider temperature to canonical degrees Celsius.
 pub fn celsius_from(value: f64, unit: &str) -> Option<f64> {
     match unit.trim() {
@@ -163,6 +179,10 @@ mod tests {
         assert_eq!(celsius_from(68.0, "°F"), Some(20.0));
         assert_eq!(celsius_from(20.0, "°C"), Some(20.0));
         assert_eq!(celsius_from(20.0, "K"), None);
+        assert_eq!(wind_speed(100.0, UnitSystem::Imperial), "62 mph");
+        assert_eq!(wind_speed(100.0, UnitSystem::Metric), "100 km/h");
+        assert_eq!(precipitation(25.4, UnitSystem::Imperial), "1.00 in");
+        assert_eq!(precipitation(25.4, UnitSystem::Metric), "25.4 mm");
     }
 
     #[test]

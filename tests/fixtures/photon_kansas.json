@@ -1,0 +1,62 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Emporia",
+        "state": "Kansas",
+        "county": "Lyon County",
+        "country": "United States",
+        "countrycode": "US",
+        "osm_value": "city"
+      },
+      "geometry": { "type": "Point", "coordinates": [-96.1817, 38.4039] }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Emporia",
+        "state": "Virginia",
+        "county": "Greensville County",
+        "country": "United States",
+        "countrycode": "US",
+        "osm_value": "town"
+      },
+      "geometry": { "type": "Point", "coordinates": [-77.5425, 36.6859] }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Springfield",
+        "state": "Missouri",
+        "country": "United States",
+        "countrycode": "US",
+        "osm_value": "city"
+      },
+      "geometry": { "type": "Point", "coordinates": [-93.2923, 37.2089] }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Springfield",
+        "state": "Illinois",
+        "country": "United States",
+        "countrycode": "US",
+        "osm_value": "city"
+      },
+      "geometry": { "type": "Point", "coordinates": [-89.6501, 39.8017] }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Topeka",
+        "state": "Kansas",
+        "country": "United States",
+        "countrycode": "US",
+        "osm_value": "city"
+      },
+      "geometry": { "type": "Point", "coordinates": [-95.6752, 39.0473] }
+    }
+  ]
+}

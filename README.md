@@ -45,7 +45,7 @@ Linux needs an X11 or Wayland client library, `libxkbcommon`, and a Vulkan loade
 
 ```
 cargo run --release
-oxrad --site KPAH
+oxrad --site KTWX
 ```
 
 `--site` starts with that NEXRAD station instead of the saved one. `--help` prints usage.

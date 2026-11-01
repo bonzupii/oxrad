@@ -42,7 +42,7 @@ pub const TYPE_BODY: f32 = 13.0;
 /// Type scale, in points.
 pub const TYPE_LABEL: f32 = 12.0;
 /// Type scale, in points.
-pub const TYPE_SMALL: f32 = 11.0;
+pub const TYPE_SMALL: f32 = 12.0;
 
 /// The selected colour theme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

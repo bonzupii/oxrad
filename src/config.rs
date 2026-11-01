@@ -296,8 +296,8 @@ mod tests {
 
     #[test]
     fn reads_a_saved_site() -> Result<(), ConfigError> {
-        let config = parse("# oxrad configuration.\nsite = \"KPAH\"\n")?;
-        assert_eq!(config.site.as_ref().map(SiteId::as_str), Some("KPAH"));
+        let config = parse("# oxrad configuration.\nsite = \"KTWX\"\n")?;
+        assert_eq!(config.site.as_ref().map(SiteId::as_str), Some("KTWX"));
         Ok(())
     }
 
@@ -311,11 +311,11 @@ mod tests {
     #[test]
     fn malformed_lines_name_the_line() {
         assert!(matches!(
-            parse("site KPAH\n"),
+            parse("site KTWX\n"),
             Err(ConfigError::Syntax { line: 1, .. })
         ));
         assert!(matches!(
-            parse("site = KPAH\n"),
+            parse("site = KTWX\n"),
             Err(ConfigError::Syntax { line: 1, .. })
         ));
         assert!(matches!(
@@ -333,7 +333,7 @@ mod tests {
             source,
         })?;
         let path = directory.join("config.toml");
-        let id = SiteId::parse("KOHX").map_err(|source| ConfigError::Site {
+        let id = SiteId::parse("KEAX").map_err(|source| ConfigError::Site {
             path: path.clone(),
             line: 0,
             source,
@@ -350,7 +350,7 @@ mod tests {
         )?;
         match load(&path)? {
             Some(config) => {
-                assert_eq!(config.site.as_ref().map(SiteId::as_str), Some("KOHX"));
+                assert_eq!(config.site.as_ref().map(SiteId::as_str), Some("KEAX"));
             }
             None => {
                 return Err(ConfigError::Syntax { path, line: 0 });

@@ -428,6 +428,12 @@ pub fn build_geometry_for(
     product: RadarProduct,
     color_table: ColorTable,
 ) -> Result<RadarGeometry, RenderError> {
+    if !volume.sweep.products.contains(&product) {
+        return Err(RenderError::ProductUnavailable {
+            product,
+            elevation: volume.sweep.elevation_number,
+        });
+    }
     let (site_x, site_y) = projection::mercator(volume.site_lat, volume.site_lon)
         .map_err(|source| RenderError::Coordinate { source })?;
     let gate_capacity = volume
@@ -590,11 +596,11 @@ mod tests {
     use crate::stations::SiteId;
     use crate::test_support::TestError;
 
-    const SITE_LAT: f64 = 37.068_33;
-    const SITE_LON: f64 = -88.771_94;
+    const SITE_LAT: f64 = 38.996_94;
+    const SITE_LON: f64 = -96.232_49;
 
     fn site() -> Result<SiteId, TestError> {
-        Ok(SiteId::parse("KPAH")?)
+        Ok(SiteId::parse("KTWX")?)
     }
 
     fn radial(left: f64, right: f64, elevation_deg: f64, values: Vec<GateValue>) -> RadialBins {
@@ -660,7 +666,7 @@ mod tests {
                 75.0,
             )?,
             origin: crate::radar::ArchiveOrigin::Cached,
-            history_key: Some(String::from("2026/10/30/KPAH/KPAH20261030_023529_V06")),
+            history_key: Some(String::from("2026/10/31/KTWX/KTWX20261031_003109_V06")),
         };
         sender
             .send(BuildRequest {
@@ -677,9 +683,9 @@ mod tests {
         assert_eq!(result.volume.origin, crate::radar::ArchiveOrigin::Cached);
         assert_eq!(
             result.volume.history_key.as_deref(),
-            Some("2026/10/30/KPAH/KPAH20261030_023529_V06")
+            Some("2026/10/31/KTWX/KTWX20261031_003109_V06")
         );
-        assert_eq!(result.volume.volume.site.as_str(), "KPAH");
+        assert_eq!(result.volume.volume.site.as_str(), "KTWX");
         assert!(result.geometry?.index_count > 0);
         Ok(())
     }
@@ -716,11 +722,11 @@ mod tests {
             geometry.site_y + f64::from(corner.y),
         )?;
         assert!(
-            (lat - 37.065_332).abs() < 5e-5,
+            (lat - 38.993_728).abs() < 5e-5,
             "rendered corner latitude {lat}"
         );
         assert!(
-            (lon + 87.928_621).abs() < 5e-5,
+            (lon + 95.366_767).abs() < 5e-5,
             "rendered corner longitude {lon}"
         );
         Ok(())
@@ -802,6 +808,22 @@ mod tests {
             .try_into()
             .map_err(|_| String::from("vertex colour"))?;
         assert_eq!(colour, range_folded_color(), "range folded colour");
+        Ok(())
+    }
+
+    #[test]
+    fn missing_product_is_not_rendered_as_an_empty_sweep() -> Result<(), TestError> {
+        let volume = volume(
+            vec![radial(89.5, 90.5, 0.0, vec![GateValue::Measured(30.0)])],
+            75.0,
+        )?;
+        assert!(matches!(
+            build_geometry_for(&volume, RadarProduct::Velocity, ColorTable::Standard),
+            Err(RenderError::ProductUnavailable {
+                product: RadarProduct::Velocity,
+                elevation: 1,
+            })
+        ));
         Ok(())
     }
 
@@ -926,19 +948,25 @@ mod tests {
         Ok(())
     }
 
-    /// Bowling Green is east and north of KHPX; Paducah is east and north of
-    /// KPAH. Both are independent geographic facts about the station catalog.
+    /// Emporia is east and south of KTWX; Topeka is east and north of KTWX.
+    /// Both are independent geographic facts about the station catalog.
     #[test]
     fn a_place_marker_sits_on_the_expected_bearing_from_the_station() -> Result<(), TestError> {
         let cases = [
             (
-                36.736_9,
-                -87.285,
-                36.990_3,
-                -86.443_6,
-                "Bowling Green from KHPX",
+                38.996_94,
+                -96.232_49,
+                39.047_3,
+                -95.675_2,
+                "Topeka from KTWX",
             ),
-            (37.068_33, -88.771_94, 37.083_4, -88.6, "Paducah from KPAH"),
+            (
+                37.654_44,
+                -97.443_05,
+                37.687_2,
+                -97.330_1,
+                "Wichita from KICT",
+            ),
         ];
         for (site_lat, site_lon, place_lat, place_lon, label) in cases {
             let (site_x, site_y) = projection::mercator(site_lat, site_lon)?;

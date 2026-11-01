@@ -25,7 +25,7 @@ export LD_LIBRARY_PATH="$PWD/.tools/root/usr/lib/x86_64-linux-gnu"
 .tools/root/usr/bin/proot -b "$PWD/.tools/root/usr/bin/xkbcomp:/usr/bin/xkbcomp" .tools/root/usr/bin/Xvfb :91 -screen 0 1280x800x24 -nolisten tcp -ac -fbdir "$PWD/target/local-x11" > target/local-x11/xvfb.log 2>&1 < /dev/null &
 echo $! > target/local-x11/xvfb.pid
 export DISPLAY=:91 VK_DRIVER_FILES="$PWD/.tools/lvp-workspace.json" WGPU_BACKEND=vulkan HOME="$PWD/target/headless-home"
-target/release/oxrad --site KPAH > target/local-x11/oxrad.log 2>&1 < /dev/null &
+target/release/oxrad --site KTWX > target/local-x11/oxrad.log 2>&1 < /dev/null &
 echo $! > target/local-x11/oxrad.pid
 ```
 

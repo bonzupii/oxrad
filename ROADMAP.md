@@ -140,18 +140,18 @@ An Android companion that streams device position. The desktop keeps location se
 
 ## Coordinate reference
 
-KPAH test origin: 37.06833 N, 88.77194 W. Geodesic direct distance: 75 km. Tolerance: 5e-7 degrees.
+KTWX test origin: 38.99694 N, 96.23249 W. Geodesic direct distance: 75 km. Tolerance: 5e-7 degrees.
 
 | Azimuth | Latitude | Longitude |
 |---|---|---|
-| 0 | 37.744095 | -88.771940 |
-| 45 | 37.544662 | -88.171837 |
-| 90 | 37.065332 | -87.928621 |
-| 135 | 36.588961 | -88.179319 |
-| 180 | 36.392487 | -88.771940 |
-| 225 | 36.588961 | -89.364561 |
-| 270 | 37.065332 | -89.615259 |
-| 315 | 37.544662 | -89.372043 |
+| 0 | 39.672483 | -96.232490 |
+| 45 | 39.473007 | -95.616164 |
+| 90 | 38.993728 | -95.366767 |
+| 135 | 38.517622 | -95.624396 |
+| 180 | 38.321319 | -96.232490 |
+| 225 | 38.517622 | -96.840584 |
+| 270 | 38.993728 | -97.098213 |
+| 315 | 39.473007 | -96.848816 |
 
 Slant-to-ground uses the 4/3 effective-radius model with a 6371.0 km mean radius. Web Mercator clamps latitude to 85.0511287798066 degrees. Longitude is normalized to [-180, 180), keeping -180 as the western edge. Antimeridian, Mercator-limit, zero-range, near-coincident, and antipodal cases have tests.
 

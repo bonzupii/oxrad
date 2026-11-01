@@ -21,6 +21,7 @@ use std::io;
 use std::path::PathBuf;
 
 use crate::place::PlaceError;
+use crate::product::RadarProduct;
 
 /// A value that cannot be placed on the ellipsoid or in the view.
 #[derive(Debug)]
@@ -28,6 +29,8 @@ pub enum CoordinateError {
     Latitude { lat: f64 },
     Longitude { lon: f64 },
     MercatorLatitude { lat: f64 },
+    MapPosition { x: f64, y: f64 },
+    ZoomFactor { factor: f64 },
     Range { range_km: f64 },
     GroundRange { slant_km: f64, elevation_deg: f64 },
     ViewExtent { extent_km: f64 },
@@ -43,6 +46,12 @@ impl CoordinateError {
             Self::Longitude { lon } => format!("Longitude {lon} is outside -180 to 180."),
             Self::MercatorLatitude { lat } => {
                 format!("Latitude {lat} is outside the range Web Mercator can project.")
+            }
+            Self::MapPosition { x, y } => {
+                format!("Map position ({x}, {y}) is not finite.")
+            }
+            Self::ZoomFactor { factor } => {
+                format!("Map zoom factor {factor} is not positive and finite.")
             }
             Self::Range { range_km } => format!("Range {range_km} km is not a valid distance."),
             Self::GroundRange {
@@ -789,9 +798,19 @@ pub enum RenderError {
     WorkerStopped,
     GpuUnavailable,
     Panic,
-    Coordinate { source: CoordinateError },
-    Color { source: ColorMapError },
-    MeshSize { vertices: usize },
+    Coordinate {
+        source: CoordinateError,
+    },
+    Color {
+        source: ColorMapError,
+    },
+    ProductUnavailable {
+        product: RadarProduct,
+        elevation: u8,
+    },
+    MeshSize {
+        vertices: usize,
+    },
 }
 
 impl RenderError {
@@ -812,6 +831,12 @@ impl RenderError {
             Self::Color { source } => {
                 format!("Failed to map radar value to a color: {source}")
             }
+            Self::ProductUnavailable { product, elevation } => {
+                format!(
+                    "{} is unavailable in radar sweep {elevation}.",
+                    product.label()
+                )
+            }
             Self::MeshSize { vertices } => {
                 format!("The radar mesh has {vertices} vertices, too many to draw.")
             }
@@ -830,9 +855,11 @@ impl Error for RenderError {
         match self {
             Self::Coordinate { source } => Some(source),
             Self::Color { source } => Some(source),
-            Self::WorkerStopped | Self::GpuUnavailable | Self::Panic | Self::MeshSize { .. } => {
-                None
-            }
+            Self::WorkerStopped
+            | Self::GpuUnavailable
+            | Self::Panic
+            | Self::ProductUnavailable { .. }
+            | Self::MeshSize { .. } => None,
         }
     }
 }

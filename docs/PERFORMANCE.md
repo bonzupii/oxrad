@@ -48,7 +48,7 @@ Tools required: `pidstat`, `perf`, and a display server. None of these has been 
 
 A measurement names its workload. The standard workload is:
 
-- KPAH, reflectivity, lowest tilt, live.
+- KTWX, reflectivity, lowest tilt, live.
 - Three nearby stations in map view.
 - NWS warnings on.
 - Global composite on at regional zoom.

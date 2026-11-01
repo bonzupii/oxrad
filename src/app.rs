@@ -27,7 +27,7 @@ use crate::basemap::{BasemapError, BasemapLayers};
 use crate::colormap::ColorTable;
 use crate::config::{self, Config};
 use crate::display::{Display, DisplayState, Frame};
-use crate::forecast::{Forecast, ForecastError, ForecastFeed, ForecastOutcome, ForecastPeriod};
+use crate::forecast::{Forecast, ForecastPeriod, ForecastState, ForecastView};
 use crate::global_radar::{
     self, DecodedTile, GlobalEvent, GlobalRadarError, GlobalRadarFeed, TileBounds, TileImage,
 };
@@ -36,10 +36,11 @@ use crate::history::{self, HistoryError, HistoryEvent, HistoryFeed};
 use crate::map::{self, MapError, MapView, WorldMap};
 use crate::overlay;
 use crate::pipeline::{Pipeline, PipelineState};
-use crate::place::{self, Place, PlaceSearch, SearchOutcome};
+use crate::place::{self, Place, SearchInteraction, SearchState};
 use crate::product::RadarProduct;
-use crate::provider::{JsonError, timestamp_label};
+use crate::provider::timestamp_label;
 use crate::radar::{ArchiveOrigin, GateValue, RetrievedVolume};
+use crate::radar_controls::{self, Selection};
 use crate::render::{self, ViewTransform};
 use crate::stations::{self, SiteId, Station, StationError, StationFeed, StationOutcome};
 use crate::theme::{self, Palette, Theme};
@@ -57,8 +58,6 @@ const RAIL_WIDTH: f32 = 320.0;
 const FORECAST_WIDTH: f32 = 340.0;
 const SEARCH_ROW_HEIGHT: f32 = 32.0;
 const STATION_LIST_HEIGHT: f32 = 220.0;
-const FORECAST_RETRY_BASE_SECS: u64 = 2;
-const FORECAST_RETRY_MAX_SECS: u64 = 60;
 const VIEW_RADAR_LIMIT: usize = 3;
 const VIEW_RADAR_TIME_WINDOW_MS: u64 = 6 * 60 * 1000;
 const STATION_REFRESH_SECS: u64 = 6 * 60 * 60;
@@ -159,7 +158,6 @@ enum HistoryStart {
 
 struct HistoryView {
     feed: HistoryFeed,
-    generation: u64,
     keys: Vec<String>,
     key: Option<String>,
     state: HistoryState,
@@ -173,7 +171,6 @@ impl HistoryView {
     fn new() -> Self {
         Self {
             feed: HistoryFeed::new(),
-            generation: 0,
             keys: Vec::new(),
             key: None,
             state: HistoryState::Idle,
@@ -185,7 +182,7 @@ impl HistoryView {
     }
 
     fn clear(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
+        self.feed.cancel();
         self.keys.clear();
         self.key = None;
         self.state = HistoryState::Idle;
@@ -290,49 +287,6 @@ fn action_button(palette: &Palette, label: &str) -> egui::Button<'static> {
     .stroke(Stroke::new(1.0_f32, palette.border))
 }
 
-fn product_buttons(
-    ui: &mut egui::Ui,
-    palette: &Palette,
-    capabilities: &[RadarProduct],
-    available_products: &[RadarProduct],
-    selected_product: RadarProduct,
-) -> Option<RadarProduct> {
-    let spacing = 6.0_f32;
-    let width = ((ui.available_width() - spacing * 2.0) / 3.0).max(84.0);
-    let mut requested = None;
-    egui::Grid::new("product-grid")
-        .num_columns(3)
-        .spacing(Vec2::new(spacing, spacing))
-        .show(ui, |ui| {
-            for (index, product) in capabilities.iter().enumerate() {
-                let available =
-                    available_products.is_empty() || available_products.contains(product);
-                let selected = *product == selected_product;
-                let label = format!("{} {}", product.id(), product.unit());
-                let button = if selected {
-                    toggle_button(palette, &label, true)
-                } else {
-                    action_button(palette, &label)
-                };
-                let response = ui
-                    .add_enabled_ui(available, |ui| ui.add_sized([width, 30.0], button))
-                    .inner;
-                let response = if available {
-                    response.on_hover_text(product.description())
-                } else {
-                    response.on_disabled_hover_text("Not carried by this sweep.")
-                };
-                if response.clicked() {
-                    requested = Some(*product);
-                }
-                if (index + 1) % 3 == 0 {
-                    ui.end_row();
-                }
-            }
-        });
-    requested
-}
-
 fn map_status_area(rect: Rect) -> Option<Rect> {
     let width = (rect.width() - 110.0).clamp(0.0, 520.0);
     let height = (rect.height() - 400.0).clamp(0.0, 130.0);
@@ -397,53 +351,12 @@ fn nearby_station_ids(
     Ok(candidates.into_iter().map(|(_, id)| id).collect())
 }
 
-fn forecast_retry_delay(error: &ForecastError, attempt: u32) -> Duration {
-    if let Some(value) = error.retry_after()
-        && let Ok(delay) = crate::retry::retry_after_delay(value)
-    {
-        return delay;
-    }
-    let factor = 2_u64.saturating_pow(attempt.min(5));
-    let seconds = FORECAST_RETRY_BASE_SECS
-        .saturating_mul(factor)
-        .min(FORECAST_RETRY_MAX_SECS);
-    Duration::from_secs(seconds) + Duration::from_millis(u64::from(attempt).wrapping_mul(137) % 500)
-}
-
-enum SearchState {
-    Idle,
-    Working { query: String },
-    Ready { places: Vec<Place> },
-    Failed { query: String, error: JsonError },
-}
-
-enum ForecastState {
-    Empty,
-    Loading {
-        place: Place,
-        last: Option<Forecast>,
-        attempt: u32,
-    },
-    Ready {
-        forecast: Forecast,
-    },
-    Failed {
-        place: Place,
-        error: ForecastError,
-        last: Option<Forecast>,
-        retry_at: Option<Instant>,
-        attempt: u32,
-    },
-}
-
 struct ViewRadar {
     site: SiteId,
     pipeline: Pipeline,
     display: Display,
     failure_reported: bool,
 }
-
-const SEARCH_DEBOUNCE: Duration = Duration::from_millis(600);
 
 pub struct OxradApp {
     gpu: Option<RadarGpu>,
@@ -456,17 +369,12 @@ pub struct OxradApp {
     applied_theme: Option<Theme>,
     config_writable: bool,
     notice: Option<String>,
-    query: String,
-    search: PlaceSearch,
-    search_state: SearchState,
-    search_due: Option<Instant>,
-    last_search_query: String,
+    search: SearchInteraction,
     place: Option<Place>,
     site: Option<SiteId>,
     pipeline: Option<Pipeline>,
     display: Display,
-    forecast: ForecastFeed,
-    forecast_state: ForecastState,
+    forecast: ForecastView,
     product: RadarProduct,
     station_query: String,
     station_picker_open: bool,
@@ -538,17 +446,12 @@ impl OxradApp {
             applied_theme: None,
             config_writable,
             notice,
-            query: String::new(),
-            search: PlaceSearch::new(),
-            search_state: SearchState::Idle,
-            search_due: None,
-            last_search_query: String::new(),
+            search: SearchInteraction::new(),
             place: restored_place.clone(),
             site: None,
             pipeline: None,
             display: Display::new(gpu, color_table),
-            forecast: ForecastFeed::new(),
-            forecast_state: ForecastState::Empty,
+            forecast: ForecastView::new(),
             product: RadarProduct::Reflectivity,
             station_query: String::new(),
             station_picker_open: restored_site.is_none(),
@@ -591,7 +494,7 @@ impl OxradApp {
                 Ok(view) => app.map_view = view,
                 Err(error) => app.notice = Some(format!("Map centre unavailable: {error}")),
             }
-            app.start_forecast(place, 0);
+            app.forecast.start(place, 0);
         }
         if let Some(id) = restored_site
             && let Ok(list) = &app.stations
@@ -660,9 +563,7 @@ impl OxradApp {
     }
 
     fn choose_site(&mut self, id: SiteId) {
-        self.search_state = SearchState::Idle;
-        self.last_search_query.clear();
-        self.search.cancel();
+        self.search.clear();
         self.open_site(id, true);
     }
 
@@ -690,41 +591,6 @@ impl OxradApp {
         for layer in &mut self.view_radars {
             layer.display.set_color_table(table);
         }
-    }
-
-    fn submit_search(&mut self) {
-        let query = self.query.trim().to_owned();
-        if query.is_empty() {
-            self.notice = Some(String::from("Type a town or place name first."));
-            return;
-        }
-        self.search_due = None;
-        self.start_search(query);
-    }
-
-    fn start_search(&mut self, query: String) {
-        self.last_search_query = query.clone();
-        self.notice = None;
-        self.station_picker_open = false;
-        match self.search.start(query.clone()) {
-            Ok(()) => self.search_state = SearchState::Working { query },
-            Err(error) => self.search_state = SearchState::Failed { query, error },
-        }
-    }
-
-    fn tick_search(&mut self) {
-        let Some(due) = self.search_due else {
-            return;
-        };
-        if Instant::now() < due {
-            return;
-        }
-        self.search_due = None;
-        let query = self.query.trim().to_owned();
-        if query.len() < 2 || query == self.last_search_query {
-            return;
-        }
-        self.start_search(query);
     }
 
     fn focus_map_context(&mut self) {
@@ -882,15 +748,14 @@ impl OxradApp {
     }
 
     fn choose_place(&mut self, place: &Place) {
-        self.query.clear();
-        self.search_state = SearchState::Idle;
+        self.search.clear();
         match MapView::focus(place.lat, place.lon, 2_200.0) {
             Ok(view) => self.map_view = view,
             Err(error) => self.notice = Some(format!("Map centre unavailable: {error}")),
         }
         self.place = Some(place.clone());
         self.config.place = Some(place.clone());
-        self.start_forecast(place, 0);
+        self.forecast.start(place, 0);
         if !place.in_united_states() {
             self.clear_site();
             self.scene_mode = SceneMode::Map;
@@ -933,94 +798,6 @@ impl OxradApp {
                     place.label()
                 ));
                 self.save_config();
-            }
-        }
-    }
-
-    fn start_forecast(&mut self, place: &Place, attempt: u32) {
-        let last = self.remembered_forecast(place);
-        match self.forecast.start(place) {
-            Ok(()) => {
-                self.forecast_state = ForecastState::Loading {
-                    place: place.clone(),
-                    last,
-                    attempt,
-                };
-            }
-            Err(error) => {
-                self.forecast_state = ForecastState::Failed {
-                    place: place.clone(),
-                    error,
-                    last,
-                    retry_at: None,
-                    attempt,
-                };
-            }
-        }
-    }
-
-    fn remembered_forecast(&self, place: &Place) -> Option<Forecast> {
-        match &self.forecast_state {
-            ForecastState::Ready { forecast } if forecast.place.same_place(place) => {
-                Some(forecast.clone())
-            }
-            ForecastState::Loading { last, .. } | ForecastState::Failed { last, .. } => last
-                .as_ref()
-                .filter(|forecast| forecast.place.same_place(place))
-                .cloned(),
-            ForecastState::Ready { .. } | ForecastState::Empty => None,
-        }
-    }
-
-    fn apply_search(&mut self, outcome: SearchOutcome) {
-        match outcome {
-            SearchOutcome::Results { places } => {
-                self.search_state = SearchState::Ready { places };
-            }
-            SearchOutcome::Failed { query, error } => {
-                self.search_state = SearchState::Failed { query, error };
-            }
-        }
-    }
-
-    fn apply_forecast(&mut self, outcome: ForecastOutcome) {
-        match outcome {
-            ForecastOutcome::Ready(forecast) => {
-                if self
-                    .place
-                    .as_ref()
-                    .is_some_and(|place| forecast.place.same_place(place))
-                {
-                    self.forecast_state = ForecastState::Ready { forecast };
-                }
-            }
-            ForecastOutcome::Failed { place, error } => {
-                if self
-                    .place
-                    .as_ref()
-                    .is_some_and(|current| !place.same_place(current))
-                {
-                    return;
-                }
-                let (last, attempt) =
-                    match std::mem::replace(&mut self.forecast_state, ForecastState::Empty) {
-                        ForecastState::Loading { last, attempt, .. }
-                        | ForecastState::Failed { last, attempt, .. } => (last, attempt),
-                        ForecastState::Ready { forecast } => (Some(forecast), 0),
-                        ForecastState::Empty => (None, 0),
-                    };
-                let retry_at = if error.is_transient() {
-                    Instant::now().checked_add(forecast_retry_delay(&error, attempt))
-                } else {
-                    None
-                };
-                self.forecast_state = ForecastState::Failed {
-                    place,
-                    error,
-                    last,
-                    retry_at,
-                    attempt,
-                };
             }
         }
     }
@@ -1081,28 +858,8 @@ impl OxradApp {
             self.station_feed = StationFeed::new();
             self.station_refresh_due = due_after(Duration::from_secs(STATION_REFRESH_SECS));
         }
-        while let Some(outcome) = self.search.poll() {
-            self.apply_search(outcome);
-        }
-        self.tick_search();
-        if let Some(outcome) = self.forecast.poll() {
-            self.apply_forecast(outcome);
-        }
-        let retry = match &self.forecast_state {
-            ForecastState::Failed {
-                place,
-                retry_at: Some(due),
-                attempt,
-                ..
-            } if Instant::now() >= *due => Some((place.clone(), attempt.saturating_add(1))),
-            ForecastState::Failed { .. }
-            | ForecastState::Empty
-            | ForecastState::Loading { .. }
-            | ForecastState::Ready { .. } => None,
-        };
-        if let Some((place, attempt)) = retry {
-            self.start_forecast(&place, attempt);
-        }
+        self.search.update(Instant::now());
+        self.forecast.update(Instant::now());
         self.update_warnings();
         self.poll_global_radar(context);
     }
@@ -1126,8 +883,8 @@ impl OxradApp {
         if self.failed() {
             return false;
         }
-        matches!(self.search_state, SearchState::Working { .. })
-            || matches!(self.forecast_state, ForecastState::Loading { .. })
+        matches!(self.search.state(), SearchState::Working { .. })
+            || matches!(self.forecast.state(), ForecastState::Loading { .. })
             || matches!(self.global_state, GlobalState::Loading)
             || matches!(self.global_playback, GlobalPlayback::Playing)
             || matches!(
@@ -1324,7 +1081,7 @@ impl OxradApp {
             let width = (ui.available_width() - 82.0).max(80.0);
             let response = ui.add_sized(
                 [width, SEARCH_ROW_HEIGHT],
-                egui::TextEdit::singleline(&mut self.query)
+                egui::TextEdit::singleline(self.search.query_mut())
                     .hint_text("Town or place")
                     .margin(Vec2::new(10.0, 7.0)),
             );
@@ -1345,21 +1102,19 @@ impl OxradApp {
             }
         });
         if edited {
-            if self.query.trim().is_empty() {
-                self.search_due = None;
-                self.search.cancel();
-                self.search_state = SearchState::Idle;
-                self.last_search_query.clear();
-            } else {
-                self.search_due = Some(Instant::now() + SEARCH_DEBOUNCE);
-            }
+            self.search.edited(Instant::now());
         }
         if submit {
-            self.submit_search();
+            if self.search.submit() {
+                self.notice = None;
+                self.station_picker_open = false;
+            } else {
+                self.notice = Some(String::from("Type a town or place name first."));
+            }
         }
         ui.add_space(theme::SPACE_S);
         let mut chosen: Option<Place> = None;
-        match &self.search_state {
+        match self.search.state() {
             SearchState::Idle => {
                 let hint = if self.place.is_some() {
                     "Type to search for another town."
@@ -1422,98 +1177,30 @@ impl OxradApp {
     }
 
     fn product_section(&mut self, ui: &mut egui::Ui) {
-        let capabilities: Vec<RadarProduct> = self
-            .site_station()
-            .map(|station| station.capabilities().to_vec())
-            .unwrap_or_default();
-        if capabilities.is_empty() {
+        let (Some(station), Some(volume)) = (self.site_station(), self.display.selection_volume())
+        else {
             return;
-        }
-        ui.add_space(theme::SPACE_M);
-        ui.label(
-            RichText::new("Product and tilt")
-                .size(theme::TYPE_TITLE)
-                .strong(),
-        );
-        ui.add_space(theme::SPACE_XS);
-        let available_products: Vec<RadarProduct> = self
-            .display
-            .frame
-            .as_ref()
-            .map(|frame| {
-                RadarProduct::ALL
-                    .into_iter()
-                    .filter(|product| frame.volume.supports_product(*product))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let requested_product = product_buttons(
+        };
+        let selection = radar_controls::show(
             ui,
-            &self.config.theme.palette(),
-            &capabilities,
-            &available_products,
+            station.capabilities(),
+            volume,
             self.product,
+            !self.display.state.is_busy(),
         );
-        let requested_tilt = self.tilt_controls(ui);
-        if let Some(product) = requested_product {
+        let (product, elevation) = match selection {
+            Some(Selection::Product(product)) => (product, None),
+            Some(Selection::Elevation(elevation)) => (self.product, Some(elevation)),
+            None => return,
+        };
+        if self.display.rebuild(product, elevation) {
             self.product = product;
-            if self.display.frame.is_some() && !self.display.rebuild(product, requested_tilt) {
-                self.notice = Some(String::from(
-                    "That product and tilt could not be prepared from the displayed volume.",
-                ));
-            }
             self.refresh_view_radars();
-        } else if let Some(number) = requested_tilt
-            && !self.display.rebuild(self.product, Some(number))
-        {
+        } else {
             self.notice = Some(String::from(
-                "That tilt is not available in the displayed volume.",
+                "That product and elevation could not be prepared from the displayed volume.",
             ));
-        } else if requested_tilt.is_some() {
-            self.refresh_view_radars();
         }
-    }
-
-    fn tilt_controls(&self, ui: &mut egui::Ui) -> Option<u8> {
-        let tilt_options: Vec<(u8, f64, bool)> = self
-            .display
-            .frame
-            .as_ref()
-            .map(|frame| frame.volume.tilt_options_for(self.product))
-            .unwrap_or_default();
-        if tilt_options.is_empty() {
-            ui.label(
-                RichText::new("Tilts appear when a volume is loaded.")
-                    .size(theme::TYPE_SMALL)
-                    .weak(),
-            );
-            return None;
-        }
-        ui.label(RichText::new("Tilt").size(theme::TYPE_SMALL).weak());
-        let palette = self.config.theme.palette();
-        let spacing = 6.0_f32;
-        let width = ((ui.available_width() - spacing * 3.0) / 4.0).max(54.0);
-        let mut requested = None;
-        egui::Grid::new("tilt-grid")
-            .num_columns(4)
-            .spacing(Vec2::new(spacing, spacing))
-            .show(ui, |ui| {
-                for (index, (number, elevation, selected)) in tilt_options.into_iter().enumerate() {
-                    let label = format!("{number} · {elevation:.2}°");
-                    let button = if selected {
-                        toggle_button(&palette, &label, true)
-                    } else {
-                        action_button(&palette, &label)
-                    };
-                    if ui.add_sized([width, 28.0], button).clicked() && !selected {
-                        requested = Some(number);
-                    }
-                    if (index + 1) % 4 == 0 {
-                        ui.end_row();
-                    }
-                }
-            });
-        requested
     }
 
     fn station_section(&mut self, ui: &mut egui::Ui) {
@@ -1546,7 +1233,9 @@ impl OxradApp {
                         .weak(),
                     );
                 }
-                station_details(ui, station);
+                egui::CollapsingHeader::new("Station details")
+                    .id_salt("station-details")
+                    .show(ui, |ui| station_details(ui, station));
             }
             _ => {
                 ui.label(RichText::new("No radar station selected").size(theme::TYPE_BODY));
@@ -1643,7 +1332,7 @@ impl OxradApp {
                 ui.add_space(theme::SPACE_M);
                 ui.label(RichText::new("Forecast").size(theme::TYPE_TITLE).strong());
                 ui.add_space(theme::SPACE_XS);
-                match &self.forecast_state {
+                match self.forecast.state() {
                     ForecastState::Empty => {
                         ui.label(RichText::new("No town selected").size(14.0).strong());
                         ui.label(
@@ -1705,7 +1394,7 @@ impl OxradApp {
                 ui.add_space(theme::SPACE_S);
             });
         if retry && let Some(place) = self.place.clone() {
-            self.start_forecast(&place, 0);
+            self.forecast.start(&place, 0);
         }
     }
 
@@ -1714,7 +1403,7 @@ impl OxradApp {
         if let Some(place) = &self.place {
             egui::Panel::bottom("forecast_footer").show_inside(ui, |ui| {
                 ui.separator();
-                if matches!(self.forecast_state, ForecastState::Ready { .. }) {
+                if matches!(self.forecast.state(), ForecastState::Ready { .. }) {
                     retry = ui.button("Refresh forecast").clicked();
                     ui.add_space(theme::SPACE_XS);
                 }
@@ -2453,7 +2142,13 @@ impl OxradApp {
             && let Some(pointer) = ui.input(|input| input.pointer.hover_pos())
             && rect.contains(pointer)
         {
-            let point = transform.latlon_at(pointer);
+            let point = match transform.latlon_at(pointer) {
+                Ok(point) => point,
+                Err(error) => {
+                    self.notice = Some(format!("Measurement point unavailable: {error}"));
+                    return;
+                }
+            };
             if self.measure_start.is_none() || self.measure_end.is_some() {
                 self.measure_start = Some(point);
                 self.measure_end = None;
@@ -3025,22 +2720,18 @@ impl OxradApp {
     }
 
     fn apply_history_event(&mut self, event: HistoryEvent) {
-        let generation = self.history.generation;
         match event {
-            HistoryEvent::Keys {
-                generation: event_generation,
-                keys,
-            } if event_generation == generation => {
+            HistoryEvent::Keys { keys, .. } => {
                 self.history.keys = keys;
                 self.history.state = HistoryState::Ready;
             }
             HistoryEvent::Volume {
-                generation: event_generation,
                 key,
                 volume,
                 from_cache,
                 cache_warning,
-            } if event_generation == generation => {
+                ..
+            } => {
                 self.history.key = Some(key.clone());
                 self.history.state = HistoryState::Reviewing;
                 self.history.scrub_index = None;
@@ -3061,10 +2752,10 @@ impl OxradApp {
                 }
             }
             HistoryEvent::Failed {
-                generation: event_generation,
                 error,
                 cache_warning,
-            } if event_generation == generation => {
+                ..
+            } => {
                 self.history_failure(error);
                 if let Some(warning) = cache_warning {
                     let failure = self
@@ -3074,9 +2765,6 @@ impl OxradApp {
                     self.notice = Some(format!("{failure} Cache warning: {warning}."));
                 }
             }
-            HistoryEvent::Keys { .. }
-            | HistoryEvent::Volume { .. }
-            | HistoryEvent::Failed { .. } => {}
         }
     }
 
@@ -3100,10 +2788,7 @@ impl OxradApp {
         self.history.key = None;
         self.history.error = None;
         match self.history.feed.request_keys(&site) {
-            Ok(generation) => {
-                self.history.generation = generation;
-                self.history.state = HistoryState::LoadingKeys;
-            }
+            Ok(()) => self.history.state = HistoryState::LoadingKeys,
             Err(error) => self.history_failure(error),
         }
     }
@@ -3121,10 +2806,7 @@ impl OxradApp {
         self.history.error = None;
         self.history.next_frame = None;
         match self.history.feed.request_volume(&site, key) {
-            Ok(generation) => {
-                self.history.generation = generation;
-                self.history.state = HistoryState::LoadingVolume;
-            }
+            Ok(()) => self.history.state = HistoryState::LoadingVolume,
             Err(error) => self.history_failure(error),
         }
     }
@@ -3325,14 +3007,13 @@ impl OxradApp {
                 .size(theme::TYPE_SMALL)
                 .weak(),
         );
-        if !self.history.keys.is_empty() {
+        if let Some(current) = self
+            .history
+            .key
+            .as_deref()
+            .and_then(|key| self.history.keys.iter().position(|item| item == key))
+        {
             let last = self.history.keys.len().saturating_sub(1);
-            let current = self
-                .history
-                .key
-                .as_deref()
-                .and_then(|key| self.history.keys.iter().position(|item| item == key))
-                .unwrap_or(0);
             let mut requested = self.history.scrub_index.unwrap_or(current).min(last);
             let response = ui.add(
                 egui::Slider::new(&mut requested, 0..=last)
@@ -3677,7 +3358,19 @@ impl OxradApp {
         {
             return;
         }
-        let (lat, lon) = transform.latlon_at(pointer);
+        let (lat, lon) = match transform.latlon_at(pointer) {
+            Ok(point) => point,
+            Err(error) => {
+                ui.painter().text(
+                    pointer,
+                    Align2::LEFT_TOP,
+                    format!("Map coordinates unavailable: {error}"),
+                    FontId::proportional(theme::TYPE_SMALL),
+                    ERROR,
+                );
+                return;
+            }
+        };
         let mut label = format!("{lat:.4}, {lon:.4}");
         if radar_visible
             && let Some(frame) = &self.display.frame
@@ -4165,8 +3858,14 @@ fn forecast_body(
         );
     ui.label(
         RichText::new(format!(
-            "Feels {apparent} · humidity {:.0}% · {} · precipitation {:.1} mm",
-            forecast.current.humidity, forecast.current.wind, forecast.current.precipitation
+            "Feels {apparent} · humidity {:.0}% · {} · precipitation {}",
+            forecast.current.humidity,
+            crate::forecast::wind(
+                forecast.current.wind_direction_deg,
+                forecast.current.wind_speed_kmh,
+                units,
+            ),
+            crate::units::precipitation(forecast.current.precipitation, units)
         ))
         .size(theme::TYPE_SMALL)
         .weak(),
@@ -4217,11 +3916,9 @@ fn forecast_period(ui: &mut egui::Ui, period: &ForecastPeriod, units: crate::uni
     let precipitation = period
         .precipitation
         .map_or_else(String::new, |chance| format!(" · {chance}% precipitation"));
-    let wind = if period.wind.is_empty() {
-        String::new()
-    } else {
-        format!(" · wind {}", period.wind)
-    };
+    let wind = period.wind_speed_kmh.map_or_else(String::new, |speed| {
+        format!(" · wind {}", crate::units::wind_speed(speed, units))
+    });
     ui.label(
         RichText::new(format!(
             "{}{wind}{precipitation}",
@@ -4575,16 +4272,6 @@ mod tests {
     use super::*;
     use crate::test_support::TestError;
 
-    fn throttled(retry_after: Option<&str>) -> ForecastError {
-        ForecastError::Provider {
-            source: JsonError::Status {
-                url: String::from("https://api.weather.gov/points/example"),
-                status: 503,
-                retry_after: retry_after.map(String::from),
-            },
-        }
-    }
-
     fn warning(id: &str, event: &str) -> Warning {
         Warning {
             id: String::from(id),
@@ -4636,18 +4323,6 @@ mod tests {
         assert!(!scans_align(0, VIEW_RADAR_TIME_WINDOW_MS.saturating_add(1)));
     }
 
-    #[test]
-    fn forecast_retry_honors_retry_after_and_grows_exponentially() {
-        assert_eq!(
-            forecast_retry_delay(&throttled(Some("17")), 0),
-            Duration::from_secs(17)
-        );
-        let first = forecast_retry_delay(&throttled(None), 0);
-        let second = forecast_retry_delay(&throttled(None), 1);
-        assert_eq!(first, Duration::from_secs(2));
-        assert!(second > first, "{second:?} must exceed {first:?}");
-        assert!(second <= Duration::from_secs(5));
-    }
     fn test_station(id: &str, lat: f64, lon: f64) -> Result<Station, TestError> {
         Ok(Station {
             id: SiteId::parse(id)?,

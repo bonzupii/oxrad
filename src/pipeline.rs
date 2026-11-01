@@ -535,8 +535,8 @@ mod tests {
     fn volume(site: SiteId) -> RadarVolume {
         RadarVolume {
             site,
-            site_lat: 37.06833,
-            site_lon: -88.77194,
+            site_lat: 38.99694,
+            site_lon: -96.23249,
             scan_unix_ms: 1_793_327_729_000,
             sweep: crate::radar::RadarSweep {
                 elevation_deg: 0.5,
@@ -556,7 +556,7 @@ mod tests {
 
     #[test]
     fn cache_origin_belongs_to_the_fetched_volume() -> Result<(), TestError> {
-        let site = SiteId::parse("KPAH")?;
+        let site = SiteId::parse("KTWX")?;
         let (_events, event_receiver) = mpsc::channel();
         let (retry, _retries) = mpsc::channel();
         let mut pipeline = Pipeline {
@@ -618,18 +618,18 @@ mod tests {
 
     #[test]
     fn a_failed_step_keeps_its_operation_and_error() -> Result<(), TestError> {
-        let site = SiteId::parse("KPAH")?;
+        let site = SiteId::parse("KTWX")?;
         let failed = worker_failure(
             &site,
             Operation::Fetching,
             RadarError::WorkerStopped {
-                site: String::from("KPAH"),
+                site: String::from("KTWX"),
             },
         );
         assert_eq!(failed.operation, Operation::Fetching);
         assert!(matches!(
             failed.error,
-            RadarError::WorkerStopped { ref site } if site == "KPAH"
+            RadarError::WorkerStopped { ref site } if site == "KTWX"
         ));
         Ok(())
     }

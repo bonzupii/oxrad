@@ -34,6 +34,7 @@ mod product;
 mod projection;
 mod provider;
 mod radar;
+mod radar_controls;
 mod render;
 mod retry;
 mod stations;
@@ -72,7 +73,7 @@ fn main() -> ExitCode {
                     }
                 },
                 None => {
-                    eprintln!("--site needs an identifier such as KPAH.\n\n{USAGE}");
+                    eprintln!("--site needs an identifier such as KTWX.\n\n{USAGE}");
                     return ExitCode::FAILURE;
                 }
             },

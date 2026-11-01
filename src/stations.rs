@@ -37,7 +37,7 @@ use crate::provider::{self, JsonError};
 const STATIONS_URL: &str = "https://api.weather.gov/radar/stations";
 const ACCEPT: &str = "application/geo+json";
 
-/// A four-character radar site identifier such as `KPAH`.
+/// A four-character radar site identifier such as `KTWX`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SiteId {
     code: String,
@@ -529,17 +529,17 @@ mod tests {
             "live station count {}",
             stations.len()
         );
-        let kpah = SiteId::parse("KPAH").map_err(|_| shape("KPAH identifier"))?;
+        let kpah = SiteId::parse("KTWX").map_err(|_| shape("KTWX identifier"))?;
         let station = find(&stations, &kpah).ok_or(StationError::NoStations)?;
-        assert_eq!(station.name, "Paducah");
+        assert_eq!(station.name, "Topeka");
         assert!(
-            (station.lat - 37.068_33).abs() < 5e-4,
-            "KPAH latitude {}",
+            (station.lat - 38.996_94).abs() < 5e-4,
+            "KTWX latitude {}",
             station.lat
         );
         assert!(
-            (station.lon + 88.771_94).abs() < 5e-4,
-            "KPAH longitude {}",
+            (station.lon + 96.232_49).abs() < 5e-4,
+            "KTWX longitude {}",
             station.lon
         );
         assert_eq!(station.source, RadarSource::Nexrad);

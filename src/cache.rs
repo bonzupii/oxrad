@@ -209,14 +209,17 @@ impl Store {
                 detail: "metadata belongs to another key",
             });
         }
-        let expected_len = metadata
+        let stored_len = metadata
             .get("body_len")
             .and_then(Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok())
             .ok_or_else(|| CacheError::Corrupt {
                 key: String::from(key),
-                detail: "missing body length",
+                detail: "missing or invalid body length",
             })?;
+        let expected_len = usize::try_from(stored_len).map_err(|_| CacheError::Corrupt {
+            key: String::from(key),
+            detail: "body length exceeds the platform limit",
+        })?;
         let expected_digest = metadata
             .get("body_sha256")
             .and_then(Value::as_str)
