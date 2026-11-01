@@ -23,7 +23,6 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs;
 use std::io::ErrorKind;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
@@ -190,7 +189,6 @@ pub enum StationError {
     NoStations,
     NotRadar,
     WorkerStopped,
-    WorkerPanic,
 }
 
 impl StationError {
@@ -215,9 +213,6 @@ impl StationError {
             Self::WorkerStopped => {
                 String::from("The station discovery worker stopped before answering.")
             }
-            Self::WorkerPanic => {
-                String::from("The station discovery worker panicked while answering.")
-            }
         }
     }
 }
@@ -238,8 +233,7 @@ impl Error for StationError {
             | Self::Duplicate { .. }
             | Self::NoStations
             | Self::NotRadar
-            | Self::WorkerStopped
-            | Self::WorkerPanic => None,
+            | Self::WorkerStopped => None,
         }
     }
 }
@@ -464,14 +458,19 @@ impl StationFeed {
     pub fn new() -> Self {
         let (sender, results) = mpsc::channel();
         std::thread::spawn(move || {
-            let outcome = catch_unwind(AssertUnwindSafe(discover)).map_or(
-                StationOutcome::Failed(StationError::WorkerPanic),
-                |result| match result {
-                    Ok(discovery) => StationOutcome::Ready(discovery),
-                    Err(error) => StationOutcome::Failed(error),
-                },
-            );
-            drop(sender.send(outcome));
+            // Discovery either answers or reports why it could not. There is no
+            // panic catcher around it: a panic here would be a defect in this
+            // code, and reporting it as a station-feed error would only make a
+            // broken program look like a working one that had a bad day. A
+            // worker that dies now surfaces as a disconnected feed, which the
+            // poller already reports as WorkerStopped.
+            let outcome = match discover() {
+                Ok(discovery) => StationOutcome::Ready(discovery),
+                Err(error) => StationOutcome::Failed(error),
+            };
+            if sender.send(outcome).is_err() {
+                // Nothing is waiting for the answer: the feed was dropped.
+            }
         });
         Self {
             results,
