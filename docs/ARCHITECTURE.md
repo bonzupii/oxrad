@@ -22,7 +22,7 @@ The binary is one crate. `main.rs` parses arguments and constructs the applicati
 | `network` | 451 | NEXRAD S3 listing and retrieval |
 | `config` | 359 | `~/.oxrad/config.toml` |
 | `retry` | 327 | Backoff and `Retry-After` |
-| `colormap` | 308 | Product palettes |
+| `colormap` | 546 | Product palettes and color-vision tables |
 | `history` | 307 | Recent-volume listing and fetch |
 | `gpu` | 268 | wgpu pipeline and buffers |
 | `display` | 257 | Displayed frame and geometry worker |

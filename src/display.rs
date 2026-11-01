@@ -19,6 +19,7 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
 use eframe::egui::{Rect, Shape};
 
+use crate::colormap::ColorTable;
 use crate::error::RenderError;
 use crate::gpu::{self, RadarGpu, RadarMesh};
 use crate::product::RadarProduct;
@@ -78,10 +79,11 @@ pub struct Display {
     queued: Option<(u64, RetrievedVolume, RadarProduct)>,
     generation: u64,
     product: RadarProduct,
+    color_table: ColorTable,
 }
 
 impl Display {
-    pub fn new(gpu: Option<RadarGpu>) -> Self {
+    pub fn new(gpu: Option<RadarGpu>, color_table: ColorTable) -> Self {
         let (sender, receiver) = render::start_build_thread();
         let state = if gpu.is_some() {
             DisplayState::Waiting
@@ -97,7 +99,14 @@ impl Display {
             queued: None,
             generation: 0,
             product: RadarProduct::Reflectivity,
+            color_table,
         }
+    }
+
+    /// Recolors the displayed volume without changing its product or tilt.
+    pub fn set_color_table(&mut self, color_table: ColorTable) -> bool {
+        self.color_table = color_table;
+        self.rebuild(self.product, None)
     }
 
     /// Drops the current frame and discards any result still in flight.
@@ -184,6 +193,7 @@ impl Display {
         match self.sender.send(render::BuildRequest {
             volume,
             product,
+            color_table: self.color_table,
             generation,
         }) {
             Ok(()) => self.state = DisplayState::Building,
@@ -219,6 +229,14 @@ impl Display {
             return;
         }
         if !matches!(self.state, DisplayState::Building) || result.generation != self.generation {
+            return;
+        }
+        if result
+            .geometry
+            .as_ref()
+            .is_ok_and(|geometry| geometry.color_table != self.color_table)
+        {
+            self.send(self.generation, result.volume, self.product);
             return;
         }
         self.state = match result.geometry {

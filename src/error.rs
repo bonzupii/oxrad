@@ -147,6 +147,11 @@ pub enum ConfigError {
         line: usize,
         value: String,
     },
+    InvalidPalette {
+        path: PathBuf,
+        line: usize,
+        value: String,
+    },
     UnknownKey {
         path: PathBuf,
         line: usize,
@@ -197,6 +202,10 @@ impl ConfigError {
                 "{} line {line} sets the theme to {value:?}, which is not dark or light.",
                 path.display()
             ),
+            Self::InvalidPalette { path, line, value } => format!(
+                "{} line {line} sets the palette to {value:?}, which is not a supported color table.",
+                path.display()
+            ),
             Self::UnknownKey { path, line, key } => format!(
                 "{} line {line} sets the unrecognized key {key}.",
                 path.display()
@@ -245,6 +254,7 @@ impl Error for ConfigError {
             Self::Syntax { .. }
             | Self::InvalidUnit { .. }
             | Self::InvalidTheme { .. }
+            | Self::InvalidPalette { .. }
             | Self::UnknownKey { .. }
             | Self::IncompletePlaceEntry { .. }
             | Self::PlaceNumber { .. } => None,

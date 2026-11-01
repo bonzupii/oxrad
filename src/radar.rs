@@ -1889,7 +1889,11 @@ mod tests {
         }
         assert_eq!(volume.skipped_radials, 0, "no radial is skipped");
 
-        let geometry = crate::render::build_geometry_for(&volume, RadarProduct::Reflectivity)?;
+        let geometry = crate::render::build_geometry_for(
+            &volume,
+            RadarProduct::Reflectivity,
+            crate::colormap::ColorTable::Standard,
+        )?;
         assert!(geometry.index_count > 0, "mesh has triangles");
         // Web Mercator stretches ground distance by 1/cos(latitude). The mesh
         // bounds reach the poleward edge of the sweep, where that factor is

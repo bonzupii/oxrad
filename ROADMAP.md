@@ -16,6 +16,7 @@ Only behavior observed in the running binary is listed as verified.
 | NEXRAD decoding | Verified | Type 31 radials, seven moment blocks, typed structural rejection |
 | Products and tilts | Verified | DREF, DVEL, DSW, DZDR, DRHO, DPHI, DKDP; sweeps filtered by product |
 | Radar rendering | Verified | WGS84 gate corners, product palette, rings, grid, pointer readout |
+| Radar color tables | Verified | Standard, deuteranopia, protanopia, tritanopia, high contrast; mesh and legend recolor; persisted |
 | Radar history | Verified | Eight recent volumes, loop, scrub, UTC label, cached-volume label |
 | Global place search | Verified | Photon live results; partial and transposed names, ranked; proximity bias absent |
 | Global forecast | Verified | Open-Meteo current, hourly, daily, retry, stale labeling |
@@ -63,6 +64,8 @@ These are established defects. They are requirements, not questions.
 | D-22 | Subsystems are not integrated | ARCH |
 | D-23 | Two-point measurement is partial | MAP-11 |
 
+Color-vision support is no longer absent. Five radar tables are selectable in the header and persist in configuration. Non-color encoding and the rest of A11Y-2 through A11Y-5 remain open.
+
 ## Structural defects
 
 | Defect | Evidence |
@@ -106,7 +109,7 @@ A phase is complete only when its behavior runs in the binary, its failure paths
 | 6 | International parity: DWD first, then other national adapters | Not started |
 | 7 | Environmental layers: seismic, wildfire, satellite, air quality, hydrology | Not started |
 | 8 | Performance and caching: measure, then optimize; unified cache policy | Not started |
-| 9 | Accessibility, localization, information radio | Not started |
+| 9 | Accessibility, localization, information radio | In progress: radar color tables done |
 | 10 | Integration, acceptance, full visual QA, release | Not started |
 
 ### Phase detail
@@ -127,7 +130,7 @@ A phase is complete only when its behavior runs in the binary, its failure paths
 
 **Phase 8.** Measure against [docs/PERFORMANCE.md](docs/PERFORMANCE.md). Then optimize the measured bottleneck. Unify cache classes and policy.
 
-**Phase 9.** Colourblind palettes, interface scale, keyboard reach, accessible names, localization, information radio.
+**Phase 9.** Radar color tables are implemented. Interface scale, keyboard reach, accessible names, non-color encodings, localization, and information radio remain.
 
 **Phase 10.** Full state matrix inspection at four window sizes and two themes. Complete gates. Remote delivery.
 

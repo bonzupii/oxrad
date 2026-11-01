@@ -46,6 +46,125 @@ const PRODUCT: &str = "BaseReflectivity";
 pub const MIN_REFLECTIVITY_DBZ: f32 = -32.0;
 pub const MAX_REFLECTIVITY_DBZ: f32 = 94.5;
 
+/// A radar color table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColorTable {
+    /// The NWS-style table used by default.
+    #[default]
+    Standard,
+    /// A blue-to-yellow ramp that does not rely on the red-green axis.
+    Deuteranopia,
+    /// A blue-to-yellow ramp tuned for reduced red sensitivity.
+    Protanopia,
+    /// A yellow-to-red ramp that avoids the blue-yellow axis.
+    Tritanopia,
+    /// A lightness-only ramp for severe color-vision loss and grayscale output.
+    HighContrast,
+}
+
+impl ColorTable {
+    /// Every selectable table, in menu order.
+    pub const ALL: [Self; 5] = [
+        Self::Standard,
+        Self::Deuteranopia,
+        Self::Protanopia,
+        Self::Tritanopia,
+        Self::HighContrast,
+    ];
+
+    /// The control label.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Standard => "Standard",
+            Self::Deuteranopia => "Deuteranopia",
+            Self::Protanopia => "Protanopia",
+            Self::Tritanopia => "Tritanopia",
+            Self::HighContrast => "High contrast",
+        }
+    }
+
+    /// The configuration token written to disk.
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Deuteranopia => "deuteranopia",
+            Self::Protanopia => "protanopia",
+            Self::Tritanopia => "tritanopia",
+            Self::HighContrast => "high-contrast",
+        }
+    }
+
+    /// Parses a configuration token.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "standard" => Some(Self::Standard),
+            "deuteranopia" => Some(Self::Deuteranopia),
+            "protanopia" => Some(Self::Protanopia),
+            "tritanopia" => Some(Self::Tritanopia),
+            "high-contrast" => Some(Self::HighContrast),
+            _ => None,
+        }
+    }
+
+    /// The accessibility use this table addresses.
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Standard => "Familiar NWS-style reflectivity colors.",
+            Self::Deuteranopia => "Blue-to-yellow ramp that stays ordered with deuteranopia.",
+            Self::Protanopia => "Blue-to-yellow ramp that stays ordered with protanopia.",
+            Self::Tritanopia => "Yellow-to-red ramp that stays ordered with tritanopia.",
+            Self::HighContrast => {
+                "Lightness-only ramp for severe color-vision loss and grayscale output."
+            }
+        }
+    }
+}
+
+const DEUTERANOPIA_RAMP: [(f32, [u8; 3]); 9] = [
+    (0.0, [16, 38, 84]),
+    (0.125, [22, 64, 130]),
+    (0.25, [28, 96, 165]),
+    (0.375, [40, 130, 180]),
+    (0.5, [70, 165, 170]),
+    (0.625, [125, 195, 120]),
+    (0.75, [195, 215, 60]),
+    (0.875, [240, 235, 80]),
+    (1.0, [255, 252, 200]),
+];
+const PROTANOPIA_RAMP: [(f32, [u8; 3]); 9] = [
+    (0.0, [18, 26, 52]),
+    (0.125, [24, 58, 100]),
+    (0.25, [30, 94, 140]),
+    (0.375, [50, 130, 158]),
+    (0.5, [90, 165, 150]),
+    (0.625, [150, 196, 110]),
+    (0.75, [212, 220, 80]),
+    (0.875, [246, 238, 110]),
+    (1.0, [255, 253, 220]),
+];
+const TRITANOPIA_RAMP: [(f32, [u8; 3]); 9] = [
+    (0.0, [30, 25, 30]),
+    (0.125, [70, 30, 38]),
+    (0.25, [110, 40, 45]),
+    (0.375, [145, 55, 42]),
+    (0.5, [180, 70, 45]),
+    (0.625, [210, 105, 42]),
+    (0.75, [240, 150, 50]),
+    (0.875, [252, 205, 80]),
+    (1.0, [255, 245, 190]),
+];
+const HIGH_CONTRAST_RAMP: [(f32, [u8; 3]); 9] = [
+    (0.0, [72, 72, 72]),
+    (0.125, [88, 88, 88]),
+    (0.25, [108, 108, 108]),
+    (0.375, [128, 128, 128]),
+    (0.5, [150, 150, 150]),
+    (0.625, [172, 172, 172]),
+    (0.75, [198, 198, 198]),
+    (0.875, [224, 224, 224]),
+    (1.0, [255, 255, 255]),
+];
+
 const fn with_alpha(rgb: [u8; 3]) -> [u8; 4] {
     [rgb[0], rgb[1], rgb[2], 255]
 }
@@ -105,6 +224,13 @@ const VELOCITY_RAMP: [(f32, [u8; 3]); 5] = [
     (0.0, [235, 235, 235]),
     (30.0, [214, 126, 24]),
     (100.0, [150, 24, 24]),
+];
+const ACCESSIBLE_VELOCITY_RAMP: [(f32, [u8; 3]); 5] = [
+    (-100.0, [10, 25, 70]),
+    (-30.0, [30, 100, 180]),
+    (0.0, [240, 240, 240]),
+    (30.0, [220, 130, 20]),
+    (100.0, [120, 40, 10]),
 ];
 const SPECTRUM_WIDTH_RAMP: [(f32, [u8; 3]); 4] = [
     (0.0, [30, 30, 38]),
@@ -169,7 +295,7 @@ fn ramp_color(
     )
 }
 
-/// The color for a value of the selected product.
+/// The color for a value of the selected product in the standard table.
 pub fn color_for_product(product: RadarProduct, value: f32) -> Result<[u8; 4], ColorMapError> {
     if product == RadarProduct::Reflectivity {
         return color_for_reflectivity(value);
@@ -185,6 +311,73 @@ pub fn color_for_product(product: RadarProduct, value: f32) -> Result<[u8; 4], C
         RadarProduct::Reflectivity => &KEYPOINTS,
     };
     ramp_color(ramp, product.id(), value, minimum, maximum)
+}
+
+const fn table_ramp(table: ColorTable) -> &'static [(f32, [u8; 3])] {
+    match table {
+        ColorTable::Standard => &KEYPOINTS,
+        ColorTable::Deuteranopia => &DEUTERANOPIA_RAMP,
+        ColorTable::Protanopia => &PROTANOPIA_RAMP,
+        ColorTable::Tritanopia => &TRITANOPIA_RAMP,
+        ColorTable::HighContrast => &HIGH_CONTRAST_RAMP,
+    }
+}
+
+fn ramp_at(ramp: &[(f32, [u8; 3])], fraction: f32) -> [u8; 4] {
+    let fraction = fraction.clamp(0.0, 1.0);
+    let mut previous: Option<(f32, [u8; 3])> = None;
+    for (key, rgb) in ramp {
+        match previous {
+            None => {
+                if fraction <= *key {
+                    return with_alpha(*rgb);
+                }
+            }
+            Some((low, low_rgb)) => {
+                if fraction <= *key {
+                    let span = *key - low;
+                    let local = if span > 0.0 {
+                        (fraction - low) / span
+                    } else {
+                        0.0
+                    };
+                    return interpolate(low_rgb, *rgb, local);
+                }
+            }
+        }
+        previous = Some((*key, *rgb));
+    }
+    ramp.last()
+        .map_or(RANGE_FOLDED, |(_, rgb)| with_alpha(*rgb))
+}
+
+/// The color for a value of the selected product in a selected table.
+pub fn color_for_product_with(
+    table: ColorTable,
+    product: RadarProduct,
+    value: f32,
+) -> Result<[u8; 4], ColorMapError> {
+    if table == ColorTable::Standard {
+        return color_for_product(product, value);
+    }
+    let (minimum, maximum) = product.value_range();
+    if !value.is_finite() || !(minimum..=maximum).contains(&value) {
+        return Err(ColorMapError::OutOfRange {
+            product: product.id(),
+            value,
+        });
+    }
+    if product == RadarProduct::Velocity {
+        return ramp_color(
+            &ACCESSIBLE_VELOCITY_RAMP,
+            product.id(),
+            value,
+            minimum,
+            maximum,
+        );
+    }
+    let fraction = (value - minimum) / (maximum - minimum);
+    Ok(ramp_at(table_ramp(table), fraction))
 }
 
 pub const fn range_folded_color() -> [u8; 4] {
@@ -304,5 +497,50 @@ mod tests {
             matches!(result, Err(ColorMapError::OutOfRange { product, value }) if product == PRODUCT && value == 95.0),
             "expected OutOfRange carrying 95.0, got {result:?}"
         );
+    }
+
+    #[test]
+    fn table_tokens_round_trip_and_reject_unknown_values() {
+        for table in ColorTable::ALL {
+            assert_eq!(ColorTable::parse(table.token()), Some(table));
+        }
+        assert_eq!(ColorTable::parse("viridis"), None);
+    }
+
+    #[test]
+    fn every_accessible_table_keeps_reflectivity_steps_distinct() -> Result<(), TestFailure> {
+        for table in ColorTable::ALL {
+            let mut previous: Option<[u8; 4]> = None;
+            for dbz in [-30.0_f32, 0.0, 20.0, 40.0, 60.0, 80.0] {
+                let color = color_for_product_with(table, RadarProduct::Reflectivity, dbz)?;
+                if let Some(previous) = previous {
+                    assert_ne!(previous, color, "{} at {dbz} dBZ", table.label());
+                }
+                previous = Some(color);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn high_contrast_uses_equal_channels() -> Result<(), TestFailure> {
+        for dbz in [-30.0_f32, 0.0, 30.0, 60.0, 80.0] {
+            let color =
+                color_for_product_with(ColorTable::HighContrast, RadarProduct::Reflectivity, dbz)?;
+            assert!(
+                color[0] == color[1] && color[1] == color[2],
+                "{dbz} dBZ is not gray: {color:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn accessible_tables_reject_out_of_range_values() {
+        assert!(matches!(
+            color_for_product_with(ColorTable::Deuteranopia, RadarProduct::Reflectivity, 95.0),
+            Err(ColorMapError::OutOfRange { product, value })
+                if product == RadarProduct::Reflectivity.id() && value == 95.0
+        ));
     }
 }

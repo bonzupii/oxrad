@@ -17,7 +17,7 @@
 
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Stroke, Vec2};
 
-use crate::colormap::color_for_product;
+use crate::colormap::{ColorTable, color_for_product_with};
 use crate::product::RadarProduct;
 use crate::render::{RadarGeometry, ViewTransform};
 use crate::theme::Palette;
@@ -83,15 +83,22 @@ pub fn draw_rings(
 }
 
 fn legend_colour(
+    table: ColorTable,
     product: RadarProduct,
     fraction: f32,
 ) -> Result<[u8; 4], crate::error::ColorMapError> {
     let (minimum, maximum) = product.value_range();
     let value = maximum - fraction * (maximum - minimum);
-    color_for_product(product, value)
+    color_for_product_with(table, product, value)
 }
 
-pub fn draw_legend(painter: &egui::Painter, rect: Rect, product: RadarProduct, palette: &Palette) {
+pub fn draw_legend(
+    painter: &egui::Painter,
+    rect: Rect,
+    product: RadarProduct,
+    table: ColorTable,
+    palette: &Palette,
+) {
     let (minimum, maximum) = product.value_range();
     let range = maximum - minimum;
     let x = rect.right() - 42.0;
@@ -120,7 +127,7 @@ pub fn draw_legend(painter: &egui::Painter, rect: Rect, product: RadarProduct, p
     );
     for index in 0..LEGEND_BANDS {
         let fraction = (index as f32 + 0.5) / LEGEND_BANDS as f32;
-        let rgba = match legend_colour(product, fraction) {
+        let rgba = match legend_colour(table, product, fraction) {
             Ok(value) => value,
             Err(error) => {
                 painter.text(

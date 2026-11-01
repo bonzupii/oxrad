@@ -26,7 +26,7 @@ This is a pre-release build. The radar display works. The product around it does
 | Units selection | Partial: distance and temperature convert; other quantities do not |
 | Light theme | Implemented for chrome, basemap, and radar canvas; two map controls keep their dark fill |
 | Layer management | Not implemented |
-| Colourblind-safe palettes | Not implemented |
+| Radar color tables | Implemented: five tables, persisted; the global raster keeps its provider palette |
 | Performance measurement | Not taken |
 
 Do not use this build for safety decisions. Coverage, warnings, and geographic detail are incomplete.
@@ -62,6 +62,8 @@ Radar history pauses live acquisition while a scan is reviewed. Returning to liv
 
 Map view overlays the selected station and up to three nearby stations when their scans fall within six minutes of the selected scan. Stations outside that window are withheld and named. This is a time-bounded overlay, not a value-composited mosaic.
 
+The header Colors control selects the radar color table: Standard, Deuteranopia, Protanopia, Tritanopia, or High contrast. The selection persists and recolors both the radar mesh and its legend.
+
 ## Configuration and stored data
 
 | Path | Contents |
@@ -94,7 +96,7 @@ Requests identify the client as `oxrad/<version> (https://github.com/bonzupii/ox
 - The basemap has no street-level roads or terrain. Settlements, admin-1 boundaries, major rivers, and major highways are embedded Natural Earth layers.
 - Range rings and spokes render in map view; the product grid remains radar-canvas only.
 - Units selection covers distance and temperature; wind speed, precipitation, pressure, and elevation still use provider units.
-- There is one dark palette per product. No colourblind-safe alternative exists.
+- Radar color-table selection covers the seven decoded products; the global RainViewer raster keeps its provider palette.
 - Search ranks by name match only; results are not biased toward the current map centre.
 - Warnings cover the United States and its territories only.
 - Layers cannot be reordered, grouped, or made partially transparent. Warnings, global radar, and station overlays each have an independent toggle and nothing else.

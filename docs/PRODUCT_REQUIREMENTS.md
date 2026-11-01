@@ -23,7 +23,7 @@ The application exposes three levels over one state model. A level controls whic
 
 | Level | Visible | Hidden |
 |---|---|---|
-| Basic | Place search, forecast, radar image, product and tilt, warnings, playback | Thresholds, palettes, interpolation, compositing, source selection |
+| Basic | Place search, forecast, radar image, product and tilt, color table, warnings, playback | Thresholds, interpolation, compositing, source selection |
 | Standard | Basic plus layer panel, units, map style, legend controls | Per-layer diagnostics, raw readouts, cache state |
 | Expert | Everything, including thresholds, interpolation, compositing policy, provenance, diagnostics | Nothing |
 
@@ -127,7 +127,7 @@ Forecast units are whatever the provider returns. Radar readouts use product uni
 | UI-3 | Body text is at least 13 points at default scale | Partially implemented |
 | UI-4 | Every panel collapses and restores without losing state | Not implemented |
 | UI-5 | Layout holds at 1040x640 and 2560x1440 | Partially implemented |
-| UI-6 | A colourblind-safe palette set is selectable per product | Not implemented |
+| UI-6 | A colourblind-safe palette set is selectable per product | Implemented: five tables, persisted, applied to mesh and legend |
 
 ### Accessibility
 
@@ -137,7 +137,7 @@ Forecast units are whatever the provider returns. Radar readouts use product uni
 | A11Y-2 | Focus order is logical and focus is always visible | Not implemented |
 | A11Y-3 | Every control has an accessible name | Not implemented |
 | A11Y-4 | Interface scale is adjustable | Not implemented |
-| A11Y-5 | Qualitative meaning survives without colour | Not implemented |
+| A11Y-5 | Qualitative meaning survives without colour | Partially implemented: color-vision tables; no non-color encoding |
 
 ### Performance
 

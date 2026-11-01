@@ -135,7 +135,7 @@ Theme is a persisted preference. This build implements `dark` and `light`; `syst
 | Keyboard reach | Every control reachable in reading order |
 | Accessible names | Every control labelled, icons carry text alternatives |
 | Scale | Interface scale 90 to 150 percent, persisted |
-| Colour independence | Palette sets tested for deuteranopia, protanopia, tritanopia, and grayscale |
+| Colour independence | Five radar tables; ordered steps tested in every table, all five inspected in the running binary |
 | Motion | Playback stops on request; no automatic animation without a visible control |
 
 ## Visual QA matrix
@@ -164,6 +164,7 @@ Every cell is inspected in dark and light themes. The matrix is 80 combinations.
 | Tokens | Partial. `src/theme.rs` holds both palettes, the type scale, and spacing; residual literals remain |
 | Type scale | Partial. Sizes route through `TYPE_*`; 10 to 17 point literals remain |
 | Themes | Implemented: dark and light, persisted. Two map chrome elements still draw dark fills in light mode |
+| Radar color tables | Implemented: Standard, Deuteranopia, Protanopia, Tritanopia, High contrast; persisted; mesh and legend update |
 | Map radar geometry | Implemented: geodesic 50 km rings, eight spokes, unit-aware labels, adaptive graticule |
 | Map detail | Implemented: 1:10m settlements and major highways, 1:50m admin-1 boundaries and rivers, span-filtered |
 | Panel collapse | Absent |

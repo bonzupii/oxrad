@@ -2,7 +2,9 @@
 
 ## Current suite
 
-148 tests run under `cargo test`. Last recorded run in this repository: 148 passed, 0 failed.
+153 tests run under `cargo test`. Last recorded run in this repository: 153 passed, 0 failed.
+
+Color-table tests assert ordered reflectivity steps in every selectable table, out-of-range rejection, configuration token round trips, and equal channels in the high-contrast table.
 
 | Area | Coverage |
 |---|---|

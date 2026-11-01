@@ -19,6 +19,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
+use crate::colormap::ColorTable;
 use crate::error::ConfigError;
 use crate::paths;
 use crate::place::{Place, PlaceError};
@@ -38,6 +39,8 @@ pub struct Config {
     pub units: UnitSystem,
     /// The colour theme for the interface.
     pub theme: Theme,
+    /// The radar color table, including color-vision-safe options.
+    pub color_table: ColorTable,
 }
 
 fn strip_quotes(value: &str) -> Option<&str> {
@@ -165,6 +168,18 @@ fn parse_text_line(path: &Path, text: &str) -> Result<Config, ConfigError> {
                     value: String::from(text),
                 })?;
             }
+            "palette" => {
+                let text = strip_quotes(value).ok_or_else(|| ConfigError::Syntax {
+                    path: path.to_path_buf(),
+                    line: number,
+                })?;
+                config.color_table =
+                    ColorTable::parse(text).ok_or_else(|| ConfigError::InvalidPalette {
+                        path: path.to_path_buf(),
+                        line: number,
+                        value: String::from(text),
+                    })?;
+            }
             "place_name" => {
                 place.name = Some(quoted_text(path, number, value)?);
                 if place.line == 0 {
@@ -242,6 +257,7 @@ pub fn save(config: &Config, path: &Path) -> Result<(), ConfigError> {
     }
     lines.push(format!("units = \"{}\"", config.units.token()));
     lines.push(format!("theme = \"{}\"", config.theme.token()));
+    lines.push(format!("palette = \"{}\"", config.color_table.token()));
     if let Some(place) = &config.place {
         lines.push(format!("place_name = \"{}\"", place.name));
         lines.push(format!("place_region = \"{}\"", place.region));
@@ -303,8 +319,8 @@ mod tests {
             Err(ConfigError::Syntax { line: 1, .. })
         ));
         assert!(matches!(
-            parse("palette = \"nws\"\n"),
-            Err(ConfigError::UnknownKey { line: 1, ref key, .. }) if key == "palette"
+            parse("colormap = \"nws\"\n"),
+            Err(ConfigError::UnknownKey { line: 1, ref key, .. }) if key == "colormap"
         ));
     }
 
@@ -327,6 +343,7 @@ mod tests {
                 place: None,
                 units: UnitSystem::Metric,
                 theme: Theme::Dark,
+                color_table: ColorTable::Standard,
             },
             &path,
         )?;
@@ -362,6 +379,7 @@ mod tests {
                 place: Some(place),
                 units: UnitSystem::Metric,
                 theme: Theme::Dark,
+                color_table: ColorTable::Deuteranopia,
             },
             &path,
         )?;
@@ -369,6 +387,7 @@ mod tests {
             path: path.clone(),
             line: 0,
         })?;
+        assert_eq!(loaded.color_table, ColorTable::Deuteranopia);
         let restored = loaded.place.ok_or(ConfigError::Syntax {
             path: path.clone(),
             line: 0,
@@ -394,6 +413,21 @@ mod tests {
                 ref value,
                 ..
             }) if value == "kelvin"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn palette_round_trips_and_rejects_unknown_values() -> Result<(), ConfigError> {
+        let config = parse("palette = \"tritanopia\"\n")?;
+        assert_eq!(config.color_table, ColorTable::Tritanopia);
+        assert!(matches!(
+            parse("palette = \"nws\"\n"),
+            Err(ConfigError::InvalidPalette {
+                line: 1,
+                ref value,
+                ..
+            }) if value == "nws"
         ));
         Ok(())
     }

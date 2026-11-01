@@ -24,6 +24,7 @@ use eframe::egui::{
 };
 
 use crate::basemap::{BasemapError, BasemapLayers};
+use crate::colormap::ColorTable;
 use crate::config::{self, Config};
 use crate::display::{Display, DisplayState, Frame};
 use crate::forecast::{Forecast, ForecastError, ForecastFeed, ForecastOutcome, ForecastPeriod};
@@ -260,6 +261,23 @@ fn toggle_button(palette: &Palette, label: &str, selected: bool) -> egui::Button
     egui::Button::new(RichText::new(label).size(theme::TYPE_BODY).color(text))
         .fill(fill)
         .stroke(Stroke::new(1.0_f32, palette.border))
+}
+
+fn color_table_selector(ui: &mut egui::Ui, selected: ColorTable) -> ColorTable {
+    let mut chosen = selected;
+    let response = egui::ComboBox::from_id_salt("color-table")
+        .selected_text(format!("Colors · {}", selected.label()))
+        .width(126.0)
+        .show_ui(ui, |ui| {
+            for table in ColorTable::ALL {
+                ui.selectable_value(&mut chosen, table, table.label())
+                    .on_hover_text(table.description());
+            }
+        });
+    response
+        .response
+        .on_hover_text("Radar color table, including options for color-vision deficiencies.");
+    chosen
 }
 
 fn action_button(palette: &Palette, label: &str) -> egui::Button<'static> {
@@ -502,6 +520,7 @@ impl OxradApp {
         }
         let restored_site = initial.or_else(|| config.site.clone());
         let restored_place = config.place.clone();
+        let color_table = config.color_table;
         let stations = match stations::load_cache() {
             Ok(Some(cached)) => Ok(cached),
             Ok(None) => Err(StationError::NoStations),
@@ -527,7 +546,7 @@ impl OxradApp {
             place: restored_place.clone(),
             site: None,
             pipeline: None,
-            display: Display::new(gpu),
+            display: Display::new(gpu, color_table),
             forecast: ForecastFeed::new(),
             forecast_state: ForecastState::Empty,
             product: RadarProduct::Reflectivity,
@@ -665,6 +684,14 @@ impl OxradApp {
         }
     }
 
+    fn apply_color_table(&mut self) {
+        let table = self.config.color_table;
+        self.display.set_color_table(table);
+        for layer in &mut self.view_radars {
+            layer.display.set_color_table(table);
+        }
+    }
+
     fn submit_search(&mut self) {
         let query = self.query.trim().to_owned();
         if query.is_empty() {
@@ -754,7 +781,7 @@ impl OxradApp {
         for site in sites {
             layers.push(ViewRadar {
                 pipeline: Pipeline::start(site.clone()),
-                display: Display::new(Some(gpu.clone())),
+                display: Display::new(Some(gpu.clone()), self.config.color_table),
                 site,
                 failure_reported: false,
             });
@@ -1157,6 +1184,7 @@ impl OxradApp {
     fn header(&mut self, ui: &mut egui::Ui) {
         let mut units = self.config.units;
         let mut theme = self.config.theme;
+        let mut color_table = self.config.color_table;
         egui::Panel::top("header")
             .exact_size(56.0)
             .show_inside(ui, |ui| {
@@ -1187,6 +1215,8 @@ impl OxradApp {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.selectable_value(&mut theme, Theme::Light, Theme::Light.label());
                         ui.selectable_value(&mut theme, Theme::Dark, Theme::Dark.label());
+                        ui.separator();
+                        color_table = color_table_selector(ui, color_table);
                         ui.separator();
                         ui.selectable_value(
                             &mut units,
@@ -1235,10 +1265,18 @@ impl OxradApp {
                     });
                 });
             });
-        if units != self.config.units || theme != self.config.theme {
+        if units != self.config.units
+            || theme != self.config.theme
+            || color_table != self.config.color_table
+        {
+            let color_changed = color_table != self.config.color_table;
             self.config.units = units;
             self.config.theme = theme;
+            self.config.color_table = color_table;
             self.save_config();
+            if color_changed {
+                self.apply_color_table();
+            }
         }
     }
 
@@ -2288,6 +2326,7 @@ impl OxradApp {
                 ui.painter(),
                 rect,
                 self.product,
+                self.config.color_table,
                 &self.config.theme.palette(),
             );
         }
@@ -3754,7 +3793,13 @@ impl OxradApp {
         if let Some(error) = self.radar_warnings(ui.painter(), frame, &transform, viewport) {
             self.notice = Some(error);
         }
-        overlay::draw_legend(ui.painter(), rect, frame.geometry.product, &palette);
+        overlay::draw_legend(
+            ui.painter(),
+            rect,
+            frame.geometry.product,
+            self.config.color_table,
+            &palette,
+        );
         if let Some(place) = &self.place {
             draw_place_marker(ui.painter(), frame, &transform, viewport, rect, place);
         }
