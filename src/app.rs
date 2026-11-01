@@ -51,9 +51,9 @@ const STALE: Color32 = Color32::from_rgb(255, 196, 64);
 const STALE_AFTER_MS: u64 = 15 * 60 * 1000;
 const BUSY_REPAINT_MS: u64 = 100;
 const IDLE_REPAINT_MS: u64 = 1000;
-const RAIL_WIDTH: f32 = 300.0;
-const FORECAST_WIDTH: f32 = 330.0;
-const SEARCH_ROW_HEIGHT: f32 = 34.0;
+const RAIL_WIDTH: f32 = 320.0;
+const FORECAST_WIDTH: f32 = 340.0;
+const SEARCH_ROW_HEIGHT: f32 = 32.0;
 const STATION_LIST_HEIGHT: f32 = 220.0;
 const FORECAST_RETRY_BASE_SECS: u64 = 2;
 const FORECAST_RETRY_MAX_SECS: u64 = 60;
@@ -257,6 +257,49 @@ fn action_button(palette: &Palette, label: &str) -> egui::Button<'static> {
     )
     .fill(palette.surface)
     .stroke(Stroke::new(1.0_f32, palette.border))
+}
+
+fn product_buttons(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    capabilities: &[RadarProduct],
+    available_products: &[RadarProduct],
+    selected_product: RadarProduct,
+) -> Option<RadarProduct> {
+    let spacing = 6.0_f32;
+    let width = ((ui.available_width() - spacing * 2.0) / 3.0).max(84.0);
+    let mut requested = None;
+    egui::Grid::new("product-grid")
+        .num_columns(3)
+        .spacing(Vec2::new(spacing, spacing))
+        .show(ui, |ui| {
+            for (index, product) in capabilities.iter().enumerate() {
+                let available =
+                    available_products.is_empty() || available_products.contains(product);
+                let selected = *product == selected_product;
+                let label = format!("{} {}", product.id(), product.unit());
+                let button = if selected {
+                    toggle_button(palette, &label, true)
+                } else {
+                    action_button(palette, &label)
+                };
+                let response = ui
+                    .add_enabled_ui(available, |ui| ui.add_sized([width, 30.0], button))
+                    .inner;
+                let response = if available {
+                    response.on_hover_text(product.description())
+                } else {
+                    response.on_disabled_hover_text("Not carried by this sweep.")
+                };
+                if response.clicked() {
+                    requested = Some(*product);
+                }
+                if (index + 1) % 3 == 0 {
+                    ui.end_row();
+                }
+            }
+        });
+    requested
 }
 
 fn map_status_area(rect: Rect) -> Option<Rect> {
@@ -1070,11 +1113,10 @@ impl OxradApp {
         let mut units = self.config.units;
         let mut theme = self.config.theme;
         egui::Panel::top("header")
-            .exact_size(46.0)
+            .exact_size(56.0)
             .show_inside(ui, |ui| {
                 ui.style_mut().visuals = self.config.theme.visuals();
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_centered(|ui| {
                     ui.label(RichText::new("oxrad").size(theme::TYPE_DISPLAY).strong());
                     ui.label(
                         RichText::new("weather radar")
@@ -1157,8 +1199,10 @@ impl OxradApp {
 
     fn rail(&mut self, ui: &mut egui::Ui) {
         egui::Panel::left("rail")
-            .exact_size(RAIL_WIDTH)
-            .resizable(false)
+            .default_size(RAIL_WIDTH)
+            .min_size(280.0)
+            .max_size(440.0)
+            .resizable(true)
             .show_inside(ui, |ui| {
                 ui.style_mut().visuals = self.config.theme.visuals();
                 egui::ScrollArea::vertical()
@@ -1193,12 +1237,12 @@ impl OxradApp {
     fn search_section(&mut self, ui: &mut egui::Ui) {
         let mut submit = false;
         ui.horizontal(|ui| {
-            let width = (ui.available_width() - 74.0).max(80.0);
+            let width = (ui.available_width() - 82.0).max(80.0);
             let response = ui.add_sized(
                 [width, SEARCH_ROW_HEIGHT],
                 egui::TextEdit::singleline(&mut self.query)
                     .hint_text("Town or place")
-                    .margin(Vec2::new(8.0, 6.0)),
+                    .margin(Vec2::new(10.0, 7.0)),
             );
             let shortcut = ui.input(|input| input.key_pressed(egui::Key::Slash));
             if self.first_run || shortcut {
@@ -1209,7 +1253,7 @@ impl OxradApp {
                 submit = true;
             }
             if ui
-                .add_sized([66.0, SEARCH_ROW_HEIGHT], egui::Button::new("Search"))
+                .add_sized([72.0, SEARCH_ROW_HEIGHT], egui::Button::new("Search"))
                 .clicked()
             {
                 submit = true;
@@ -1308,63 +1352,14 @@ impl OxradApp {
                     .collect()
             })
             .unwrap_or_default();
-        let mut requested_product = None;
-        ui.horizontal_wrapped(|ui| {
-            for product in &capabilities {
-                let available =
-                    available_products.is_empty() || available_products.contains(product);
-                let selected = *product == self.product;
-                let label = format!("{} {}", product.id(), product.unit());
-                let button = ui.add_enabled(
-                    available,
-                    egui::Button::new(label).fill(if selected {
-                        ui.visuals().selection.bg_fill
-                    } else {
-                        ui.visuals().faint_bg_color
-                    }),
-                );
-                let button = if available {
-                    button.on_hover_text(product.description())
-                } else {
-                    button.on_disabled_hover_text("Not carried by this sweep.")
-                };
-                if button.clicked() {
-                    requested_product = Some(*product);
-                }
-            }
-        });
-        let tilt_options: Vec<(u8, f64, bool)> = self
-            .display
-            .frame
-            .as_ref()
-            .map(|frame| frame.volume.tilt_options_for(self.product))
-            .unwrap_or_default();
-        let mut requested_tilt = None;
-        if tilt_options.is_empty() {
-            ui.label(
-                RichText::new("Tilts appear when a volume is loaded.")
-                    .size(theme::TYPE_SMALL)
-                    .weak(),
-            );
-        } else {
-            ui.label(RichText::new("Tilt").size(theme::TYPE_SMALL).weak());
-            ui.horizontal_wrapped(|ui| {
-                for (number, elevation, selected) in tilt_options {
-                    let label = format!("{number} · {elevation:.2}°");
-                    if ui
-                        .add(egui::Button::new(label).fill(if selected {
-                            ui.visuals().selection.bg_fill
-                        } else {
-                            ui.visuals().faint_bg_color
-                        }))
-                        .clicked()
-                        && !selected
-                    {
-                        requested_tilt = Some(number);
-                    }
-                }
-            });
-        }
+        let requested_product = product_buttons(
+            ui,
+            &self.config.theme.palette(),
+            &capabilities,
+            &available_products,
+            self.product,
+        );
+        let requested_tilt = self.tilt_controls(ui);
         if let Some(product) = requested_product {
             self.product = product;
             if self.display.frame.is_some() && !self.display.rebuild(product, requested_tilt) {
@@ -1382,6 +1377,48 @@ impl OxradApp {
         } else if requested_tilt.is_some() {
             self.refresh_view_radars();
         }
+    }
+
+    fn tilt_controls(&self, ui: &mut egui::Ui) -> Option<u8> {
+        let tilt_options: Vec<(u8, f64, bool)> = self
+            .display
+            .frame
+            .as_ref()
+            .map(|frame| frame.volume.tilt_options_for(self.product))
+            .unwrap_or_default();
+        if tilt_options.is_empty() {
+            ui.label(
+                RichText::new("Tilts appear when a volume is loaded.")
+                    .size(theme::TYPE_SMALL)
+                    .weak(),
+            );
+            return None;
+        }
+        ui.label(RichText::new("Tilt").size(theme::TYPE_SMALL).weak());
+        let palette = self.config.theme.palette();
+        let spacing = 6.0_f32;
+        let width = ((ui.available_width() - spacing * 3.0) / 4.0).max(54.0);
+        let mut requested = None;
+        egui::Grid::new("tilt-grid")
+            .num_columns(4)
+            .spacing(Vec2::new(spacing, spacing))
+            .show(ui, |ui| {
+                for (index, (number, elevation, selected)) in tilt_options.into_iter().enumerate() {
+                    let label = format!("{number} · {elevation:.2}°");
+                    let button = if selected {
+                        toggle_button(&palette, &label, true)
+                    } else {
+                        action_button(&palette, &label)
+                    };
+                    if ui.add_sized([width, 28.0], button).clicked() && !selected {
+                        requested = Some(number);
+                    }
+                    if (index + 1) % 4 == 0 {
+                        ui.end_row();
+                    }
+                }
+            });
+        requested
     }
 
     fn station_section(&mut self, ui: &mut egui::Ui) {
@@ -1501,8 +1538,10 @@ impl OxradApp {
     fn forecast_panel(&mut self, ui: &mut egui::Ui) {
         let mut retry = false;
         egui::Panel::right("forecast")
-            .exact_size(FORECAST_WIDTH)
-            .resizable(false)
+            .default_size(FORECAST_WIDTH)
+            .min_size(300.0)
+            .max_size(460.0)
+            .resizable(true)
             .show_inside(ui, |ui| {
                 ui.style_mut().visuals = self.config.theme.visuals();
                 retry = self.forecast_footer(ui);
@@ -4235,9 +4274,16 @@ fn diagnostics(ui: &mut egui::Ui, frame: &Frame, catalog: Option<&Station>) {
         });
     let text = format!("{text}{catalog_note}");
     if volume.skipped_radials > 0 {
-        ui.colored_label(ui.visuals().warn_fg_color, text);
+        ui.add(
+            egui::Label::new(
+                RichText::new(text)
+                    .size(theme::TYPE_SMALL)
+                    .color(ui.visuals().warn_fg_color),
+            )
+            .wrap(),
+        );
     } else {
-        ui.label(RichText::new(text).size(theme::TYPE_SMALL).weak());
+        ui.add(egui::Label::new(RichText::new(text).size(theme::TYPE_SMALL).weak()).wrap());
     }
     if let Some((product, error)) = &volume.moment_error {
         ui.colored_label(
