@@ -23,6 +23,7 @@ use eframe::egui::{
     Stroke, Vec2,
 };
 
+use crate::basemap::{BasemapError, BasemapLayers};
 use crate::config::{self, Config};
 use crate::display::{Display, DisplayState, Frame};
 use crate::forecast::{Forecast, ForecastError, ForecastFeed, ForecastOutcome, ForecastPeriod};
@@ -207,6 +208,18 @@ struct GlobalFrameTexture {
 fn due_after(delay: Duration) -> Instant {
     let now = Instant::now();
     now.checked_add(delay).unwrap_or(now)
+}
+
+fn load_basemap(notice: Option<String>) -> (Result<BasemapLayers, BasemapError>, Option<String>) {
+    let layers = BasemapLayers::load();
+    let notice = match &layers {
+        Ok(_) => notice,
+        Err(error) => Some(notice.map_or_else(
+            || format!("Supplemental map layers unavailable: {error}"),
+            |existing| format!("{existing} Supplemental map layers unavailable: {error}"),
+        )),
+    };
+    (layers, notice)
 }
 
 const fn scans_align(reference_ms: u64, scan_ms: u64) -> bool {
@@ -444,6 +457,7 @@ pub struct OxradApp {
     map: Result<WorldMap, MapError>,
     map_view: MapView,
     map_viewport: Option<Rect>,
+    basemap_layers: Result<BasemapLayers, BasemapError>,
     map_radar: RadarLayer,
     map_reload_due: Option<Instant>,
     global_feed: GlobalRadarFeed,
@@ -493,6 +507,7 @@ impl OxradApp {
             Ok(None) => Err(StationError::NoStations),
             Err(error) => Err(error),
         };
+        let (basemap_layers, notice) = load_basemap(notice);
         let mut app = Self {
             gpu: gpu.clone(),
             view_radars: Vec::new(),
@@ -523,6 +538,7 @@ impl OxradApp {
             map: WorldMap::load(),
             map_view: MapView::default(),
             map_viewport: None,
+            basemap_layers,
             map_radar: RadarLayer::Shown,
             map_reload_due: None,
             global_feed: GlobalRadarFeed::new(),
@@ -1859,6 +1875,7 @@ impl OxradApp {
             }
         };
         self.map_basemap(ui, rect);
+        self.map_supplemental_lines(ui, rect, &transform);
         self.map_global(ui, &transform);
         let radar_visible = self.map_radar(ui, rect, &transform);
         let ring_origin = self
@@ -1878,6 +1895,7 @@ impl OxradApp {
             self.notice = Some(format!("Map range rings could not be drawn: {error}"));
         }
         self.map_warnings(ui, rect, &transform);
+        self.map_supplemental_places(ui, rect, &transform);
         self.map_measure(ui, rect, &transform, &interaction);
         let clicked_site = if self.measure.is_on() {
             None
@@ -1890,6 +1908,30 @@ impl OxradApp {
         self.map_readout(ui, rect, &transform, radar_visible);
         if let Some(id) = clicked_site {
             self.choose_site(id);
+        }
+    }
+
+    fn map_supplemental_lines(&self, ui: &egui::Ui, rect: Rect, transform: &map::MapTransform) {
+        if let Ok(layers) = &self.basemap_layers {
+            layers.draw_lines(
+                ui.painter(),
+                transform,
+                rect,
+                self.map_view.span_km(),
+                &self.config.theme.palette(),
+            );
+        }
+    }
+
+    fn map_supplemental_places(&self, ui: &egui::Ui, rect: Rect, transform: &map::MapTransform) {
+        if let Ok(layers) = &self.basemap_layers {
+            layers.draw_places(
+                ui.painter(),
+                transform,
+                rect,
+                self.map_view.span_km(),
+                &self.config.theme.palette(),
+            );
         }
     }
 

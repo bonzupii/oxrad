@@ -16,7 +16,7 @@ This is the direct dependency record required by `STYLE.md`. It records what eac
 
 ## Data assets
 
-`assets/ne_110m_admin_0_countries.geojson` is Natural Earth 1:110m Admin 0 Countries, public domain. It is compiled into the binary with `include_str!` and parsed with `serde_json`; it is not a tile service and has no network or attribution requirement. Its provenance and licence are recorded in `assets/README.md`.
+The embedded Natural Earth layers are public domain: 1:110m Admin 0 Countries, 1:10m Populated Places, 1:50m Admin 1 boundary lines, and 1:50m Rivers and Lake Centerlines. They are compiled into the binary with `include_str!` and parsed with `serde_json`; they are not a tile service and have no network or attribution requirement. Their provenance and licence are recorded in `assets/README.md`.
 
 ## Dependency boundaries
 

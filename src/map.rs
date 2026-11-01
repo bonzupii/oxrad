@@ -295,7 +295,9 @@ impl WorldMap {
                 labels.push((country.name.as_str(), country.label_rank, lat, lon));
             }
         }
-        draw_labels(painter, &transform, rect, &labels, view.span_km, palette);
+        if view.span_km >= 2_000.0 {
+            draw_labels(painter, &transform, rect, &labels, view.span_km, palette);
+        }
         Ok(())
     }
 }

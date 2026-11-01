@@ -17,7 +17,7 @@ This is a pre-release build. The radar display works. The product around it does
 | NEXRAD Level II decode and display | Working |
 | Radar products and tilts | Working: seven moment products, every complete sweep |
 | Radar history and playback | Working: eight recent volumes, loop, scrub |
-| Offline vector basemap | Working at country scale only |
+| Offline vector basemap | Working: countries, settlements, admin-1 boundaries, rivers |
 | Global radar composite | Working: RainViewer, two-hour loop |
 | Forecast | Working: Open-Meteo, global |
 | Place search | Working: live partial and transposed names via Photon; proximity ranking absent |
@@ -81,6 +81,7 @@ The cache holds up to 256 entries and 128 MiB. Every body is verified against it
 | National Weather Service active alerts | Warnings | United States and territories | Public domain |
 | Open-Meteo | Forecast | Global | CC BY 4.0 |
 | OpenStreetMap contributors, Photon | Place search | Global | ODbL |
+| Natural Earth | Offline basemap | Global | Public domain |
 | RainViewer | Reflectivity composite | 1,200 or more radars, 150 or more countries | Free terms, attribution required |
 
 Attribution is displayed in the application. Details and researched but unintegrated sources are in [docs/DATA_SOURCES.md](docs/DATA_SOURCES.md).
@@ -90,8 +91,8 @@ Requests identify the client as `oxrad/<version> (https://github.com/bonzupii/ox
 ## Limitations
 
 - Radar moments outside the United States are not decoded. No DWD, ECCC, BoM, JMA, CMA, IMD, OPERA, or ODIM reader exists.
-- The basemap has no roads, streets, terrain, hydrography, or settlement detail.
-- Radar range rings and the grid are not drawn in map view.
+- The basemap has no roads, streets, or terrain. Settlements, admin-1 boundaries, and major rivers are embedded Natural Earth layers.
+- Range rings and spokes render in map view; the product grid remains radar-canvas only.
 - Units selection covers distance and temperature; wind speed, precipitation, pressure, and elevation still use provider units.
 - There is one dark palette per product. No colourblind-safe alternative exists.
 - Search ranks by name match only; results are not biased toward the current map centre.
