@@ -257,7 +257,7 @@ impl RadarGpu {
             vertices,
             indices,
             index_count: geometry.lattice.index_count,
-            texels: [geometry.raster.width as f32, geometry.raster.height as f32],
+            texels: [geometry.raster.gates as f32, geometry.raster.radials as f32],
             _texture: texture,
         })
     }
@@ -311,12 +311,12 @@ impl RadarGpu {
 
     fn upload_texture(&self, geometry: &RadarGeometry) -> Result<wgpu::Texture, RenderError> {
         let raster = &geometry.raster;
-        if raster.width == 0 || raster.height == 0 {
+        if raster.gates == 0 || raster.radials == 0 {
             return Err(RenderError::MeshSize { vertices: 0 });
         }
         let size = wgpu::Extent3d {
-            width: raster.width,
-            height: raster.height,
+            width: raster.gates,
+            height: raster.radials,
             depth_or_array_layers: 1,
         };
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -341,7 +341,7 @@ impl RadarGpu {
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(pixels.row_bytes),
-                rows_per_image: Some(raster.height),
+                rows_per_image: Some(raster.radials),
             },
             size,
         );
@@ -361,12 +361,14 @@ fn padded_rows(raster: &crate::raster::RadarRaster) -> Result<PaddedRows, Render
         vertices: raster.texels.len() / 4,
     };
     let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-    let unpadded = raster.width.checked_mul(4).ok_or_else(oversized)?;
+    let unpadded = raster.gates.checked_mul(4).ok_or_else(oversized)?;
     let row_bytes = unpadded
         .div_ceil(alignment)
         .checked_mul(alignment)
         .ok_or_else(oversized)?;
-    let total = row_bytes.checked_mul(raster.height).ok_or_else(oversized)?;
+    let total = row_bytes
+        .checked_mul(raster.radials)
+        .ok_or_else(oversized)?;
     let (Ok(unpadded), Ok(row_bytes), Ok(total)) = (
         usize::try_from(unpadded),
         usize::try_from(row_bytes),

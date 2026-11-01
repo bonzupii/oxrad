@@ -443,7 +443,7 @@ fn build_lattice(
         };
         let path = projection::GeodesicPath::new(volume.site_lat, volume.site_lon, azimuth_deg)
             .map_err(|source| RenderError::Coordinate { source })?;
-        let u = column as f32 / columns.saturating_sub(1) as f32;
+        let v = column as f32 / columns.saturating_sub(1) as f32;
         for row in 0..=rows {
             let fraction = row as f32 / rows as f32;
             let gate = f64::from(fraction) * grid.gate_count as f64;
@@ -456,7 +456,9 @@ fn build_lattice(
             let offset = place_offset(lat, lon, site_x, site_y)
                 .map_err(|source| RenderError::Coordinate { source })?;
             extent_km = extent_km.max(f64::from(offset.x.hypot(offset.y)));
-            lattice.push_vertex(offset, Pos2::new(u, fraction));
+            // A raster row runs along the gates and its rows stack along the
+            // radials, so the range sets u and the radial sets v.
+            lattice.push_vertex(offset, Pos2::new(fraction, v));
         }
     }
     let row_stride = u32::try_from(rows.saturating_add(1)).map_err(|_| RenderError::MeshSize {
@@ -715,7 +717,14 @@ mod tests {
             vec![radial(89.5, 90.5, 0.0, vec![GateValue::RangeFolded])],
             75.0,
         )?;
-        let texel = geometry.raster.texel(0, 0).ok_or("missing texel")?;
+        let start = 0;
+        let texel: [u8; 4] = geometry
+            .raster
+            .texels
+            .get(start..start + 4)
+            .ok_or("missing texel")?
+            .try_into()
+            .map_err(|_| TestError::from(String::from("texel is truncated")))?;
         assert_eq!(texel, crate::colormap::range_folded_color());
         Ok(())
     }
@@ -752,6 +761,47 @@ mod tests {
         Ok(())
     }
 
+    /// The GPU reads a texel as a texture does: gates along `u`, radials along
+    /// `v`. Following a mesh corner's texture coordinate back to the texel it
+    /// lands on must recover the radial and gate that vertex stands on; when the
+    /// raster was laid out rows-per-radial, this walked into a neighbouring
+    /// radial and the sweep came out sheared.
+    #[test]
+    fn every_mesh_corner_samples_the_gate_it_stands_on() -> Result<(), TestError> {
+        let gates = 6;
+        let radials = vec![
+            radial(0.0, 1.0, 0.5, vec![GateValue::Measured(10.0); gates]),
+            radial(1.0, 2.0, 0.5, vec![GateValue::Measured(20.0); gates]),
+            radial(2.0, 3.0, 0.5, vec![GateValue::Measured(30.0); gates]),
+        ];
+        let (_, geometry) = build(radials, 75.0)?;
+        let raster = &geometry.raster;
+        assert_eq!(raster.gates as usize, gates, "raster width");
+        assert_eq!(raster.radials, 3, "raster height");
+        let columns = 4;
+        let rows = LATTICE_RANGE_STEPS.min(gates);
+        for column in 0..columns {
+            for row in 0..=rows {
+                let index = column * (rows + 1) + row;
+                let texcoord = geometry.lattice.texcoord(index).ok_or("missing texcoord")?;
+                let gate = (texcoord.x * raster.gates as f32).clamp(0.0, (raster.gates - 1) as f32)
+                    as usize;
+                let radial = (texcoord.y * raster.radials as f32)
+                    .clamp(0.0, (raster.radials - 1) as f32) as usize;
+                assert_eq!(
+                    radial,
+                    column.min(raster.radials as usize - 1),
+                    "column {column} sampled radial {radial}"
+                );
+                let start = (radial * gates + gate) * 4;
+                let alpha = raster.texels.get(start + 3).copied().ok_or("texel")?;
+                let expected = if gate < gates { 255 } else { 0 };
+                assert_eq!(alpha, expected, "column {column} row {row}");
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn the_lattice_samples_every_corner_of_the_raster() -> Result<(), TestError> {
         let values = vec![GateValue::Measured(30.0); 8];
@@ -770,10 +820,11 @@ mod tests {
             .lattice
             .texcoord(vertices - 1)
             .ok_or("no last vertex")?;
-        assert!((last.x - 1.0).abs() < 1e-6, "last column {last:?}");
-        assert!((last.y - 1.0).abs() < 1e-6, "last row {last:?}");
-        let u = geometry.lattice.texcoord(1).ok_or("no second vertex")?;
-        assert!(u.x.abs() < 1e-6, "first column {u:?}");
+        assert!((last.x - 1.0).abs() < 1e-6, "last gate {last:?}");
+        assert!((last.y - 1.0).abs() < 1e-6, "last radial {last:?}");
+        let second = geometry.lattice.texcoord(1).ok_or("no second vertex")?;
+        assert!(second.y.abs() < 1e-6, "first radial {second:?}");
+        assert!(second.x > 0.0, "second vertex is past the near gate");
         Ok(())
     }
 
