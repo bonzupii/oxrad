@@ -572,8 +572,9 @@ mod tests {
     #[test]
     fn a_cached_document_survives_without_the_network() -> Result<(), StationError> {
         let document = live_document()?;
-        let directory = std::env::temp_dir().join("oxrad-station-cache-test");
-        fs::create_dir_all(&directory).map_err(|source| StationError::CacheWrite {
+        let directory =
+            std::env::temp_dir().join(format!("oxrad-station-cache-test-{}", std::process::id()));
+        fs::create_dir(&directory).map_err(|source| StationError::CacheWrite {
             path: directory.display().to_string(),
             source,
         })?;
@@ -586,6 +587,10 @@ mod tests {
             cached.first().map(|station| &station.id),
             live.first().map(|station| &station.id)
         );
+        fs::remove_dir_all(&directory).map_err(|source| StationError::CacheWrite {
+            path: directory.display().to_string(),
+            source,
+        })?;
         Ok(())
     }
 

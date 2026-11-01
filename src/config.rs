@@ -326,8 +326,9 @@ mod tests {
 
     #[test]
     fn save_and_load_round_trip_the_site() -> Result<(), ConfigError> {
-        let directory = std::env::temp_dir().join("oxrad-config-test");
-        std::fs::create_dir_all(&directory).map_err(|source| ConfigError::Write {
+        let directory =
+            std::env::temp_dir().join(format!("oxrad-config-test-{}", std::process::id()));
+        std::fs::create_dir(&directory).map_err(|source| ConfigError::Write {
             path: directory.clone(),
             source,
         })?;
@@ -357,12 +358,17 @@ mod tests {
         }
         let absent = directory.join("absent.toml");
         assert!(load(&absent)?.is_none());
+        std::fs::remove_dir_all(&directory).map_err(|source| ConfigError::Write {
+            path: directory,
+            source,
+        })?;
         Ok(())
     }
     #[test]
     fn a_saved_place_round_trips_without_restoring_a_site() -> Result<(), ConfigError> {
-        let directory = std::env::temp_dir().join("oxrad-config-place-test");
-        std::fs::create_dir_all(&directory).map_err(|source| ConfigError::Write {
+        let directory =
+            std::env::temp_dir().join(format!("oxrad-config-place-test-{}", std::process::id()));
+        std::fs::create_dir(&directory).map_err(|source| ConfigError::Write {
             path: directory.clone(),
             source,
         })?;
@@ -399,6 +405,10 @@ mod tests {
             loaded.site.is_none(),
             "a place must not restore a radar site"
         );
+        std::fs::remove_dir_all(&directory).map_err(|source| ConfigError::Write {
+            path: directory,
+            source,
+        })?;
         Ok(())
     }
 

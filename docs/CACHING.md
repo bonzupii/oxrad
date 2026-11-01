@@ -28,7 +28,7 @@ Other persisted state: `~/.oxrad/stations.json` holds the last station document 
 
 | Defect | Consequence |
 |---|---|
-| No TTL or freshness field | A cached body is treated as valid forever; food safety relies on the caller |
+| No TTL or freshness field | A cached body is treated as valid indefinitely; freshness handling relies on the caller |
 | No conditional requests | Every miss refetches a full body |
 | No stale-while-revalidate | A stale entry cannot serve while a refresh runs |
 | No per-class policy | Radar volumes, tiles, forecasts, and alerts share one set of limits |

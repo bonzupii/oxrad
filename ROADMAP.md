@@ -70,11 +70,11 @@ Color-vision support is no longer absent. Five radar tables are selectable in th
 
 | Defect | Evidence |
 |---|---|
-| `app.rs` god module | 4254 lines, 60 fields, 30 methods |
+| `app.rs` god module | 4681 lines; unrelated workspace, feed, and presentation state share one application object |
 | No provider abstraction | Five sources reach the UI through separate state |
 | No layer abstraction | Each overlay owns visibility and draw path |
-| No unit model | No conversion, no preference, no canonical value type |
-| No token layer | Colours and sizes are literals at call sites |
+| Partial unit model | Distance and temperature convert through `units.rs`; other quantities retain provider units |
+| Partial token layer | `theme.rs` defines palettes and sizes; literals remain at call sites |
 | Single-mesh renderer | Composition needs a new renderer |
 
 ## Non-negotiable behavior

@@ -407,7 +407,10 @@ impl Store {
             let length = metadata
                 .get("body_len")
                 .and_then(Value::as_u64)
-                .unwrap_or(0);
+                .ok_or_else(|| CacheError::Corrupt {
+                    key: String::from(stem),
+                    detail: "missing or invalid body length during pruning",
+                })?;
             let body = path.with_file_name(format!("{stem}.body"));
             entries.push((fetched, length, body, path));
         }
@@ -485,6 +488,28 @@ mod tests {
         assert!(matches!(
             store.load("tile"),
             Err(CacheError::Corrupt { .. })
+        ));
+        cleanup(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn pruning_rejects_metadata_without_a_valid_body_length() -> Result<(), TestError> {
+        let root = directory("invalid-length")?;
+        let store = Store::at(root.clone());
+        store.store_at("broken", b"data", 1)?;
+        let (_, metadata_path) = store.paths("broken");
+        fs::write(&metadata_path, br#"{"fetched_at_unix_ms":1}"#).map_err(|source| {
+            CacheError::Write {
+                path: metadata_path.display().to_string(),
+                source,
+            }
+        })?;
+        assert!(matches!(
+            store.prune_to(1, 1024),
+            Err(CacheError::Corrupt { key, detail })
+                if key == Store::digest("broken")
+                    && detail == "missing or invalid body length during pruning"
         ));
         cleanup(&root)?;
         Ok(())

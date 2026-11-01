@@ -2,36 +2,37 @@
 
 ## Current structure
 
-The binary is one crate. `main.rs` parses arguments and constructs the application. Modules own one concern each.
+The binary is one crate. `main.rs` parses arguments and constructs the application. Several modules combine distinct responsibilities, especially `app.rs`.
 
 | Module | Lines | Responsibility |
 |---|---|---|
-| `app` | 4254 | Window, panels, interaction state, all workflow orchestration |
-| `radar` | 1915 | Archive II framing, Type 31 decode, volume and sweep assembly |
-| `render` | 933 | Gate corner geometry, overlay geometry, screen transform |
+| `app` | 4681 | Window, panels, interaction state, all workflow orchestration |
+| `radar` | 1919 | Archive II framing, Type 31 decode, volume and sweep assembly |
+| `render` | 951 | Gate corner geometry, overlay geometry, screen transform |
 | `global_radar` | 869 | RainViewer manifest, tiles, playback |
-| `error` | 808 | Application error enums |
-| `map` | 718 | Natural Earth basemap, projections, station markers |
-| `place` | 687 | Place identity, search, nearest station |
+| `error` | 838 | Application error enums |
+| `map` | 889 | Natural Earth basemap, projections, station markers |
+| `place` | 799 | Place identity, search, nearest station |
 | `pipeline` | 636 | Fetch and decode workers for one site |
 | `forecast` | 627 | Open-Meteo forecast |
-| `stations` | 624 | NWS station discovery and cache |
+| `stations` | 629 | NWS station discovery and cache |
 | `warnings` | 533 | NWS active alerts |
-| `cache` | 508 | SHA-256 verified disk cache |
+| `cache` | 533 | SHA-256 verified disk cache |
 | `projection` | 468 | WGS84 geodesics, slant range, Mercator |
 | `network` | 451 | NEXRAD S3 listing and retrieval |
-| `config` | 359 | `~/.oxrad/config.toml` |
+| `config` | 467 | `~/.oxrad/config.toml` |
 | `retry` | 327 | Backoff and `Retry-After` |
 | `colormap` | 546 | Product palettes and color-vision tables |
 | `history` | 307 | Recent-volume listing and fetch |
 | `gpu` | 268 | wgpu pipeline and buffers |
-| `display` | 257 | Displayed frame and geometry worker |
+| `display` | 275 | Displayed frame and geometry worker |
 | `provider` | 253 | HTTPS JSON access |
 | `test_support` | 172 | Test error type |
 | `product` | 137 | Product identity and units |
-| `overlay` | 134 | Grid, rings, legend drawing |
+| `overlay` | 162 | Grid, rings, legend drawing |
 | `time` | 112 | Timestamp formatting |
-| `main` | 107 | Argument parsing, window construction |
+| `units` | 175 | Metric and imperial distance and temperature formatting |
+| `main` | 110 | Argument parsing, window construction |
 | `paths` | 56 | File locations |
 
 ## Ownership
@@ -73,11 +74,11 @@ These are defects against `STYLE.md`, not preferences.
 
 | Defect | Evidence | Consequence |
 |---|---|---|
-| `app.rs` is a god module | 4254 lines; `OxradApp` holds 60 fields; 30 methods on one impl | Every feature interacts with every other; no unit can be tested alone |
+| `app.rs` is a god module | 4681 lines; `OxradApp` holds unrelated workspace, feed, and presentation state | Features share application state and responsibilities are difficult to test independently |
 | No layer abstraction | Warnings, global radar, and viewport radars each carry their own visibility, state, and draw path | A fourth data type needs a fourth parallel implementation |
-| No provider abstraction | NEXRAD, RainViewer, NWS alerts, Open-Meteo, and Nominatim each reach the UI through separate ad-hoc state | No international source can be added without new UI branches |
-| No unit model | Units arrive as provider strings; radar uses product units | No conversion, no consistency, no preference |
-| No design tokens | Colours are module constants in `app.rs`; sizes are literals at call sites | No theme, no scale, no consistency |
+| No provider abstraction | NEXRAD, RainViewer, NWS alerts, Open-Meteo, and Photon each reach the UI through separate ad-hoc state | No international source can be added without new UI branches |
+| Partial unit model | `units.rs` converts distance and temperature; other forecast values retain provider units | The persisted unit preference does not cover all displayed quantities |
+| Partial design tokens | `theme.rs` defines palettes and text sizes; `app.rs` also uses constants and literals | Theme and sizing remain inconsistent |
 | No time model | Each subsystem tracks its own timestamps | Layers cannot be aligned to one observation time |
 | Rendering assumes one mesh per scene | `gpu.rs` draws one mesh | Composition requires a new renderer |
 

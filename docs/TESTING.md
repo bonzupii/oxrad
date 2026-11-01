@@ -38,7 +38,7 @@ Several tests reach live services. A network failure fails the test. They are no
 | No cache TTL or corruption-recovery test | New cache behavior is unverified |
 | No provider adapter test for a second source | The provider boundary is unexercised |
 | No layer composition test | Ordering and opacity are unverified |
-| No unit conversion test | There is no unit system to test |
+| Incomplete unit coverage | Distance and temperature have conversion tests; other quantities do not have a conversion model |
 | No golden-image comparison | Palette and legend changes are unnoticed |
 
 ## Layers

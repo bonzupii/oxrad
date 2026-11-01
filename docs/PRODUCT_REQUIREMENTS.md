@@ -116,7 +116,7 @@ Warning and global radar visibility flags exist. They are not a layer model.
 | UNIT-4 | UTC and local time are both available and labelled | Partially implemented |
 | UNIT-5 | Decimal precision and coordinate format are configurable | Not implemented |
 
-Forecast units are whatever the provider returns. Radar readouts use product units. No preference system exists.
+The persisted metric or imperial preference converts distance and forecast temperature. Other forecast quantities retain provider units, and radar readouts use product units.
 
 ### Presentation
 
