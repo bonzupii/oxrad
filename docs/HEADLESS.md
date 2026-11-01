@@ -44,12 +44,13 @@ Inspect the resulting PNG and application log. A framebuffer capture is the whol
 
 `scripts/gui.sh <scenario>` performs the launch, input, capture, and checks above and exits non-zero when any of them fail. It finds its tools on `PATH` and then under `.tools/root/usr/bin`, and reports a missing tool as a failure rather than skipping.
 
-Scenarios: `radar`, `map`, `pan`, `zoom`, `small`. Each one asserts that the window appeared, that the process was still alive after the input, that the log contains no panic, and that the captured frame holds at least 16 distinct colours after downscaling to 200×125. A blank or single-colour frame fails. Screenshots and logs land in `target/gui/`.
+Scenarios: `radar`, `map`, `measure`, `pan`, `zoom`, `small`. Each one asserts that the window appeared, that the process was still alive after the input, that the log contains no panic, and that the captured frame holds at least 16 distinct colours after downscaling to 200×125. A blank or single-colour frame fails. The `measure` scenario additionally clicks four corners on the map and requires at least 400 pixels drawn in the measurement stroke colour inside the map region, so a measurement that stops painting fails the run. Screenshots and logs land in `target/gui/`.
 
 ```sh
 cargo build --release --locked
 scripts/gui.sh radar
 scripts/gui.sh map
+scripts/gui.sh measure
 scripts/gui.sh pan
 scripts/gui.sh small
 ```

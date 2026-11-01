@@ -14,7 +14,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 use geographiclib_rs::{
-    DirectGeodesic, Geodesic, GeodesicLine, InverseGeodesic, geodesic_capability,
+    DirectGeodesic, Geodesic, GeodesicLine, InverseGeodesic, PolygonArea, Winding,
+    geodesic_capability,
 };
 
 use crate::error::CoordinateError;
@@ -183,6 +184,44 @@ pub fn inverse(
     Ok((distance_m / METERS_PER_KM, azimuth_deg.rem_euclid(360.0)))
 }
 
+/// Area and perimeter of the closed geodesic polygon through `points`.
+///
+/// The path closes from the last corner back to the first. The area is the
+/// area enclosed on the WGS84 ellipsoid, in square kilometres, and the
+/// perimeter is the length of the boundary, in kilometres. Fewer than three
+/// corners do not enclose anything.
+pub fn polygon_area_km2(points: &[(f64, f64)]) -> Result<(f64, f64), CoordinateError> {
+    if points.len() < 3 {
+        return Err(CoordinateError::PolygonPoints {
+            count: points.len(),
+        });
+    }
+    let counter_clockwise = solved_area(points, Winding::CounterClockwise)?;
+    let clockwise = solved_area(points, Winding::Clockwise)?;
+    // Both windings describe the same boundary: one encloses the shape the
+    // corners trace and the other the rest of the planet. A measured area is a
+    // shape drawn on a map, so it is the smaller of the two.
+    let (perimeter_m, area_m2) = if counter_clockwise.1 <= clockwise.1 {
+        counter_clockwise
+    } else {
+        clockwise
+    };
+    let per_km = METERS_PER_KM * METERS_PER_KM;
+    Ok((area_m2.abs() / per_km, perimeter_m / METERS_PER_KM))
+}
+
+fn solved_area(points: &[(f64, f64)], winding: Winding) -> Result<(f64, f64), CoordinateError> {
+    let geodesic = Geodesic::wgs84();
+    let mut area = PolygonArea::new(&geodesic, winding);
+    for (lat, lon) in points {
+        validate_lat(*lat)?;
+        validate_lon(*lon)?;
+        area.add_point(*lat, *lon);
+    }
+    let (perimeter_m, area_m2, _points) = area.compute(false);
+    Ok((perimeter_m, area_m2))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,6 +256,7 @@ mod tests {
     #[derive(Debug)]
     enum TestFailure {
         Coordinate(CoordinateError),
+        Message(String),
         Value {
             label: &'static str,
             expected: f64,
@@ -235,6 +275,7 @@ mod tests {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
                 Self::Coordinate(error) => write!(formatter, "{error}"),
+                Self::Message(message) => formatter.write_str(message),
                 Self::Value {
                     label,
                     expected,
@@ -287,6 +328,53 @@ mod tests {
             )?;
         }
         Ok(())
+    }
+
+    /// A one-degree square on the equator, against the geodesic library's
+    /// published reference area and perimeter.
+    #[test]
+    fn an_equatorial_degree_square_has_its_reference_area() -> Result<(), TestFailure> {
+        let corners = [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)];
+        let (area_km2, perimeter_km) = polygon_area_km2(&corners)?;
+        expect_within("area km2", 12_308.778_361, area_km2, 1e-3)?;
+        expect_within("perimeter km", 443.770_917, perimeter_km, 1e-3)
+    }
+
+    /// The corner order a user clicks is arbitrary, so walking the same square
+    /// clockwise must report the same small area rather than flipping to the
+    /// rest of the planet.
+    #[test]
+    fn corner_order_does_not_change_the_enclosed_area() -> Result<(), TestFailure> {
+        let counter_clockwise = [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)];
+        let clockwise = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        let (first_area, first_perimeter) = polygon_area_km2(&counter_clockwise)?;
+        let (second_area, second_perimeter) = polygon_area_km2(&clockwise)?;
+        expect_within("area km2", first_area, second_area, 1e-3)?;
+        expect_within("perimeter km", first_perimeter, second_perimeter, 1e-3)
+    }
+
+    /// A polygon that walks east then back west encloses nothing, so the area
+    /// must be zero rather than a negative or doubled value.
+    #[test]
+    fn a_path_that_does_not_enclose_anything() -> Result<(), TestFailure> {
+        let out_and_back = [(0.0, 0.0), (0.0, 1.0), (0.0, 0.0)];
+        let (area_km2, _perimeter) = polygon_area_km2(&out_and_back)?;
+        assert!(area_km2.abs() < 1e-6, "area was {area_km2} km2");
+        Ok(())
+    }
+
+    #[test]
+    fn an_area_of_two_corners_is_reported() -> Result<(), TestFailure> {
+        let two = [(0.0, 0.0), (0.0, 1.0)];
+        match polygon_area_km2(&two) {
+            Err(CoordinateError::PolygonPoints { count }) => {
+                assert_eq!(count, 2);
+                Ok(())
+            }
+            other => Err(TestFailure::Message(format!(
+                "expected a polygon point error, got {other:?}"
+            ))),
+        }
     }
 
     #[test]

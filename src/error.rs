@@ -37,6 +37,7 @@ pub enum CoordinateError {
     Viewport { width: f32, height: f32 },
     Azimuth { azimuth_deg: f64 },
     Elevation { elevation_deg: f64 },
+    PolygonPoints { count: usize },
 }
 
 impl CoordinateError {
@@ -65,6 +66,9 @@ impl CoordinateError {
             }
             Self::Viewport { width, height } => {
                 format!("The viewport is {width} by {height} pixels, too small to draw radar.")
+            }
+            Self::PolygonPoints { count } => {
+                format!("A measurement area needs three corners; {count} were placed.")
             }
             Self::Azimuth { azimuth_deg } => {
                 format!("Azimuth {azimuth_deg} is outside 0 to 360.")

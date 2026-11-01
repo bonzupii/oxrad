@@ -57,6 +57,7 @@ const IDLE_REPAINT_MS: u64 = 1000;
 const RAIL_WIDTH: f32 = 320.0;
 const FORECAST_WIDTH: f32 = 340.0;
 const SEARCH_ROW_HEIGHT: f32 = 32.0;
+const MEASURE_CORNERS_MAX: usize = 24;
 const STATION_LIST_HEIGHT: f32 = 220.0;
 const VIEW_RADAR_LIMIT: usize = 3;
 const VIEW_RADAR_TIME_WINDOW_MS: u64 = 6 * 60 * 1000;
@@ -429,8 +430,7 @@ pub struct OxradApp {
     warnings_rejected: usize,
     selected_warning: Option<String>,
     measure: MeasureMode,
-    measure_start: Option<(f64, f64)>,
-    measure_end: Option<(f64, f64)>,
+    measure_points: Vec<(f64, f64)>,
     warning_layer: RadarLayer,
     warning_scope: WarningScope,
     warning_state: WarningState,
@@ -509,8 +509,7 @@ impl OxradApp {
             warnings_rejected: 0,
             selected_warning: None,
             measure: MeasureMode::Off,
-            measure_start: None,
-            measure_end: None,
+            measure_points: Vec::new(),
             warning_layer: RadarLayer::Shown,
             warning_scope: WarningScope::All,
             warning_state: WarningState::Idle,
@@ -2223,72 +2222,58 @@ impl OxradApp {
                     return;
                 }
             };
-            if self.measure_start.is_none() || self.measure_end.is_some() {
-                self.measure_start = Some(point);
-                self.measure_end = None;
-            } else {
-                self.measure_end = Some(point);
+            if self.measure_points.len() == MEASURE_CORNERS_MAX {
+                self.notice = Some(format!(
+                    "A measurement takes at most {MEASURE_CORNERS_MAX} corners. Turn measurement off to start another."
+                ));
+                return;
             }
+            self.measure_points.push(point);
         }
-        let painter = ui.painter();
-        let Some(start) = self.measure_start else {
-            return;
-        };
-        let Some(start_position) = transform.screen(start.0, start.1) else {
-            return;
-        };
-        painter.circle_filled(start_position, 5.0, palette.warning);
-        painter.text(
-            start_position + Vec2::new(8.0, 8.0),
-            Align2::LEFT_TOP,
-            "A",
-            FontId::monospace(12.0),
-            STALE,
-        );
-        let Some(end) = self.measure_end else {
-            painter.text(
-                start_position + Vec2::new(8.0, 24.0),
-                Align2::LEFT_TOP,
-                "Click a second point",
-                FontId::monospace(10.0),
-                palette.map_text,
-            );
-            return;
-        };
-        let Some(end_position) = transform.screen(end.0, end.1) else {
-            return;
-        };
-        painter.line_segment([start_position, end_position], Stroke::new(2.0_f32, STALE));
-        painter.circle_filled(end_position, 5.0, STALE);
-        painter.text(
-            end_position + Vec2::new(8.0, 8.0),
-            Align2::LEFT_TOP,
-            "B",
-            FontId::monospace(12.0),
-            STALE,
-        );
-        let detail = match crate::projection::inverse(start.0, start.1, end.0, end.1) {
-            Ok((distance_km, bearing_deg)) => format!(
-                "{} · {bearing_deg:.0}° {}",
-                crate::units::distance(distance_km, self.config.units),
-                place::compass(bearing_deg)
-            ),
+        let readout = match measure_readout(&self.measure_points, self.config.units) {
+            Ok(text) => text,
             Err(error) => format!("Measurement unavailable: {error}"),
         };
-        let label = format!(
-            "{detail}\nA {:.4}, {:.4}\nB {:.4}, {:.4}",
-            start.0, start.1, end.0, end.1
-        );
-        let galley = painter.layout_no_wrap(label, FontId::monospace(10.0), TEXT);
+        let painter = ui.painter();
+        let mut positions: Vec<Pos2> = Vec::with_capacity(self.measure_points.len());
+        for (lat, lon) in &self.measure_points {
+            match transform.screen(*lat, *lon) {
+                Some(position) => positions.push(position),
+                None => return,
+            }
+        }
+        let Some(anchor) = positions.first().copied() else {
+            return;
+        };
+        for (from, to) in positions.iter().zip(positions.iter().skip(1)) {
+            painter.line_segment([*from, *to], Stroke::new(2.0_f32, STALE));
+        }
+        if positions.len() > 2
+            && let (Some(first), Some(end)) = (positions.first(), positions.last())
+        {
+            painter.line_segment([*end, *first], Stroke::new(1.5_f32, palette.map_text));
+        }
+        for (index, position) in positions.iter().enumerate() {
+            painter.circle_filled(*position, 4.5, STALE);
+            painter.text(
+                *position + Vec2::new(8.0, 8.0),
+                Align2::LEFT_TOP,
+                (index + 1).to_string(),
+                FontId::monospace(11.0),
+                TEXT,
+            );
+        }
+        let galley = painter.layout_no_wrap(readout, FontId::monospace(10.0), TEXT);
         let padding = Vec2::splat(6.0);
         let size = galley.size() + 2.0 * padding;
-        let midpoint = start_position.lerp(end_position, 0.5);
+        // The gate readout follows the pointer, so the panel hangs off the
+        // first corner instead of the corner just clicked.
         let origin = Pos2::new(
-            (midpoint.x - size.x / 2.0).clamp(
+            (anchor.x + 12.0).clamp(
                 rect.left() + 4.0,
                 (rect.right() - size.x - 4.0).max(rect.left() + 4.0),
             ),
-            (midpoint.y - size.y - 10.0).clamp(
+            (anchor.y - size.y - 12.0).clamp(
                 rect.top() + 4.0,
                 (rect.bottom() - size.y - 4.0).max(rect.top() + 4.0),
             ),
@@ -2499,13 +2484,12 @@ impl OxradApp {
                 ),
             )
             .on_hover_text(
-                "Click two points on the map to measure geodesic distance and initial bearing.",
+                "Click map corners to measure geodesic distance and, from three corners, enclosed area.",
             )
             .clicked()
         {
             self.measure = self.measure.toggled();
-            self.measure_start = None;
-            self.measure_end = None;
+            self.measure_points.clear();
         }
     }
 
@@ -4361,6 +4345,53 @@ impl eframe::App for OxradApp {
     }
 }
 
+/// The readout for a path of map corners.
+///
+/// Two corners give a geodesic distance and initial bearing. Three or more
+/// also give the enclosed area and perimeter, treating the last corner as
+/// joined back to the first.
+fn measure_readout(
+    points: &[(f64, f64)],
+    units: crate::units::UnitSystem,
+) -> Result<String, crate::error::CoordinateError> {
+    match points {
+        [] => Ok(String::from("Click a corner to start measuring")),
+        [first] => Ok(format!(
+            "Corner 1 {:.4}, {:.4}\nClick a second corner",
+            first.0, first.1
+        )),
+        [first, second] => {
+            let (distance_km, bearing_deg) =
+                crate::projection::inverse(first.0, first.1, second.0, second.1)?;
+            Ok(format!(
+                "{} · {bearing_deg:.0}° {}\n{:.4}, {:.4}\nClick a third corner for area",
+                crate::units::distance(distance_km, units),
+                place::compass(bearing_deg),
+                first.0,
+                first.1
+            ))
+        }
+        [first, ..] => {
+            let (area_km2, perimeter_km) = crate::projection::polygon_area_km2(points)?;
+            let mut path_km = 0.0;
+            for (from, to) in points.iter().zip(points.iter().skip(1)) {
+                let (distance_km, _bearing) =
+                    crate::projection::inverse(from.0, from.1, to.0, to.1)?;
+                path_km += distance_km;
+            }
+            Ok(format!(
+                "{} corners · area {}\nperimeter {} · path {}\n{:.4}, {:.4}",
+                points.len(),
+                crate::units::area(area_km2, units),
+                crate::units::distance(perimeter_km, units),
+                crate::units::distance(path_km, units),
+                first.0,
+                first.1
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4397,6 +4428,38 @@ mod tests {
         );
         retain_warning_selection(&mut selected, &[warning("alert-a", "Other")]);
         assert_eq!(selected, None);
+    }
+
+    #[test]
+    fn two_measured_corners_report_distance_and_bearing() -> Result<(), TestError> {
+        let text = measure_readout(
+            &[(38.0, -97.0), (39.0, -97.0)],
+            crate::units::UnitSystem::Metric,
+        )?;
+        assert!(text.contains("111.0 km"), "readout was {text}");
+        assert!(text.contains("0° north"), "readout was {text}");
+        Ok(())
+    }
+
+    /// Four corners on the equator enclose the reference degree-square area, so
+    /// the panel must show both the area and the full closed perimeter rather
+    /// than only the sum of the three open legs.
+    #[test]
+    fn four_measured_corners_report_the_enclosed_area() -> Result<(), TestError> {
+        let square = [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)];
+        let text = measure_readout(&square, crate::units::UnitSystem::Metric)?;
+        assert!(text.contains("4 corners"), "readout was {text}");
+        assert!(text.contains("area 12309 km²"), "readout was {text}");
+        assert!(text.contains("perimeter 443.8 km"), "readout was {text}");
+        assert!(text.contains("path 333.2 km"), "readout was {text}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_unstarted_measurement_asks_for_a_corner() -> Result<(), TestError> {
+        let text = measure_readout(&[], crate::units::UnitSystem::Imperial)?;
+        assert_eq!(text, "Click a corner to start measuring");
+        Ok(())
     }
 
     #[test]

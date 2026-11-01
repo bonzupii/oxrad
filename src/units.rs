@@ -83,6 +83,21 @@ impl UnitSystem {
             Self::Imperial => celsius * 9.0 / 5.0 + 32.0,
         }
     }
+
+    pub const fn area_unit(self) -> &'static str {
+        match self {
+            Self::Metric => "km²",
+            Self::Imperial => "mi²",
+        }
+    }
+
+    /// Converts canonical square kilometres to the displayed area.
+    pub fn area(self, square_kilometres: f64) -> f64 {
+        match self {
+            Self::Metric => square_kilometres,
+            Self::Imperial => square_kilometres * MILES_PER_KM * MILES_PER_KM,
+        }
+    }
 }
 
 /// A distance with one decimal place.
@@ -101,6 +116,20 @@ pub fn distance_whole(kilometres: f64, units: UnitSystem) -> String {
         units.distance(kilometres),
         units.distance_unit()
     )
+}
+
+/// An area with enough precision to stay readable from a neighborhood to a
+/// county, computed from canonical square kilometres.
+pub fn area(square_kilometres: f64, units: UnitSystem) -> String {
+    let value = units.area(square_kilometres);
+    let precision = if value.abs() < 10.0 {
+        2
+    } else if value.abs() < 1000.0 {
+        1
+    } else {
+        0
+    };
+    format!("{value:.precision$} {}", units.area_unit())
 }
 
 /// A temperature with one decimal place.
@@ -183,6 +212,9 @@ mod tests {
         assert_eq!(wind_speed(100.0, UnitSystem::Metric), "100 km/h");
         assert_eq!(precipitation(25.4, UnitSystem::Imperial), "1.00 in");
         assert_eq!(precipitation(25.4, UnitSystem::Metric), "25.4 mm");
+        assert_eq!(area(12308.778, UnitSystem::Metric), "12309 km²");
+        assert_eq!(area(2.5, UnitSystem::Metric), "2.50 km²");
+        assert_eq!(area(64.0, UnitSystem::Imperial), "24.7 mi²");
     }
 
     #[test]

@@ -7,9 +7,14 @@
 # Scenarios:
 #   radar     the radar workspace as it opens
 #   map       the geographic workspace, reached by clicking the Map tab
+#   measure   the map workspace with a four-corner area measurement drawn
 #   pan       the radar workspace after a 240 px drag east
 #   zoom      the radar workspace after ten scroll-wheel zoom steps
 #   small     the radar workspace in a 940x680 window
+#
+# The measure scenario clicks fixed points inside the default 1280x800 layout
+# and then counts pixels in the measurement stroke colour, so a polygon that
+# silently stopped drawing fails the run.
 #
 # Requires Xvfb, xdotool, xwdtopnm, pnmtopng, pnmtoplainpnm. It looks for them
 # on PATH first and then under .tools/root/usr/bin, which is where the
@@ -47,7 +52,7 @@ find_tool() {
     return 1
 }
 
-for tool in Xvfb xdotool xwdtopnm pnmtopng pngtopnm pnmtoplainpnm; do
+for tool in Xvfb xdotool xwdtopnm pnmtopng pngtopnm pnmtoplainpnm pamcut; do
     found="$(find_tool "$tool")" || fail "$tool is required and was not found"
     printf -v "tool_$tool" '%s' "$found"
 done
@@ -142,6 +147,14 @@ drag() {
 case "$scenario" in
     radar) ;;
     map) click 240 28 ;;
+    measure)
+        click 240 28
+        click 72 387
+        click 420 300
+        click 700 320
+        click 690 560
+        click 430 540
+        ;;
     pan) drag 240 0 ;;
     zoom) scroll 10 ;;
     small)
@@ -178,6 +191,23 @@ colours="$("$tool_pngtopnm" "$png" 2>/dev/null |
     sort -u | wc -l)"
 if [[ -z "$colours" ]] || ((colours < 16)); then
     fail "the captured frame has $colours distinct colours, which is not a rendered interface"
+fi
+
+if [[ "$scenario" == "measure" ]]; then
+    # The measurement stroke is drawn in the fixed stale-amber colour, which the
+    # ambient map chrome barely uses, so a painted polygon stands out in the
+    # count. The map region is excluded of the rail and the forecast panel.
+    stroked="$("$tool_pngtopnm" "$png" 2>/dev/null |
+        "$tool_pamcut" -left 320 -top 56 -width 660 -height 700 2>/dev/null |
+        "$tool_pnmtoplainpnm" 2>/dev/null |
+        awk 'NR <= 3 { next }
+             { for (i = 1; i <= NF; i++) { k = n % 3; part[k] = $i; n++
+                 if (k == 2 && part[0] == 255 && part[1] == 196 && part[2] == 64) c++ } }
+             END { print c + 0 }')"
+    if [[ -z "$stroked" ]] || ((stroked < 400)); then
+        fail "the measured polygon is not on the map ($stroked stroke pixels)"
+    fi
+    printf 'gui: measurement drew %s stroke pixels\n' "$stroked"
 fi
 
 printf 'gui: %s ok (%sx%s, %s colours) %s\n' "$scenario" "$width" "$height" "$colours" "$png"
