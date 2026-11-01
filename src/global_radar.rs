@@ -634,6 +634,19 @@ pub fn tile_grid_for_view(
     center_lon: f64,
     span_km: f64,
 ) -> Result<TileGrid, GlobalRadarError> {
+    tile_grid_for_view_capped(center_lat, center_lon, span_km, MAX_ZOOM)
+}
+
+/// Selects the same bounded grid, but never above a provider's deepest level.
+///
+/// A source that publishes only to level six must be asked for level six: a
+/// request above it would fail and leave the view empty.
+pub fn tile_grid_for_view_capped(
+    center_lat: f64,
+    center_lon: f64,
+    span_km: f64,
+    max_zoom: u8,
+) -> Result<TileGrid, GlobalRadarError> {
     if !(center_lat.is_finite()
         && center_lon.is_finite()
         && span_km.is_finite()
@@ -649,7 +662,7 @@ pub fn tile_grid_for_view(
     let longitude_km = EARTH_KM_PER_DEGREE * latitude_radians.cos().max(0.05);
     let lat_extent = (span_km / EARTH_KM_PER_DEGREE).min(170.0);
     let lon_extent = (span_km / longitude_km).min(360.0);
-    for zoom in (0..=MAX_ZOOM).rev() {
+    for zoom in (0..=max_zoom.min(MAX_ZOOM)).rev() {
         let grid = grid_at_zoom(center_lat, center_lon, lat_extent, lon_extent, zoom)?;
         if !grid.tiles.is_empty() && grid.tiles.len() <= MAX_VIEW_TILES {
             return Ok(grid);

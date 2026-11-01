@@ -126,9 +126,25 @@ impl Error for JsonError {
     }
 }
 
+/// Fetches a binary document, such as an imagery tile.
+///
+/// A failed status is a failure, never a body: an error page must not be
+/// decoded as though it were an image.
+pub fn get_bytes(url: &str, accept: &str, limit: u64) -> Result<Vec<u8>, JsonError> {
+    fetch(url, accept, limit)
+}
+
 /// Fetches a JSON document, failing on a non-success status rather than
 /// returning the provider's error page as data.
 pub fn get_json(url: &str, accept: &str) -> Result<Value, JsonError> {
+    let body = fetch(url, accept, MAX_BODY_BYTES)?;
+    serde_json::from_slice(&body).map_err(|source| JsonError::Json {
+        url: String::from(url),
+        source,
+    })
+}
+
+fn fetch(url: &str, accept: &str, limit: u64) -> Result<Vec<u8>, JsonError> {
     let mut response = ureq::get(url)
         .header("User-Agent", USER_AGENT)
         .header("Accept", accept)
@@ -153,19 +169,15 @@ pub fn get_json(url: &str, accept: &str) -> Result<Value, JsonError> {
             retry_after,
         });
     }
-    let body = response
+    response
         .body_mut()
         .with_config()
-        .limit(MAX_BODY_BYTES)
+        .limit(limit)
         .read_to_vec()
         .map_err(|source| JsonError::Body {
             url: String::from(url),
             source,
-        })?;
-    serde_json::from_slice(&body).map_err(|source| JsonError::Json {
-        url: String::from(url),
-        source,
-    })
+        })
 }
 
 /// Percent-encodes a query value, keeping only unreserved characters.

@@ -44,6 +44,7 @@ use crate::quake_layer::QuakeLayer;
 use crate::radar::{ArchiveOrigin, GateValue, RetrievedVolume};
 use crate::radar_controls::{self, Selection};
 use crate::render;
+use crate::satellite::SatelliteLayer;
 use crate::stations::{self, SiteId, Station, StationError, StationFeed, StationOutcome};
 use crate::theme::{self, Palette, Theme};
 use crate::time;
@@ -443,6 +444,7 @@ pub struct OxradApp {
     warning_request_due: Option<Instant>,
     warning_refresh_due: Option<Instant>,
     quakes: QuakeLayer,
+    satellite: SatelliteLayer,
     history: HistoryView,
 }
 
@@ -524,6 +526,7 @@ impl OxradApp {
             warning_request_due: Some(Instant::now()),
             warning_refresh_due: None,
             quakes: QuakeLayer::new(),
+            satellite: SatelliteLayer::new(),
             history: HistoryView::new(),
         };
         if let Some(place) = &restored_place {
@@ -925,6 +928,7 @@ impl OxradApp {
         self.forecast.update(Instant::now());
         self.update_warnings();
         self.quakes.update(Instant::now());
+        self.satellite.update(context, &self.map_view);
         self.poll_global_radar(context);
     }
 
@@ -1138,7 +1142,7 @@ impl OxradApp {
                             SceneMode::Map => {
                                 self.map_layer_controls(ui);
                                 self.map_overlay_controls(ui);
-                                self.quake_rail(ui);
+                                self.map_layer_rail(ui);
                             }
                         }
                         self.warning_section(ui);
@@ -2407,6 +2411,12 @@ impl OxradApp {
         );
     }
 
+    fn map_layer_rail(&mut self, ui: &mut egui::Ui) {
+        let palette = self.config.theme.palette();
+        self.satellite.rail(ui, &palette);
+        self.quake_rail(ui);
+    }
+
     fn quake_rail(&mut self, ui: &mut egui::Ui) {
         let palette = self.config.theme.palette();
         let Some((lat, lon)) = self.quakes.rail(ui, &palette) else {
@@ -3595,6 +3605,9 @@ impl OxradApp {
         }
         self.map_supplemental_lines(ui, rect, transform, span_km);
         self.map_supplemental_roads(ui, rect, transform, span_km);
+        if canvas == Canvas::Map {
+            self.satellite.draw(ui, transform, rect);
+        }
         self.map_global(ui, transform);
         let include_viewport = canvas == Canvas::Map;
         let radar_visible = self.radars(ui, rect, transform, span_km, include_viewport);
@@ -3907,11 +3920,8 @@ fn global_texture(
     ))
 }
 
-/// Draws one display's raster into a geographic canvas.
-///
-/// The raster is never placed by its own arithmetic: the site's screen position
-/// and the view's span come from the same transform that places the rings and
-/// the readout, so a gate, a ring, and a pointer sample cannot disagree.
+/// Draws one display's raster into a geographic canvas, from the same
+/// transform that places the rings and the readout.
 fn draw_map_display(
     display: &Display,
     gpu: &RadarGpu,

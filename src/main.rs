@@ -41,6 +41,7 @@ mod radar_controls;
 mod raster;
 mod render;
 mod retry;
+mod satellite;
 mod stations;
 #[cfg(test)]
 mod test_support;

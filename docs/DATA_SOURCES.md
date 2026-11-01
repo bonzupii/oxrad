@@ -24,6 +24,7 @@ A source is never listed as available because an organisation publishes somethin
 | Global radar composite | RainViewer | 1,200 or more radars in 150 or more countries | Reflectivity composite tiles, two hours of ten-minute frames | `api.rainviewer.com` manifest, `tilecache.rainviewer.com` tiles | 10 minutes | Free personal and community terms, visible attribution required | Verified |
 | Basemap | Natural Earth | Global | Countries, settlements, admin-1 boundaries, rivers, major highways | Embedded GeoJSON | Static release | Public domain | Verified |
 | Earthquakes | USGS Earthquake Hazards Program | Global | Epicentre, magnitude and scale, depth, origin time, review status, tsunami flag, PAGER alert level, felt reports, event page | `earthquake.usgs.gov/earthquakes/feed/v1.0/summary/`, GeoJSON | Minute-scale, feeds summarise the past hour, day, week | United States Government work, public domain | Verified |
+| Satellite imagery | NASA EOSDIS GIBS | Global, Web Mercator, to level 9 for true colour and level 6 for the other layers | MODIS Terra corrected reflectance, MODIS Terra daytime cloud-top temperature, MODIS Terra aerosol optical depth, GPM IMERG precipitation rate | `gibs.earthdata.nasa.gov/wmts/epsg3857/best/wmts.cgi`, WMTS KVP, PNG and JPEG tiles | Daily composites, six days of archive in the layer | NASA open data, no key required | Verified: tiles fetched and drawn for 2026-10-31 and 2026-11-01 |
 
 RainViewer is a processed composite. It is not Level II and cannot supply moment-level products. Attribution is displayed in map view.
 
@@ -72,7 +73,7 @@ Coverage claims for these networks stay out of the interface until an adapter wo
 | Domain | Service | Status |
 |---|---|---|
 | Wildfire hotspots | NASA FIRMS | Candidate |
-| Satellite imagery | EUMETSAT, NOAA nowCOAST and GOES products | Candidate |
+| Satellite imagery | NASA EUMETSAT and NOAA products | Candidate |
 | Air quality | OpenAQ | Candidate |
 | River levels | National hydrological services | Candidate |
 | Lightning | Regional detection networks | Candidate |

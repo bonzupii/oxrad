@@ -155,6 +155,12 @@ case "$scenario" in
         click 690 560
         click 430 540
         ;;
+    satellite)
+        click 240 28
+        "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/satellite-before.png"
+        click 46 465
+        sleep "${OXRAD_GUI_SATELLITE_SETTLE:-12}"
+        ;;
     pan) drag 240 0 ;;
     zoom) scroll 10 ;;
     small)
@@ -208,6 +214,26 @@ if [[ "$scenario" == "measure" ]]; then
         fail "the measured polygon is not on the map ($stroked stroke pixels)"
     fi
     printf 'gui: measurement drew %s stroke pixels\n' "$stroked"
+fi
+
+if [[ "$scenario" == "satellite" ]]; then
+    # Turning the layer on must change the map itself, not merely a status
+    # line. Both frames are cut to the map canvas and reduced before the
+    # comparison, so provider imagery that failed to arrive leaves the region
+    # almost identical and the run fails.
+    sample() {
+        "$tool_pngtopnm" "$1" 2>/dev/null |
+            "$tool_pamcut" -left 320 -top 120 -width 660 -height 500 2>/dev/null |
+            "$scale_pnmscale" -xsize 160 -ysize 120 2>/dev/null |
+            "$scale_pnmtoplainpnm" 2>/dev/null |
+            awk 'NR <= 3 { next } { printf "%s %s %s\n", $1, $2, $3 }'
+    }
+    changed="$(diff <(sample "$output/satellite-before.png") <(sample "$png") |
+        grep -c '^[<>]' || true)"
+    if [[ -z "$changed" ]] || ((changed < 2000)); then
+        fail "the satellite layer changed $changed map samples; imagery never arrived"
+    fi
+    printf 'gui: satellite imagery redrew %s map samples\n' "$changed"
 fi
 
 printf 'gui: %s ok (%sx%s, %s colours) %s\n' "$scenario" "$width" "$height" "$colours" "$png"
