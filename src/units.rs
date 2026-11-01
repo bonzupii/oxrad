@@ -1,0 +1,175 @@
+// oxrad - A storm-chaser-grade NEXRAD weather radar viewer
+// Copyright (C) 2026 Micah Ostrow <bonzupii@protonmail.com>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//! Measurement units and presentation formatting.
+//!
+//! Stored values stay canonical: kilometres, metres per second, and degrees
+//! Celsius. Conversion happens only where a value becomes text.
+
+const MILES_PER_KM: f64 = 0.621_371_192_237_334;
+
+/// The unit system a user reads values in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UnitSystem {
+    #[default]
+    Metric,
+    Imperial,
+}
+
+impl UnitSystem {
+    /// The control label.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Metric => "Metric",
+            Self::Imperial => "Imperial",
+        }
+    }
+
+    /// The configuration token written to disk.
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Metric => "metric",
+            Self::Imperial => "imperial",
+        }
+    }
+
+    /// Parses a configuration token.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "metric" => Some(Self::Metric),
+            "imperial" => Some(Self::Imperial),
+            _ => None,
+        }
+    }
+
+    pub const fn distance_unit(self) -> &'static str {
+        match self {
+            Self::Metric => "km",
+            Self::Imperial => "mi",
+        }
+    }
+
+    pub const fn temperature_unit(self) -> &'static str {
+        match self {
+            Self::Metric => "°C",
+            Self::Imperial => "°F",
+        }
+    }
+
+    /// Converts canonical kilometres to the displayed distance.
+    pub fn distance(self, kilometres: f64) -> f64 {
+        match self {
+            Self::Metric => kilometres,
+            Self::Imperial => kilometres * MILES_PER_KM,
+        }
+    }
+
+    /// Converts canonical degrees Celsius to the displayed temperature.
+    pub fn temperature(self, celsius: f64) -> f64 {
+        match self {
+            Self::Metric => celsius,
+            Self::Imperial => celsius * 9.0 / 5.0 + 32.0,
+        }
+    }
+}
+
+/// A distance with one decimal place.
+pub fn distance(kilometres: f64, units: UnitSystem) -> String {
+    format!(
+        "{:.1} {}",
+        units.distance(kilometres),
+        units.distance_unit()
+    )
+}
+
+/// A distance rounded to whole units, used for range-ring labels.
+pub fn distance_whole(kilometres: f64, units: UnitSystem) -> String {
+    format!(
+        "{:.0} {}",
+        units.distance(kilometres),
+        units.distance_unit()
+    )
+}
+
+/// A temperature with one decimal place.
+pub fn temperature(celsius: f64, units: UnitSystem) -> String {
+    format!(
+        "{:.1} {}",
+        units.temperature(celsius),
+        units.temperature_unit()
+    )
+}
+
+/// A temperature rounded to whole units, used for headline readings.
+pub fn temperature_whole(celsius: f64, units: UnitSystem) -> String {
+    format!(
+        "{:.0} {}",
+        units.temperature(celsius),
+        units.temperature_unit()
+    )
+}
+
+/// Converts a provider temperature to canonical degrees Celsius.
+pub fn celsius_from(value: f64, unit: &str) -> Option<f64> {
+    match unit.trim() {
+        "°C" | "C" => Some(value),
+        "°F" | "F" => Some((value - 32.0) * 5.0 / 9.0),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn metric_keeps_canonical_values() {
+        close(UnitSystem::Metric.distance(12.5), 12.5);
+        close(UnitSystem::Metric.temperature(-5.0), -5.0);
+    }
+
+    #[test]
+    fn imperial_converts_distance_and_temperature() {
+        close(UnitSystem::Imperial.distance(100.0), 62.137_119_223_733_4);
+        close(UnitSystem::Imperial.temperature(0.0), 32.0);
+        close(UnitSystem::Imperial.temperature(100.0), 212.0);
+        close(UnitSystem::Imperial.temperature(-40.0), -40.0);
+    }
+
+    #[test]
+    fn formatting_carries_the_selected_unit() {
+        assert_eq!(distance(12.44, UnitSystem::Metric), "12.4 km");
+        assert_eq!(distance_whole(50.0, UnitSystem::Imperial), "31 mi");
+        assert_eq!(temperature(21.0, UnitSystem::Imperial), "69.8 °F");
+        assert_eq!(celsius_from(68.0, "°F"), Some(20.0));
+        assert_eq!(celsius_from(20.0, "°C"), Some(20.0));
+        assert_eq!(celsius_from(20.0, "K"), None);
+    }
+
+    #[test]
+    fn configuration_tokens_round_trip() {
+        for system in [UnitSystem::Metric, UnitSystem::Imperial] {
+            assert_eq!(UnitSystem::parse(system.token()), Some(system));
+        }
+        assert_eq!(UnitSystem::parse("kelvin"), None);
+    }
+}

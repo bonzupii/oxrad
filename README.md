@@ -23,7 +23,7 @@ This is a pre-release build. The radar display works. The product around it does
 | Place search | Working with exact names; live and fuzzy matching are not implemented |
 | Warnings | United States only |
 | Radar outside the United States | RainViewer composite only; no national Level II adapter |
-| Units selection | Not implemented |
+| Units selection | Partial: distance and temperature convert; other quantities do not |
 | Light theme | Not implemented |
 | Layer management | Not implemented |
 | Colourblind-safe palettes | Not implemented |

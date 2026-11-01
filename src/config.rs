@@ -23,6 +23,7 @@ use crate::error::ConfigError;
 use crate::paths;
 use crate::place::{Place, PlaceError};
 use crate::stations::SiteId;
+use crate::units::UnitSystem;
 
 const HEADER: &str = "# oxrad configuration.\n";
 
@@ -32,6 +33,8 @@ pub struct Config {
     pub site: Option<SiteId>,
     /// The searched forecast point restored on the next launch.
     pub place: Option<Place>,
+    /// The unit system used for every displayed measurement.
+    pub units: UnitSystem,
 }
 
 fn strip_quotes(value: &str) -> Option<&str> {
@@ -137,6 +140,17 @@ fn parse_text_line(path: &Path, text: &str) -> Result<Config, ConfigError> {
         let value = value.trim();
         match key {
             "site" => config.site = Some(parse_site(path, number, value)?),
+            "units" => {
+                let text = strip_quotes(value).ok_or_else(|| ConfigError::Syntax {
+                    path: path.to_path_buf(),
+                    line: number,
+                })?;
+                config.units = UnitSystem::parse(text).ok_or_else(|| ConfigError::InvalidUnit {
+                    path: path.to_path_buf(),
+                    line: number,
+                    value: String::from(text),
+                })?;
+            }
             "place_name" => {
                 place.name = Some(quoted_text(path, number, value)?);
                 if place.line == 0 {
@@ -212,6 +226,7 @@ pub fn save(config: &Config, path: &Path) -> Result<(), ConfigError> {
     if let Some(site) = &config.site {
         lines.push(format!("site = \"{site}\""));
     }
+    lines.push(format!("units = \"{}\"", config.units.token()));
     if let Some(place) = &config.place {
         lines.push(format!("place_name = \"{}\"", place.name));
         lines.push(format!("place_region = \"{}\"", place.region));
@@ -295,6 +310,7 @@ mod tests {
             &Config {
                 site: Some(id),
                 place: None,
+                units: UnitSystem::Metric,
             },
             &path,
         )?;
@@ -328,6 +344,7 @@ mod tests {
             &Config {
                 site: None,
                 place: Some(place),
+                units: UnitSystem::Metric,
             },
             &path,
         )?;
@@ -346,6 +363,21 @@ mod tests {
             loaded.site.is_none(),
             "a place must not restore a radar site"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn units_round_trip_and_reject_unknown_values() -> Result<(), ConfigError> {
+        let config = parse("units = \"imperial\"\n")?;
+        assert_eq!(config.units, UnitSystem::Imperial);
+        assert!(matches!(
+            parse("units = \"kelvin\"\n"),
+            Err(ConfigError::InvalidUnit {
+                line: 1,
+                ref value,
+                ..
+            }) if value == "kelvin"
+        ));
         Ok(())
     }
 

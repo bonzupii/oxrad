@@ -110,9 +110,9 @@ Warning and global radar visibility flags exist. They are not a layer model.
 
 | ID | Requirement | State |
 |---|---|---|
-| UNIT-1 | Units are selected once and apply to every panel, legend, and readout | Not implemented |
-| UNIT-2 | Temperature, distance, speed, precipitation, pressure, elevation, and visibility convert correctly | Not implemented |
-| UNIT-3 | Stored values stay canonical; conversion happens at presentation | Not implemented |
+| UNIT-1 | Units are selected once and apply to every panel, legend, and readout | Partially implemented |
+| UNIT-2 | Temperature, distance, speed, precipitation, pressure, elevation, and visibility convert correctly | Partially implemented |
+| UNIT-3 | Stored values stay canonical; conversion happens at presentation | Partially implemented |
 | UNIT-4 | UTC and local time are both available and labelled | Partially implemented |
 | UNIT-5 | Decimal precision and coordinate format are configurable | Not implemented |
 

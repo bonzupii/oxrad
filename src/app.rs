@@ -1041,6 +1041,7 @@ impl OxradApp {
     }
 
     fn header(&mut self, ui: &mut egui::Ui) {
+        let mut units = self.config.units;
         egui::Panel::top("header")
             .exact_size(46.0)
             .show_inside(ui, |ui| {
@@ -1065,6 +1066,17 @@ impl OxradApp {
                         self.global_request_due = Some(Instant::now());
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.selectable_value(
+                            &mut units,
+                            crate::units::UnitSystem::Imperial,
+                            crate::units::UnitSystem::Imperial.label(),
+                        );
+                        ui.selectable_value(
+                            &mut units,
+                            crate::units::UnitSystem::Metric,
+                            crate::units::UnitSystem::Metric.label(),
+                        );
+                        ui.separator();
                         if let Some(place) = &self.place {
                             ui.label(
                                 RichText::new(format!("Weather for {}", place.label()))
@@ -1097,6 +1109,10 @@ impl OxradApp {
                     });
                 });
             });
+        if units != self.config.units {
+            self.config.units = units;
+            self.save_config();
+        }
     }
 
     fn rail(&mut self, ui: &mut egui::Ui) {
@@ -1470,11 +1486,11 @@ impl OxradApp {
                             ui.add_space(8.0);
                             ui.colored_label(STALE, "Showing the last forecast received.");
                             ui.separator();
-                            forecast_body(ui, forecast, true);
+                            forecast_body(ui, forecast, true, self.config.units);
                         }
                     }
                     ForecastState::Ready { forecast } => {
-                        forecast_body(ui, forecast, false);
+                        forecast_body(ui, forecast, false, self.config.units);
                     }
                 }
                 ui.add_space(8.0);
@@ -2204,7 +2220,8 @@ impl OxradApp {
         );
         let detail = match crate::projection::inverse(start.0, start.1, end.0, end.1) {
             Ok((distance_km, bearing_deg)) => format!(
-                "{distance_km:.1} km · {bearing_deg:.0}° {}",
+                "{} · {bearing_deg:.0}° {}",
+                crate::units::distance(distance_km, self.config.units),
                 place::compass(bearing_deg)
             ),
             Err(error) => format!("Measurement unavailable: {error}"),
@@ -3419,7 +3436,7 @@ impl OxradApp {
             );
         }
         overlay::draw_grid(ui.painter(), &frame.geometry, &transform);
-        overlay::draw_rings(ui.painter(), &frame.geometry, &transform);
+        overlay::draw_rings(ui.painter(), &frame.geometry, &transform, self.config.units);
         if let Some(error) = self.radar_warnings(ui.painter(), frame, &transform, viewport) {
             self.notice = Some(error);
         }
@@ -3429,7 +3446,7 @@ impl OxradApp {
         }
         north_marker(ui.painter(), &viewport);
         map_caption(ui.painter(), rect, frame);
-        readout(ui, frame, &transform, viewport, rect);
+        readout(ui, frame, &transform, viewport, rect, self.config.units);
     }
 
     fn empty_state(&self, ui: &egui::Ui, rect: Rect) {
@@ -3731,7 +3748,12 @@ fn search_results(
     chosen
 }
 
-fn forecast_body(ui: &mut egui::Ui, forecast: &Forecast, stale: bool) {
+fn forecast_body(
+    ui: &mut egui::Ui,
+    forecast: &Forecast,
+    stale: bool,
+    units: crate::units::UnitSystem,
+) {
     ui.label(
         RichText::new(forecast.place.label())
             .size(15.0)
@@ -3762,10 +3784,18 @@ fn forecast_body(ui: &mut egui::Ui, forecast: &Forecast, stale: bool) {
     ui.label(RichText::new("Now").size(12.0).strong().color(TEXT));
     ui.horizontal_wrapped(|ui| {
         ui.label(
-            RichText::new(format!(
-                "{:.0} {}",
-                forecast.current.temperature, forecast.current.unit
-            ))
+            RichText::new(
+                crate::units::celsius_from(forecast.current.temperature, &forecast.current.unit)
+                    .map_or_else(
+                        || {
+                            format!(
+                                "{:.0} {}",
+                                forecast.current.temperature, forecast.current.unit
+                            )
+                        },
+                        |celsius| crate::units::temperature_whole(celsius, units),
+                    ),
+            )
             .size(20.0)
             .strong(),
         );
@@ -3775,14 +3805,15 @@ fn forecast_body(ui: &mut egui::Ui, forecast: &Forecast, stale: bool) {
                 .color(TEXT),
         );
     });
+    let apparent = crate::units::celsius_from(forecast.current.apparent, &forecast.current.unit)
+        .map_or_else(
+            || format!("{:.0} {}", forecast.current.apparent, forecast.current.unit),
+            |celsius| crate::units::temperature_whole(celsius, units),
+        );
     ui.label(
         RichText::new(format!(
-            "Feels {:.0} {} · humidity {:.0}% · {} · precipitation {:.1} mm",
-            forecast.current.apparent,
-            forecast.current.unit,
-            forecast.current.humidity,
-            forecast.current.wind,
-            forecast.current.precipitation
+            "Feels {apparent} · humidity {:.0}% · {} · precipitation {:.1} mm",
+            forecast.current.humidity, forecast.current.wind, forecast.current.precipitation
         ))
         .size(10.0)
         .color(MUTED),
@@ -3797,23 +3828,36 @@ fn forecast_body(ui: &mut egui::Ui, forecast: &Forecast, stale: bool) {
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
         .show(ui, |ui| {
             for period in &forecast.hourly {
-                forecast_period(ui, period);
+                forecast_period(ui, period, units);
             }
             ui.add_space(6.0);
             ui.label(RichText::new("Daily").size(12.0).strong().color(TEXT));
             for period in &forecast.daily {
-                forecast_period(ui, period);
+                forecast_period(ui, period, units);
             }
         });
 }
 
-fn forecast_period(ui: &mut egui::Ui, period: &ForecastPeriod) {
+fn forecast_period(ui: &mut egui::Ui, period: &ForecastPeriod, units: crate::units::UnitSystem) {
     ui.label(RichText::new(&period.name).size(12.0).strong().color(TEXT));
     ui.horizontal_wrapped(|ui| {
-        let temperature = period.minimum.map_or_else(
-            || format!("{:.0} {}", period.temperature, period.unit),
-            |minimum| format!("{:.0}/{:.0} {}", period.temperature, minimum, period.unit),
-        );
+        let high = crate::units::celsius_from(period.temperature, &period.unit);
+        let low = period
+            .minimum
+            .and_then(|minimum| crate::units::celsius_from(minimum, &period.unit));
+        let temperature = match (high, low) {
+            (Some(high), Some(low)) => format!(
+                "{:.0}/{:.0} {}",
+                units.temperature(high),
+                units.temperature(low),
+                units.temperature_unit()
+            ),
+            (Some(high), None) => crate::units::temperature(high, units),
+            (None, _) => period.minimum.map_or_else(
+                || format!("{:.0} {}", period.temperature, period.unit),
+                |minimum| format!("{:.0}/{:.0} {}", period.temperature, minimum, period.unit),
+            ),
+        };
         ui.label(RichText::new(temperature).size(17.0).strong());
         ui.label(RichText::new(&period.short).size(12.0).color(TEXT));
     });
@@ -4046,7 +4090,14 @@ fn gate_label(value: Option<GateValue>, product: RadarProduct) -> String {
     }
 }
 
-fn readout(ui: &egui::Ui, frame: &Frame, transform: &ViewTransform, viewport: Rect, bounds: Rect) {
+fn readout(
+    ui: &egui::Ui,
+    frame: &Frame,
+    transform: &ViewTransform,
+    viewport: Rect,
+    bounds: Rect,
+    units: crate::units::UnitSystem,
+) {
     let Some(position) = ui.input(|input| input.pointer.hover_pos()) else {
         return;
     };
@@ -4087,8 +4138,11 @@ fn readout(ui: &egui::Ui, frame: &Frame, transform: &ViewTransform, viewport: Re
         (String::from("no radar data"), String::new())
     };
     let label = format!(
-        "{:.4}, {:.4}\n{:.1} km  {:.0}°\n{site}{value}",
-        info.lat, info.lon, info.range_km, info.azimuth_deg
+        "{:.4}, {:.4}\n{}  {:.0}°\n{site}{value}",
+        info.lat,
+        info.lon,
+        crate::units::distance(info.range_km, units),
+        info.azimuth_deg
     );
     let stroke = Stroke::new(1.0_f32, TEXT);
     painter.line_segment(

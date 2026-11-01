@@ -47,12 +47,17 @@ pub fn draw_grid(painter: &egui::Painter, geometry: &RadarGeometry, transform: &
     }
 }
 
-pub fn draw_rings(painter: &egui::Painter, geometry: &RadarGeometry, transform: &ViewTransform) {
+pub fn draw_rings(
+    painter: &egui::Painter,
+    geometry: &RadarGeometry,
+    transform: &ViewTransform,
+    units: crate::units::UnitSystem,
+) {
     let stroke = Stroke::new(1.0_f32, RING_COLOR);
     for ring in &geometry.rings {
         polyline(painter, &ring.points, transform, stroke);
         if let Some(point) = ring.points.get(RING_LABEL_INDEX) {
-            let label = format!("{:.0} km", ring.range_km);
+            let label = crate::units::distance_whole(ring.range_km, units);
             let galley = painter.layout_no_wrap(label, FontId::monospace(10.0), RING_COLOR);
             let centre = transform.screen(*point) + Vec2::new(0.0, 4.0);
             let origin = Pos2::new(centre.x - galley.size().x / 2.0, centre.y);

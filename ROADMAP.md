@@ -27,7 +27,7 @@ Only behavior observed in the running binary is listed as verified.
 | Warnings | Partially verified | NWS polygons, list, detail, viewport filter; United States only |
 | Response cache | Verified | SHA-256 verification, atomic write, eviction, corruption removal |
 | Themes | Absent | Dark palette only; no theme code |
-| Units | Absent | Provider strings pass through; no preference or conversion |
+| Units | Partial | Metric and imperial for distance and temperature; speed, pressure, precipitation, and elevation unconverted |
 | Layer model | Absent | Three independent toggles; no ordering, opacity, or grouping |
 | International radar | Absent | RainViewer composite only |
 | Performance measurement | Absent | No baseline has been taken |

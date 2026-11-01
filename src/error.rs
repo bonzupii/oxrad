@@ -137,6 +137,11 @@ pub enum ConfigError {
         path: PathBuf,
         line: usize,
     },
+    InvalidUnit {
+        path: PathBuf,
+        line: usize,
+        value: String,
+    },
     UnknownKey {
         path: PathBuf,
         line: usize,
@@ -179,6 +184,10 @@ impl ConfigError {
             Self::Syntax { path, line } => {
                 format!("{} line {line} is not a key and a value.", path.display())
             }
+            Self::InvalidUnit { path, line, value } => format!(
+                "{} line {line} sets units to {value:?}, which is not metric or imperial.",
+                path.display()
+            ),
             Self::UnknownKey { path, line, key } => format!(
                 "{} line {line} sets the unrecognized key {key}.",
                 path.display()
@@ -225,6 +234,7 @@ impl Error for ConfigError {
             Self::PlaceEntry { source, .. } => Some(source),
             Self::Path { source } => Some(source),
             Self::Syntax { .. }
+            | Self::InvalidUnit { .. }
             | Self::UnknownKey { .. }
             | Self::IncompletePlaceEntry { .. }
             | Self::PlaceNumber { .. } => None,

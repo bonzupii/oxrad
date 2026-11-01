@@ -2,7 +2,7 @@
 
 ## Current suite
 
-131 tests run under `cargo test`. Last recorded run in this repository: 131 passed, 0 failed.
+136 tests run under `cargo test`. Last recorded run in this repository: 136 passed, 0 failed.
 
 | Area | Coverage |
 |---|---|
@@ -22,6 +22,7 @@
 | History | Key parsing, playback advance and wrap |
 | Retry | Backoff, `Retry-After` seconds and HTTP date, decode-failure policy |
 | App | Warning selection retention, forecast retry, viewport station selection, map status bounds |
+| Units | Metric and imperial conversion, provider temperature scale, configuration round trip and rejection |
 
 Several tests reach live services. A network failure fails the test. They are not replaced with fixtures.
 
