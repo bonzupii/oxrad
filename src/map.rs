@@ -27,14 +27,9 @@ use eframe::egui::{
 
 use crate::error::CoordinateError;
 use crate::projection;
+use crate::theme::Palette;
 
 const COUNTRIES: &str = include_str!("../assets/ne_110m_admin_0_countries.geojson");
-const OCEAN: Color32 = Color32::from_rgb(8, 18, 27);
-const LAND: Color32 = Color32::from_rgb(26, 39, 35);
-const COAST: Color32 = Color32::from_rgb(72, 102, 91);
-const GRID: Color32 = Color32::from_rgb(43, 60, 69);
-const LABEL: Color32 = Color32::from_rgb(170, 188, 184);
-const LABEL_SHADOW: Color32 = Color32::from_rgb(8, 18, 27);
 const MIN_SPAN_KM: f64 = 80.0;
 const MAX_SPAN_KM: f64 = 40_075.0;
 const MERCATOR_LIMIT_DEG: f64 = 85.0;
@@ -259,10 +254,11 @@ impl WorldMap {
         painter: &egui::Painter,
         view: &MapView,
         rect: Rect,
+        palette: &Palette,
     ) -> Result<(), MapError> {
         let transform = view.transform(rect)?;
-        painter.rect_filled(rect, CornerRadius::ZERO, OCEAN);
-        draw_graticule(painter, &transform, rect);
+        painter.rect_filled(rect, CornerRadius::ZERO, palette.ocean);
+        draw_graticule(painter, &transform, rect, palette);
         let mut labels = Vec::new();
         for country in &self.countries {
             for ring in &country.rings {
@@ -282,16 +278,19 @@ impl WorldMap {
                 if width > rect.width() * 3.0 {
                     continue;
                 }
-                if let Some(mesh) = filled_mesh(&points, LAND) {
+                if let Some(mesh) = filled_mesh(&points, palette.land) {
                     painter.add(Shape::mesh(mesh));
                 }
-                painter.add(Shape::closed_line(points, Stroke::new(0.7_f32, COAST)));
+                painter.add(Shape::closed_line(
+                    points,
+                    Stroke::new(0.7_f32, palette.coast),
+                ));
             }
             if let Some((lat, lon)) = country.label {
                 labels.push((country.name.as_str(), country.label_rank, lat, lon));
             }
         }
-        draw_labels(painter, &transform, rect, &labels, view.span_km);
+        draw_labels(painter, &transform, rect, &labels, view.span_km, palette);
         Ok(())
     }
 }
@@ -399,8 +398,13 @@ fn triangulate(points: &[Pos2]) -> Option<Vec<[u32; 3]>> {
     Some(triangles)
 }
 
-fn draw_graticule(painter: &egui::Painter, transform: &MapTransform, rect: Rect) {
-    let stroke = Stroke::new(0.5_f32, GRID);
+fn draw_graticule(
+    painter: &egui::Painter,
+    transform: &MapTransform,
+    rect: Rect,
+    palette: &Palette,
+) {
+    let stroke = Stroke::new(0.5_f32, palette.graticule);
     let (north, _) = transform.latlon_at(Pos2::new(rect.center().x, rect.top()));
     let (south, _) = transform.latlon_at(Pos2::new(rect.center().x, rect.bottom()));
     let mut latitude = (south / 15.0).floor() * 15.0;
@@ -439,6 +443,7 @@ fn draw_labels(
     rect: Rect,
     labels: &[(&str, u32, f64, f64)],
     span_km: f64,
+    palette: &Palette,
 ) {
     let rank_limit = if span_km > 12_000.0 {
         2
@@ -460,7 +465,11 @@ fn draw_labels(
         if !rect.shrink(8.0).contains(position) {
             continue;
         }
-        let galley = painter.layout_no_wrap(String::from(*name), FontId::proportional(11.0), LABEL);
+        let galley = painter.layout_no_wrap(
+            String::from(*name),
+            FontId::proportional(11.0),
+            palette.map_text,
+        );
         let box_rect = Rect::from_center_size(position, galley.size() + Vec2::new(6.0, 2.0));
         if used.iter().any(|other| other.intersects(box_rect)) {
             continue;
@@ -471,9 +480,9 @@ fn draw_labels(
             Align2::CENTER_CENTER,
             String::from(*name),
             FontId::proportional(11.0),
-            LABEL_SHADOW,
+            palette.surface,
         );
-        painter.galley(position - galley.size() / 2.0, galley, LABEL);
+        painter.galley(position - galley.size() / 2.0, galley, palette.map_text);
         if used.len() >= 70 {
             break;
         }
@@ -606,7 +615,12 @@ impl MapTransform {
     }
 }
 
-pub fn draw_scale(painter: &egui::Painter, rect: Rect, transform: &MapTransform) {
+pub fn draw_scale(
+    painter: &egui::Painter,
+    rect: Rect,
+    transform: &MapTransform,
+    palette: &Palette,
+) {
     let target_pixels = 110.0_f32;
     let raw_km = f64::from(target_pixels) * transform.kilometers_per_pixel();
     let power = 10_f64.powf(raw_km.log10().floor());
@@ -621,22 +635,27 @@ pub fn draw_scale(painter: &egui::Painter, rect: Rect, transform: &MapTransform)
     painter.rect_filled(
         Rect::from_min_size(start - Vec2::new(6.0, 20.0), Vec2::new(pixels + 18.0, 32.0)),
         CornerRadius::same(3),
-        Color32::from_black_alpha(150),
+        Color32::from_rgba_unmultiplied(
+            palette.surface.r(),
+            palette.surface.g(),
+            palette.surface.b(),
+            210,
+        ),
     );
     painter.line_segment(
         [start, start + Vec2::new(pixels, 0.0)],
-        Stroke::new(2.0_f32, LABEL),
+        Stroke::new(2.0_f32, palette.map_text),
     );
     painter.line_segment(
         [start + Vec2::new(0.0, -4.0), start + Vec2::new(0.0, 4.0)],
-        Stroke::new(1.0_f32, LABEL),
+        Stroke::new(1.0_f32, palette.map_text),
     );
     painter.line_segment(
         [
             start + Vec2::new(pixels, -4.0),
             start + Vec2::new(pixels, 4.0),
         ],
-        Stroke::new(1.0_f32, LABEL),
+        Stroke::new(1.0_f32, palette.map_text),
     );
     let label = if kilometers >= 1000.0 {
         format!("{:.0} 000 km", kilometers / 1000.0)
@@ -648,7 +667,7 @@ pub fn draw_scale(painter: &egui::Painter, rect: Rect, transform: &MapTransform)
         Align2::CENTER_BOTTOM,
         label,
         FontId::monospace(10.0),
-        LABEL,
+        palette.map_text,
     );
 }
 

@@ -26,7 +26,7 @@ Only behavior observed in the running binary is listed as verified.
 | Global radar composite | Verified | RainViewer manifest, tiles, scrub, loop, attribution |
 | Warnings | Partially verified | NWS polygons, list, detail, viewport filter; United States only |
 | Response cache | Verified | SHA-256 verification, atomic write, eviction, corruption removal |
-| Themes | Absent | Dark palette only; no theme code |
+| Themes | Implemented | Dark and light palettes, persisted preference; two map controls still draw dark in light mode |
 | Units | Partial | Metric and imperial for distance and temperature; speed, pressure, precipitation, and elevation unconverted |
 | Layer model | Absent | Three independent toggles; no ordering, opacity, or grouping |
 | International radar | Absent | RainViewer composite only |

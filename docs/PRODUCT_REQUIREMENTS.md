@@ -122,9 +122,9 @@ Forecast units are whatever the provider returns. Radar readouts use product uni
 
 | ID | Requirement | State |
 |---|---|---|
-| UI-1 | Every colour and dimension comes from a named token | Not implemented |
-| UI-2 | A light theme and a dark theme both render the whole interface | Not implemented |
-| UI-3 | Body text is at least 13 points at default scale | Not implemented |
+| UI-1 | Every colour and dimension comes from a named token | Partially implemented |
+| UI-2 | A light theme and a dark theme both render the whole interface | Partially implemented |
+| UI-3 | Body text is at least 13 points at default scale | Partially implemented |
 | UI-4 | Every panel collapses and restores without losing state | Not implemented |
 | UI-5 | Layout holds at 1040x640 and 2560x1440 | Partially implemented |
 | UI-6 | A colourblind-safe palette set is selectable per product | Not implemented |
@@ -133,7 +133,7 @@ Forecast units are whatever the provider returns. Radar readouts use product uni
 
 | ID | Requirement | State |
 |---|---|---|
-| A11Y-1 | Text meets 4.5:1 contrast against its background | Not implemented |
+| A11Y-1 | Text meets 4.5:1 contrast against its background | Partially implemented |
 | A11Y-2 | Focus order is logical and focus is always visible | Not implemented |
 | A11Y-3 | Every control has an accessible name | Not implemented |
 | A11Y-4 | Interface scale is adjustable | Not implemented |

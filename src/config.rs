@@ -23,6 +23,7 @@ use crate::error::ConfigError;
 use crate::paths;
 use crate::place::{Place, PlaceError};
 use crate::stations::SiteId;
+use crate::theme::Theme;
 use crate::units::UnitSystem;
 
 const HEADER: &str = "# oxrad configuration.\n";
@@ -35,6 +36,8 @@ pub struct Config {
     pub place: Option<Place>,
     /// The unit system used for every displayed measurement.
     pub units: UnitSystem,
+    /// The colour theme for the interface.
+    pub theme: Theme,
 }
 
 fn strip_quotes(value: &str) -> Option<&str> {
@@ -151,6 +154,17 @@ fn parse_text_line(path: &Path, text: &str) -> Result<Config, ConfigError> {
                     value: String::from(text),
                 })?;
             }
+            "theme" => {
+                let text = strip_quotes(value).ok_or_else(|| ConfigError::Syntax {
+                    path: path.to_path_buf(),
+                    line: number,
+                })?;
+                config.theme = Theme::parse(text).ok_or_else(|| ConfigError::InvalidTheme {
+                    path: path.to_path_buf(),
+                    line: number,
+                    value: String::from(text),
+                })?;
+            }
             "place_name" => {
                 place.name = Some(quoted_text(path, number, value)?);
                 if place.line == 0 {
@@ -227,6 +241,7 @@ pub fn save(config: &Config, path: &Path) -> Result<(), ConfigError> {
         lines.push(format!("site = \"{site}\""));
     }
     lines.push(format!("units = \"{}\"", config.units.token()));
+    lines.push(format!("theme = \"{}\"", config.theme.token()));
     if let Some(place) = &config.place {
         lines.push(format!("place_name = \"{}\"", place.name));
         lines.push(format!("place_region = \"{}\"", place.region));
@@ -311,6 +326,7 @@ mod tests {
                 site: Some(id),
                 place: None,
                 units: UnitSystem::Metric,
+                theme: Theme::Dark,
             },
             &path,
         )?;
@@ -345,6 +361,7 @@ mod tests {
                 site: None,
                 place: Some(place),
                 units: UnitSystem::Metric,
+                theme: Theme::Dark,
             },
             &path,
         )?;
@@ -377,6 +394,21 @@ mod tests {
                 ref value,
                 ..
             }) if value == "kelvin"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn theme_round_trips_and_rejects_unknown_values() -> Result<(), ConfigError> {
+        let config = parse("theme = \"light\"\n")?;
+        assert_eq!(config.theme, Theme::Light);
+        assert!(matches!(
+            parse("theme = \"sepia\"\n"),
+            Err(ConfigError::InvalidTheme {
+                line: 1,
+                ref value,
+                ..
+            }) if value == "sepia"
         ));
         Ok(())
     }

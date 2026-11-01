@@ -24,7 +24,7 @@ This is a pre-release build. The radar display works. The product around it does
 | Warnings | United States only |
 | Radar outside the United States | RainViewer composite only; no national Level II adapter |
 | Units selection | Partial: distance and temperature convert; other quantities do not |
-| Light theme | Not implemented |
+| Light theme | Implemented for chrome, basemap, and radar canvas; two map controls keep their dark fill |
 | Layer management | Not implemented |
 | Colourblind-safe palettes | Not implemented |
 | Performance measurement | Not taken |

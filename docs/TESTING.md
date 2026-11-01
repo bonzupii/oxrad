@@ -2,7 +2,7 @@
 
 ## Current suite
 
-136 tests run under `cargo test`. Last recorded run in this repository: 136 passed, 0 failed.
+139 tests run under `cargo test`. Last recorded run in this repository: 139 passed, 0 failed.
 
 | Area | Coverage |
 |---|---|
@@ -64,7 +64,7 @@ The headless workflow is recorded in [HEADLESS.md](HEADLESS.md). It runs the rel
 
 The state matrix in [UI_DESIGN.md](UI_DESIGN.md) defines what must be inspected. Each capture is inspected, defects are recorded, fixed, and recaptured.
 
-Current GUI evidence covers the radar scene and the map scene at 1280x800, and the map at 1040x640. It does not cover light theme, collapsed panels, street-scale map, multi-layer composition, search interaction, or the empty, loading, and error states.
+Current GUI evidence covers the radar and map scenes at 1280x800 in dark and light themes. It does not cover 1040x640 in light mode, collapsed panels, street-scale map, multi-layer composition, search interaction, or the empty, loading, and error states.
 
 ## Adding a source
 

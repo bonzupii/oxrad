@@ -20,11 +20,7 @@ use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Stro
 use crate::colormap::color_for_product;
 use crate::product::RadarProduct;
 use crate::render::{RadarGeometry, ViewTransform};
-
-const GRID_COLOR: Color32 = Color32::from_rgb(90, 100, 114);
-const RING_COLOR: Color32 = Color32::from_rgb(174, 184, 197);
-const TEXT_COLOR: Color32 = Color32::from_rgb(206, 214, 226);
-const ERROR_COLOR: Color32 = Color32::from_rgb(255, 122, 122);
+use crate::theme::Palette;
 const LEGEND_WIDTH: f32 = 14.0;
 const LEGEND_HEIGHT: f32 = 260.0;
 const LEGEND_BANDS: usize = 20;
@@ -40,8 +36,16 @@ fn polyline(painter: &egui::Painter, points: &[Pos2], transform: &ViewTransform,
     }
 }
 
-pub fn draw_grid(painter: &egui::Painter, geometry: &RadarGeometry, transform: &ViewTransform) {
-    let stroke = Stroke::new(1.0_f32, GRID_COLOR);
+pub fn draw_grid(
+    painter: &egui::Painter,
+    geometry: &RadarGeometry,
+    transform: &ViewTransform,
+    palette: &Palette,
+) {
+    let stroke = Stroke::new(
+        1.0_f32,
+        Color32::from_rgba_unmultiplied(palette.ring.r(), palette.ring.g(), palette.ring.b(), 90),
+    );
     for line in &geometry.grid {
         polyline(painter, line, transform, stroke);
     }
@@ -52,21 +56,28 @@ pub fn draw_rings(
     geometry: &RadarGeometry,
     transform: &ViewTransform,
     units: crate::units::UnitSystem,
+    palette: &Palette,
 ) {
-    let stroke = Stroke::new(1.0_f32, RING_COLOR);
+    let stroke = Stroke::new(1.0_f32, palette.ring);
     for ring in &geometry.rings {
         polyline(painter, &ring.points, transform, stroke);
         if let Some(point) = ring.points.get(RING_LABEL_INDEX) {
             let label = crate::units::distance_whole(ring.range_km, units);
-            let galley = painter.layout_no_wrap(label, FontId::monospace(10.0), RING_COLOR);
+            let galley =
+                painter.layout_no_wrap(label, FontId::monospace(10.0), palette.canvas_text);
             let centre = transform.screen(*point) + Vec2::new(0.0, 4.0);
             let origin = Pos2::new(centre.x - galley.size().x / 2.0, centre.y);
             painter.rect_filled(
                 Rect::from_min_size(origin - Vec2::splat(2.0), galley.size() + Vec2::splat(4.0)),
                 CornerRadius::same(2),
-                Color32::from_black_alpha(170),
+                Color32::from_rgba_unmultiplied(
+                    palette.legend.r(),
+                    palette.legend.g(),
+                    palette.legend.b(),
+                    170,
+                ),
             );
-            painter.galley(origin, galley, RING_COLOR);
+            painter.galley(origin, galley, palette.canvas_text);
         }
     }
 }
@@ -80,7 +91,7 @@ fn legend_colour(
     color_for_product(product, value)
 }
 
-pub fn draw_legend(painter: &egui::Painter, rect: Rect, product: RadarProduct) {
+pub fn draw_legend(painter: &egui::Painter, rect: Rect, product: RadarProduct, palette: &Palette) {
     let (minimum, maximum) = product.value_range();
     let range = maximum - minimum;
     let x = rect.right() - 42.0;
@@ -93,14 +104,19 @@ pub fn draw_legend(painter: &egui::Painter, rect: Rect, product: RadarProduct) {
             Pos2::new(x + LEGEND_WIDTH + 10.0, top + height + 24.0),
         ),
         CornerRadius::same(4),
-        Color32::from_black_alpha(220),
+        Color32::from_rgba_unmultiplied(
+            palette.legend.r(),
+            palette.legend.g(),
+            palette.legend.b(),
+            220,
+        ),
     );
     painter.text(
         Pos2::new(x + LEGEND_WIDTH / 2.0, top - 10.0),
         Align2::CENTER_BOTTOM,
         format!("{} {}", product.id(), product.unit()),
         FontId::monospace(10.0),
-        TEXT_COLOR,
+        palette.canvas_text,
     );
     for index in 0..LEGEND_BANDS {
         let fraction = (index as f32 + 0.5) / LEGEND_BANDS as f32;
@@ -112,7 +128,7 @@ pub fn draw_legend(painter: &egui::Painter, rect: Rect, product: RadarProduct) {
                     Align2::LEFT_TOP,
                     format!("Legend error: {error}"),
                     FontId::monospace(12.0),
-                    ERROR_COLOR,
+                    palette.error,
                 );
                 return;
             }
@@ -133,7 +149,7 @@ pub fn draw_legend(painter: &egui::Painter, rect: Rect, product: RadarProduct) {
             Align2::RIGHT_CENTER,
             format!("{value:.1}"),
             FontId::monospace(10.0),
-            TEXT_COLOR,
+            palette.canvas_text,
         );
     }
 }

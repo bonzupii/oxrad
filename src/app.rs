@@ -40,16 +40,14 @@ use crate::provider::{JsonError, timestamp_label};
 use crate::radar::{ArchiveOrigin, GateValue, RetrievedVolume};
 use crate::render::{self, ViewTransform};
 use crate::stations::{self, SiteId, Station, StationError, StationFeed, StationOutcome};
+use crate::theme::{self, Palette, Theme};
 use crate::time;
 use crate::warnings::{Severity, Warning, WarningError, WarningEvent, WarningFeed};
 
-const BACKGROUND: Color32 = Color32::from_rgb(8, 10, 14);
-const CARD: Color32 = Color32::from_rgb(18, 22, 30);
 const TEXT: Color32 = Color32::from_rgb(214, 221, 232);
 const MUTED: Color32 = Color32::from_rgb(156, 168, 184);
 const ERROR: Color32 = Color32::from_rgb(255, 122, 122);
 const STALE: Color32 = Color32::from_rgb(255, 196, 64);
-const HIGHLIGHT: Color32 = Color32::from_rgb(40, 64, 96);
 const STALE_AFTER_MS: u64 = 15 * 60 * 1000;
 const BUSY_REPAINT_MS: u64 = 100;
 const IDLE_REPAINT_MS: u64 = 1000;
@@ -235,6 +233,32 @@ const fn warning_colour(severity: Severity) -> Color32 {
     }
 }
 
+fn toggle_button(palette: &Palette, label: &str, selected: bool) -> egui::Button<'static> {
+    let fill = if selected {
+        palette.accent
+    } else {
+        palette.surface
+    };
+    let text = if selected {
+        Color32::WHITE
+    } else {
+        palette.text
+    };
+    egui::Button::new(RichText::new(label).size(theme::TYPE_BODY).color(text))
+        .fill(fill)
+        .stroke(Stroke::new(1.0_f32, palette.border))
+}
+
+fn action_button(palette: &Palette, label: &str) -> egui::Button<'static> {
+    egui::Button::new(
+        RichText::new(label)
+            .size(theme::TYPE_BODY)
+            .color(palette.text),
+    )
+    .fill(palette.surface)
+    .stroke(Stroke::new(1.0_f32, palette.border))
+}
+
 fn map_status_area(rect: Rect) -> Option<Rect> {
     let width = (rect.width() - 110.0).clamp(0.0, 520.0);
     let height = (rect.height() - 400.0).clamp(0.0, 130.0);
@@ -353,6 +377,7 @@ pub struct OxradApp {
     station_refresh_due: Instant,
     pending_site: Option<SiteId>,
     config: Config,
+    applied_theme: Option<Theme>,
     config_writable: bool,
     notice: Option<String>,
     query: String,
@@ -429,6 +454,7 @@ impl OxradApp {
             station_refresh_due: due_after(Duration::from_secs(STATION_REFRESH_SECS)),
             pending_site: restored_site.clone(),
             config,
+            applied_theme: None,
             config_writable,
             notice,
             query: String::new(),
@@ -1042,14 +1068,20 @@ impl OxradApp {
 
     fn header(&mut self, ui: &mut egui::Ui) {
         let mut units = self.config.units;
+        let mut theme = self.config.theme;
         egui::Panel::top("header")
             .exact_size(46.0)
             .show_inside(ui, |ui| {
+                ui.style_mut().visuals = self.config.theme.visuals();
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("oxrad").size(21.0).strong().color(TEXT));
-                    ui.label(RichText::new("weather radar").size(12.0).color(MUTED));
-                    ui.add_space(18.0);
+                    ui.label(RichText::new("oxrad").size(theme::TYPE_DISPLAY).strong());
+                    ui.label(
+                        RichText::new("weather radar")
+                            .size(theme::TYPE_LABEL)
+                            .weak(),
+                    );
+                    ui.add_space(theme::SPACE_L);
                     if ui
                         .selectable_label(self.scene_mode == SceneMode::Radar, "Radar")
                         .clicked()
@@ -1066,6 +1098,9 @@ impl OxradApp {
                         self.global_request_due = Some(Instant::now());
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.selectable_value(&mut theme, Theme::Light, Theme::Light.label());
+                        ui.selectable_value(&mut theme, Theme::Dark, Theme::Dark.label());
+                        ui.separator();
                         ui.selectable_value(
                             &mut units,
                             crate::units::UnitSystem::Imperial,
@@ -1080,37 +1115,42 @@ impl OxradApp {
                         if let Some(place) = &self.place {
                             ui.label(
                                 RichText::new(format!("Weather for {}", place.label()))
-                                    .size(13.0)
-                                    .color(TEXT),
+                                    .size(theme::TYPE_BODY),
                             );
                         } else {
-                            ui.label(RichText::new("No town selected").size(13.0).color(MUTED));
+                            ui.label(
+                                RichText::new("No town selected")
+                                    .size(theme::TYPE_BODY)
+                                    .weak(),
+                            );
                         }
                         ui.separator();
                         match (&self.site, self.site_station()) {
                             (Some(site), Some(station)) => {
                                 ui.label(
                                     RichText::new(format!("Radar {site} · {}", station.name))
-                                        .size(13.0)
-                                        .color(TEXT),
+                                        .size(theme::TYPE_BODY),
                                 );
                             }
                             (Some(site), None) => {
                                 ui.label(
-                                    RichText::new(format!("Radar {site}"))
-                                        .size(13.0)
-                                        .color(TEXT),
+                                    RichText::new(format!("Radar {site}")).size(theme::TYPE_BODY),
                                 );
                             }
                             (None, _) => {
-                                ui.label(RichText::new("No site selected").size(13.0).color(MUTED));
+                                ui.label(
+                                    RichText::new("No site selected")
+                                        .size(theme::TYPE_BODY)
+                                        .weak(),
+                                );
                             }
                         }
                     });
                 });
             });
-        if units != self.config.units {
+        if units != self.config.units || theme != self.config.theme {
             self.config.units = units;
+            self.config.theme = theme;
             self.save_config();
         }
     }
@@ -1120,26 +1160,31 @@ impl OxradApp {
             .exact_size(RAIL_WIDTH)
             .resizable(false)
             .show_inside(ui, |ui| {
+                ui.style_mut().visuals = self.config.theme.visuals();
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.add_space(12.0);
-                        ui.label(RichText::new("Weather for").size(12.0).color(MUTED));
+                        ui.add_space(theme::SPACE_XL);
+                        ui.label(
+                            RichText::new("Weather for")
+                                .size(theme::TYPE_TITLE)
+                                .strong(),
+                        );
                         self.search_section(ui);
                         if self.place.is_some() {
                             ui.add_space(14.0);
                             self.place_card(ui);
-                            ui.add_space(18.0);
+                            ui.add_space(theme::SPACE_L);
                         }
                         ui.separator();
-                        ui.add_space(12.0);
+                        ui.add_space(theme::SPACE_M);
                         self.station_section(ui);
                         self.product_section(ui);
                         self.history_section(ui);
                         self.warning_section(ui);
                         if let Some(notice) = &self.notice {
-                            ui.add_space(12.0);
-                            ui.colored_label(STALE, notice);
+                            ui.add_space(theme::SPACE_M);
+                            ui.colored_label(ui.visuals().warn_fg_color, notice);
                         }
                     });
             });
@@ -1173,7 +1218,7 @@ impl OxradApp {
         if submit {
             self.submit_search();
         }
-        ui.add_space(8.0);
+        ui.add_space(theme::SPACE_S);
         let mut chosen: Option<Place> = None;
         match &self.search_state {
             SearchState::Idle => {
@@ -1182,20 +1227,23 @@ impl OxradApp {
                 } else {
                     "Type a town, then press Enter."
                 };
-                ui.label(RichText::new(hint).size(11.0).color(MUTED));
+                ui.label(RichText::new(hint).size(theme::TYPE_SMALL).weak());
             }
             SearchState::Working { query } => {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label(
                         RichText::new(format!("Looking up {query}…"))
-                            .size(12.0)
-                            .color(MUTED),
+                            .size(theme::TYPE_LABEL)
+                            .weak(),
                     );
                 });
             }
             SearchState::Failed { query, error } => {
-                ui.colored_label(ERROR, format!("Could not search for {query}: {error}"));
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    format!("Could not search for {query}: {error}"),
+                );
             }
             SearchState::Ready { places } => {
                 chosen = search_results(ui, places, &self.stations);
@@ -1204,11 +1252,11 @@ impl OxradApp {
         if let Some(place) = chosen {
             self.choose_place(&place);
         }
-        ui.add_space(4.0);
+        ui.add_space(theme::SPACE_XS);
         ui.label(
             RichText::new("Place search data © OpenStreetMap contributors.")
-                .size(9.0)
-                .color(MUTED),
+                .size(theme::TYPE_SMALL)
+                .weak(),
         );
     }
 
@@ -1217,19 +1265,19 @@ impl OxradApp {
             return;
         };
         egui::Frame::new()
-            .fill(CARD)
+            .fill(ui.visuals().faint_bg_color)
             .inner_margin(egui::Margin::same(10))
             .corner_radius(CornerRadius::same(6))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(RichText::new(place.label()).size(14.0).strong().color(TEXT));
+                ui.label(RichText::new(place.label()).size(14.0).strong());
                 ui.label(
                     RichText::new(format!(
                         "{} · forecast point {}, {}",
                         place.country, place.lat, place.lon
                     ))
-                    .size(10.0)
-                    .color(MUTED),
+                    .size(theme::TYPE_SMALL)
+                    .weak(),
                 );
             });
     }
@@ -1242,9 +1290,13 @@ impl OxradApp {
         if capabilities.is_empty() {
             return;
         }
-        ui.add_space(12.0);
-        ui.label(RichText::new("Product and tilt").size(12.0).color(MUTED));
-        ui.add_space(4.0);
+        ui.add_space(theme::SPACE_M);
+        ui.label(
+            RichText::new("Product and tilt")
+                .size(theme::TYPE_TITLE)
+                .strong(),
+        );
+        ui.add_space(theme::SPACE_XS);
         let available_products: Vec<RadarProduct> = self
             .display
             .frame
@@ -1265,7 +1317,11 @@ impl OxradApp {
                 let label = format!("{} {}", product.id(), product.unit());
                 let button = ui.add_enabled(
                     available,
-                    egui::Button::new(label).fill(if selected { HIGHLIGHT } else { CARD }),
+                    egui::Button::new(label).fill(if selected {
+                        ui.visuals().selection.bg_fill
+                    } else {
+                        ui.visuals().faint_bg_color
+                    }),
                 );
                 let button = if available {
                     button.on_hover_text(product.description())
@@ -1287,16 +1343,20 @@ impl OxradApp {
         if tilt_options.is_empty() {
             ui.label(
                 RichText::new("Tilts appear when a volume is loaded.")
-                    .size(10.0)
-                    .color(MUTED),
+                    .size(theme::TYPE_SMALL)
+                    .weak(),
             );
         } else {
-            ui.label(RichText::new("Tilt").size(11.0).color(MUTED));
+            ui.label(RichText::new("Tilt").size(theme::TYPE_SMALL).weak());
             ui.horizontal_wrapped(|ui| {
                 for (number, elevation, selected) in tilt_options {
                     let label = format!("{number} · {elevation:.2}°");
                     if ui
-                        .add(egui::Button::new(label).fill(if selected { HIGHLIGHT } else { CARD }))
+                        .add(egui::Button::new(label).fill(if selected {
+                            ui.visuals().selection.bg_fill
+                        } else {
+                            ui.visuals().faint_bg_color
+                        }))
                         .clicked()
                         && !selected
                     {
@@ -1325,8 +1385,12 @@ impl OxradApp {
     }
 
     fn station_section(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Radar station").size(12.0).color(MUTED));
-        ui.add_space(4.0);
+        ui.label(
+            RichText::new("Radar station")
+                .size(theme::TYPE_TITLE)
+                .strong(),
+        );
+        ui.add_space(theme::SPACE_XS);
         match (&self.site, self.site_station()) {
             (Some(site), Some(station)) => {
                 ui.label(
@@ -1346,14 +1410,14 @@ impl OxradApp {
                             nearest.distance_km.round(),
                             place::compass(nearest.bearing_deg)
                         ))
-                        .size(11.0)
-                        .color(MUTED),
+                        .size(theme::TYPE_SMALL)
+                        .weak(),
                     );
                 }
                 station_details(ui, station);
             }
             _ => {
-                ui.label(RichText::new("No radar station selected").size(13.0));
+                ui.label(RichText::new("No radar station selected").size(theme::TYPE_BODY));
             }
         }
         if let Some(place) = &self.place
@@ -1364,11 +1428,11 @@ impl OxradApp {
                     "No supported radar source covers {}.",
                     place.country
                 ))
-                .size(11.0)
-                .color(MUTED),
+                .size(theme::TYPE_SMALL)
+                .weak(),
             );
         }
-        ui.add_space(8.0);
+        ui.add_space(theme::SPACE_S);
         if ui
             .button(if self.station_picker_open {
                 "Close station list"
@@ -1396,7 +1460,10 @@ impl OxradApp {
         let mut chosen: Option<SiteId> = None;
         match &self.stations {
             Err(error) => {
-                ui.colored_label(ERROR, format!("Radar site catalog unavailable: {error}"));
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    format!("Radar site catalog unavailable: {error}"),
+                );
             }
             Ok(list) => {
                 egui::ScrollArea::vertical()
@@ -1408,7 +1475,11 @@ impl OxradApp {
                             .filter(|station| stations::matches(station, &query))
                         {
                             let selected = self.site.as_ref() == Some(&station.id);
-                            let fill = if selected { HIGHLIGHT } else { CARD };
+                            let fill = if selected {
+                                ui.visuals().selection.bg_fill
+                            } else {
+                                ui.visuals().faint_bg_color
+                            };
                             if ui
                                 .add_sized(
                                     [ui.available_width(), 26.0],
@@ -1433,10 +1504,11 @@ impl OxradApp {
             .exact_size(FORECAST_WIDTH)
             .resizable(false)
             .show_inside(ui, |ui| {
+                ui.style_mut().visuals = self.config.theme.visuals();
                 retry = self.forecast_footer(ui);
-                ui.add_space(12.0);
-                ui.label(RichText::new("Forecast").size(12.0).color(MUTED));
-                ui.add_space(4.0);
+                ui.add_space(theme::SPACE_M);
+                ui.label(RichText::new("Forecast").size(theme::TYPE_TITLE).strong());
+                ui.add_space(theme::SPACE_XS);
                 match &self.forecast_state {
                     ForecastState::Empty => {
                         ui.label(RichText::new("No town selected").size(14.0).strong());
@@ -1444,8 +1516,8 @@ impl OxradApp {
                             RichText::new(
                                 "Search for a town on the left to see its forecast here.",
                             )
-                            .size(11.0)
-                            .color(MUTED),
+                            .size(theme::TYPE_SMALL)
+                            .weak(),
                         );
                     }
                     ForecastState::Loading { place, .. } => {
@@ -1454,8 +1526,8 @@ impl OxradApp {
                             ui.spinner();
                             ui.label(
                                 RichText::new("Loading the forecast…")
-                                    .size(12.0)
-                                    .color(MUTED),
+                                    .size(theme::TYPE_LABEL)
+                                    .weak(),
                             );
                         });
                     }
@@ -1467,7 +1539,7 @@ impl OxradApp {
                         ..
                     } => {
                         ui.label(RichText::new(place.label()).size(14.0).strong());
-                        ui.colored_label(ERROR, error.to_string());
+                        ui.colored_label(ui.visuals().error_fg_color, error.to_string());
                         if let Some(due) = retry_at {
                             let seconds = due
                                 .saturating_duration_since(Instant::now())
@@ -1475,16 +1547,19 @@ impl OxradApp {
                                 .saturating_add(1);
                             ui.label(
                                 RichText::new(format!("Automatic retry in {seconds} s."))
-                                    .size(11.0)
-                                    .color(STALE),
+                                    .size(theme::TYPE_SMALL)
+                                    .color(ui.visuals().warn_fg_color),
                             );
                             retry = ui.button("Retry now").clicked();
                         } else {
                             retry = ui.button("Retry forecast").clicked();
                         }
                         if let Some(forecast) = last {
-                            ui.add_space(8.0);
-                            ui.colored_label(STALE, "Showing the last forecast received.");
+                            ui.add_space(theme::SPACE_S);
+                            ui.colored_label(
+                                ui.visuals().warn_fg_color,
+                                "Showing the last forecast received.",
+                            );
                             ui.separator();
                             forecast_body(ui, forecast, true, self.config.units);
                         }
@@ -1493,7 +1568,7 @@ impl OxradApp {
                         forecast_body(ui, forecast, false, self.config.units);
                     }
                 }
-                ui.add_space(8.0);
+                ui.add_space(theme::SPACE_S);
             });
         if retry && let Some(place) = self.place.clone() {
             self.start_forecast(&place, 0);
@@ -1507,7 +1582,7 @@ impl OxradApp {
                 ui.separator();
                 if matches!(self.forecast_state, ForecastState::Ready { .. }) {
                     retry = ui.button("Refresh forecast").clicked();
-                    ui.add_space(4.0);
+                    ui.add_space(theme::SPACE_XS);
                 }
                 let note = self.site.as_ref().map_or_else(
                     || {
@@ -1523,15 +1598,15 @@ impl OxradApp {
                         )
                     },
                 );
-                ui.label(RichText::new(note).size(10.0).color(MUTED));
+                ui.label(RichText::new(note).size(theme::TYPE_SMALL).weak());
                 ui.label(
                     RichText::new(
                         "Forecast times are local to the forecast point; radar times are UTC.",
                     )
-                    .size(10.0)
-                    .color(MUTED),
+                    .size(theme::TYPE_SMALL)
+                    .weak(),
                 );
-                ui.add_space(4.0);
+                ui.add_space(theme::SPACE_XS);
             });
         }
         retry
@@ -1544,7 +1619,11 @@ impl OxradApp {
             .as_ref()
             .is_some_and(|frame| frame.origin == ArchiveOrigin::Cached)
         {
-            ui.label(RichText::new("cached volume").size(11.0).color(STALE));
+            ui.label(
+                RichText::new("cached volume")
+                    .size(theme::TYPE_SMALL)
+                    .color(ui.visuals().warn_fg_color),
+            );
         }
     }
 
@@ -1553,6 +1632,7 @@ impl OxradApp {
         let mut retry_display = false;
         let failed = self.failed();
         egui::Panel::bottom("status").show_inside(ui, |ui| {
+            ui.style_mut().visuals = self.config.theme.visuals();
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
                 match (&self.site, self.site_station()) {
@@ -1583,8 +1663,8 @@ impl OxradApp {
                         ui.separator();
                         ui.label(
                             RichText::new(format!("History {}", history::key_label(key)))
-                                .size(11.0)
-                                .color(MUTED),
+                                .size(theme::TYPE_SMALL)
+                                .weak(),
                         );
                     }
                     scan_status(ui, frame, failed);
@@ -1653,8 +1733,11 @@ impl OxradApp {
 
     fn map_scene(&mut self, ui: &mut egui::Ui) {
         let full_rect = ui.max_rect();
-        ui.painter()
-            .rect_filled(full_rect, CornerRadius::ZERO, BACKGROUND);
+        ui.painter().rect_filled(
+            full_rect,
+            CornerRadius::ZERO,
+            self.config.theme.palette().background,
+        );
         if self.global_layer.is_shown() && !self.global_frames.is_empty() {
             self.global_history(ui);
         }
@@ -1706,7 +1789,7 @@ impl OxradApp {
             self.map_stations(ui, rect, &transform, &interaction)
         };
         self.map_place(ui, &transform);
-        map::draw_scale(ui.painter(), rect, &transform);
+        map::draw_scale(ui.painter(), rect, &transform, &self.config.theme.palette());
         self.map_controls(ui, rect);
         self.map_readout(ui, rect, &transform, radar_visible);
         if let Some(id) = clicked_site {
@@ -1918,15 +2001,17 @@ impl OxradApp {
         let mut requested = index;
         let mut playback = self.global_playback;
         let mut scrub = false;
+        let palette = self.config.theme.palette();
         egui::Panel::bottom("global_history")
             .exact_size(64.0)
             .resizable(false)
             .frame(
                 egui::Frame::new()
-                    .fill(CARD)
+                    .fill(palette.raised)
                     .inner_margin(egui::Margin::symmetric(10, 5)),
             )
             .show_inside(ui, |ui| {
+                ui.style_mut().visuals = self.config.theme.visuals();
                 ui.horizontal(|ui| {
                     let label = if playback == GlobalPlayback::Playing {
                         "Pause"
@@ -1956,22 +2041,21 @@ impl OxradApp {
                             count,
                             global_radar::PALETTE
                         ))
-                        .size(10.0)
-                        .color(MUTED),
+                        .size(theme::TYPE_SMALL)
+                        .weak(),
                     );
                 });
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(format!("Global composite · {stamp}"))
-                            .size(10.0)
-                            .monospace()
-                            .color(TEXT),
+                            .size(theme::TYPE_SMALL)
+                            .monospace(),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.hyperlink_to(
                             RichText::new(global_radar::ATTRIBUTION)
-                                .size(9.0)
-                                .color(MUTED),
+                                .size(theme::TYPE_SMALL)
+                                .weak(),
                             "https://www.rainviewer.com/",
                         );
                     });
@@ -2049,7 +2133,12 @@ impl OxradApp {
             }
         }
         if drew {
-            overlay::draw_legend(ui.painter(), rect, self.product);
+            overlay::draw_legend(
+                ui.painter(),
+                rect,
+                self.product,
+                &self.config.theme.palette(),
+            );
         }
         drew
     }
@@ -2169,6 +2258,7 @@ impl OxradApp {
         if !self.measure.is_on() {
             return;
         }
+        let palette = self.config.theme.palette();
         if interaction.clicked()
             && let Some(pointer) = ui.input(|input| input.pointer.hover_pos())
             && rect.contains(pointer)
@@ -2188,7 +2278,7 @@ impl OxradApp {
         let Some(start_position) = transform.screen(start.0, start.1) else {
             return;
         };
-        painter.circle_filled(start_position, 5.0, STALE);
+        painter.circle_filled(start_position, 5.0, palette.warning);
         painter.text(
             start_position + Vec2::new(8.0, 8.0),
             Align2::LEFT_TOP,
@@ -2202,7 +2292,7 @@ impl OxradApp {
                 Align2::LEFT_TOP,
                 "Click a second point",
                 FontId::monospace(10.0),
-                MUTED,
+                palette.map_text,
             );
             return;
         };
@@ -2255,7 +2345,12 @@ impl OxradApp {
     fn map_basemap(&self, ui: &egui::Ui, rect: Rect) {
         match &self.map {
             Ok(world) => {
-                if let Err(error) = world.draw(ui.painter(), &self.map_view, rect) {
+                if let Err(error) = world.draw(
+                    ui.painter(),
+                    &self.map_view,
+                    rect,
+                    &self.config.theme.palette(),
+                ) {
                     ui.painter().text(
                         rect.left_top() + Vec2::new(18.0, 52.0),
                         Align2::LEFT_TOP,
@@ -2285,6 +2380,7 @@ impl OxradApp {
         interaction: &egui::Response,
     ) -> Option<SiteId> {
         let pointer = ui.input(|input| input.pointer.hover_pos());
+        let palette = self.config.theme.palette();
         let mut nearest: Option<(f32, SiteId)> = None;
         if let Ok(stations) = &self.stations {
             for station in stations {
@@ -2296,14 +2392,17 @@ impl OxradApp {
                 }
                 let selected = self.site.as_ref() == Some(&station.id);
                 if selected {
-                    ui.painter()
-                        .circle_stroke(position, 8.0, Stroke::new(2.0_f32, STALE));
+                    ui.painter().circle_stroke(
+                        position,
+                        8.0,
+                        Stroke::new(2.0_f32, palette.warning),
+                    );
                 }
                 ui.painter().circle_filled(
                     position,
                     if selected { 4.0 } else { 2.4 },
                     if selected {
-                        STALE
+                        palette.warning
                     } else {
                         Color32::from_rgb(105, 202, 214)
                     },
@@ -2314,7 +2413,11 @@ impl OxradApp {
                         Align2::LEFT_BOTTOM,
                         station.id.as_str(),
                         FontId::monospace(10.0),
-                        if selected { STALE } else { MUTED },
+                        if selected {
+                            palette.warning
+                        } else {
+                            palette.map_text
+                        },
                     );
                 }
                 if let Some(pointer) = pointer {
@@ -2337,6 +2440,7 @@ impl OxradApp {
         let Some(place) = &self.place else {
             return;
         };
+        let palette = self.config.theme.palette();
         let Some(position) = transform.screen(place.lat, place.lon) else {
             return;
         };
@@ -2346,8 +2450,8 @@ impl OxradApp {
             position + Vec2::new(8.0, 8.0),
             Align2::LEFT_TOP,
             place.label(),
-            FontId::proportional(11.0),
-            TEXT,
+            FontId::proportional(theme::TYPE_SMALL),
+            palette.map_text,
         );
     }
 
@@ -2361,6 +2465,7 @@ impl OxradApp {
                 .max_rect(area)
                 .layout(Layout::top_down(Align::Min)),
             |ui| {
+                ui.style_mut().visuals = self.config.theme.visuals();
                 ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
                 self.map_layer_controls(ui, rect);
                 self.map_overlay_controls(ui);
@@ -2370,27 +2475,37 @@ impl OxradApp {
     }
 
     fn map_layer_controls(&mut self, ui: &mut egui::Ui, rect: Rect) {
+        let palette = self.config.theme.palette();
         if ui
             .add_sized(
-                [116.0, 28.0],
-                egui::Button::new(if self.map_radar.is_shown() {
-                    "Hide radar layer"
-                } else {
-                    "Show radar layer"
-                }),
+                [116.0, 30.0],
+                action_button(
+                    &palette,
+                    if self.map_radar.is_shown() {
+                        "Hide radar layer"
+                    } else {
+                        "Show radar layer"
+                    },
+                ),
             )
             .clicked()
         {
             self.map_radar = self.map_radar.toggled();
         }
         ui.horizontal(|ui| {
-            if ui.add_sized([32.0, 30.0], egui::Button::new("+")).clicked() {
+            if ui
+                .add_sized([34.0, 30.0], action_button(&palette, "+"))
+                .clicked()
+            {
                 match self.map_view.zoom_at(rect, rect.center(), 1.6) {
                     Ok(()) => self.schedule_viewport_reload(),
                     Err(error) => self.notice = Some(format!("Map zoom failed: {error}")),
                 }
             }
-            if ui.add_sized([32.0, 30.0], egui::Button::new("−")).clicked() {
+            if ui
+                .add_sized([34.0, 30.0], action_button(&palette, "−"))
+                .clicked()
+            {
                 match self.map_view.zoom_at(rect, rect.center(), 1.0 / 1.6) {
                     Ok(()) => self.schedule_viewport_reload(),
                     Err(error) => self.notice = Some(format!("Map zoom failed: {error}")),
@@ -2398,7 +2513,7 @@ impl OxradApp {
             }
             if self.place.is_some()
                 && ui
-                    .add_sized([58.0, 30.0], egui::Button::new("Focus"))
+                    .add_sized([64.0, 30.0], action_button(&palette, "Focus"))
                     .clicked()
             {
                 self.focus_map_context();
@@ -2406,7 +2521,7 @@ impl OxradApp {
             }
         });
         if ui
-            .add_sized([116.0, 28.0], egui::Button::new("Reload nearby"))
+            .add_sized([116.0, 30.0], action_button(&palette, "Reload nearby"))
             .on_hover_text("Find up to three stations around the current map centre.")
             .clicked()
         {
@@ -2415,19 +2530,19 @@ impl OxradApp {
     }
 
     fn map_overlay_controls(&mut self, ui: &mut egui::Ui) {
+        let palette = self.config.theme.palette();
         if ui
             .add_sized(
-                [116.0, 28.0],
-                egui::Button::new(if self.warning_layer.is_shown() {
-                    "Hide warnings"
-                } else {
-                    "Show warnings"
-                })
-                .fill(if self.warning_layer.is_shown() {
-                    HIGHLIGHT
-                } else {
-                    CARD
-                }),
+                [116.0, 30.0],
+                toggle_button(
+                    &palette,
+                    if self.warning_layer.is_shown() {
+                        "Hide warnings"
+                    } else {
+                        "Show warnings"
+                    },
+                    self.warning_layer.is_shown(),
+                ),
             )
             .on_hover_text("Show active National Weather Service warning polygons for the United States and territories.")
             .clicked()
@@ -2439,17 +2554,16 @@ impl OxradApp {
         }
         if ui
             .add_sized(
-                [158.0, 28.0],
-                egui::Button::new(if self.global_layer.is_shown() {
-                    "Global radar: on"
-                } else {
-                    "Global radar: off"
-                })
-                .fill(if self.global_layer.is_shown() {
-                    HIGHLIGHT
-                } else {
-                    CARD
-                }),
+                [158.0, 30.0],
+                toggle_button(
+                    &palette,
+                    if self.global_layer.is_shown() {
+                        "Global radar: on"
+                    } else {
+                        "Global radar: off"
+                    },
+                    self.global_layer.is_shown(),
+                ),
             )
             .on_hover_text("RainViewer global reflectivity composite with two hours of history.")
             .clicked()
@@ -2463,17 +2577,16 @@ impl OxradApp {
         }
         if ui
             .add_sized(
-                [116.0, 28.0],
-                egui::Button::new(if self.measure.is_on() {
-                    "Measure: on"
-                } else {
-                    "Measure: off"
-                })
-                .fill(if self.measure.is_on() {
-                    HIGHLIGHT
-                } else {
-                    CARD
-                }),
+                [116.0, 30.0],
+                toggle_button(
+                    &palette,
+                    if self.measure.is_on() {
+                        "Measure: on"
+                    } else {
+                        "Measure: off"
+                    },
+                    self.measure.is_on(),
+                ),
             )
             .on_hover_text(
                 "Click two points on the map to measure geodesic distance and initial bearing.",
@@ -2490,6 +2603,7 @@ impl OxradApp {
         let Some(area) = map_status_area(rect) else {
             return;
         };
+        let palette = self.config.theme.palette();
         let width = area.width();
         let height = area.height();
         ui.scope_builder(
@@ -2498,7 +2612,12 @@ impl OxradApp {
                 .layout(Layout::top_down(Align::Min)),
             |ui| {
                 egui::Frame::new()
-                    .fill(Color32::from_black_alpha(220))
+                    .fill(Color32::from_rgba_unmultiplied(
+                        palette.surface.r(),
+                        palette.surface.g(),
+                        palette.surface.b(),
+                        232,
+                    ))
                     .inner_margin(6.0)
                     .show(ui, |ui| {
                         ui.set_width(width - 12.0);
@@ -2507,7 +2626,10 @@ impl OxradApp {
                             .show(ui, |ui| {
                                 if let Some(layers) = self.map_layer_line() {
                                     ui.label(
-                                        RichText::new(layers).monospace().size(10.0).color(MUTED),
+                                        RichText::new(layers)
+                                            .monospace()
+                                            .size(theme::TYPE_SMALL)
+                                            .weak(),
                                     );
                                 }
                                 if self.warning_layer.is_shown()
@@ -2522,15 +2644,15 @@ impl OxradApp {
                                             warning.expires
                                         ))
                                         .monospace()
-                                        .size(10.0)
-                                        .color(ERROR),
+                                        .size(theme::TYPE_SMALL)
+                                        .color(ui.visuals().error_fg_color),
                                     );
                                     if !warning.sent.is_empty() {
                                         ui.label(
                                             RichText::new(format!("Issued {}", warning.sent))
                                                 .monospace()
-                                                .size(10.0)
-                                                .color(MUTED),
+                                                .size(theme::TYPE_SMALL)
+                                                .weak(),
                                         );
                                     }
                                 }
@@ -2543,41 +2665,62 @@ impl OxradApp {
     fn map_status(&self, ui: &mut egui::Ui, rect: Rect) {
         let countries = self.map.as_ref().map_or(0, WorldMap::country_count);
         self.map_status_details(ui, rect);
+        let palette = self.config.theme.palette();
+        let secondary = Color32::from_rgba_unmultiplied(
+            palette.map_text.r(),
+            palette.map_text.g(),
+            palette.map_text.b(),
+            200,
+        );
         let centre = self.map_view.center_latlon().map_or_else(
             |_| String::from("unavailable"),
             |(lat, lon)| format!("{lat:.2}, {lon:.2}"),
         );
-        ui.painter().text(
-            rect.left_top() + Vec2::new(16.0, 16.0),
-            Align2::LEFT_TOP,
-            "Geographic map",
-            FontId::proportional(15.0),
-            TEXT,
+        let panel = Rect::from_min_size(
+            rect.left_top() + Vec2::new(8.0, 8.0),
+            Vec2::new(470.0, 62.0),
+        );
+        ui.painter().rect_filled(
+            panel,
+            CornerRadius::same(6),
+            Color32::from_rgba_unmultiplied(
+                palette.surface.r(),
+                palette.surface.g(),
+                palette.surface.b(),
+                214,
+            ),
         );
         ui.painter().text(
-            rect.left_top() + Vec2::new(16.0, 36.0),
+            panel.left_top() + Vec2::new(10.0, 6.0),
+            Align2::LEFT_TOP,
+            "Geographic map",
+            FontId::proportional(theme::TYPE_TITLE),
+            palette.map_text,
+        );
+        ui.painter().text(
+            panel.left_top() + Vec2::new(10.0, 29.0),
             Align2::LEFT_TOP,
             format!(
                 "Centre {centre} · {countries} countries · {:.0} km wide · {} viewport radars",
                 self.map_view.span_km(),
                 self.view_radars.len()
             ),
-            FontId::proportional(10.0),
-            MUTED,
+            FontId::proportional(theme::TYPE_SMALL),
+            secondary,
+        );
+        ui.painter().text(
+            panel.left_top() + Vec2::new(10.0, 44.0),
+            Align2::LEFT_TOP,
+            "Drag to pan · scroll to zoom · click a radar site",
+            FontId::proportional(theme::TYPE_SMALL),
+            secondary,
         );
         ui.painter().text(
             Pos2::new(rect.right() - 12.0, rect.bottom() - 12.0),
             Align2::RIGHT_BOTTOM,
             "Natural Earth 1:110m · public domain",
-            FontId::proportional(10.0),
-            MUTED,
-        );
-        ui.painter().text(
-            rect.left_top() + Vec2::new(16.0, 52.0),
-            Align2::LEFT_TOP,
-            "Drag to pan · scroll to zoom · click a radar site",
-            FontId::proportional(10.0),
-            MUTED,
+            FontId::proportional(theme::TYPE_SMALL),
+            secondary,
         );
     }
 
@@ -2874,12 +3017,16 @@ impl OxradApp {
         if self.site.is_none() {
             return;
         }
-        ui.add_space(12.0);
-        ui.label(RichText::new("Recent NEXRAD scans").size(12.0).color(MUTED));
+        ui.add_space(theme::SPACE_M);
+        ui.label(
+            RichText::new("Recent NEXRAD scans")
+                .size(theme::TYPE_LABEL)
+                .weak(),
+        );
         ui.label(
             RichText::new("Archive II volumes · scan times in UTC")
-                .size(10.0)
-                .color(MUTED),
+                .size(theme::TYPE_SMALL)
+                .weak(),
         );
         let mut load = false;
         let mut selected = None;
@@ -2891,8 +3038,8 @@ impl OxradApp {
             HistoryState::Idle => {
                 ui.label(
                     RichText::new("Load the latest scans without leaving the live feed.")
-                        .size(10.0)
-                        .color(MUTED),
+                        .size(theme::TYPE_SMALL)
+                        .weak(),
                 );
                 if ui.button("Load recent scans").clicked() {
                     load = true;
@@ -2903,8 +3050,8 @@ impl OxradApp {
                     ui.spinner();
                     ui.label(
                         RichText::new("Listing recent volumes…")
-                            .size(11.0)
-                            .color(MUTED),
+                            .size(theme::TYPE_SMALL)
+                            .weak(),
                     );
                 });
             }
@@ -2912,8 +3059,8 @@ impl OxradApp {
                 if self.history.keys.is_empty() {
                     ui.label(
                         RichText::new("No complete volumes were listed in the last three days.")
-                            .size(10.0)
-                            .color(MUTED),
+                            .size(theme::TYPE_SMALL)
+                            .weak(),
                     );
                 } else if let Some(key) = self.history_scan_list(ui) {
                     selected = Some(key);
@@ -2935,8 +3082,8 @@ impl OxradApp {
                     ui.spinner();
                     ui.label(
                         RichText::new(format!("Fetching {key}…"))
-                            .size(11.0)
-                            .color(MUTED),
+                            .size(theme::TYPE_SMALL)
+                            .weak(),
                     );
                 });
             }
@@ -2982,11 +3129,11 @@ impl OxradApp {
         } else {
             format!("Preparing {key}…")
         };
-        ui.label(RichText::new(message).size(11.0).color(TEXT));
+        ui.label(RichText::new(message).size(theme::TYPE_SMALL));
         ui.label(
             RichText::new("Live radar is paused while you inspect this scan.")
-                .size(10.0)
-                .color(MUTED),
+                .size(theme::TYPE_SMALL)
+                .weak(),
         );
         if !self.history.keys.is_empty() {
             let last = self.history.keys.len().saturating_sub(1);
@@ -3033,8 +3180,8 @@ impl OxradApp {
                         index.saturating_add(1),
                         self.history.keys.len()
                     ))
-                    .size(10.0)
-                    .color(MUTED),
+                    .size(theme::TYPE_SMALL)
+                    .weak(),
                 );
             }
         });
@@ -3054,8 +3201,10 @@ impl OxradApp {
                     if ui
                         .add_sized(
                             [ui.available_width(), 32.0],
-                            egui::Button::new(RichText::new(history::key_label(key)).size(11.0))
-                                .fill(CARD),
+                            egui::Button::new(
+                                RichText::new(history::key_label(key)).size(theme::TYPE_SMALL),
+                            )
+                            .fill(ui.visuals().faint_bg_color),
                         )
                         .clicked()
                     {
@@ -3070,7 +3219,10 @@ impl OxradApp {
         let mut load = false;
         let mut retry = None;
         if let Some(error) = &self.history.error {
-            ui.colored_label(ERROR, format!("History failed: {error}"));
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("History failed: {error}"),
+            );
         }
         if let Some(key) = &self.history.key
             && ui.button("Retry selected scan").clicked()
@@ -3110,12 +3262,16 @@ impl OxradApp {
         if !self.warning_layer.is_shown() || self.warnings.is_empty() {
             return;
         }
-        ui.add_space(12.0);
-        ui.label(RichText::new("Active warnings").size(12.0).color(MUTED));
+        ui.add_space(theme::SPACE_M);
+        ui.label(
+            RichText::new("Active warnings")
+                .size(theme::TYPE_LABEL)
+                .weak(),
+        );
         ui.label(
             RichText::new("National Weather Service · United States and territories")
-                .size(10.0)
-                .color(MUTED),
+                .size(theme::TYPE_SMALL)
+                .weak(),
         );
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.warning_scope, WarningScope::All, "All active");
@@ -3160,11 +3316,7 @@ impl OxradApp {
                     if ui
                         .add_sized(
                             [ui.available_width(), 52.0],
-                            egui::Button::new(RichText::new(label).size(11.0)).fill(if selected {
-                                HIGHLIGHT
-                            } else {
-                                CARD
-                            }),
+                            toggle_button(&self.config.theme.palette(), &label, selected),
                         )
                         .clicked()
                     {
@@ -3175,8 +3327,8 @@ impl OxradApp {
         if visible == 0 {
             ui.label(
                 RichText::new("No active warnings intersect the visible map.")
-                    .size(10.0)
-                    .color(MUTED),
+                    .size(theme::TYPE_SMALL)
+                    .weak(),
             );
         }
         if self.warnings.len() > 40 {
@@ -3185,8 +3337,8 @@ impl OxradApp {
                     "Showing 40 most severe of {} active alerts.",
                     self.warnings.len()
                 ))
-                .size(10.0)
-                .color(MUTED),
+                .size(theme::TYPE_SMALL)
+                .weak(),
             );
         }
         if let Some(index) = chosen {
@@ -3218,13 +3370,17 @@ impl OxradApp {
         };
         ui.add_space(10.0);
         ui.separator();
-        ui.label(RichText::new("Selected alert").size(12.0).color(MUTED));
+        ui.label(
+            RichText::new("Selected alert")
+                .size(theme::TYPE_LABEL)
+                .weak(),
+        );
         let title = if warning.headline.is_empty() {
             format!("{} for {}", warning.event, warning.area)
         } else {
             warning.headline.clone()
         };
-        ui.label(RichText::new(title).size(12.0).strong().color(TEXT));
+        ui.label(RichText::new(title).size(theme::TYPE_LABEL).strong());
         ui.label(
             RichText::new(format!(
                 "{} · {} · {}",
@@ -3232,45 +3388,45 @@ impl OxradApp {
                 warning.urgency.label(),
                 warning.area
             ))
-            .size(10.0)
-            .color(MUTED),
+            .size(theme::TYPE_SMALL)
+            .weak(),
         );
         ui.label(
             RichText::new(format!(
                 "Issued {} · expires {}",
                 warning.sent, warning.expires
             ))
-            .size(10.0)
-            .color(MUTED),
+            .size(theme::TYPE_SMALL)
+            .weak(),
         );
         if warning.description.is_empty() {
             ui.label(
                 RichText::new("This alert carries no description text.")
-                    .size(10.0)
-                    .color(MUTED),
+                    .size(theme::TYPE_SMALL)
+                    .weak(),
             );
         } else {
             egui::ScrollArea::vertical()
                 .max_height(220.0)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.label(RichText::new(&warning.description).size(11.0).color(TEXT));
+                    ui.label(RichText::new(&warning.description).size(theme::TYPE_SMALL));
                     if let Some(instruction) = &warning.instruction {
                         ui.add_space(6.0);
                         ui.label(
                             RichText::new("Instructions")
-                                .size(11.0)
+                                .size(theme::TYPE_SMALL)
                                 .strong()
-                                .color(MUTED),
+                                .weak(),
                         );
-                        ui.label(RichText::new(instruction).size(11.0).color(TEXT));
+                        ui.label(RichText::new(instruction).size(theme::TYPE_SMALL));
                     }
                 });
         }
         ui.label(
             RichText::new(format!("Source: NWS active alerts · {}", warning.id))
-                .size(9.0)
-                .color(MUTED),
+                .size(theme::TYPE_SMALL)
+                .weak(),
         );
     }
 
@@ -3397,8 +3553,9 @@ impl OxradApp {
 
     fn radar_scene(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
+        let palette = self.config.theme.palette();
         ui.painter()
-            .rect_filled(rect, CornerRadius::ZERO, BACKGROUND);
+            .rect_filled(rect, CornerRadius::ZERO, palette.canvas);
         if self.display.frame.is_none() {
             self.empty_state(ui, rect);
             return;
@@ -3435,12 +3592,18 @@ impl OxradApp {
                 TEXT,
             );
         }
-        overlay::draw_grid(ui.painter(), &frame.geometry, &transform);
-        overlay::draw_rings(ui.painter(), &frame.geometry, &transform, self.config.units);
+        overlay::draw_grid(ui.painter(), &frame.geometry, &transform, &palette);
+        overlay::draw_rings(
+            ui.painter(),
+            &frame.geometry,
+            &transform,
+            self.config.units,
+            &palette,
+        );
         if let Some(error) = self.radar_warnings(ui.painter(), frame, &transform, viewport) {
             self.notice = Some(error);
         }
-        overlay::draw_legend(ui.painter(), rect, frame.geometry.product);
+        overlay::draw_legend(ui.painter(), rect, frame.geometry.product, &palette);
         if let Some(place) = &self.place {
             draw_place_marker(ui.painter(), frame, &transform, viewport, rect, place);
         }
@@ -3650,8 +3813,8 @@ fn station_details(ui: &mut egui::Ui, station: &Station) {
                 ""
             }
         ))
-        .size(10.0)
-        .color(MUTED),
+        .size(theme::TYPE_SMALL)
+        .weak(),
     )
     .on_hover_text(
         station
@@ -3674,22 +3837,22 @@ fn station_details(ui: &mut egui::Ui, station: &Station) {
     if let Some(elevation) = station.elevation_m {
         ui.label(
             RichText::new(format!("Site elevation {elevation:.0} m"))
-                .size(10.0)
-                .color(MUTED),
+                .size(theme::TYPE_SMALL)
+                .weak(),
         );
     }
     if let Some(status) = &station.status {
         ui.label(
             RichText::new(format!("RDA status: {status}"))
-                .size(10.0)
-                .color(MUTED),
+                .size(theme::TYPE_SMALL)
+                .weak(),
         );
     }
     if let Some(last_data) = &station.last_data {
         ui.label(
             RichText::new(format!("Level II last received: {last_data}"))
-                .size(10.0)
-                .color(MUTED),
+                .size(theme::TYPE_SMALL)
+                .weak(),
         );
     }
     ui.label(
@@ -3698,8 +3861,8 @@ fn station_details(ui: &mut egui::Ui, station: &Station) {
             station.source.id(),
             station.source.provider()
         ))
-        .size(10.0)
-        .color(MUTED),
+        .size(theme::TYPE_SMALL)
+        .weak(),
     );
 }
 
@@ -3709,7 +3872,10 @@ fn search_results(
     stations: &Result<Vec<Station>, StationError>,
 ) -> Option<Place> {
     if places.is_empty() {
-        ui.colored_label(STALE, "No place matches that search. Check the spelling.");
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            "No place matches that search. Check the spelling.",
+        );
         return None;
     }
     let mut chosen: Option<Place> = None;
@@ -3736,8 +3902,8 @@ fn search_results(
         if ui
             .add_sized(
                 [ui.available_width(), 52.0],
-                egui::Button::new(RichText::new(label).size(12.0))
-                    .fill(CARD)
+                egui::Button::new(RichText::new(label).size(theme::TYPE_LABEL))
+                    .fill(ui.visuals().faint_bg_color)
                     .corner_radius(CornerRadius::same(4)),
             )
             .clicked()
@@ -3754,21 +3920,16 @@ fn forecast_body(
     stale: bool,
     units: crate::units::UnitSystem,
 ) {
-    ui.label(
-        RichText::new(forecast.place.label())
-            .size(15.0)
-            .strong()
-            .color(TEXT),
-    );
+    ui.label(RichText::new(forecast.place.label()).size(15.0).strong());
     ui.label(
         RichText::new(format!("Forecast for {}", forecast.place.coordinates()))
-            .size(10.0)
-            .color(MUTED),
+            .size(theme::TYPE_SMALL)
+            .weak(),
     );
     if stale {
-        ui.colored_label(STALE, "Stale forecast");
+        ui.colored_label(ui.visuals().warn_fg_color, "Stale forecast");
     }
-    ui.add_space(4.0);
+    ui.add_space(theme::SPACE_XS);
     ui.label(
         RichText::new(format!(
             "{} · {} ({}) · {}",
@@ -3777,11 +3938,11 @@ fn forecast_body(
             forecast.timezone_abbreviation,
             timestamp_label(&forecast.current.observed)
         ))
-        .size(10.0)
-        .color(MUTED),
+        .size(theme::TYPE_SMALL)
+        .weak(),
     );
     ui.separator();
-    ui.label(RichText::new("Now").size(12.0).strong().color(TEXT));
+    ui.label(RichText::new("Now").size(theme::TYPE_TITLE).strong());
     ui.horizontal_wrapped(|ui| {
         ui.label(
             RichText::new(
@@ -3799,11 +3960,7 @@ fn forecast_body(
             .size(20.0)
             .strong(),
         );
-        ui.label(
-            RichText::new(&forecast.current.short)
-                .size(12.0)
-                .color(TEXT),
-        );
+        ui.label(RichText::new(&forecast.current.short).size(theme::TYPE_LABEL));
     });
     let apparent = crate::units::celsius_from(forecast.current.apparent, &forecast.current.unit)
         .map_or_else(
@@ -3815,12 +3972,12 @@ fn forecast_body(
             "Feels {apparent} · humidity {:.0}% · {} · precipitation {:.1} mm",
             forecast.current.humidity, forecast.current.wind, forecast.current.precipitation
         ))
-        .size(10.0)
-        .color(MUTED),
+        .size(theme::TYPE_SMALL)
+        .weak(),
     );
     ui.add_space(6.0);
     ui.separator();
-    ui.label(RichText::new("Hourly").size(12.0).strong().color(TEXT));
+    ui.label(RichText::new("Hourly").size(theme::TYPE_TITLE).strong());
     let list_height = (ui.available_height() - 8.0).max(80.0);
     egui::ScrollArea::vertical()
         .max_height(list_height)
@@ -3831,7 +3988,7 @@ fn forecast_body(
                 forecast_period(ui, period, units);
             }
             ui.add_space(6.0);
-            ui.label(RichText::new("Daily").size(12.0).strong().color(TEXT));
+            ui.label(RichText::new("Daily").size(theme::TYPE_TITLE).strong());
             for period in &forecast.daily {
                 forecast_period(ui, period, units);
             }
@@ -3839,7 +3996,7 @@ fn forecast_body(
 }
 
 fn forecast_period(ui: &mut egui::Ui, period: &ForecastPeriod, units: crate::units::UnitSystem) {
-    ui.label(RichText::new(&period.name).size(12.0).strong().color(TEXT));
+    ui.label(RichText::new(&period.name).size(theme::TYPE_LABEL).strong());
     ui.horizontal_wrapped(|ui| {
         let high = crate::units::celsius_from(period.temperature, &period.unit);
         let low = period
@@ -3859,7 +4016,7 @@ fn forecast_period(ui: &mut egui::Ui, period: &ForecastPeriod, units: crate::uni
             ),
         };
         ui.label(RichText::new(temperature).size(17.0).strong());
-        ui.label(RichText::new(&period.short).size(12.0).color(TEXT));
+        ui.label(RichText::new(&period.short).size(theme::TYPE_LABEL));
     });
     let precipitation = period
         .precipitation
@@ -3874,8 +4031,8 @@ fn forecast_period(ui: &mut egui::Ui, period: &ForecastPeriod, units: crate::uni
             "{}{wind}{precipitation}",
             timestamp_label(&period.start)
         ))
-        .size(10.0)
-        .color(MUTED),
+        .size(theme::TYPE_SMALL)
+        .weak(),
     );
     ui.add_space(6.0);
     ui.separator();
@@ -4012,12 +4169,15 @@ fn scan_status(ui: &mut egui::Ui, frame: &Frame, failed: bool) {
             ui.label(format!("Scan {text}"));
         }
         Err(error) => {
-            ui.colored_label(ERROR, format!("Scan time unavailable: {error}"));
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("Scan time unavailable: {error}"),
+            );
         }
     }
     match time::now_unix_ms() {
         Ok(now) if now < scan => {
-            ui.colored_label(ERROR, time::age_label(now, scan));
+            ui.colored_label(ui.visuals().error_fg_color, time::age_label(now, scan));
         }
         Ok(now) if failed || now - scan > STALE_AFTER_MS => {
             ui.colored_label(
@@ -4029,7 +4189,10 @@ fn scan_status(ui: &mut egui::Ui, frame: &Frame, failed: bool) {
             ui.label(time::age_label(now, scan));
         }
         Err(error) => {
-            ui.colored_label(ERROR, format!("Scan age unavailable: {error}"));
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("Scan age unavailable: {error}"),
+            );
         }
     }
 }
@@ -4072,12 +4235,15 @@ fn diagnostics(ui: &mut egui::Ui, frame: &Frame, catalog: Option<&Station>) {
         });
     let text = format!("{text}{catalog_note}");
     if volume.skipped_radials > 0 {
-        ui.colored_label(STALE, text);
+        ui.colored_label(ui.visuals().warn_fg_color, text);
     } else {
-        ui.label(RichText::new(text).size(10.0).color(MUTED));
+        ui.label(RichText::new(text).size(theme::TYPE_SMALL).weak());
     }
     if let Some((product, error)) = &volume.moment_error {
-        ui.colored_label(STALE, format!("Rejected {} radial: {error}", product.id()));
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            format!("Rejected {} radial: {error}", product.id()),
+        );
     }
 }
 
@@ -4179,13 +4345,17 @@ fn readout(
 
 impl eframe::App for OxradApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if self.applied_theme != Some(self.config.theme) {
+            ui.ctx().set_visuals(self.config.theme.visuals());
+            self.applied_theme = Some(self.config.theme);
+        }
         self.update_workers(ui.ctx());
         self.header(ui);
         self.status(ui);
         self.rail(ui);
         self.forecast_panel(ui);
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(BACKGROUND))
+            .frame(egui::Frame::NONE.fill(self.config.theme.palette().background))
             .show_inside(ui, |ui| self.scene(ui));
         let interval = if self.busy() {
             BUSY_REPAINT_MS

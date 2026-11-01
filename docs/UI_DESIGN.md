@@ -124,7 +124,7 @@ The level selector is in the header. It changes what is visible in the rail and 
 
 ## Themes
 
-Theme is a persisted preference with three values: `system`, `dark`, `light`. `system` reads the platform preference. Switching repaints the whole window, including map fills, radar palettes, legends, and warning colours. Radar palettes have defined light-theme variants so a light interface does not sit under a dark-tuned legend.
+Theme is a persisted preference. This build implements `dark` and `light`; `system` is planned. Switching repaints panels, controls, text, the basemap, the map chrome, and the radar canvas fill. The radar canvas stays dark in both themes because the product colours are calibrated against it, and the legend keeps its dark backdrop. Two map chrome elements still draw their dark fills in light mode.
 
 ## Accessibility
 
@@ -161,9 +161,9 @@ Every cell is inspected in dark and light themes. The matrix is 80 combinations.
 
 | Element | State |
 |---|---|
-| Tokens | Absent. Colours are constants in `app.rs`; sizes are literals |
-| Type scale | Absent. Sizes range from 9 to 21 at call sites |
-| Themes | Dark only. No theme code exists |
+| Tokens | Partial. `src/theme.rs` holds both palettes, the type scale, and spacing; residual literals remain |
+| Type scale | Partial. Sizes route through `TYPE_*`; 10 to 17 point literals remain |
+| Themes | Implemented: dark and light, persisted. Two map chrome elements still draw dark fills in light mode |
 | Panel collapse | Absent |
 | Focus ring | Absent |
 | Accessible names | Not provided |

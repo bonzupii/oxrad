@@ -142,6 +142,11 @@ pub enum ConfigError {
         line: usize,
         value: String,
     },
+    InvalidTheme {
+        path: PathBuf,
+        line: usize,
+        value: String,
+    },
     UnknownKey {
         path: PathBuf,
         line: usize,
@@ -186,6 +191,10 @@ impl ConfigError {
             }
             Self::InvalidUnit { path, line, value } => format!(
                 "{} line {line} sets units to {value:?}, which is not metric or imperial.",
+                path.display()
+            ),
+            Self::InvalidTheme { path, line, value } => format!(
+                "{} line {line} sets the theme to {value:?}, which is not dark or light.",
                 path.display()
             ),
             Self::UnknownKey { path, line, key } => format!(
@@ -235,6 +244,7 @@ impl Error for ConfigError {
             Self::Path { source } => Some(source),
             Self::Syntax { .. }
             | Self::InvalidUnit { .. }
+            | Self::InvalidTheme { .. }
             | Self::UnknownKey { .. }
             | Self::IncompletePlaceEntry { .. }
             | Self::PlaceNumber { .. } => None,
