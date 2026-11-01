@@ -1895,13 +1895,6 @@ mod tests {
             ratio > site_scale && ratio < poleward_scale,
             "Mercator extent ratio {ratio} outside {site_scale}..{poleward_scale}"
         );
-        let ring = geometry.rings.first().ok_or("no range rings")?;
-        assert!((ring.range_km - 50.0).abs() < 1e-9, "first ring radius");
-        assert_eq!(
-            geometry.rings.len(),
-            9,
-            "rings at 50 km intervals to 459.48 km"
-        );
         Ok(())
     }
 }

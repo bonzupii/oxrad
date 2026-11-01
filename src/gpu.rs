@@ -16,17 +16,17 @@
 //! The GPU pipeline that draws a frame's gate raster.
 //!
 //! The vertex buffer is the frame's lattice: a site-relative kilometre offset
-//! and a raster coordinate per corner. One uniform carries the clip-space scale
-//! for the volume, so every window size and every zoom level draws the same
-//! uploaded vertices. The sampler decides whether the raster is drawn as
-//! measured gates or filtered between them.
+//! and a raster coordinate per corner. Each draw supplies its own placement, so
+//! the same uploaded vertices serve both workspaces at every window size and
+//! zoom level without any state carried between frames. The sampler decides
+//! whether the raster is drawn as measured gates or filtered between them.
 
 use eframe::egui::{Rect, Shape};
 use eframe::egui_wgpu::{self, wgpu};
 use wgpu::util::DeviceExt;
 
-use crate::error::{CoordinateError, RenderError};
-use crate::render::{self, LATTICE_STRIDE, RadarGeometry, Sampling};
+use crate::error::RenderError;
+use crate::render::{LATTICE_STRIDE, Placement, RadarGeometry, Sampling};
 
 const SHADER: &str = r#"
 struct Frame {
@@ -108,52 +108,37 @@ pub struct RadarGpu {
     linear: wgpu::Sampler,
 }
 
-/// Uploaded raster, lattice, and transform for one frame.
+/// Uploaded raster and lattice for one frame.
 pub struct RadarMesh {
-    pipeline: wgpu::RenderPipeline,
-    frame_bind_group: wgpu::BindGroup,
+    view: wgpu::TextureView,
+    sampling: Sampling,
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     index_count: u32,
-    /// Kept alive with its bind group so another mesh cannot overwrite its scale.
-    _uniform: wgpu::Buffer,
-    /// Kept alive by the bind group that samples it.
+    texels: [f32; 2],
+    /// Kept alive by the texture view that samples it.
     _texture: wgpu::Texture,
 }
 
 struct RadarDraw {
     pipeline: wgpu::RenderPipeline,
-    frame_bind_group: wgpu::BindGroup,
+    bind_group: wgpu::BindGroup,
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     index_count: u32,
 }
 
-/// Clip-space scale and map-space origin for a mesh whose vertices carry
-/// north-positive kilometre offsets. WebGPU clip space has y up, so both axes
-/// keep their sign; the screen transform in `render` applies the pixel flip.
-fn uniform_bytes(scale_x: f32, scale_y: f32, origin_x: f32, origin_y: f32) -> [u8; 16] {
-    let mut bytes = [0_u8; 16];
-    for (chunk, value) in bytes
-        .chunks_mut(4)
-        .zip([scale_x, scale_y, origin_x, origin_y])
-    {
-        chunk.copy_from_slice(&value.to_le_bytes());
-    }
-    bytes
-}
-
-/// The full frame uniform: the view transform, the raster size, and whether
-/// the raster is smoothed.
+/// The per-draw uniform: where the mesh lands, how big the raster is, and
+/// whether the raster is smoothed.
 const UNIFORM_BYTES: usize = 32;
 
-fn frame_uniform(scale: f32, texels: [f32; 2], smoothing: bool) -> [u8; UNIFORM_BYTES] {
+fn frame_uniform(placement: Placement, texels: [f32; 2], smoothing: bool) -> [u8; UNIFORM_BYTES] {
     let mut bytes = [0_u8; UNIFORM_BYTES];
     let values = [
-        scale,
-        scale,
-        0.0,
-        0.0,
+        placement.scale[0],
+        placement.scale[1],
+        placement.origin[0],
+        placement.origin[1],
         texels[0],
         texels[1],
         if smoothing { 1.0 } else { 0.0 },
@@ -250,13 +235,6 @@ impl RadarGpu {
         if geometry.lattice.is_empty() || geometry.lattice.vertices.is_empty() {
             return Err(RenderError::MeshSize { vertices: 0 });
         }
-        let scale = render::projection_scale(geometry.extent_km)
-            .map_err(|source: CoordinateError| RenderError::Coordinate { source })?;
-        let uniform = frame_uniform(
-            scale as f32,
-            [geometry.raster.width as f32, geometry.raster.height as f32],
-            matches!(sampling, Sampling::Bilinear),
-        );
         let vertices = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -271,46 +249,64 @@ impl RadarGpu {
                 contents: &geometry.lattice.indices,
                 usage: wgpu::BufferUsages::INDEX,
             });
-        let frame_uniform = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("radar frame uniform"),
-                contents: &uniform,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
         let texture = self.upload_texture(geometry)?;
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let frame_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("radar frame bind group"),
+        Ok(RadarMesh {
+            view,
+            sampling,
+            vertices,
+            indices,
+            index_count: geometry.lattice.index_count,
+            texels: [geometry.raster.width as f32, geometry.raster.height as f32],
+            _texture: texture,
+        })
+    }
+
+    /// A paint callback that draws `mesh` inside `rect`, placed by the canvas's
+    /// geographic transform.
+    pub fn shape(&self, mesh: &RadarMesh, rect: Rect, placement: Placement) -> Shape {
+        let uniform = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("radar draw uniform"),
+                contents: &frame_uniform(
+                    placement,
+                    mesh.texels,
+                    matches!(mesh.sampling, Sampling::Bilinear),
+                ),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("radar draw bind group"),
             layout: &self.pipeline.get_bind_group_layout(0),
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: frame_uniform.as_entire_binding(),
+                    resource: uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&view),
+                    resource: wgpu::BindingResource::TextureView(&mesh.view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::Sampler(match sampling {
+                    resource: wgpu::BindingResource::Sampler(match mesh.sampling {
                         Sampling::Nearest => &self.nearest,
                         Sampling::Bilinear => &self.linear,
                     }),
                 },
             ],
         });
-        self.queue.write_buffer(&frame_uniform, 0, &uniform);
-        Ok(RadarMesh {
-            pipeline: self.pipeline.clone(),
-            frame_bind_group,
-            vertices,
-            indices,
-            index_count: geometry.lattice.index_count,
-            _uniform: frame_uniform,
-            _texture: texture,
-        })
+        Shape::Callback(egui_wgpu::Callback::new_paint_callback(
+            rect,
+            RadarDraw {
+                pipeline: self.pipeline.clone(),
+                bind_group,
+                vertices: mesh.vertices.clone(),
+                indices: mesh.indices.clone(),
+                index_count: mesh.index_count,
+            },
+        ))
     }
 
     fn upload_texture(&self, geometry: &RadarGeometry) -> Result<wgpu::Texture, RenderError> {
@@ -350,16 +346,6 @@ impl RadarGpu {
             size,
         );
         Ok(texture)
-    }
-
-    /// Places an uploaded mesh in a geographic viewport. The origin is the
-    /// station offset from the viewport centre in kilometres, north-positive.
-    pub fn write_view(&self, mesh: &RadarMesh, scale_x: f32, scale_y: f32, origin: [f32; 2]) {
-        self.queue.write_buffer(
-            &mesh._uniform,
-            0,
-            &uniform_bytes(scale_x, scale_y, origin[0], origin[1]),
-        );
     }
 }
 
@@ -404,20 +390,6 @@ fn padded_rows(raster: &crate::raster::RadarRaster) -> Result<PaddedRows, Render
     })
 }
 
-/// A paint callback that draws `mesh` inside `rect`.
-pub fn shape(mesh: &RadarMesh, rect: Rect) -> Shape {
-    Shape::Callback(egui_wgpu::Callback::new_paint_callback(
-        rect,
-        RadarDraw {
-            pipeline: mesh.pipeline.clone(),
-            frame_bind_group: mesh.frame_bind_group.clone(),
-            vertices: mesh.vertices.clone(),
-            indices: mesh.indices.clone(),
-            index_count: mesh.index_count,
-        },
-    ))
-}
-
 impl egui_wgpu::CallbackTrait for RadarDraw {
     fn paint(
         &self,
@@ -426,7 +398,7 @@ impl egui_wgpu::CallbackTrait for RadarDraw {
         _resources: &egui_wgpu::CallbackResources,
     ) {
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.frame_bind_group, &[]);
+        pass.set_bind_group(0, &self.bind_group, &[]);
         pass.set_vertex_buffer(0, self.vertices.slice(..));
         pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..self.index_count, 0, 0..1);
@@ -435,11 +407,12 @@ impl egui_wgpu::CallbackTrait for RadarDraw {
 
 #[cfg(test)]
 mod tests {
-    use super::uniform_bytes;
+    use super::{UNIFORM_BYTES, frame_uniform};
 
+    use crate::render::Placement;
     use crate::test_support::TestError;
 
-    fn component(bytes: [u8; 16], offset: usize) -> Result<f32, TestError> {
+    fn component(bytes: [u8; UNIFORM_BYTES], offset: usize) -> Result<f32, TestError> {
         let slice = bytes
             .get(offset..offset + 4)
             .ok_or_else(|| format!("uniform byte offset {offset}"))?;
@@ -454,11 +427,18 @@ mod tests {
     /// screen-space rings and readout stayed north-up.
     #[test]
     fn clip_space_keeps_north_positive() -> Result<(), TestError> {
-        let bytes = uniform_bytes(2.0, 3.0, -40.0, 25.0);
+        let placement = Placement {
+            scale: [2.0, 3.0],
+            origin: [-0.4, 0.25],
+        };
+        let bytes = frame_uniform(placement, [720.0, 1832.0], true);
         assert_eq!(component(bytes, 0)?, 2.0, "x scale");
         assert_eq!(component(bytes, 4)?, 3.0, "y scale");
-        assert_eq!(component(bytes, 8)?, -40.0, "x origin");
-        assert_eq!(component(bytes, 12)?, 25.0, "y origin");
+        assert_eq!(component(bytes, 8)?, -0.4, "x origin");
+        assert_eq!(component(bytes, 12)?, 0.25, "y origin");
+        assert_eq!(component(bytes, 16)?, 720.0, "texel columns");
+        assert_eq!(component(bytes, 20)?, 1832.0, "texel rows");
+        assert_eq!(component(bytes, 24)?, 1.0, "smoothing");
         Ok(())
     }
 }

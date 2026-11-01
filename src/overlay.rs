@@ -13,74 +13,16 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
-//! Grid, range rings, and the active product legend.
+//! The active product legend.
 
-use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Stroke, Vec2};
+use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Vec2};
 
 use crate::colormap::{ColorTable, color_for_product_with};
 use crate::product::RadarProduct;
-use crate::render::{RadarGeometry, ViewTransform};
 use crate::theme::Palette;
 const LEGEND_WIDTH: f32 = 14.0;
 const LEGEND_HEIGHT: f32 = 260.0;
 const LEGEND_BANDS: usize = 20;
-/// Due-south point of each ring, where labels stack clear of the legend and
-/// the eastbound pointer readout.
-const RING_LABEL_INDEX: usize = 64;
-
-fn polyline(painter: &egui::Painter, points: &[Pos2], transform: &ViewTransform, stroke: Stroke) {
-    for pair in points.windows(2) {
-        if let [a, b] = pair {
-            painter.line_segment([transform.screen(*a), transform.screen(*b)], stroke);
-        }
-    }
-}
-
-pub fn draw_grid(
-    painter: &egui::Painter,
-    geometry: &RadarGeometry,
-    transform: &ViewTransform,
-    palette: &Palette,
-) {
-    let stroke = Stroke::new(
-        1.0_f32,
-        Color32::from_rgba_unmultiplied(palette.ring.r(), palette.ring.g(), palette.ring.b(), 90),
-    );
-    for line in &geometry.grid {
-        polyline(painter, line, transform, stroke);
-    }
-}
-
-pub fn draw_rings(
-    painter: &egui::Painter,
-    geometry: &RadarGeometry,
-    transform: &ViewTransform,
-    units: crate::units::UnitSystem,
-    palette: &Palette,
-) {
-    let stroke = Stroke::new(1.0_f32, palette.ring);
-    for ring in &geometry.rings {
-        polyline(painter, &ring.points, transform, stroke);
-        if let Some(point) = ring.points.get(RING_LABEL_INDEX) {
-            let label = crate::units::distance_whole(ring.range_km, units);
-            let galley =
-                painter.layout_no_wrap(label, FontId::monospace(10.0), palette.canvas_text);
-            let centre = transform.screen(*point) + Vec2::new(0.0, 4.0);
-            let origin = Pos2::new(centre.x - galley.size().x / 2.0, centre.y);
-            painter.rect_filled(
-                Rect::from_min_size(origin - Vec2::splat(2.0), galley.size() + Vec2::splat(4.0)),
-                CornerRadius::same(2),
-                Color32::from_rgba_unmultiplied(
-                    palette.legend.r(),
-                    palette.legend.g(),
-                    palette.legend.b(),
-                    170,
-                ),
-            );
-            painter.galley(origin, galley, palette.canvas_text);
-        }
-    }
-}
 
 fn legend_colour(
     table: ColorTable,

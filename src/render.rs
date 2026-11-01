@@ -30,7 +30,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
-use eframe::egui::{Pos2, Rect, Vec2};
+use eframe::egui::{Pos2, Rect};
 
 use crate::colormap::ColorTable;
 use crate::error::{CoordinateError, RenderError};
@@ -39,12 +39,6 @@ use crate::projection;
 use crate::radar::{GateValue, RadarVolume, RadialBins, RetrievedVolume};
 use crate::raster::{self, GateGrid, RadarRaster};
 
-/// Half-width of the radar disc as a fraction of the viewport side.
-const VIEW_MARGIN: f64 = 0.48;
-const RING_STEP_KM: f64 = 50.0;
-const RING_SAMPLES: u32 = 128;
-const GRID_SAMPLES: u32 = 64;
-const GRID_DEGREES_EACH_SIDE: i32 = 3;
 /// Bytes per lattice vertex: position and texture coordinate.
 pub const LATTICE_STRIDE: usize = 16;
 /// Range subdivisions between the site and the farthest gate.
@@ -103,12 +97,48 @@ impl Sampling {
     }
 }
 
-/// One geodesic circle around the site.
-pub struct RangeRing {
-    /// Radius in kilometres of ground range.
-    pub range_km: f64,
-    /// The circle's points, as site-relative kilometre offsets.
-    pub points: Vec<Pos2>,
+/// Where a frame's vertices land inside a canvas.
+///
+/// The lattice stores site-relative offsets in projected kilometres, so one
+/// scale and one origin place it in any window, at any zoom. Both come from the
+/// geographic transform that also places the rings, the warnings, and the
+/// pointer readout, so the raster cannot drift away from the map under it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Placement {
+    /// Clip-space units per projected kilometre, one per axis.
+    pub scale: [f32; 2],
+    /// The station's position in clip space.
+    pub origin: [f32; 2],
+}
+
+impl Placement {
+    /// Places a station drawn at `site` inside `rect` for a view `span_km` wide.
+    ///
+    /// The geographic transform draws a projected kilometre at the same number
+    /// of pixels on both axes, so the view's width fixes the scale and the
+    /// station's own screen position fixes the origin.
+    pub fn new(site: Pos2, rect: Rect, span_km: f64) -> Result<Self, CoordinateError> {
+        if !(span_km.is_finite() && span_km > 0.0) {
+            return Err(CoordinateError::ViewExtent { extent_km: span_km });
+        }
+        let width = f64::from(rect.width());
+        let height = f64::from(rect.height());
+        if !(width.is_finite() && height.is_finite()) || width <= 0.0 || height <= 0.0 {
+            return Err(CoordinateError::Viewport {
+                width: rect.width(),
+                height: rect.height(),
+            });
+        }
+        let center = rect.center();
+        let clip_per_km = 2.0 / span_km;
+        Ok(Self {
+            scale: [clip_per_km as f32, (clip_per_km * width / height) as f32],
+            origin: [
+                (2.0 * f64::from(site.x - center.x) / width) as f32,
+                (-2.0 * f64::from(site.y - center.y) / height) as f32,
+            ],
+        })
+    }
 }
 
 /// The gate under a map point.
@@ -310,10 +340,6 @@ pub struct RadarGeometry {
     pub raster: RadarRaster,
     /// The mesh that samples the raster.
     pub lattice: Lattice,
-    /// Range rings around the site.
-    pub rings: Vec<RangeRing>,
-    /// Latitude and longitude graticule.
-    pub grid: Vec<Vec<Pos2>>,
     /// Pointer lookup into the drawn sweep.
     pub lookup: SweepLookup,
     /// The product the raster was coloured for.
@@ -324,10 +350,6 @@ pub struct RadarGeometry {
     pub site_lat: f64,
     /// Site longitude.
     pub site_lon: f64,
-    /// Site Web Mercator x.
-    pub site_x: f64,
-    /// Site Web Mercator y.
-    pub site_y: f64,
 }
 
 pub struct BuildRequest {
@@ -452,82 +474,6 @@ fn build_lattice(
     Ok((lattice, extent_km))
 }
 
-fn build_rings(
-    volume: &RadarVolume,
-    site_x: f64,
-    site_y: f64,
-) -> Result<Vec<RangeRing>, RenderError> {
-    let mut rings = Vec::new();
-    let mut range_km = RING_STEP_KM;
-    while range_km <= volume.sweep.max_ground_range_km {
-        let mut points = Vec::with_capacity(RING_SAMPLES as usize + 1);
-        for step in 0..=RING_SAMPLES {
-            let azimuth_deg = f64::from(step) * 360.0 / f64::from(RING_SAMPLES);
-            let (lat, lon) =
-                projection::forward(range_km, azimuth_deg, volume.site_lat, volume.site_lon)
-                    .map_err(|source| RenderError::Coordinate { source })?;
-            points.push(
-                place_offset(lat, lon, site_x, site_y)
-                    .map_err(|source| RenderError::Coordinate { source })?,
-            );
-        }
-        rings.push(RangeRing { range_km, points });
-        range_km += RING_STEP_KM;
-    }
-    Ok(rings)
-}
-
-fn grid_line(
-    start: (f64, f64),
-    step: (f64, f64),
-    site_x: f64,
-    site_y: f64,
-) -> Result<Vec<Pos2>, RenderError> {
-    let mut points = Vec::with_capacity(GRID_SAMPLES as usize + 1);
-    for sample in 0..=GRID_SAMPLES {
-        let fraction = f64::from(sample) / f64::from(GRID_SAMPLES);
-        let lat = start.0 + step.0 * fraction;
-        let lon = start.1 + step.1 * fraction;
-        if (-85.051_128_779_806_6..=85.051_128_779_806_6).contains(&lat) {
-            points.push(
-                place_offset(lat, lon, site_x, site_y)
-                    .map_err(|source| RenderError::Coordinate { source })?,
-            );
-        }
-    }
-    Ok(points)
-}
-
-fn build_grid(
-    volume: &RadarVolume,
-    site_x: f64,
-    site_y: f64,
-) -> Result<Vec<Vec<Pos2>>, RenderError> {
-    let mut lines = Vec::new();
-    let span = f64::from(GRID_DEGREES_EACH_SIDE) + 0.5;
-    let first_latitude = volume.site_lat.floor() as i32 - GRID_DEGREES_EACH_SIDE;
-    let last_latitude = volume.site_lat.ceil() as i32 + GRID_DEGREES_EACH_SIDE;
-    let first_longitude = volume.site_lon.floor() as i32 - GRID_DEGREES_EACH_SIDE;
-    let last_longitude = volume.site_lon.ceil() as i32 + GRID_DEGREES_EACH_SIDE;
-    for latitude in first_latitude..=last_latitude {
-        lines.push(grid_line(
-            (f64::from(latitude), volume.site_lon - span),
-            (0.0, 2.0 * span),
-            site_x,
-            site_y,
-        )?);
-    }
-    for longitude in first_longitude..=last_longitude {
-        lines.push(grid_line(
-            (volume.site_lat - span, f64::from(longitude)),
-            (2.0 * span, 0.0),
-            site_x,
-            site_y,
-        )?);
-    }
-    Ok(lines)
-}
-
 /// Builds one product's raster and the lattice that samples it, plus the
 /// overlays and pointer lookup shared by both workspaces.
 pub fn build_geometry_for(
@@ -552,8 +498,6 @@ pub fn build_geometry_for(
     };
     Ok(RadarGeometry {
         extent_km,
-        rings: build_rings(volume, site_x, site_y)?,
-        grid: build_grid(volume, site_x, site_y)?,
         lookup: SweepLookup::new(volume, product),
         raster,
         lattice,
@@ -561,100 +505,14 @@ pub fn build_geometry_for(
         color_table,
         site_lat: volume.site_lat,
         site_lon: volume.site_lon,
-        site_x,
-        site_y,
     })
-}
-
-/// Clip-space units per kilometre of offset, shared by the mesh shader and the
-/// screen transform so both place a gate in the same spot.
-pub fn projection_scale(extent_km: f64) -> Result<f64, CoordinateError> {
-    if !(extent_km.is_finite() && extent_km > 0.0) {
-        return Err(CoordinateError::ViewExtent { extent_km });
-    }
-    Ok(2.0 * VIEW_MARGIN / extent_km)
-}
-
-/// The square of the window the radar disc is drawn into.
-pub fn radar_viewport(rect: Rect) -> Rect {
-    Rect::from_center_size(rect.center(), Vec2::splat(rect.width().min(rect.height())))
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct PointerInfo {
-    pub lat: f64,
-    pub lon: f64,
-    pub range_km: f64,
-    pub azimuth_deg: f64,
-}
-
-/// Screen placement for one geometry at the current viewport size.
-#[derive(Debug, Clone, Copy)]
-pub struct ViewTransform {
-    center: Pos2,
-    pixels_per_km: f64,
-    site_lat: f64,
-    site_lon: f64,
-    site_x: f64,
-    site_y: f64,
-}
-
-impl ViewTransform {
-    pub fn new(viewport: Rect, geometry: &RadarGeometry) -> Result<Self, CoordinateError> {
-        let side = f64::from(viewport.width().min(viewport.height()));
-        if !(side.is_finite() && side > 0.0) {
-            return Err(CoordinateError::Viewport {
-                width: viewport.width(),
-                height: viewport.height(),
-            });
-        }
-        let scale = projection_scale(geometry.extent_km)?;
-        Ok(Self {
-            center: viewport.center(),
-            pixels_per_km: 0.5 * side * scale,
-            site_lat: geometry.site_lat,
-            site_lon: geometry.site_lon,
-            site_x: geometry.site_x,
-            site_y: geometry.site_y,
-        })
-    }
-
-    /// Places a site-relative kilometre offset in the window.
-    pub fn screen(&self, offset: Pos2) -> Pos2 {
-        self.center
-            + Vec2::new(
-                (f64::from(offset.x) * self.pixels_per_km) as f32,
-                (-f64::from(offset.y) * self.pixels_per_km) as f32,
-            )
-    }
-
-    /// The site-relative kilometre offset under a window position.
-    pub fn offset_at(&self, position: Pos2) -> Pos2 {
-        Pos2::new(
-            (f64::from(position.x - self.center.x) / self.pixels_per_km) as f32,
-            (-f64::from(position.y - self.center.y) / self.pixels_per_km) as f32,
-        )
-    }
-
-    pub fn pointer_info(&self, position: Pos2) -> Result<PointerInfo, CoordinateError> {
-        let offset = self.offset_at(position);
-        let (lat, lon) = projection::mercator_inverse(
-            self.site_x + f64::from(offset.x),
-            self.site_y + f64::from(offset.y),
-        )?;
-        let (range_km, azimuth_deg) = projection::inverse(self.site_lat, self.site_lon, lat, lon)?;
-        Ok(PointerInfo {
-            lat,
-            lon,
-            range_km,
-            azimuth_deg,
-        })
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use eframe::egui::Vec2;
 
     use crate::radar::{MomentBins, RadarSweep};
     use crate::stations::SiteId;
@@ -762,6 +620,7 @@ mod tests {
             75.0,
         )?;
         assert!(geometry.lattice.index_count > 0, "lattice is empty");
+        let (site_x, site_y) = projection::mercator(SITE_LAT, SITE_LON)?;
         let far = geometry.lattice.vertices.len() / LATTICE_STRIDE - 1;
         let corner = geometry
             .lattice
@@ -773,8 +632,8 @@ mod tests {
             .ok_or("no far corner texture coordinate")?;
         assert!((texcoord.y - 1.0).abs() < 1e-6, "far row {texcoord:?}");
         let (lat, lon) = projection::mercator_inverse(
-            geometry.site_x + f64::from(corner.x),
-            geometry.site_y + f64::from(corner.y),
+            site_x + f64::from(corner.x),
+            site_y + f64::from(corner.y),
         )?;
         assert!(
             (lat - 38.993_728).abs() < 5e-5,
@@ -918,45 +777,66 @@ mod tests {
         Ok(())
     }
 
+    /// A 1,600-pixel view spanning 8,000 km draws a kilometre in 0.2 pixels, so
+    /// 800 km east of a station that already sits 80 px right of the centre
+    /// must land 240 px right of it. The height covers 4,500 km, so 400 km south
+    /// of a station 40 px above the centre lands 40 px below it. Both
+    /// expectations are arithmetic on the view, not the placement formula.
     #[test]
-    fn viewport_transform_maps_offsets_and_pointer_positions() -> Result<(), TestError> {
-        let (_, geometry) = build(
-            vec![radial(89.5, 90.5, 0.0, vec![GateValue::Measured(30.0)])],
-            75.0,
-        )?;
-        let viewport = radar_viewport(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 900.0)));
-        let transform = ViewTransform::new(viewport, &geometry)?;
-        let offset = Pos2::new(40.0, -25.0);
-        let screen = transform.screen(offset);
-        let recovered = transform.offset_at(screen);
+    fn a_gate_draws_at_the_distance_the_view_says_it_should() -> Result<(), TestError> {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 900.0));
+        let site = rect.center() + Vec2::new(80.0, -40.0);
+        let placement = Placement::new(site, rect, 8_000.0)?;
+        let east_km = 800.0_f32;
+        let clip_x = placement.origin[0] + east_km * placement.scale[0];
+        let pixels_right = f64::from(clip_x) * 0.5 * f64::from(rect.width());
         assert!(
-            (recovered.x - offset.x).abs() < 1e-2 && (recovered.y - offset.y).abs() < 1e-2,
-            "offset round trip {recovered:?}"
+            (pixels_right - 240.0).abs() < 0.01,
+            "gate drew {pixels_right} px right of the centre"
         );
-        let info = transform.pointer_info(screen)?;
-        let (expected_lat, expected_lon) =
-            projection::mercator_inverse(geometry.site_x + 40.0, geometry.site_y - 25.0)?;
+        let south_km = 400.0_f32;
+        let clip_y = placement.origin[1] - south_km * placement.scale[1];
+        let pixels_up = f64::from(clip_y) * 0.5 * f64::from(rect.height());
         assert!(
-            (info.lat - expected_lat).abs() < 1e-6,
-            "latitude {}",
-            info.lat
+            (pixels_up + 40.0).abs() < 0.01,
+            "gate drew {pixels_up} px above the centre"
+        );
+        Ok(())
+    }
+
+    /// The placement and the geographic transform draw a kilometre with the
+    /// same number of pixels, so a station plotted through one lands on the
+    /// station plotted through the other.
+    #[test]
+    fn placement_agrees_with_the_geographic_transform() -> Result<(), TestError> {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0));
+        let view = crate::map::MapView::focus(SITE_LAT, SITE_LON, 600.0)?;
+        let transform = view.transform(rect)?;
+        let site = transform
+            .screen(SITE_LAT, SITE_LON)
+            .ok_or("station does not project")?;
+        let placement = Placement::new(site, rect, view.span_km())?;
+        let (lat, lon) = projection::forward(120.0, 45.0, SITE_LAT, SITE_LON)?;
+        let drawn = transform.screen(lat, lon).ok_or("gate does not project")?;
+        let (site_x, site_y) = projection::mercator(SITE_LAT, SITE_LON)?;
+        let offset = place_offset(lat, lon, site_x, site_y)?;
+        let clip_x = placement.origin[0] + offset.x * placement.scale[0];
+        let clip_y = placement.origin[1] + offset.y * placement.scale[1];
+        let placed = Pos2::new(
+            rect.center().x + clip_x * 0.5 * rect.width(),
+            rect.center().y - clip_y * 0.5 * rect.height(),
         );
         assert!(
-            (info.lon - expected_lon).abs() < 1e-6,
-            "longitude {}",
-            info.lon
+            (placed - drawn).length() < 0.5,
+            "placement drew {placed:?} but the map drew {drawn:?}"
         );
         Ok(())
     }
 
     #[test]
     fn a_viewport_without_pixels_is_rejected() -> Result<(), TestError> {
-        let (_, geometry) = build(
-            vec![radial(89.5, 90.5, 0.0, vec![GateValue::Measured(30.0)])],
-            75.0,
-        )?;
         let empty = Rect::from_min_size(Pos2::ZERO, Vec2::ZERO);
-        match ViewTransform::new(empty, &geometry) {
+        match Placement::new(Pos2::ZERO, empty, 600.0) {
             Err(CoordinateError::Viewport { width, height }) => {
                 assert!(width.abs() < f32::EPSILON && height.abs() < f32::EPSILON);
                 Ok(())
@@ -968,52 +848,41 @@ mod tests {
     }
 
     #[test]
-    fn range_rings_are_geodesic_circles_at_fifty_kilometre_intervals() -> Result<(), TestError> {
-        let (_, geometry) = build(
-            vec![radial(89.5, 90.5, 0.0, vec![GateValue::Measured(30.0)])],
-            75.0,
-        )?;
-        assert_eq!(geometry.rings.len(), 1, "one ring inside a 75 km extent");
-        let ring = geometry.rings.first().ok_or("no ring")?;
-        assert!((ring.range_km - 50.0).abs() < 1e-9, "ring radius");
-        let first = ring.points.first().ok_or("no ring point")?;
-        let (lat, lon) = projection::mercator_inverse(
-            geometry.site_x + f64::from(first.x),
-            geometry.site_y + f64::from(first.y),
-        )?;
-        let (range_km, _) = projection::inverse(SITE_LAT, SITE_LON, lat, lon)?;
-        assert!(
-            (range_km - 50.0).abs() < 1e-3,
-            "ring point range {range_km}"
-        );
-        Ok(())
+    fn a_view_span_without_kilometres_is_rejected() -> Result<(), TestError> {
+        match Placement::new(
+            Pos2::ZERO,
+            Rect::from_min_size(Pos2::ZERO, Vec2::splat(400.0)),
+            0.0,
+        ) {
+            Err(CoordinateError::ViewExtent { extent_km }) => {
+                assert!(extent_km.abs() < f64::EPSILON);
+                Ok(())
+            }
+            other => Err(TestError::from(format!(
+                "expected a view extent error, got {other:?}"
+            ))),
+        }
     }
 
     /// North is positive Mercator y and must draw above the site; east is
     /// positive Mercator x and must draw to the right. Both expectations come
-    /// from the map, not from the transform under test.
+    /// from the projection, not from the placement under test.
     #[test]
     fn north_and_east_plot_on_the_expected_sides_of_the_site() -> Result<(), TestError> {
-        let (_, geometry) = build(
-            vec![radial(89.5, 90.5, 0.0, vec![GateValue::Measured(30.0)])],
-            75.0,
-        )?;
-        let viewport = radar_viewport(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 900.0)));
-        let transform = ViewTransform::new(viewport, &geometry)?;
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 900.0));
+        let site = rect.center();
+        let placement = Placement::new(site, rect, 600.0)?;
+        let (site_x, site_y) = projection::mercator(SITE_LAT, SITE_LON)?;
         let (north_lat, north_lon) = projection::forward(75.0, 0.0, SITE_LAT, SITE_LON)?;
-        let north = place_offset(north_lat, north_lon, geometry.site_x, geometry.site_y)?;
+        let north = place_offset(north_lat, north_lon, site_x, site_y)?;
         assert!(north.y > 0.0, "north offset y {}", north.y);
-        assert!(
-            transform.screen(north).y < viewport.center().y,
-            "north draws below the site"
-        );
+        let north_clip = placement.origin[1] + north.y * placement.scale[1];
+        assert!(north_clip > 0.0, "north drew below the site: {north_clip}");
         let (east_lat, east_lon) = projection::forward(75.0, 90.0, SITE_LAT, SITE_LON)?;
-        let east = place_offset(east_lat, east_lon, geometry.site_x, geometry.site_y)?;
+        let east = place_offset(east_lat, east_lon, site_x, site_y)?;
         assert!(east.x > 0.0, "east offset x {}", east.x);
-        assert!(
-            transform.screen(east).x > viewport.center().x,
-            "east draws left of the site"
-        );
+        let east_clip = placement.origin[0] + east.x * placement.scale[0];
+        assert!(east_clip > 0.0, "east drew left of the site: {east_clip}");
         Ok(())
     }
 

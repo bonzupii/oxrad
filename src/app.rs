@@ -41,7 +41,7 @@ use crate::product::RadarProduct;
 use crate::provider::timestamp_label;
 use crate::radar::{ArchiveOrigin, GateValue, RetrievedVolume};
 use crate::radar_controls::{self, Selection};
-use crate::render::{self, ViewTransform};
+use crate::render;
 use crate::stations::{self, SiteId, Station, StationError, StationFeed, StationOutcome};
 use crate::theme::{self, Palette, Theme};
 use crate::time;
@@ -98,6 +98,13 @@ impl RadarLayer {
 enum GlobalPlayback {
     Stopped,
     Playing,
+}
+
+/// Which geographic canvas received a pointer gesture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Canvas {
+    Map,
+    Radar,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -382,6 +389,8 @@ pub struct OxradApp {
     scene_mode: SceneMode,
     map: Result<WorldMap, MapError>,
     map_view: MapView,
+    radar_view: MapView,
+    radar_fitted: Option<SiteId>,
     map_viewport: Option<Rect>,
     basemap_layers: Result<BasemapLayers, BasemapError>,
     map_radar: RadarLayer,
@@ -460,6 +469,8 @@ impl OxradApp {
             scene_mode: SceneMode::Radar,
             map: WorldMap::load(),
             map_view: MapView::default(),
+            radar_view: MapView::default(),
+            radar_fitted: None,
             map_viewport: None,
             basemap_layers,
             map_radar: RadarLayer::Shown,
@@ -1596,7 +1607,7 @@ impl OxradApp {
             ui.id().with("geographic-map"),
             egui::Sense::click_and_drag(),
         );
-        self.map_input(ui, rect, &interaction);
+        self.canvas_input(ui, rect, &interaction, Canvas::Map);
         let now = Instant::now();
         if self.map_reload_due.is_some_and(|due| now >= due) {
             self.map_reload_due = None;
@@ -1623,27 +1634,19 @@ impl OxradApp {
                 return;
             }
         };
-        self.map_basemap(ui, rect);
+        let palette = self.config.theme.palette();
+        // The stack is drawn bottom-up in one place so a layer's position is
+        // deliberate: the basemap, then its roads, then the radar over the
+        // roads, then warnings, then the map's own text. Roads used to be drawn
+        // after the radar, which buried the echo under the highway lines a
+        // chaser is trying to read it against.
+        self.draw_basemap(ui, rect, &palette);
         self.map_supplemental_lines(ui, rect, &transform);
-        self.map_global(ui, &transform);
-        let radar_visible = self.map_radar(ui, rect, &transform);
-        let ring_origin = self
-            .site_station()
-            .map(|station| (station.lat, station.lon));
-        if let Some((lat, lon)) = ring_origin
-            && let Err(error) = map::draw_range_rings(
-                ui.painter(),
-                rect,
-                &transform,
-                lat,
-                lon,
-                self.config.units,
-                &self.config.theme.palette(),
-            )
-        {
-            self.notice = Some(format!("Map range rings could not be drawn: {error}"));
-        }
         self.map_supplemental_roads(ui, rect, &transform);
+        self.map_global(ui, &transform);
+        let span_km = self.map_view.span_km();
+        let radar_visible = self.radars(ui, rect, &transform, span_km, true);
+        self.draw_rings(ui, rect, &transform);
         self.map_warnings(ui, rect, &transform);
         self.map_supplemental_places(ui, rect, &transform);
         self.map_measure(ui, rect, &transform, &interaction);
@@ -1653,7 +1656,7 @@ impl OxradApp {
             self.map_stations(ui, rect, &transform, &interaction)
         };
         self.map_place(ui, &transform);
-        map::draw_scale(ui.painter(), rect, &transform, &self.config.theme.palette());
+        map::draw_scale(ui.painter(), rect, &transform, &palette);
         self.map_controls(ui, rect);
         self.map_readout(ui, rect, &transform, radar_visible);
         if let Some(id) = clicked_site {
@@ -1697,31 +1700,39 @@ impl OxradApp {
         }
     }
 
-    fn map_input(&mut self, ui: &egui::Ui, rect: Rect, interaction: &egui::Response) {
+    /// Drag to pan and scroll to zoom, on whichever canvas the pointer is in.
+    fn canvas_input(
+        &mut self,
+        ui: &egui::Ui,
+        rect: Rect,
+        interaction: &egui::Response,
+        canvas: Canvas,
+    ) {
+        let view = match canvas {
+            Canvas::Map => &mut self.map_view,
+            Canvas::Radar => &mut self.radar_view,
+        };
+        let mut outcome: Result<bool, MapError> = Ok(false);
         if interaction.dragged() {
             let delta = ui.input(|input| input.pointer.delta());
-            match self.map_view.pan(rect, delta) {
-                Ok(()) => self.schedule_viewport_reload(),
-                Err(error) => self.notice = Some(format!("Map pan failed: {error}")),
-            }
-        }
-        if interaction.hovered()
-            && !ui
-                .input(|input| input.pointer.hover_pos())
-                .is_some_and(|pointer| {
-                    map_status_area(rect).is_some_and(|area| area.contains(pointer))
-                })
-        {
+            outcome = view.pan(rect, delta).map(|()| true);
+        } else if interaction.hovered() {
             let scroll = ui.input(|input| input.smooth_scroll_delta.y);
             if scroll.abs() > 0.01
                 && let Some(pointer) = ui.input(|input| input.pointer.hover_pos())
             {
                 let factor = (f64::from(scroll) / 240.0).exp();
-                match self.map_view.zoom_at(rect, pointer, factor) {
-                    Ok(()) => self.schedule_viewport_reload(),
-                    Err(error) => self.notice = Some(format!("Map zoom failed: {error}")),
+                outcome = view.zoom_at(rect, pointer, factor).map(|()| true);
+            }
+        }
+        match outcome {
+            Ok(false) => {}
+            Ok(true) => {
+                if canvas == Canvas::Map {
+                    self.schedule_viewport_reload();
                 }
             }
+            Err(error) => self.notice = Some(format!("The view could not be moved: {error}")),
         }
     }
 
@@ -1989,14 +2000,26 @@ impl OxradApp {
             })
     }
 
-    fn map_radar(&mut self, ui: &egui::Ui, rect: Rect, transform: &map::MapTransform) -> bool {
-        if !self.map_radar.is_shown() {
+    /// Draws every radar the view holds, nearest station last so the selected
+    /// station covers the ones around it.
+    fn radars(
+        &mut self,
+        ui: &egui::Ui,
+        rect: Rect,
+        transform: &map::MapTransform,
+        span_km: f64,
+        include_viewport: bool,
+    ) -> bool {
+        if !self.map_radar.is_shown() && include_viewport {
             return false;
         }
-        let span_km = self.map_view.span_km();
+        let Some(gpu) = self.gpu.clone() else {
+            return false;
+        };
         let reference = self.displayed_scan_reference();
         let mut drew = false;
-        for layer in self.view_radars.iter().rev() {
+        let mut failure: Option<String> = None;
+        for layer in self.view_radars.iter().rev().filter(|_| include_viewport) {
             let Some(frame) = layer.display.frame.as_ref() else {
                 continue;
             };
@@ -2007,11 +2030,11 @@ impl OxradApp {
             {
                 continue;
             }
-            match draw_map_display(&layer.display, ui.painter(), rect, transform, span_km) {
+            match draw_map_display(&layer.display, &gpu, ui.painter(), rect, transform, span_km) {
                 Ok(true) => drew = true,
                 Ok(false) => {}
                 Err(error) => {
-                    self.notice = Some(format!(
+                    failure = Some(format!(
                         "Viewport radar {} could not be placed: {error}",
                         layer.site
                     ));
@@ -2024,13 +2047,16 @@ impl OxradApp {
             .as_ref()
             .is_some_and(|frame| frame.geometry.product == self.product);
         if selected_matches {
-            match draw_map_display(&self.display, ui.painter(), rect, transform, span_km) {
+            match draw_map_display(&self.display, &gpu, ui.painter(), rect, transform, span_km) {
                 Ok(true) => drew = true,
                 Ok(false) => {}
                 Err(error) => {
-                    self.notice = Some(format!("Selected radar could not be placed: {error}"))
+                    failure = Some(format!("Selected radar could not be placed: {error}"))
                 }
             }
+        }
+        if let Some(message) = failure {
+            self.notice = Some(message);
         }
         if drew {
             overlay::draw_legend(
@@ -2084,69 +2110,6 @@ impl OxradApp {
                     .add(Shape::closed_line(points, Stroke::new(width, colour)));
             }
         }
-    }
-
-    fn radar_warnings(
-        &self,
-        painter: &egui::Painter,
-        frame: &Frame,
-        transform: &ViewTransform,
-        viewport: Rect,
-    ) -> Option<String> {
-        if !self.warning_layer.is_shown() {
-            return None;
-        }
-        for warning in &self.warnings {
-            let mut rings = Vec::new();
-            let mut bounds: Option<Rect> = None;
-            for ring in &warning.polygons {
-                let mut points = Vec::with_capacity(ring.len());
-                for (lat, lon) in ring {
-                    let offset = match render::place_offset(
-                        *lat,
-                        *lon,
-                        frame.geometry.site_x,
-                        frame.geometry.site_y,
-                    ) {
-                        Ok(offset) => offset,
-                        Err(error) => {
-                            return Some(format!(
-                                "Warning {} could not be placed: {error}",
-                                warning.event
-                            ));
-                        }
-                    };
-                    let point = transform.screen(offset);
-                    points.push(point);
-                    bounds = Some(bounds.map_or_else(
-                        || Rect::from_min_max(point, point),
-                        |bounds| {
-                            Rect::from_min_max(
-                                Pos2::new(bounds.min.x.min(point.x), bounds.min.y.min(point.y)),
-                                Pos2::new(bounds.max.x.max(point.x), bounds.max.y.max(point.y)),
-                            )
-                        },
-                    ));
-                }
-                if points.len() >= 3 {
-                    rings.push(points);
-                }
-            }
-            if rings.is_empty() || !bounds.is_some_and(|bounds| bounds.intersects(viewport)) {
-                continue;
-            }
-            let selected = self.selected_warning.as_deref() == Some(warning.id.as_str());
-            let width = if selected { 4.0_f32 } else { 2.0_f32 };
-            let colour = if selected {
-                TEXT
-            } else {
-                warning_colour(warning.severity)
-            };
-            for points in rings {
-                painter.add(Shape::closed_line(points, Stroke::new(width, colour)));
-            }
-        }
-        None
     }
 
     fn map_measure(
@@ -2247,36 +2210,6 @@ impl OxradApp {
             Color32::from_black_alpha(220),
         );
         painter.galley(origin + padding, galley, TEXT);
-    }
-
-    fn map_basemap(&self, ui: &egui::Ui, rect: Rect) {
-        match &self.map {
-            Ok(world) => {
-                if let Err(error) = world.draw(
-                    ui.painter(),
-                    &self.map_view,
-                    rect,
-                    &self.config.theme.palette(),
-                ) {
-                    ui.painter().text(
-                        rect.left_top() + Vec2::new(18.0, 52.0),
-                        Align2::LEFT_TOP,
-                        format!("The basemap could not be drawn: {error}"),
-                        FontId::proportional(13.0),
-                        ERROR,
-                    );
-                }
-            }
-            Err(error) => {
-                ui.painter().text(
-                    rect.center(),
-                    Align2::CENTER_CENTER,
-                    format!("The basemap could not be loaded: {error}"),
-                    FontId::proportional(14.0),
-                    ERROR,
-                );
-            }
-        }
     }
 
     fn map_stations(
@@ -3456,23 +3389,33 @@ impl OxradApp {
         painter.galley(origin + padding, galley, TEXT);
     }
 
+    /// The radar workspace.
+    ///
+    /// It is the geographic workspace locked to the selected station rather
+    /// than a second, non-geographic canvas: the same projection, the same
+    /// layer stack, the same pan and zoom, and the same pointer readout. A
+    /// storm-chaser view that cannot pan or zoom is a view that cannot be used
+    /// to find a road under the storm.
     fn radar_scene(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
         let palette = self.config.theme.palette();
         ui.painter()
             .rect_filled(rect, CornerRadius::ZERO, palette.canvas);
+        if rect.width() <= 0.0 || rect.height() <= 0.0 {
+            return;
+        }
+        let interaction = ui.interact(
+            rect,
+            ui.id().with("radar-canvas"),
+            egui::Sense::click_and_drag(),
+        );
+        self.canvas_input(ui, rect, &interaction, Canvas::Radar);
+        self.fit_radar_view();
         if self.display.frame.is_none() {
             self.empty_state(ui, rect);
             return;
         }
-        let Some(frame) = self.display.frame.as_ref() else {
-            return;
-        };
-        if rect.width() <= 0.0 || rect.height() <= 0.0 {
-            return;
-        }
-        let viewport = render::radar_viewport(rect);
-        let transform = match ViewTransform::new(viewport, &frame.geometry) {
+        let transform = match self.radar_view.transform(rect) {
             Ok(transform) => transform,
             Err(error) => {
                 ui.painter().text(
@@ -3485,42 +3428,106 @@ impl OxradApp {
                 return;
             }
         };
-        if let Some(shape) = frame.shape(viewport) {
-            ui.painter().add(shape);
+        self.draw_basemap(ui, rect, &palette);
+        let radar_visible = self.radars(ui, rect, &transform, self.radar_view.span_km(), false);
+        self.draw_rings(ui, rect, &transform);
+        self.map_warnings(ui, rect, &transform);
+        let clicked_site = if self.measure.is_on() {
+            None
+        } else {
+            self.map_stations(ui, rect, &transform, &interaction)
+        };
+        self.map_place(ui, &transform);
+        map::draw_scale(ui.painter(), rect, &transform, &palette);
+        north_marker(ui.painter(), rect);
+        if let Some(frame) = self.display.frame.as_ref() {
+            map_caption(ui.painter(), rect, frame);
+            if frame.geometry.raster.is_empty() {
+                ui.painter().text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    "No measured echo in this sweep. This does not establish clear weather.",
+                    FontId::proportional(15.0),
+                    TEXT,
+                );
+            }
         }
-        if frame.geometry.raster.is_empty() {
-            ui.painter().text(
-                rect.center(),
-                Align2::CENTER_CENTER,
-                "No measured echo in this sweep. This does not establish clear weather.",
-                FontId::proportional(15.0),
-                TEXT,
-            );
+        self.map_readout(ui, rect, &transform, radar_visible);
+        if let Some(id) = clicked_site {
+            self.choose_site(id);
         }
-        overlay::draw_grid(ui.painter(), &frame.geometry, &transform, &palette);
-        overlay::draw_rings(
-            ui.painter(),
-            &frame.geometry,
-            &transform,
-            self.config.units,
-            &palette,
-        );
-        if let Some(error) = self.radar_warnings(ui.painter(), frame, &transform, viewport) {
-            self.notice = Some(error);
+    }
+
+    /// Draws the basemap under everything else, reporting its failure where the
+    /// map would have been rather than in a corner.
+    fn draw_basemap(&self, ui: &egui::Ui, rect: Rect, palette: &Palette) {
+        match &self.map {
+            Ok(world) => {
+                if let Err(error) = world.draw(ui.painter(), &self.map_view, rect, palette) {
+                    ui.painter().text(
+                        rect.center(),
+                        Align2::CENTER_CENTER,
+                        format!("The basemap could not be drawn: {error}"),
+                        FontId::proportional(14.0),
+                        ERROR,
+                    );
+                }
+            }
+            Err(error) => {
+                ui.painter().text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    format!("The basemap could not be loaded: {error}"),
+                    FontId::proportional(14.0),
+                    ERROR,
+                );
+            }
         }
-        overlay::draw_legend(
+    }
+
+    fn draw_rings(&self, ui: &egui::Ui, rect: Rect, transform: &map::MapTransform) {
+        let Some(station) = self.site_station() else {
+            return;
+        };
+        if let Err(error) = map::draw_range_rings(
             ui.painter(),
             rect,
-            frame.geometry.product,
-            self.config.color_table,
-            &palette,
-        );
-        if let Some(place) = &self.place {
-            draw_place_marker(ui.painter(), frame, &transform, viewport, rect, place);
+            transform,
+            station.lat,
+            station.lon,
+            self.config.units,
+            &self.config.theme.palette(),
+        ) {
+            ui.painter().text(
+                Pos2::new(rect.left() + 16.0, rect.bottom() - 20.0),
+                Align2::LEFT_CENTER,
+                format!("Range rings could not be drawn: {error}"),
+                FontId::proportional(12.0),
+                ERROR,
+            );
         }
-        north_marker(ui.painter(), &viewport);
-        map_caption(ui.painter(), rect, frame);
-        readout(ui, frame, &transform, viewport, rect, self.config.units);
+    }
+
+    /// Fits the radar view to the selected station the first time its frame
+    /// arrives, and after the station changes.
+    fn fit_radar_view(&mut self) {
+        let Some(site) = self.site.clone() else {
+            return;
+        };
+        if self.radar_fitted.as_ref() == Some(&site) {
+            return;
+        }
+        let Some(frame) = self.display.frame.as_ref() else {
+            return;
+        };
+        let span_km = frame.geometry.extent_km * 2.1;
+        match map::MapView::focus(frame.geometry.site_lat, frame.geometry.site_lon, span_km) {
+            Ok(view) => {
+                self.radar_view = view;
+                self.radar_fitted = Some(site);
+            }
+            Err(error) => self.notice = Some(format!("Radar view could not be fitted: {error}")),
+        }
     }
 
     fn empty_state(&self, ui: &egui::Ui, rect: Rect) {
@@ -3666,8 +3673,14 @@ fn global_texture(
     ))
 }
 
+/// Draws one display's raster into a geographic canvas.
+///
+/// The raster is never placed by its own arithmetic: the site's screen position
+/// and the view's span come from the same transform that places the rings and
+/// the readout, so a gate, a ring, and a pointer sample cannot disagree.
 fn draw_map_display(
     display: &Display,
+    gpu: &RadarGpu,
     painter: &egui::Painter,
     rect: Rect,
     transform: &map::MapTransform,
@@ -3679,18 +3692,9 @@ fn draw_map_display(
     let Some(site) = transform.screen(frame.geometry.site_lat, frame.geometry.site_lon) else {
         return Ok(false);
     };
-    if !(span_km.is_finite() && span_km > 0.0 && rect.width() > 0.0 && rect.height() > 0.0) {
-        return Ok(false);
-    }
-    let kilometers_per_pixel = transform.kilometers_per_pixel();
-    let origin = [
-        ((site.x - rect.center().x) as f64 * kilometers_per_pixel) as f32,
-        (-(site.y - rect.center().y) as f64 * kilometers_per_pixel) as f32,
-    ];
-    let scale_x = (2.0 / span_km) as f32;
-    let scale_y = (2.0 * f64::from(rect.width()) / (span_km * f64::from(rect.height()))) as f32;
-    display.set_map_view(scale_x, scale_y, origin)?;
-    if let Some(shape) = frame.shape(rect) {
+    let placement = render::Placement::new(site, rect, span_km)
+        .map_err(|source| crate::error::RenderError::Coordinate { source })?;
+    if let Some(shape) = frame.shape(gpu, rect, placement) {
         painter.add(shape);
     }
     Ok(true)
@@ -3953,95 +3957,6 @@ fn forecast_period(ui: &mut egui::Ui, period: &ForecastPeriod, units: crate::uni
     ui.separator();
 }
 
-fn draw_place_marker(
-    painter: &egui::Painter,
-    frame: &Frame,
-    transform: &ViewTransform,
-    viewport: Rect,
-    bounds: Rect,
-    place: &Place,
-) {
-    let offset = match render::place_offset(
-        place.lat,
-        place.lon,
-        frame.geometry.site_x,
-        frame.geometry.site_y,
-    ) {
-        Ok(offset) => offset,
-        Err(error) => {
-            painter.text(
-                Pos2::new(bounds.left() + 16.0, bounds.top() + 34.0),
-                Align2::LEFT_TOP,
-                format!("Town marker unavailable: {error}"),
-                FontId::proportional(12.0),
-                ERROR,
-            );
-            return;
-        }
-    };
-    let (distance_km, azimuth_deg) = match crate::projection::inverse(
-        frame.volume.site_lat,
-        frame.volume.site_lon,
-        place.lat,
-        place.lon,
-    ) {
-        Ok(value) => value,
-        Err(error) => {
-            painter.text(
-                Pos2::new(bounds.left() + 16.0, bounds.top() + 34.0),
-                Align2::LEFT_TOP,
-                format!("Town distance unavailable: {error}"),
-                FontId::proportional(12.0),
-                ERROR,
-            );
-            return;
-        }
-    };
-    let position = transform.screen(offset);
-    let detail = format!(
-        "{} · {:.0} km {}",
-        place.name,
-        distance_km,
-        place::compass(azimuth_deg)
-    );
-    if viewport.contains(position) {
-        painter.circle_filled(position, 4.0, STALE);
-        painter.circle_stroke(position, 7.0, Stroke::new(1.0_f32, TEXT));
-        let galley = painter.layout_no_wrap(detail, FontId::proportional(12.0), TEXT);
-        let size = galley.size();
-        let gap = 10.0;
-        let origin = if position.x < viewport.center().x {
-            Pos2::new(position.x - size.x - gap, position.y - size.y - gap)
-        } else {
-            Pos2::new(position.x + gap, position.y - size.y - gap)
-        };
-        let origin = Pos2::new(
-            origin.x.clamp(
-                bounds.left() + 4.0,
-                (bounds.right() - size.x - 10.0).max(bounds.left() + 4.0),
-            ),
-            origin.y.clamp(
-                bounds.top() + 4.0,
-                (bounds.bottom() - size.y - 10.0).max(bounds.top() + 4.0),
-            ),
-        );
-        painter.rect_filled(
-            Rect::from_min_size(origin - Vec2::splat(3.0), size + Vec2::splat(6.0)),
-            CornerRadius::same(3),
-            Color32::from_black_alpha(210),
-        );
-        painter.galley(origin, galley, TEXT);
-    } else {
-        painter.text(
-            Pos2::new(bounds.left() + 16.0, bounds.top() + 34.0),
-            Align2::LEFT_TOP,
-            format!("{detail} · outside the radar view"),
-            FontId::proportional(12.0),
-            STALE,
-        );
-    }
-}
-
 fn map_caption(painter: &egui::Painter, rect: Rect, frame: &Frame) {
     let product = frame.geometry.product;
     let label = format!(
@@ -4061,9 +3976,9 @@ fn map_caption(painter: &egui::Painter, rect: Rect, frame: &Frame) {
     );
 }
 
-fn north_marker(painter: &egui::Painter, viewport: &Rect) {
-    let x = viewport.center().x;
-    let top = viewport.top() + 12.0;
+fn north_marker(painter: &egui::Painter, rect: Rect) {
+    let x = rect.center().x;
+    let top = rect.top() + 12.0;
     painter.text(
         Pos2::new(x, top),
         Align2::CENTER_TOP,
@@ -4186,93 +4101,6 @@ fn gate_label(value: Option<GateValue>, product: RadarProduct) -> String {
         Some(GateValue::RangeFolded) => String::from("range folded"),
         None => String::from("no radar data"),
     }
-}
-
-fn readout(
-    ui: &egui::Ui,
-    frame: &Frame,
-    transform: &ViewTransform,
-    viewport: Rect,
-    bounds: Rect,
-    units: crate::units::UnitSystem,
-) {
-    let Some(position) = ui.input(|input| input.pointer.hover_pos()) else {
-        return;
-    };
-    if !bounds.contains(position) {
-        return;
-    }
-    let painter = ui.painter();
-    let info = match transform.pointer_info(position) {
-        Ok(info) => info,
-        Err(error) => {
-            painter.text(
-                position,
-                Align2::LEFT_TOP,
-                format!("Pointer unavailable: {error}"),
-                FontId::monospace(12.0),
-                ERROR,
-            );
-            return;
-        }
-    };
-    let (value, site) = if viewport.contains(position) {
-        let product = frame.geometry.product;
-        let value = match frame
-            .geometry
-            .lookup
-            .gate(&frame.volume, info.range_km, info.azimuth_deg)
-        {
-            Ok(Some(hit)) => format!(
-                "{} · {:.2}° beam",
-                gate_label(Some(hit.value), product),
-                hit.elevation_deg
-            ),
-            Ok(None) => gate_label(None, product),
-            Err(error) => format!("readout unavailable: {error}"),
-        };
-        (value, format!("{}: ", frame.volume.site))
-    } else {
-        (String::from("no radar data"), String::new())
-    };
-    let label = format!(
-        "{:.4}, {:.4}\n{}  {:.0}°\n{site}{value}",
-        info.lat,
-        info.lon,
-        crate::units::distance(info.range_km, units),
-        info.azimuth_deg
-    );
-    let stroke = Stroke::new(1.0_f32, TEXT);
-    painter.line_segment(
-        [
-            position - Vec2::new(6.0, 0.0),
-            position + Vec2::new(6.0, 0.0),
-        ],
-        stroke,
-    );
-    painter.line_segment(
-        [
-            position - Vec2::new(0.0, 6.0),
-            position + Vec2::new(0.0, 6.0),
-        ],
-        stroke,
-    );
-    let galley = painter.layout_no_wrap(label, FontId::monospace(12.0), TEXT);
-    let padding = Vec2::splat(6.0);
-    let size = galley.size() + 2.0 * padding;
-    let x = (position.x + 12.0).min((bounds.right() - size.x).max(bounds.left()));
-    let y = if position.y >= viewport.center().y {
-        (position.y - size.y - 12.0).max(bounds.top())
-    } else {
-        (position.y + 12.0).min((bounds.bottom() - size.y).max(bounds.top()))
-    };
-    let origin = Pos2::new(x, y);
-    painter.rect_filled(
-        Rect::from_min_size(origin, size),
-        CornerRadius::same(4),
-        Color32::from_black_alpha(220),
-    );
-    painter.galley(origin + padding, galley, TEXT);
 }
 
 impl eframe::App for OxradApp {

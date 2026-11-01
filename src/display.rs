@@ -22,7 +22,7 @@ use eframe::egui::{Rect, Shape};
 
 use crate::colormap::ColorTable;
 use crate::error::RenderError;
-use crate::gpu::{self, RadarGpu, RadarMesh};
+use crate::gpu::{RadarGpu, RadarMesh};
 use crate::product::RadarProduct;
 use crate::radar::{ArchiveOrigin, RadarVolume, RetrievedVolume};
 use crate::render::{self, RadarGeometry, Sampling};
@@ -40,9 +40,11 @@ pub struct Frame {
 }
 
 impl Frame {
-    /// The draw callback for this frame at the current viewport.
-    pub fn shape(&self, viewport: Rect) -> Option<Shape> {
-        self.mesh.as_ref().map(|mesh| gpu::shape(mesh, viewport))
+    /// The draw callback for this frame at one placement in one canvas.
+    pub fn shape(&self, gpu: &RadarGpu, rect: Rect, placement: render::Placement) -> Option<Shape> {
+        self.mesh
+            .as_ref()
+            .map(|mesh| gpu.shape(mesh, rect, placement))
     }
 }
 
@@ -172,24 +174,6 @@ impl Display {
             },
             None => false,
         }
-    }
-
-    /// Moves the current mesh into a geographic view. A missing mesh is a
-    /// valid empty product, not an error.
-    pub fn set_map_view(
-        &self,
-        scale_x: f32,
-        scale_y: f32,
-        origin: [f32; 2],
-    ) -> Result<(), RenderError> {
-        let Some(gpu) = self.gpu.as_ref() else {
-            return Ok(());
-        };
-        let Some(mesh) = self.frame.as_ref().and_then(|frame| frame.mesh.as_ref()) else {
-            return Ok(());
-        };
-        gpu.write_view(mesh, scale_x, scale_y, origin);
-        Ok(())
     }
 
     pub fn reset(&mut self) {
@@ -505,6 +489,7 @@ mod tests {
             volume,
             geometry: Ok(geometry),
             generation: 1,
+            elapsed: Duration::from_millis(7),
         });
         let request = requests
             .try_recv()
@@ -537,6 +522,7 @@ mod tests {
             volume: retrieved(100)?,
             geometry: Err(RenderError::Panic),
             generation: 1,
+            elapsed: Duration::from_millis(7),
         });
         let request = requests
             .try_recv()
