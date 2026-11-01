@@ -60,7 +60,9 @@ struct VertexOutput {
 
 @vertex fn vertex_main(input: VertexInput) -> VertexOutput {
     var output: VertexOutput;
-    output.position = vec4<f32>((input.offset_km + frame.origin) * frame.scale, 0.0, 1.0);
+    // The uniform carries a clip-space scale and a clip-space origin, so the
+    // projected offset is scaled and the origin is added afterwards.
+    output.position = vec4<f32>(input.offset_km * frame.scale + frame.origin, 0.0, 1.0);
     output.texcoord = input.texcoord;
     return output;
 }
@@ -409,10 +411,11 @@ impl egui_wgpu::CallbackTrait for RadarDraw {
 
 #[cfg(test)]
 mod tests {
-    use super::{UNIFORM_BYTES, frame_uniform};
+    use super::{SHADER, UNIFORM_BYTES, frame_uniform};
 
     use crate::render::Placement;
     use crate::test_support::TestError;
+    use naga::{Expression, Handle};
 
     fn component(bytes: [u8; UNIFORM_BYTES], offset: usize) -> Result<f32, TestError> {
         let slice = bytes
@@ -441,6 +444,134 @@ mod tests {
         assert_eq!(component(bytes, 16)?, 720.0, "texel columns");
         assert_eq!(component(bytes, 20)?, 1832.0, "texel rows");
         assert_eq!(component(bytes, 24)?, 1.0, "smoothing");
+        Ok(())
+    }
+
+    /// The term a position component is built from, once loads are stripped.
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+    enum Shape {
+        Scale,
+        Origin,
+        Offset,
+        Sum(Box<Shape>, Box<Shape>),
+        Product(Box<Shape>, Box<Shape>),
+        Other,
+    }
+
+    fn expression(function: &naga::Function, handle: Handle<Expression>) -> Option<&Expression> {
+        match function.expressions.try_get(handle) {
+            Ok(expression) => Some(expression),
+            Err(_) => None,
+        }
+    }
+
+    fn stripped(function: &naga::Function, mut handle: Handle<Expression>) -> Handle<Expression> {
+        while let Some(Expression::Load { pointer }) = expression(function, handle) {
+            handle = *pointer;
+        }
+        handle
+    }
+
+    fn leaf(function: &naga::Function, handle: Handle<Expression>) -> Option<Shape> {
+        let Expression::AccessIndex { base, index } =
+            expression(function, stripped(function, handle))?
+        else {
+            return None;
+        };
+        match expression(function, stripped(function, *base))? {
+            Expression::GlobalVariable(_) => match index {
+                0 => Some(Shape::Scale),
+                1 => Some(Shape::Origin),
+                _ => None,
+            },
+            Expression::FunctionArgument(0) => match index {
+                0 => Some(Shape::Offset),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn shape(function: &naga::Function, handle: Handle<Expression>, depth: u8) -> Shape {
+        if depth == 0 {
+            return Shape::Other;
+        }
+        if let Some(leaf) = leaf(function, handle) {
+            return leaf;
+        }
+        let Some(Expression::Binary { op, left, right }) =
+            expression(function, stripped(function, handle))
+        else {
+            return Shape::Other;
+        };
+        let left = shape(function, *left, depth - 1);
+        let right = shape(function, *right, depth - 1);
+        match op {
+            naga::BinaryOperator::Add => Shape::Sum(Box::new(left), Box::new(right)),
+            naga::BinaryOperator::Multiply => Shape::Product(Box::new(left), Box::new(right)),
+            _ => Shape::Other,
+        }
+    }
+
+    fn canonical(shape: Shape) -> Shape {
+        match shape {
+            Shape::Sum(left, right) => {
+                let [low, high] = sorted(*left, *right);
+                Shape::Sum(Box::new(low), Box::new(high))
+            }
+            Shape::Product(left, right) => {
+                let [low, high] = sorted(*left, *right);
+                Shape::Product(Box::new(low), Box::new(high))
+            }
+            other => other,
+        }
+    }
+
+    fn sorted(left: Shape, right: Shape) -> [Shape; 2] {
+        let mut pair = [canonical(left), canonical(right)];
+        pair.sort();
+        pair
+    }
+
+    /// The vertex stage is the only place the placement contract reaches the
+    /// GPU. A scale applied to the station's clip-space origin shrinks that
+    /// origin toward zero, which parks the echo at the canvas centre while the
+    /// map pans out from under it, so the shader source the pipeline compiles
+    /// is parsed here and its position expression is inspected.
+    #[test]
+    fn vertex_position_scales_the_offset_and_adds_the_origin() -> Result<(), TestError> {
+        let module = naga::front::wgsl::parse_str(SHADER)
+            .map_err(|error| TestError::from(format!("shader source: {error}")))?;
+        let vertex = module
+            .entry_points
+            .iter()
+            .find(|entry| entry.stage == naga::ShaderStage::Vertex)
+            .ok_or_else(|| TestError::from("the shader declares no vertex entry point"))?;
+        let mut position = None;
+        for statement in &vertex.function.body {
+            if let naga::Statement::Store { value, .. } = statement
+                && let Some(Expression::Compose { components, .. }) =
+                    expression(&vertex.function, *value)
+                && let [x, _, _] = components.as_slice()
+            {
+                position = Some(shape(&vertex.function, *x, 6));
+            }
+        }
+        let position = position.ok_or_else(|| {
+            TestError::from("the vertex stage writes no four-component clip position")
+        })?;
+        let expected = Shape::Sum(
+            Box::new(Shape::Product(
+                Box::new(Shape::Offset),
+                Box::new(Shape::Scale),
+            )),
+            Box::new(Shape::Origin),
+        );
+        assert_eq!(
+            canonical(position),
+            canonical(expected),
+            "the vertex stage must compute offset_km * scale + origin"
+        );
         Ok(())
     }
 }
