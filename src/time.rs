@@ -43,6 +43,22 @@ pub const fn civil_from_days(days: i64) -> (i32, u32, u32) {
     (civil_year as i32, month as u32, day as u32)
 }
 
+/// Days since the Unix epoch for a calendar date, the inverse of
+/// [`civil_from_days`].
+pub const fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let adjusted = if month <= 2 { year - 1 } else { year };
+    let era = adjusted.div_euclid(400);
+    let year_of_era = adjusted - era * 400;
+    let month_prime = if month > 2 { month - 3 } else { month + 9 };
+    // Widened before the arithmetic: a date in the far past or future would
+    // otherwise overflow the narrower intermediates.
+    let day_of_year = ((153 * month_prime + 2) / 5) as i64 + day as i64 - 1;
+    let day_of_era = (year_of_era as i64) * 365 + (year_of_era / 4) as i64
+        - (year_of_era / 100) as i64
+        + day_of_year;
+    (era as i64) * 146_097 + day_of_era - 719_468
+}
+
 pub fn format_utc(unix_ms: u64) -> Result<String, RadarError> {
     let days =
         i64::try_from(unix_ms / MS_PER_DAY).map_err(|source| RadarError::DateRange { source })?;
@@ -97,6 +113,18 @@ mod tests {
     #[test]
     fn formats_scan_timestamp() {
         assert_eq!(formatted(1_793_232_075_000), "2026-10-29 00:01:15 UTC");
+    }
+
+    #[test]
+    fn calendar_days_round_trip_with_the_formatter() {
+        for days in [-7_000_i64, -1, 0, 1, 20_656, 20_729] {
+            let (year, month, day) = civil_from_days(days);
+            assert_eq!(days_from_civil(year, month, day), days, "{days}");
+        }
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(2000, 1, 1), 10_957);
+        assert_eq!(days_from_civil(2026, 11, 1), 20_758);
+        assert_eq!(days_from_civil(2026, 10, 29), 20_755);
     }
 
     #[test]

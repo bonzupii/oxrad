@@ -34,6 +34,7 @@ use crate::global_radar::{
 };
 use crate::gpu::RadarGpu;
 use crate::history::{self, HistoryError, HistoryEvent, HistoryFeed};
+use crate::hydro_layer::HydroLayer;
 use crate::map::{self, MapError, MapView, WorldMap};
 use crate::overlay;
 use crate::pipeline::{Pipeline, PipelineState};
@@ -445,6 +446,7 @@ pub struct OxradApp {
     warning_refresh_due: Option<Instant>,
     quakes: QuakeLayer,
     satellite: SatelliteLayer,
+    hydro: HydroLayer,
     history: HistoryView,
 }
 
@@ -527,6 +529,7 @@ impl OxradApp {
             warning_refresh_due: None,
             quakes: QuakeLayer::new(),
             satellite: SatelliteLayer::new(),
+            hydro: HydroLayer::new(),
             history: HistoryView::new(),
         };
         if let Some(place) = &restored_place {
@@ -929,6 +932,7 @@ impl OxradApp {
         self.update_warnings();
         self.quakes.update(Instant::now());
         self.satellite.update(context, &self.map_view);
+        self.hydro.update(Instant::now(), &self.map_view);
         self.poll_global_radar(context);
     }
 
@@ -2414,6 +2418,7 @@ impl OxradApp {
     fn map_layer_rail(&mut self, ui: &mut egui::Ui) {
         let palette = self.config.theme.palette();
         self.satellite.rail(ui, &palette);
+        self.hydro.rail(ui, &palette);
         self.quake_rail(ui);
     }
 

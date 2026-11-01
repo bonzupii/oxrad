@@ -25,6 +25,8 @@ mod forecast;
 mod global_radar;
 mod gpu;
 mod history;
+mod hydro;
+mod hydro_layer;
 mod map;
 mod network;
 mod overlay;

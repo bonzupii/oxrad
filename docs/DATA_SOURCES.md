@@ -25,6 +25,7 @@ A source is never listed as available because an organisation publishes somethin
 | Basemap | Natural Earth | Global | Countries, settlements, admin-1 boundaries, rivers, major highways | Embedded GeoJSON | Static release | Public domain | Verified |
 | Earthquakes | USGS Earthquake Hazards Program | Global | Epicentre, magnitude and scale, depth, origin time, review status, tsunami flag, PAGER alert level, felt reports, event page | `earthquake.usgs.gov/earthquakes/feed/v1.0/summary/`, GeoJSON | Minute-scale, feeds summarise the past hour, day, week | United States Government work, public domain | Verified |
 | Satellite imagery | NASA EOSDIS GIBS | Global, Web Mercator, to level 9 for true colour and the vegetation index, level 8 for snow cover, level 7 for the temperature and chlorophyll layers, level 6 for the rest | MODIS Terra corrected reflectance, cloud-top temperature and height, aerosol optical depth, land-surface and sea-surface temperature, ocean chlorophyll, snow cover, eight-day NDVI, and GPM IMERG precipitation rate | `gibs.earthdata.nasa.gov/wmts/epsg3857/best/wmts.cgi`, WMTS KVP, PNG and JPEG tiles | Provider composites; the layer offers six days of archive and falls back a day when a composite is not built yet | NASA open data, no key required | Verified: tiles fetched for every layer; true colour, cloud-top temperature, and NDVI drawn in the application |
+| River discharge | Open-Meteo flood service (GloFAS) | Global river network grid | Daily river discharge in cubic metres per second, deterministic run plus ensemble members | `flood-api.open-meteo.com/v1/flood`, JSON | Daily, three weeks of past days and seven forecast days in the layer | CC BY 4.0, attribution required | Verified: 28-day record and 50 ensemble members read at 39.0, -96.2 |
 
 RainViewer is a processed composite. It is not Level II and cannot supply moment-level products. Attribution is displayed in map view.
 
@@ -75,7 +76,7 @@ Coverage claims for these networks stay out of the interface until an adapter wo
 | Wildfire hotspots | NASA FIRMS | Candidate |
 | Satellite imagery | NASA EUMETSAT and NOAA products | Candidate |
 | Air quality | OpenAQ | Candidate |
-| River levels | National hydrological services | Candidate |
+| River gauge levels | National hydrological services | Candidate: a gauge reading needs a national service per country, and the discharge layer uses a global model instead |
 | Lightning | Regional detection networks | Candidate |
 
 These are research targets. None has an adapter, and none appears as a layer.

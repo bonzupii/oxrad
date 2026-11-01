@@ -131,6 +131,15 @@ scroll() {
     done
     sleep 2
 }
+rail_scroll() {
+    local steps="$1"
+    "$tool_xdotool" mousemove 150 500
+    for _ in $(seq 1 "$steps"); do
+        "$tool_xdotool" click 5
+        sleep 0.15
+    done
+    sleep 2
+}
 drag() {
     local dx="$1" dy="$2" steps=10
     "$tool_xdotool" mousemove 700 450
@@ -160,6 +169,13 @@ case "$scenario" in
         "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/satellite-before.png"
         click 46 465
         sleep "${OXRAD_GUI_SATELLITE_SETTLE:-12}"
+        ;;
+    rivers)
+        click 240 28
+        "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/rivers-before.png"
+        click 60 707
+        sleep "${OXRAD_GUI_RIVERS_SETTLE:-14}"
+        rail_scroll 6
         ;;
     pan) drag 240 0 ;;
     zoom) scroll 10 ;;
@@ -234,6 +250,24 @@ if [[ "$scenario" == "satellite" ]]; then
         fail "the satellite layer changed $changed map samples; imagery never arrived"
     fi
     printf 'gui: satellite imagery redrew %s map samples\n' "$changed"
+fi
+
+if [[ "$scenario" == "rivers" ]]; then
+    # The rail below the imagery controls is where the discharge section and its
+    # hydrograph appear, so a layer that fails to fetch leaves that strip alone.
+    rail_sample() {
+        "$tool_pngtopnm" "$1" 2>/dev/null |
+            "$tool_pamcut" -left 0 -top 300 -width 320 -height 420 2>/dev/null |
+            "$scale_pnmscale" -xsize 160 -ysize 210 2>/dev/null |
+            "$scale_pnmtoplainpnm" 2>/dev/null |
+            awk 'NR <= 3 { next } { printf "%s %s %s\n", $1, $2, $3 }'
+    }
+    changed="$(diff <(rail_sample "$output/rivers-before.png") <(rail_sample "$png") |
+        grep -c '^[<>]' || true)"
+    if [[ -z "$changed" ]] || ((changed < 800)); then
+        fail "the river section changed $changed rail samples; the hydrograph never arrived"
+    fi
+    printf 'gui: river section redrew %s rail samples\n' "$changed"
 fi
 
 printf 'gui: %s ok (%sx%s, %s colours) %s\n' "$scenario" "$width" "$height" "$colours" "$png"
