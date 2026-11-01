@@ -71,6 +71,18 @@ impl JsonError {
         )
     }
 
+    /// Whether the provider says it holds nothing for this request, which for
+    /// an archive product usually means the date is newer than the archive.
+    pub const fn is_missing(&self) -> bool {
+        matches!(
+            self,
+            Self::Status {
+                status: 400 | 404,
+                ..
+            }
+        )
+    }
+
     /// The server's requested wait after a 429 or 503, when it supplied one.
     pub const fn retry_after(&self) -> Option<&str> {
         match self {

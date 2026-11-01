@@ -51,16 +51,28 @@ const RETRY_STEPS: u32 = 5;
 pub enum Imagery {
     TrueColor,
     CloudTopTemp,
+    CloudTopHeight,
     Aerosol,
     Precipitation,
+    LandSurfaceTemp,
+    SeaSurfaceTemp,
+    Chlorophyll,
+    SnowCover,
+    Vegetation,
 }
 
 impl Imagery {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 10] = [
         Self::TrueColor,
         Self::CloudTopTemp,
+        Self::CloudTopHeight,
         Self::Aerosol,
         Self::Precipitation,
+        Self::LandSurfaceTemp,
+        Self::SeaSurfaceTemp,
+        Self::Chlorophyll,
+        Self::SnowCover,
+        Self::Vegetation,
     ];
 
     /// The provider's layer identifier.
@@ -68,8 +80,14 @@ impl Imagery {
         match self {
             Self::TrueColor => "MODIS_Terra_CorrectedReflectance_TrueColor",
             Self::CloudTopTemp => "MODIS_Terra_Cloud_Top_Temp_Day",
+            Self::CloudTopHeight => "MODIS_Terra_Cloud_Top_Height_Day",
             Self::Aerosol => "MODIS_Terra_Aerosol",
             Self::Precipitation => "IMERG_Precipitation_Rate",
+            Self::LandSurfaceTemp => "MODIS_Terra_Land_Surface_Temp_Day",
+            Self::SeaSurfaceTemp => "MODIS_Terra_L2_Sea_Surface_Temp_Day",
+            Self::Chlorophyll => "MODIS_Terra_L2_Chlorophyll_A",
+            Self::SnowCover => "MODIS_Terra_NDSI_Snow_Cover",
+            Self::Vegetation => "MODIS_Terra_NDVI_8Day",
         }
     }
 
@@ -77,8 +95,14 @@ impl Imagery {
         match self {
             Self::TrueColor => "True color",
             Self::CloudTopTemp => "Cloud-top temperature",
+            Self::CloudTopHeight => "Cloud-top height",
             Self::Aerosol => "Aerosol optical depth",
             Self::Precipitation => "Precipitation rate",
+            Self::LandSurfaceTemp => "Land-surface temperature",
+            Self::SeaSurfaceTemp => "Sea-surface temperature",
+            Self::Chlorophyll => "Ocean chlorophyll",
+            Self::SnowCover => "Snow cover",
+            Self::Vegetation => "Vegetation index",
         }
     }
 
@@ -91,9 +115,27 @@ impl Imagery {
             Self::CloudTopTemp => {
                 "MODIS Terra daytime cloud-top temperature; cold tops mark deep convection."
             }
+            Self::CloudTopHeight => {
+                "MODIS Terra daytime cloud-top height; high tops mark overshooting convection."
+            }
             Self::Aerosol => "MODIS Terra aerosol optical depth where the retrieval is valid.",
             Self::Precipitation => {
                 "GPM IMERG precipitation rate, a merged satellite and gauge estimate."
+            }
+            Self::LandSurfaceTemp => {
+                "MODIS Terra daytime land-surface temperature, the skin temperature of the ground."
+            }
+            Self::SeaSurfaceTemp => {
+                "MODIS Terra daytime sea-surface temperature, blank where cloud hides the water."
+            }
+            Self::Chlorophyll => {
+                "MODIS Terra ocean chlorophyll-a, a proxy for phytoplankton and ocean colour, blank over land."
+            }
+            Self::SnowCover => {
+                "MODIS Terra snow cover by normalised difference snow index, drawn where snow is detected."
+            }
+            Self::Vegetation => {
+                "MODIS Terra eight-day normalised difference vegetation index composite; bright is green."
             }
         }
     }
@@ -102,7 +144,10 @@ impl Imagery {
     pub const fn level(self) -> u8 {
         match self {
             Self::TrueColor => 9,
-            Self::CloudTopTemp | Self::Aerosol | Self::Precipitation => 6,
+            Self::Vegetation => 9,
+            Self::SnowCover => 8,
+            Self::LandSurfaceTemp | Self::SeaSurfaceTemp | Self::Chlorophyll => 7,
+            Self::CloudTopTemp | Self::CloudTopHeight | Self::Aerosol | Self::Precipitation => 6,
         }
     }
 
@@ -111,14 +156,14 @@ impl Imagery {
     pub const fn format(self) -> &'static str {
         match self {
             Self::TrueColor => "image%2Fjpeg",
-            Self::CloudTopTemp | Self::Aerosol | Self::Precipitation => "image%2Fpng",
+            _ => "image%2Fpng",
         }
     }
 
     pub const fn content_type(self) -> &'static str {
         match self {
             Self::TrueColor => "image/jpeg",
-            Self::CloudTopTemp | Self::Aerosol | Self::Precipitation => "image/png",
+            _ => "image/png",
         }
     }
 
@@ -128,8 +173,16 @@ impl Imagery {
         match self {
             Self::TrueColor => "Natural color; no measurement scale applies.",
             Self::CloudTopTemp => "The provider's own cloud-top temperature colour map.",
+            Self::CloudTopHeight => "The provider's own cloud-top height colour map.",
             Self::Aerosol => "Transparent where the retrieval has no valid value.",
             Self::Precipitation => "Transparent where the estimate is zero.",
+            Self::LandSurfaceTemp => "The provider's own skin-temperature colour map.",
+            Self::SeaSurfaceTemp => "The provider's own sea-surface temperature colour map.",
+            Self::Chlorophyll => {
+                "The provider's own chlorophyll colour map; transparent over land."
+            }
+            Self::SnowCover => "Drawn only where the index detects snow; transparent elsewhere.",
+            Self::Vegetation => "The provider's own NDVI colour map; transparent over water.",
         }
     }
 
@@ -178,6 +231,17 @@ impl Error for SatelliteError {
 }
 
 impl SatelliteError {
+    /// Whether the provider says it holds nothing for the requested date.
+    ///
+    /// A composite that is still being built answers this way, so the layer
+    /// walks back to the newest day the archive does hold.
+    pub const fn is_missing(&self) -> bool {
+        match self {
+            Self::Provider { source } => source.is_missing(),
+            Self::Shape { .. } | Self::Image { .. } | Self::WorkerStopped => false,
+        }
+    }
+
     pub const fn is_transient(&self) -> bool {
         match self {
             Self::Provider { source } => source.is_transient(),
@@ -490,6 +554,7 @@ pub struct SatelliteLayer {
     shown: bool,
     imagery: Imagery,
     day_offset: u8,
+    lag: u8,
     opacity: u8,
     generation: u64,
     planned: Option<String>,
@@ -506,6 +571,7 @@ impl SatelliteLayer {
             shown: false,
             imagery: Imagery::TrueColor,
             day_offset: 0,
+            lag: 0,
             opacity: 235,
             generation: 0,
             planned: None,
@@ -539,7 +605,7 @@ impl SatelliteLayer {
                 return;
             }
         };
-        let day = match day_for(self.day_offset) {
+        let day = match day_for(self.day_offset.saturating_add(self.lag)) {
             Ok(day) => day,
             Err(message) => {
                 self.record_failure(message, false);
@@ -663,11 +729,32 @@ impl SatelliteLayer {
                     if generation != self.generation {
                         continue;
                     }
-                    let transient = error.is_transient();
-                    self.record_failure(format!("{error}"), transient);
+                    self.failed(&error);
                 }
             }
         }
+    }
+
+    /// Handles a provider failure: a composite that is still being built is not
+    /// a failure of the layer, because the archive simply stops a few days back.
+    /// That case walks to the newest day the archive does hold; anything else is
+    /// a failure with the usual retry.
+    fn failed(&mut self, error: &SatelliteError) {
+        let newest = self.day_offset.saturating_add(self.lag);
+        if error.is_missing() && newest < DAYS_BACK {
+            self.lag = self.lag.saturating_add(1);
+            self.failures = 0;
+            self.retry_due = None;
+            self.planned = None;
+            let asked = day_for(newest).map_or_else(|reason| reason, |day| day.path());
+            self.status = Status::Failed {
+                message: format!("NASA holds no tile for {asked} yet; asking for the day before"),
+                retrying: false,
+            };
+            return;
+        }
+        let transient = error.is_transient();
+        self.record_failure(format!("{error}"), transient);
     }
 
     /// Draws the imagery under the vector geography, inside the map canvas.
@@ -741,6 +828,7 @@ impl SatelliteLayer {
         if chosen != self.imagery {
             self.imagery = chosen;
             self.planned = None;
+            self.lag = 0;
         }
         ui.label(
             RichText::new(self.imagery.description())
@@ -762,18 +850,22 @@ impl SatelliteLayer {
             {
                 self.day_offset = offset;
                 self.planned = None;
+                self.lag = 0;
             }
-            let text = match day_for(self.day_offset) {
+            let text = match day_for(self.day_offset.saturating_add(self.lag)) {
                 Ok(day) => day.path(),
                 Err(message) => format!("unavailable: {message}"),
             };
             ui.label(RichText::new(text).size(theme::TYPE_SMALL).strong());
         });
-        ui.label(
-            RichText::new("Zero is today; the slider walks back through the archive.")
-                .size(theme::TYPE_SMALL)
-                .weak(),
-        );
+        let arrived = if self.lag == 0 {
+            String::from("Zero is today; the slider walks back through the archive.")
+        } else {
+            String::from(
+                "NASA has no composite for the newest day you picked, so this is the day before it. Zero is today.",
+            )
+        };
+        ui.label(RichText::new(arrived).size(theme::TYPE_SMALL).weak());
         self.rail_report(ui);
     }
 
@@ -885,6 +977,61 @@ mod tests {
         assert_eq!(Imagery::Aerosol.format(), "image%2Fpng");
         assert!(Imagery::CloudTopTemp.is_measurement());
         assert!(!Imagery::TrueColor.is_measurement());
+        for imagery in Imagery::ALL {
+            assert_eq!(imagery.is_measurement(), imagery != Imagery::TrueColor);
+            let format = if imagery == Imagery::TrueColor {
+                "image%2Fjpeg"
+            } else {
+                "image%2Fpng"
+            };
+            assert_eq!(imagery.format(), format);
+        }
+        assert_eq!(Imagery::TrueColor.format(), "image%2Fjpeg");
+    }
+
+    #[test]
+    fn every_planned_tile_lies_inside_its_own_zoom() -> Result<(), SatelliteError> {
+        for imagery in Imagery::ALL {
+            let plan = plan_view(imagery, 39.0, -96.23, 950.0)?;
+            let count = 1_u32 << plan.zoom;
+            assert_eq!(plan.zoom, plan.tiles.first().map_or(plan.zoom, |t| t.zoom));
+            for tile in &plan.tiles {
+                assert!(
+                    tile.x < count,
+                    "{}: column {} at zoom {}",
+                    imagery.layer(),
+                    tile.x,
+                    tile.zoom
+                );
+                assert!(
+                    tile.y < count,
+                    "{}: row {} at zoom {}",
+                    imagery.layer(),
+                    tile.y,
+                    tile.zoom
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_layer_names_its_own_product_and_tile_level() {
+        let mut layers: Vec<&str> = Imagery::ALL.iter().map(|imagery| imagery.layer()).collect();
+        layers.sort_unstable();
+        let count = layers.len();
+        layers.dedup();
+        assert_eq!(layers.len(), count, "two products share a layer identifier");
+        // The levels are the ones the provider's capabilities document gives
+        // each layer; asking above them returns nothing.
+        assert_eq!(Imagery::TrueColor.level(), 9);
+        assert_eq!(Imagery::Vegetation.level(), 9);
+        assert_eq!(Imagery::SnowCover.level(), 8);
+        assert_eq!(Imagery::Chlorophyll.level(), 7);
+        assert_eq!(Imagery::SeaSurfaceTemp.level(), 7);
+        assert_eq!(Imagery::LandSurfaceTemp.level(), 7);
+        assert_eq!(Imagery::CloudTopHeight.level(), 6);
+        assert_eq!(Imagery::Precipitation.level(), 6);
     }
 
     #[test]
@@ -967,6 +1114,64 @@ mod tests {
         assert!(matches!(
             layer.status,
             Status::Failed { retrying: true, .. }
+        ));
+    }
+
+    fn status_error(status: u16) -> SatelliteError {
+        SatelliteError::Provider {
+            source: JsonError::Status {
+                url: String::from("https://example.invalid/tile"),
+                status,
+                retry_after: None,
+            },
+        }
+    }
+
+    #[test]
+    fn a_missing_composite_walks_back_a_day_instead_of_retrying() {
+        let mut layer = SatelliteLayer::new();
+        layer.shown = true;
+        layer.planned = Some(String::from("the newest day"));
+        layer.failed(&status_error(404));
+        assert_eq!(layer.lag, 1);
+        assert!(layer.planned.is_none(), "the day before is planned again");
+        assert!(layer.retry_due.is_none(), "a missing day is not an outage");
+        assert!(matches!(
+            layer.status,
+            Status::Failed {
+                retrying: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_provider_outage_retries_where_it_is() {
+        let mut layer = SatelliteLayer::new();
+        layer.shown = true;
+        layer.planned = Some(String::from("the same day"));
+        layer.failed(&status_error(503));
+        assert_eq!(layer.lag, 0, "an outage does not move the archive day");
+        assert!(layer.retry_due.is_some());
+        assert!(matches!(
+            layer.status,
+            Status::Failed { retrying: true, .. }
+        ));
+    }
+
+    #[test]
+    fn the_archive_walk_stops_at_the_oldest_day_the_layer_offers() {
+        let mut layer = SatelliteLayer::new();
+        layer.shown = true;
+        layer.day_offset = DAYS_BACK;
+        layer.failed(&status_error(404));
+        assert_eq!(layer.lag, 0);
+        assert!(matches!(
+            layer.status,
+            Status::Failed {
+                retrying: false,
+                ..
+            }
         ));
     }
 
