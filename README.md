@@ -20,7 +20,7 @@ This is a pre-release build. The radar display works. The product around it does
 | Offline vector basemap | Working at country scale only |
 | Global radar composite | Working: RainViewer, two-hour loop |
 | Forecast | Working: Open-Meteo, global |
-| Place search | Working with exact names; live and fuzzy matching are not implemented |
+| Place search | Working: live partial and transposed names via Photon; proximity ranking absent |
 | Warnings | United States only |
 | Radar outside the United States | RainViewer composite only; no national Level II adapter |
 | Units selection | Partial: distance and temperature convert; other quantities do not |
@@ -80,7 +80,7 @@ The cache holds up to 256 entries and 128 MiB. Every body is verified against it
 | National Weather Service station directory | Station discovery | United States and territories | Public domain |
 | National Weather Service active alerts | Warnings | United States and territories | Public domain |
 | Open-Meteo | Forecast | Global | CC BY 4.0 |
-| OpenStreetMap Nominatim | Place search | Global | ODbL |
+| OpenStreetMap contributors, Photon | Place search | Global | ODbL |
 | RainViewer | Reflectivity composite | 1,200 or more radars, 150 or more countries | Free terms, attribution required |
 
 Attribution is displayed in the application. Details and researched but unintegrated sources are in [docs/DATA_SOURCES.md](docs/DATA_SOURCES.md).
@@ -92,9 +92,9 @@ Requests identify the client as `oxrad/<version> (https://github.com/bonzupii/ox
 - Radar moments outside the United States are not decoded. No DWD, ECCC, BoM, JMA, CMA, IMD, OPERA, or ODIM reader exists.
 - The basemap has no roads, streets, terrain, hydrography, or settlement detail.
 - Radar range rings and the grid are not drawn in map view.
-- Units cannot be switched. Forecast units are whatever the provider returns.
+- Units selection covers distance and temperature; wind speed, precipitation, pressure, and elevation still use provider units.
 - There is one dark palette per product. No colourblind-safe alternative exists.
-- Search requires Enter or the Search button and matches names rather than accepting partial or misspelled input.
+- Search ranks by name match only; results are not biased toward the current map centre.
 - Warnings cover the United States and its territories only.
 - Layers cannot be reordered, grouped, or made partially transparent. Warnings, global radar, and station overlays each have an independent toggle and nothing else.
 - Pan and zoom performance has not been measured.
