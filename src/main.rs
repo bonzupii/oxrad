@@ -35,6 +35,7 @@ mod projection;
 mod provider;
 mod radar;
 mod radar_controls;
+mod raster;
 mod render;
 mod retry;
 mod stations;

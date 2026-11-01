@@ -125,6 +125,13 @@ pub fn draw_legend(
         FontId::monospace(10.0),
         palette.canvas_text,
     );
+    painter.text(
+        Pos2::new(x + LEGEND_WIDTH / 2.0, top + height + 12.0),
+        Align2::CENTER_TOP,
+        product.scale_label(),
+        FontId::monospace(9.0),
+        palette.canvas_text,
+    );
     for index in 0..LEGEND_BANDS {
         let fraction = (index as f32 + 0.5) / LEGEND_BANDS as f32;
         let rgba = match legend_colour(table, product, fraction) {

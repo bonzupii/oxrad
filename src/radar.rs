@@ -60,8 +60,6 @@ pub struct MomentBins {
     pub first_gate_km: f64,
     pub gate_width_km: f64,
     pub values: Vec<GateValue>,
-    pub below_threshold: usize,
-    pub range_folded: usize,
 }
 
 /// One gate column of a sweep: its azimuth boundaries and every moment the
@@ -95,6 +93,8 @@ pub struct RadarSweep {
 }
 
 impl RadarSweep {
+    /// Every gate the sweep collected, across all its moments.
+    #[cfg(test)]
     pub fn gate_count(&self) -> usize {
         self.radials
             .iter()
@@ -330,21 +330,11 @@ fn parse_radial(radial: &DigitalRadarData) -> Result<Radial, RadialDefect> {
         }
         let values =
             decode_moment(block).map_err(|source| RadialDefect::Moment { product, source })?;
-        let below_threshold = values
-            .iter()
-            .filter(|value| matches!(value, GateValue::BelowThreshold))
-            .count();
-        let range_folded = values
-            .iter()
-            .filter(|value| matches!(value, GateValue::RangeFolded))
-            .count();
         moments.push(MomentBins {
             product,
             first_gate_km,
             gate_width_km,
             values,
-            below_threshold,
-            range_folded,
         });
     }
     if moments.is_empty() {
@@ -1337,8 +1327,6 @@ mod tests {
                 first_gate_km: 2.0,
                 gate_width_km: 0.25,
                 values: vec![GateValue::Measured(20.0); gates],
-                below_threshold: 0,
-                range_folded: 0,
             }],
         }
     }
@@ -1886,27 +1874,6 @@ mod tests {
             volume.sweep.gate_count(),
             "gate categories partition the gates"
         );
-        for product in &volume.sweep.products {
-            let gates = volume
-                .sweep
-                .radials
-                .iter()
-                .filter_map(|radial| radial.moment(*product))
-                .map(|moment| moment.values.len())
-                .sum::<usize>();
-            let below = volume
-                .sweep
-                .radials
-                .iter()
-                .filter_map(|radial| radial.moment(*product))
-                .map(|moment| moment.below_threshold)
-                .sum::<usize>();
-            assert!(
-                below <= gates,
-                "{} below-threshold count {below} exceeds {gates} gates",
-                product.id()
-            );
-        }
         assert_eq!(volume.skipped_radials, 0, "no radial is skipped");
 
         let geometry = crate::render::build_geometry_for(
@@ -1914,7 +1881,8 @@ mod tests {
             RadarProduct::Reflectivity,
             crate::colormap::ColorTable::Standard,
         )?;
-        assert!(geometry.index_count > 0, "mesh has triangles");
+        assert!(geometry.lattice.index_count > 0, "lattice has triangles");
+        assert_eq!(geometry.raster.counts.mismatched_radials, 0, "gate grid");
         // Web Mercator stretches ground distance by 1/cos(latitude). The mesh
         // bounds reach the poleward edge of the sweep, where that factor is
         // largest, so the extent lies between the factor at the site and the

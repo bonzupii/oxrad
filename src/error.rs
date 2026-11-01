@@ -161,6 +161,11 @@ pub enum ConfigError {
         line: usize,
         value: String,
     },
+    InvalidSampling {
+        path: PathBuf,
+        line: usize,
+        value: String,
+    },
     UnknownKey {
         path: PathBuf,
         line: usize,
@@ -215,6 +220,10 @@ impl ConfigError {
                 "{} line {line} sets the palette to {value:?}, which is not a supported color table.",
                 path.display()
             ),
+            Self::InvalidSampling { path, line, value } => format!(
+                "{} line {line} sets the interpolation to {value:?}, which is neither nearest nor bilinear.",
+                path.display()
+            ),
             Self::UnknownKey { path, line, key } => format!(
                 "{} line {line} sets the unrecognized key {key}.",
                 path.display()
@@ -264,6 +273,7 @@ impl Error for ConfigError {
             | Self::InvalidUnit { .. }
             | Self::InvalidTheme { .. }
             | Self::InvalidPalette { .. }
+            | Self::InvalidSampling { .. }
             | Self::UnknownKey { .. }
             | Self::IncompletePlaceEntry { .. }
             | Self::PlaceNumber { .. } => None,
@@ -801,9 +811,6 @@ pub enum RenderError {
     Coordinate {
         source: CoordinateError,
     },
-    Color {
-        source: ColorMapError,
-    },
     ProductUnavailable {
         product: RadarProduct,
         elevation: u8,
@@ -828,9 +835,6 @@ impl RenderError {
             Self::Coordinate { source } => {
                 format!("Radar geographic placement failed: {source}")
             }
-            Self::Color { source } => {
-                format!("Failed to map radar value to a color: {source}")
-            }
             Self::ProductUnavailable { product, elevation } => {
                 format!(
                     "{} is unavailable in radar sweep {elevation}.",
@@ -854,7 +858,6 @@ impl Error for RenderError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Coordinate { source } => Some(source),
-            Self::Color { source } => Some(source),
             Self::WorkerStopped
             | Self::GpuUnavailable
             | Self::Panic

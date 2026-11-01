@@ -429,6 +429,7 @@ impl OxradApp {
         let restored_site = initial.or_else(|| config.site.clone());
         let restored_place = config.place.clone();
         let color_table = config.color_table;
+        let sampling = config.sampling;
         let stations = match stations::load_cache() {
             Ok(Some(cached)) => Ok(cached),
             Ok(None) => Err(StationError::NoStations),
@@ -450,7 +451,7 @@ impl OxradApp {
             place: restored_place.clone(),
             site: None,
             pipeline: None,
-            display: Display::new(gpu, color_table),
+            display: Display::new(gpu, color_table, sampling),
             forecast: ForecastView::new(),
             product: RadarProduct::Reflectivity,
             station_query: String::new(),
@@ -593,6 +594,14 @@ impl OxradApp {
         }
     }
 
+    fn apply_sampling(&mut self) {
+        let sampling = self.config.sampling;
+        self.display.set_sampling(sampling);
+        for layer in &mut self.view_radars {
+            layer.display.set_sampling(sampling);
+        }
+    }
+
     fn focus_map_context(&mut self) {
         let place = self
             .place
@@ -647,7 +656,11 @@ impl OxradApp {
         for site in sites {
             layers.push(ViewRadar {
                 pipeline: Pipeline::start(site.clone()),
-                display: Display::new(Some(gpu.clone()), self.config.color_table),
+                display: Display::new(
+                    Some(gpu.clone()),
+                    self.config.color_table,
+                    self.config.sampling,
+                ),
                 site,
                 failure_reported: false,
             });
@@ -1186,11 +1199,20 @@ impl OxradApp {
             station.capabilities(),
             volume,
             self.product,
+            self.config.sampling,
             !self.display.state.is_busy(),
         );
         let (product, elevation) = match selection {
             Some(Selection::Product(product)) => (product, None),
             Some(Selection::Elevation(elevation)) => (self.product, Some(elevation)),
+            Some(Selection::Sampling(sampling)) => {
+                if self.config.sampling != sampling {
+                    self.config.sampling = sampling;
+                    self.save_config();
+                    self.apply_sampling();
+                }
+                return;
+            }
             None => return,
         };
         if self.display.rebuild(product, elevation) {
@@ -3466,7 +3488,7 @@ impl OxradApp {
         if let Some(shape) = frame.shape(viewport) {
             ui.painter().add(shape);
         }
-        if frame.mesh.is_none() {
+        if frame.geometry.raster.is_empty() {
             ui.painter().text(
                 rect.center(),
                 Align2::CENTER_CENTER,
@@ -4093,27 +4115,37 @@ fn scan_status(ui: &mut egui::Ui, frame: &Frame, failed: bool) {
 fn diagnostics(ui: &mut egui::Ui, frame: &Frame, catalog: Option<&Station>) {
     let volume = &frame.volume;
     let product = frame.geometry.product;
-    let (gates, below, folded) = volume
-        .sweep
-        .radials
-        .iter()
-        .filter_map(|radial| radial.moment(product))
-        .fold((0_usize, 0_usize, 0_usize), |counts, moment| {
-            (
-                counts.0.saturating_add(moment.values.len()),
-                counts.1.saturating_add(moment.below_threshold),
-                counts.2.saturating_add(moment.range_folded),
-            )
-        });
+    let counts = frame.geometry.raster.counts;
     let radials = volume.sweep.radials.len();
-    let total_gates = volume.sweep.gate_count();
     let max_range = volume.sweep.max_ground_range_km;
     let skipped = volume.skipped_radials;
     let non_data = volume.skipped_non_data;
+    let (minimum, maximum) = product.value_range();
     let id = product.id();
     let text = format!(
-        "{radials} radials · {total_gates} gates total · {gates} {id} gates · {below} below threshold · {folded} range folded · {max_range:.0} km · Skipped radials: {skipped} · Non-data messages: {non_data}"
+        "{radials} radials · {id} {minimum} to {maximum} · drawn {} · below threshold {} · range folded {} · below the floor {} · above the scale {} · unreadable {} · {max_range:.0} km · built in {} ms, uploaded in {} ms",
+        counts.drawn,
+        counts.below_threshold,
+        counts.range_folded,
+        counts.below_scale,
+        counts.above_scale,
+        counts.not_finite,
+        frame.built_in.as_millis(),
+        frame.uploaded_in.as_millis(),
     );
+    let text = if counts.mismatched_radials > 0 {
+        format!(
+            "{text} · {} radials on a different gate spacing",
+            counts.mismatched_radials
+        )
+    } else {
+        text
+    };
+    let text = if skipped > 0 {
+        format!("{text} · Skipped radials: {skipped} · Non-data messages: {non_data}")
+    } else {
+        text
+    };
     let catalog_note =
         catalog.map_or_else(String::new, |station| {
             match crate::projection::inverse(

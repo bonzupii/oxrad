@@ -19,11 +19,13 @@ use eframe::egui::{self, RichText};
 
 use crate::product::RadarProduct;
 use crate::radar::RadarVolume;
+use crate::render::Sampling;
 use crate::theme;
 
 pub enum Selection {
     Product(RadarProduct),
     Elevation(u8),
+    Sampling(Sampling),
 }
 
 pub fn show(
@@ -31,6 +33,7 @@ pub fn show(
     capabilities: &[RadarProduct],
     volume: &RadarVolume,
     selected: RadarProduct,
+    sampling: Sampling,
     enabled: bool,
 ) -> Option<Selection> {
     let mut selection = None;
@@ -98,5 +101,17 @@ pub fn show(
             ui.label("This volume does not contain the selected product.");
         }
     });
+    ui.add_space(theme::SPACE_S);
+    ui.label(RichText::new("Rendering").size(theme::TYPE_BODY));
+    for mode in Sampling::ALL {
+        if ui
+            .selectable_label(sampling == mode, mode.label())
+            .on_hover_text(mode.description())
+            .clicked()
+            && sampling != mode
+        {
+            selection = Some(Selection::Sampling(mode));
+        }
+    }
     selection
 }

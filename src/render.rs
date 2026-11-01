@@ -15,41 +15,108 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 //! Radar gate geometry, overlay geometry, and the screen transform.
 //!
-//! Every gate corner is placed with the WGS84 geodesic direct solution from the
-//! site after its slant range is converted to ground range, then projected to
-//! Web Mercator. Vertices carry kilometre offsets from the site, which the GPU
-//! scales into the viewport, so one mesh serves every window size. The pointer
+//! A frame is a texel per gate plus a lattice that carries both the geodesic
+//! position of every lattice corner and its coordinate in the raster. The GPU
+//! interpolates the lattice and filters the raster, so gate placement is the
+//! WGS84 direct solution while the image itself is drawn in one pass. Building
+//! a textured quad per gate instead cost tens of megabytes per frame and made
+//! every redraw and zoom pay for a million triangles.
+//!
+//! Lattice vertices carry kilometre offsets from the site, which the shader
+//! scales into the viewport, so one frame serves every window size. The pointer
 //! lookup inverts the same model.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::{Duration, Instant};
 
-use eframe::egui::{Color32, Pos2, Rect, Vec2};
+use eframe::egui::{Pos2, Rect, Vec2};
 
-use crate::colormap::{ColorTable, color_for_product_with, range_folded_color};
+use crate::colormap::ColorTable;
 use crate::error::{CoordinateError, RenderError};
 use crate::product::RadarProduct;
 use crate::projection;
 use crate::radar::{GateValue, RadarVolume, RadialBins, RetrievedVolume};
+use crate::raster::{self, GateGrid, RadarRaster};
 
-const RADAR_ALPHA: u8 = 255;
-const VERTEX_BYTES: usize = 12;
 /// Half-width of the radar disc as a fraction of the viewport side.
 const VIEW_MARGIN: f64 = 0.48;
 const RING_STEP_KM: f64 = 50.0;
 const RING_SAMPLES: u32 = 128;
 const GRID_SAMPLES: u32 = 64;
 const GRID_DEGREES_EACH_SIDE: i32 = 3;
+/// Bytes per lattice vertex: position and texture coordinate.
+pub const LATTICE_STRIDE: usize = 16;
+/// Range subdivisions between the site and the farthest gate.
+///
+/// Gate spacing is uniform along a radial, but ground range is not linear in
+/// slant range. Sixty-four subdivisions keep the lattice's linear interpolation
+/// of ground range inside a fraction of a metre at every elevation angle the
+/// radar scans.
+const LATTICE_RANGE_STEPS: usize = 64;
 
+/// How a frame's raster is sampled onto the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Sampling {
+    /// Each screen pixel takes the colour of the gate that covers it.
+    #[default]
+    Nearest,
+    /// Colours are blended between neighbouring gates.
+    Bilinear,
+}
+
+impl Sampling {
+    /// Every selectable sampling mode, in menu order.
+    pub const ALL: [Self; 2] = [Self::Nearest, Self::Bilinear];
+
+    /// The control label.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Nearest => "Nearest gate",
+            Self::Bilinear => "Smoothed",
+        }
+    }
+
+    /// The configuration token written to disk.
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Nearest => "nearest",
+            Self::Bilinear => "bilinear",
+        }
+    }
+
+    /// Parses a configuration token.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "nearest" => Some(Self::Nearest),
+            "bilinear" => Some(Self::Bilinear),
+            _ => None,
+        }
+    }
+
+    /// What the mode does to the measured data.
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Nearest => "Shows each measured gate as its own block.",
+            Self::Bilinear => "Blends between gates for display only; no new measurements.",
+        }
+    }
+}
+
+/// One geodesic circle around the site.
 pub struct RangeRing {
+    /// Radius in kilometres of ground range.
     pub range_km: f64,
+    /// The circle's points, as site-relative kilometre offsets.
     pub points: Vec<Pos2>,
 }
 
 /// The gate under a map point.
 #[derive(Debug, Clone, Copy)]
 pub struct GateHit {
+    /// The gate's value as the radar reported it.
     pub value: GateValue,
+    /// The elevation angle of the radial that carries it.
     pub elevation_deg: f64,
 }
 
@@ -162,20 +229,104 @@ impl SweepLookup {
     }
 }
 
+/// The mesh that places raster texels on the map.
+pub struct Lattice {
+    /// Interleaved `x, y, u, v` vertices, site-relative and north-positive.
+    pub vertices: Vec<u8>,
+    /// Triangle indices into `vertices`.
+    pub indices: Vec<u8>,
+    /// Index count the draw call submits.
+    pub index_count: u32,
+}
+
+impl Lattice {
+    /// The site-relative kilometre offset of a vertex.
+    #[cfg(test)]
+    pub fn position(&self, index: usize) -> Option<Pos2> {
+        let start = index.checked_mul(LATTICE_STRIDE)?;
+        Some(Pos2::new(
+            read_f32(&self.vertices, start)?,
+            read_f32(&self.vertices, start + 4)?,
+        ))
+    }
+
+    /// The raster coordinate of a vertex, from zero to one on each axis.
+    #[cfg(test)]
+    pub fn texcoord(&self, index: usize) -> Option<Pos2> {
+        let start = index.checked_mul(LATTICE_STRIDE)?;
+        Some(Pos2::new(
+            read_f32(&self.vertices, start + 8)?,
+            read_f32(&self.vertices, start + 12)?,
+        ))
+    }
+
+    /// Whether the lattice has nothing to draw.
+    pub const fn is_empty(&self) -> bool {
+        self.index_count == 0
+    }
+
+    fn reserved(vertex_count: usize, quad_count: usize) -> Self {
+        Self {
+            vertices: Vec::with_capacity(vertex_count.saturating_mul(LATTICE_STRIDE)),
+            indices: Vec::with_capacity(quad_count.saturating_mul(6 * 4)),
+            index_count: 0,
+        }
+    }
+
+    fn push_vertex(&mut self, offset: Pos2, texcoord: Pos2) {
+        for value in [offset.x, offset.y, texcoord.x, texcoord.y] {
+            self.vertices.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    /// Adds the two triangles of the lattice cell whose near-left corner is
+    /// `base`, with `row_stride` vertices between one row and the next.
+    fn push_quad(&mut self, base: u32, row_stride: u32) -> Result<(), RenderError> {
+        let below = base.checked_add(row_stride).ok_or(RenderError::MeshSize {
+            vertices: self.vertices.len() / LATTICE_STRIDE,
+        })?;
+        for index in [base, base + 1, below + 1, base, below + 1, below] {
+            self.indices.extend_from_slice(&index.to_le_bytes());
+        }
+        self.index_count =
+            u32::try_from(self.indices.len() / 4).map_err(|_| RenderError::MeshSize {
+                vertices: self.vertices.len() / LATTICE_STRIDE,
+            })?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn read_f32(buffer: &[u8], start: usize) -> Option<f32> {
+    let bytes: [u8; 4] = buffer.get(start..start + 4)?.try_into().ok()?;
+    Some(f32::from_le_bytes(bytes))
+}
+
 /// Everything a frame draws, built once per volume off the UI thread.
 pub struct RadarGeometry {
+    /// Radius the view is scaled to, in kilometres.
     pub extent_km: f64,
-    pub vertices: Vec<u8>,
-    pub indices: Vec<u8>,
-    pub index_count: u32,
+    /// Gate colours, one texel per gate.
+    pub raster: RadarRaster,
+    /// The mesh that samples the raster.
+    pub lattice: Lattice,
+    /// Range rings around the site.
     pub rings: Vec<RangeRing>,
+    /// Latitude and longitude graticule.
     pub grid: Vec<Vec<Pos2>>,
+    /// Pointer lookup into the drawn sweep.
     pub lookup: SweepLookup,
+    /// The product the raster was coloured for.
     pub product: RadarProduct,
+    /// The table the raster was coloured with.
     pub color_table: ColorTable,
+    /// Site latitude.
     pub site_lat: f64,
+    /// Site longitude.
     pub site_lon: f64,
+    /// Site Web Mercator x.
     pub site_x: f64,
+    /// Site Web Mercator y.
     pub site_y: f64,
 }
 
@@ -190,6 +341,8 @@ pub struct BuildResult {
     pub volume: RetrievedVolume,
     pub geometry: Result<RadarGeometry, RenderError>,
     pub generation: u64,
+    /// How long the raster and lattice took to build, off the UI thread.
+    pub elapsed: Duration,
 }
 
 /// Runs geometry construction on its own thread; a panic is reported, not fatal.
@@ -198,6 +351,7 @@ pub fn start_build_thread() -> (Sender<BuildRequest>, Receiver<BuildResult>) {
     let (result_sender, result_receiver) = mpsc::channel::<BuildResult>();
     std::thread::spawn(move || {
         while let Ok(request) = request_receiver.recv() {
+            let started = Instant::now();
             let geometry = catch_unwind(AssertUnwindSafe(|| {
                 build_geometry_for(&request.volume.volume, request.product, request.color_table)
             }))
@@ -207,6 +361,7 @@ pub fn start_build_thread() -> (Sender<BuildRequest>, Receiver<BuildResult>) {
                 volume: request.volume,
                 geometry,
                 generation: request.generation,
+                elapsed: started.elapsed(),
             };
             if result_sender.send(result).is_err() {
                 return;
@@ -225,124 +380,76 @@ pub fn place_offset(lat: f64, lon: f64, site_x: f64, site_y: f64) -> Result<Pos2
     ))
 }
 
-fn place_corner(
-    path: &projection::GeodesicPath,
-    range_km: f64,
+/// The azimuth and elevation of the lattice column at `column`.
+fn column_angles(radials: &[RadialBins], column: usize) -> Option<(f64, f64)> {
+    radials.get(column).map_or_else(
+        || {
+            radials
+                .last()
+                .map(|last| (last.azimuth_right_deg, last.elevation_deg))
+        },
+        |radial| Some((radial.azimuth_left_deg, radial.elevation_deg)),
+    )
+}
+
+/// The vertex count of a lattice with `columns` radial boundaries and `rows`
+/// range subdivisions.
+fn lattice_shape(radials: usize, grid: GateGrid) -> (usize, usize) {
+    let rows = LATTICE_RANGE_STEPS.min(grid.gate_count.max(1));
+    (radials.saturating_add(1), rows)
+}
+
+fn build_lattice(
+    volume: &RadarVolume,
+    grid: GateGrid,
     site_x: f64,
     site_y: f64,
-) -> Result<Pos2, RenderError> {
-    let (lat, lon) = path
-        .position(range_km)
-        .map_err(|source| RenderError::Coordinate { source })?;
-    place_offset(lat, lon, site_x, site_y).map_err(|source| RenderError::Coordinate { source })
-}
-
-fn bin_color(
-    product: RadarProduct,
-    color_table: ColorTable,
-    value: GateValue,
-) -> Result<Option<Color32>, RenderError> {
-    let rgba = match value {
-        GateValue::Measured(value) => color_for_product_with(color_table, product, value),
-        GateValue::BelowThreshold => return Ok(None),
-        GateValue::RangeFolded => Ok(range_folded_color()),
+) -> Result<(Lattice, f64), RenderError> {
+    let radials = &volume.sweep.radials;
+    let (columns, rows) = lattice_shape(radials.len(), grid);
+    let mut lattice = Lattice::reserved(
+        columns.saturating_mul(rows.saturating_add(1)),
+        columns.saturating_mul(rows),
+    );
+    if radials.is_empty() {
+        return Ok((lattice, 0.0));
     }
-    .map_err(|source| RenderError::Color { source })?;
-    Ok(Some(Color32::from_rgba_unmultiplied(
-        rgba[0],
-        rgba[1],
-        rgba[2],
-        RADAR_ALPHA,
-    )))
-}
-
-fn push_quad(
-    vertices: &mut Vec<u8>,
-    indices: &mut Vec<u8>,
-    corners: [Pos2; 4],
-    color: Color32,
-) -> Result<(), RenderError> {
-    let count = vertices.len() / VERTEX_BYTES;
-    let base = u32::try_from(count).map_err(|_| RenderError::MeshSize { vertices: count })?;
-    if base.checked_add(4).is_none() {
-        return Err(RenderError::MeshSize { vertices: count });
-    }
-    let channels = color.to_array();
-    for corner in corners {
-        vertices.extend_from_slice(&corner.x.to_le_bytes());
-        vertices.extend_from_slice(&corner.y.to_le_bytes());
-        vertices.extend_from_slice(&channels);
-    }
-    for index in [base, base + 1, base + 2, base, base + 2, base + 3] {
-        indices.extend_from_slice(&index.to_le_bytes());
-    }
-    Ok(())
-}
-
-struct BuildState {
-    vertices: Vec<u8>,
-    indices: Vec<u8>,
-    extent_km: f64,
-    site_x: f64,
-    site_y: f64,
-    near: [Pos2; 2],
-    near_slant: Option<f64>,
-}
-
-impl BuildState {
-    fn corners_at(
-        &mut self,
-        slant_km: f64,
-        elevation_deg: f64,
-        left: &projection::GeodesicPath,
-        right: &projection::GeodesicPath,
-    ) -> Result<[Pos2; 2], RenderError> {
-        let ground = projection::ground_range(slant_km, elevation_deg)
+    let mut extent_km: f64 = 0.0;
+    for column in 0..columns {
+        let Some((azimuth_deg, elevation_deg)) = column_angles(radials, column) else {
+            continue;
+        };
+        let path = projection::GeodesicPath::new(volume.site_lat, volume.site_lon, azimuth_deg)
             .map_err(|source| RenderError::Coordinate { source })?;
-        let left_corner = place_corner(left, ground, self.site_x, self.site_y)?;
-        let right_corner = place_corner(right, ground, self.site_x, self.site_y)?;
-        self.extent_km = self
-            .extent_km
-            .max(f64::from(left_corner.x.hypot(left_corner.y)))
-            .max(f64::from(right_corner.x.hypot(right_corner.y)));
-        Ok([left_corner, right_corner])
-    }
-}
-
-fn radial_quads(
-    radial: &RadialBins,
-    product: RadarProduct,
-    color_table: ColorTable,
-    left_path: &projection::GeodesicPath,
-    right_path: &projection::GeodesicPath,
-    build: &mut BuildState,
-) -> Result<(), RenderError> {
-    let Some(moment) = radial.moment(product) else {
-        return Ok(());
-    };
-    let width = moment.gate_width_km;
-    for (gate, value) in moment.values.iter().enumerate() {
-        let centre = moment.first_gate_km + gate as f64 * width;
-        let colour = bin_color(product, color_table, *value)?;
-        let near_slant = centre - width / 2.0;
-        let far_slant = centre + width / 2.0;
-        if build.near_slant != Some(near_slant) {
-            build.near =
-                build.corners_at(near_slant, radial.elevation_deg, left_path, right_path)?;
+        let u = column as f32 / columns.saturating_sub(1) as f32;
+        for row in 0..=rows {
+            let fraction = row as f32 / rows as f32;
+            let gate = f64::from(fraction) * grid.gate_count as f64;
+            let slant_km = grid.near_slant_km(gate).max(0.0);
+            let ground_km = projection::ground_range(slant_km, elevation_deg)
+                .map_err(|source| RenderError::Coordinate { source })?;
+            let (lat, lon) = path
+                .position(ground_km)
+                .map_err(|source| RenderError::Coordinate { source })?;
+            let offset = place_offset(lat, lon, site_x, site_y)
+                .map_err(|source| RenderError::Coordinate { source })?;
+            extent_km = extent_km.max(f64::from(offset.x.hypot(offset.y)));
+            lattice.push_vertex(offset, Pos2::new(u, fraction));
         }
-        let far = build.corners_at(far_slant, radial.elevation_deg, left_path, right_path)?;
-        if let Some(colour) = colour {
-            push_quad(
-                &mut build.vertices,
-                &mut build.indices,
-                [build.near[0], build.near[1], far[1], far[0]],
-                colour,
-            )?;
-        }
-        build.near = far;
-        build.near_slant = Some(far_slant);
     }
-    Ok(())
+    let row_stride = u32::try_from(rows.saturating_add(1)).map_err(|_| RenderError::MeshSize {
+        vertices: lattice.vertices.len() / LATTICE_STRIDE,
+    })?;
+    for column in 0..columns.saturating_sub(1) {
+        for row in 0..rows {
+            let base = column.saturating_mul(rows + 1).saturating_add(row);
+            let base = u32::try_from(base).map_err(|_| RenderError::MeshSize {
+                vertices: lattice.vertices.len() / LATTICE_STRIDE,
+            })?;
+            lattice.push_quad(base, row_stride)?;
+        }
+    }
+    Ok((lattice, extent_km))
 }
 
 fn build_rings(
@@ -421,8 +528,8 @@ fn build_grid(
     Ok(lines)
 }
 
-/// Builds the mesh for one product from the selected sweep, plus overlays and
-/// the pointer lookup shared by both workspaces.
+/// Builds one product's raster and the lattice that samples it, plus the
+/// overlays and pointer lookup shared by both workspaces.
 pub fn build_geometry_for(
     volume: &RadarVolume,
     product: RadarProduct,
@@ -436,62 +543,20 @@ pub fn build_geometry_for(
     }
     let (site_x, site_y) = projection::mercator(volume.site_lat, volume.site_lon)
         .map_err(|source| RenderError::Coordinate { source })?;
-    let gate_capacity = volume
-        .sweep
-        .radials
-        .iter()
-        .filter_map(|radial| radial.moment(product))
-        .map(|moment| moment.values.len())
-        .sum::<usize>();
-    let mut build = BuildState {
-        vertices: Vec::with_capacity(gate_capacity.saturating_mul(4 * VERTEX_BYTES)),
-        indices: Vec::with_capacity(gate_capacity.saturating_mul(6 * 4)),
-        extent_km: 0.0,
-        site_x,
-        site_y,
-        near: [Pos2::ZERO; 2],
-        near_slant: None,
-    };
-    for radial in &volume.sweep.radials {
-        let left_path = projection::GeodesicPath::new(
-            volume.site_lat,
-            volume.site_lon,
-            radial.azimuth_left_deg,
-        )
-        .map_err(|source| RenderError::Coordinate { source })?;
-        let right_path = projection::GeodesicPath::new(
-            volume.site_lat,
-            volume.site_lon,
-            radial.azimuth_right_deg,
-        )
-        .map_err(|source| RenderError::Coordinate { source })?;
-        build.near_slant = None;
-        radial_quads(
-            radial,
-            product,
-            color_table,
-            &left_path,
-            &right_path,
-            &mut build,
-        )?;
-    }
-    let index_count =
-        u32::try_from(build.indices.len() / 4).map_err(|_| RenderError::MeshSize {
-            vertices: build.vertices.len() / VERTEX_BYTES,
-        })?;
-    let extent_km = if build.extent_km > 0.0 {
-        build.extent_km
+    let raster = raster::build(volume, product, color_table);
+    let (lattice, extent_km) = build_lattice(volume, raster.grid, site_x, site_y)?;
+    let extent_km = if extent_km > 0.0 {
+        extent_km
     } else {
         volume.sweep.max_ground_range_km.max(1.0)
     };
     Ok(RadarGeometry {
         extent_km,
-        vertices: build.vertices,
-        indices: build.indices,
-        index_count,
         rings: build_rings(volume, site_x, site_y)?,
         grid: build_grid(volume, site_x, site_y)?,
         lookup: SweepLookup::new(volume, product),
+        raster,
+        lattice,
         product,
         color_table,
         site_lat: volume.site_lat,
@@ -591,8 +656,7 @@ impl ViewTransform {
 mod tests {
     use super::*;
 
-    use crate::error::ColorMapError;
-    use crate::radar::RadarSweep;
+    use crate::radar::{MomentBins, RadarSweep};
     use crate::stations::SiteId;
     use crate::test_support::TestError;
 
@@ -611,13 +675,11 @@ mod tests {
             elevation_deg,
             first_gate_km: 74.75,
             gate_width_km: 0.5,
-            moments: vec![crate::radar::MomentBins {
+            moments: vec![MomentBins {
                 product: RadarProduct::Reflectivity,
                 first_gate_km: 74.75,
                 gate_width_km: 0.5,
                 values,
-                below_threshold: 0,
-                range_folded: 0,
             }],
         }
     }
@@ -662,7 +724,7 @@ mod tests {
         let (sender, receiver) = start_build_thread();
         let retrieved = RetrievedVolume {
             volume: volume(
-                vec![radial(89.5, 90.5, 0.0, vec![GateValue::Measured(2.0)])],
+                vec![radial(89.5, 90.5, 0.0, vec![GateValue::Measured(20.0)])],
                 75.0,
             )?,
             origin: crate::radar::ArchiveOrigin::Cached,
@@ -686,37 +748,30 @@ mod tests {
             Some("2026/10/31/KTWX/KTWX20261031_003109_V06")
         );
         assert_eq!(result.volume.volume.site.as_str(), "KTWX");
-        assert!(result.geometry?.index_count > 0);
+        assert!(result.geometry?.raster.counts.drawn > 0);
         Ok(())
     }
 
-    fn vertex(geometry: &RadarGeometry, index: usize) -> Result<Pos2, TestError> {
-        let start = index * VERTEX_BYTES;
-        let x: [u8; 4] = geometry
-            .vertices
-            .get(start..start + 4)
-            .ok_or("vertex x")?
-            .try_into()
-            .map_err(|_| String::from("vertex x"))?;
-        let y: [u8; 4] = geometry
-            .vertices
-            .get(start + 4..start + 8)
-            .ok_or("vertex y")?
-            .try_into()
-            .map_err(|_| String::from("vertex y"))?;
-        Ok(Pos2::new(f32::from_le_bytes(x), f32::from_le_bytes(y)))
-    }
-
     /// At zero elevation the 75 km slant range converts to 74.998 km of ground
-    /// range, so the corner sits 2 m inside the roadmap's 75 km reference point;
-    /// 5e-5 degrees is 4.4 m at this latitude.
+    /// range, so the far lattice corner sits 2 m inside the roadmap's 75 km
+    /// reference point; 5e-5 degrees is 4.4 m at this latitude.
     #[test]
     fn rendered_corner_lands_on_the_reference_geodesic_point() -> Result<(), TestError> {
         let (_, geometry) = build(
             vec![radial(90.0, 90.0, 0.0, vec![GateValue::Measured(30.0)])],
             75.0,
         )?;
-        let corner = vertex(&geometry, 2)?;
+        assert!(geometry.lattice.index_count > 0, "lattice is empty");
+        let far = geometry.lattice.vertices.len() / LATTICE_STRIDE - 1;
+        let corner = geometry
+            .lattice
+            .position(far)
+            .ok_or("no far corner vertex")?;
+        let texcoord = geometry
+            .lattice
+            .texcoord(far)
+            .ok_or("no far corner texture coordinate")?;
+        assert!((texcoord.y - 1.0).abs() < 1e-6, "far row {texcoord:?}");
         let (lat, lon) = projection::mercator_inverse(
             geometry.site_x + f64::from(corner.x),
             geometry.site_y + f64::from(corner.y),
@@ -778,9 +833,9 @@ mod tests {
             vec![radial(89.5, 90.5, 0.0, vec![GateValue::BelowThreshold])],
             75.0,
         )?;
-        assert_eq!(
-            geometry.index_count, 0,
-            "below-threshold gates are excluded from the mesh"
+        assert!(
+            geometry.raster.is_empty(),
+            "below-threshold gates are excluded from the raster"
         );
         let ground = projection::ground_range(74.75, 0.0)?;
         let hit = geometry.lookup.gate(&volume, ground, 90.0)?;
@@ -801,13 +856,8 @@ mod tests {
             vec![radial(89.5, 90.5, 0.0, vec![GateValue::RangeFolded])],
             75.0,
         )?;
-        let colour: [u8; 4] = geometry
-            .vertices
-            .get(8..12)
-            .ok_or("vertex colour")?
-            .try_into()
-            .map_err(|_| String::from("vertex colour"))?;
-        assert_eq!(colour, range_folded_color(), "range folded colour");
+        let texel = geometry.raster.texel(0, 0).ok_or("missing texel")?;
+        assert_eq!(texel, crate::colormap::range_folded_color());
         Ok(())
     }
 
@@ -827,26 +877,45 @@ mod tests {
         Ok(())
     }
 
+    /// A value above the top of the scale is a gate to draw, not a reason to
+    /// abandon the whole image: the frame keeps every other gate and reports
+    /// how many were clipped.
     #[test]
-    fn an_unmappable_reflectivity_value_is_an_error() -> Result<(), TestError> {
+    fn a_gate_above_the_scale_does_not_fail_the_frame() -> Result<(), TestError> {
         let volume = volume(
             vec![radial(89.5, 90.5, 0.0, vec![GateValue::Measured(95.0)])],
             75.0,
         )?;
-        match build_geometry_for(&volume, RadarProduct::Reflectivity, ColorTable::Standard) {
-            Err(RenderError::Color {
-                source: ColorMapError::OutOfRange { value, .. },
-            }) => {
-                assert!((value - 95.0).abs() < f32::EPSILON, "carried value {value}");
-                Ok(())
-            }
-            Err(error) => Err(TestError::from(format!(
-                "expected a colour error, got {error}"
-            ))),
-            Ok(_) => Err(TestError::from(String::from(
-                "expected a colour error, got a geometry",
-            ))),
-        }
+        let geometry =
+            build_geometry_for(&volume, RadarProduct::Reflectivity, ColorTable::Standard)?;
+        assert_eq!(geometry.raster.counts.above_scale, 1);
+        assert_eq!(geometry.raster.counts.drawn, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn the_lattice_samples_every_corner_of_the_raster() -> Result<(), TestError> {
+        let values = vec![GateValue::Measured(30.0); 8];
+        let (_, geometry) = build(
+            vec![
+                radial(89.5, 90.5, 0.0, values.clone()),
+                radial(90.5, 91.5, 0.0, values),
+            ],
+            75.0,
+        )?;
+        let columns = 3;
+        let rows = LATTICE_RANGE_STEPS.min(8);
+        let vertices = (columns) * (rows + 1);
+        assert_eq!(geometry.lattice.vertices.len() / LATTICE_STRIDE, vertices);
+        let last = geometry
+            .lattice
+            .texcoord(vertices - 1)
+            .ok_or("no last vertex")?;
+        assert!((last.x - 1.0).abs() < 1e-6, "last column {last:?}");
+        assert!((last.y - 1.0).abs() < 1e-6, "last row {last:?}");
+        let u = geometry.lattice.texcoord(1).ok_or("no second vertex")?;
+        assert!(u.x.abs() < 1e-6, "first column {u:?}");
+        Ok(())
     }
 
     #[test]

@@ -16,6 +16,7 @@
 //! The displayed frame and the render worker that prepares it.
 
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::time::{Duration, Instant};
 
 use eframe::egui::{Rect, Shape};
 
@@ -24,7 +25,7 @@ use crate::error::RenderError;
 use crate::gpu::{self, RadarGpu, RadarMesh};
 use crate::product::RadarProduct;
 use crate::radar::{ArchiveOrigin, RadarVolume, RetrievedVolume};
-use crate::render::{self, RadarGeometry};
+use crate::render::{self, RadarGeometry, Sampling};
 
 pub struct Frame {
     pub volume: RadarVolume,
@@ -32,6 +33,10 @@ pub struct Frame {
     pub history_key: Option<String>,
     pub geometry: RadarGeometry,
     pub mesh: Option<RadarMesh>,
+    /// How long the frame took to prepare off the UI thread.
+    pub built_in: Duration,
+    /// How long this frame took to upload on the UI thread.
+    pub uploaded_in: Duration,
 }
 
 impl Frame {
@@ -109,10 +114,11 @@ pub struct Display {
     product: RadarProduct,
     elevation: Option<u8>,
     color_table: ColorTable,
+    sampling: Sampling,
 }
 
 impl Display {
-    pub fn new(gpu: Option<RadarGpu>, color_table: ColorTable) -> Self {
+    pub fn new(gpu: Option<RadarGpu>, color_table: ColorTable, sampling: Sampling) -> Self {
         let (sender, receiver) = render::start_build_thread();
         let state = if gpu.is_some() {
             DisplayState::Waiting
@@ -131,6 +137,7 @@ impl Display {
             product: RadarProduct::Reflectivity,
             elevation: None,
             color_table,
+            sampling,
         }
     }
 
@@ -141,6 +148,30 @@ impl Display {
             return true;
         }
         self.rebuild(self.product, self.elevation)
+    }
+
+    /// Resamples the displayed frame without recolouring or re-downloading it.
+    pub fn set_sampling(&mut self, sampling: Sampling) -> bool {
+        if self.sampling == sampling {
+            return false;
+        }
+        self.sampling = sampling;
+        let Some(frame) = self.frame.as_mut() else {
+            return false;
+        };
+        match self.gpu.as_ref() {
+            Some(gpu) => match gpu.upload(&frame.geometry, sampling) {
+                Ok(mesh) => {
+                    frame.mesh = Some(mesh);
+                    true
+                }
+                Err(error) => {
+                    self.state = DisplayState::Unavailable(error);
+                    false
+                }
+            },
+            None => false,
+        }
     }
 
     /// Moves the current mesh into a geographic view. A missing mesh is a
@@ -320,15 +351,19 @@ impl Display {
             self.send(self.generation, result.volume, self.product);
             return;
         }
+        let upload_started = Instant::now();
         self.state = match result.geometry {
             Ok(geometry) => match self.upload(&geometry) {
                 Ok(mesh) => {
+                    let uploaded_in = upload_started.elapsed();
                     self.frame = Some(Frame {
                         volume: result.volume.volume,
                         origin: result.volume.origin,
                         history_key: result.volume.history_key,
                         geometry,
                         mesh,
+                        built_in: result.elapsed,
+                        uploaded_in,
                     });
                     DisplayState::Ready
                 }
@@ -348,10 +383,10 @@ impl Display {
         let Some(gpu) = self.gpu.as_ref() else {
             return Err(RenderError::GpuUnavailable);
         };
-        if geometry.index_count == 0 {
+        if geometry.lattice.is_empty() {
             return Ok(None);
         }
-        gpu.upload(geometry).map(Some)
+        gpu.upload(geometry, self.sampling).map(Some)
     }
 }
 
@@ -434,6 +469,7 @@ mod tests {
             product: RadarProduct::Velocity,
             elevation: Some(1),
             color_table: ColorTable::Standard,
+            sampling: Sampling::Nearest,
         };
         let volume = display.selection_volume().ok_or("failed volume missing")?;
         assert_eq!(volume.scan_unix_ms, 200);
@@ -457,6 +493,7 @@ mod tests {
             product: RadarProduct::Reflectivity,
             elevation: None,
             color_table: ColorTable::Tritanopia,
+            sampling: Sampling::Nearest,
         };
         let volume = retrieved(100)?;
         let geometry = render::build_geometry_for(
@@ -494,6 +531,7 @@ mod tests {
             product: RadarProduct::Reflectivity,
             elevation: None,
             color_table: ColorTable::Tritanopia,
+            sampling: Sampling::Nearest,
         };
         display.complete(render::BuildResult {
             volume: retrieved(100)?,

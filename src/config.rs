@@ -23,6 +23,7 @@ use crate::colormap::ColorTable;
 use crate::error::ConfigError;
 use crate::paths;
 use crate::place::{Place, PlaceError};
+use crate::render::Sampling;
 use crate::stations::SiteId;
 use crate::theme::Theme;
 use crate::units::UnitSystem;
@@ -41,6 +42,8 @@ pub struct Config {
     pub theme: Theme,
     /// The radar color table, including color-vision-safe options.
     pub color_table: ColorTable,
+    /// How radar gates are sampled onto the screen.
+    pub sampling: Sampling,
 }
 
 fn strip_quotes(value: &str) -> Option<&str> {
@@ -142,91 +145,108 @@ fn parse_text_line(path: &Path, text: &str) -> Result<Config, ConfigError> {
             path: path.to_path_buf(),
             line: number,
         })?;
-        let key = key.trim();
-        let value = value.trim();
-        match key {
-            "site" => config.site = Some(parse_site(path, number, value)?),
-            "units" => {
-                let text = strip_quotes(value).ok_or_else(|| ConfigError::Syntax {
-                    path: path.to_path_buf(),
-                    line: number,
-                })?;
-                config.units = UnitSystem::parse(text).ok_or_else(|| ConfigError::InvalidUnit {
-                    path: path.to_path_buf(),
-                    line: number,
-                    value: String::from(text),
-                })?;
-            }
-            "theme" => {
-                let text = strip_quotes(value).ok_or_else(|| ConfigError::Syntax {
-                    path: path.to_path_buf(),
-                    line: number,
-                })?;
-                config.theme = Theme::parse(text).ok_or_else(|| ConfigError::InvalidTheme {
-                    path: path.to_path_buf(),
-                    line: number,
-                    value: String::from(text),
-                })?;
-            }
-            "palette" => {
-                let text = strip_quotes(value).ok_or_else(|| ConfigError::Syntax {
-                    path: path.to_path_buf(),
-                    line: number,
-                })?;
-                config.color_table =
-                    ColorTable::parse(text).ok_or_else(|| ConfigError::InvalidPalette {
-                        path: path.to_path_buf(),
-                        line: number,
-                        value: String::from(text),
-                    })?;
-            }
-            "place_name" => {
-                place.name = Some(quoted_text(path, number, value)?);
-                if place.line == 0 {
-                    place.line = number;
-                }
-            }
-            "place_region" => {
-                place.region = Some(quoted_text(path, number, value)?);
-                if place.line == 0 {
-                    place.line = number;
-                }
-            }
-            "place_country" => {
-                place.country = Some(quoted_text(path, number, value)?);
-                if place.line == 0 {
-                    place.line = number;
-                }
-            }
-            "place_country_code" => {
-                place.country_code = Some(quoted_text(path, number, value)?);
-                if place.line == 0 {
-                    place.line = number;
-                }
-            }
-            "place_lat" => {
-                place.lat = Some(quoted_text(path, number, value)?);
-                if place.line == 0 {
-                    place.line = number;
-                }
-            }
-            "place_lon" => {
-                place.lon = Some(quoted_text(path, number, value)?);
-                if place.line == 0 {
-                    place.line = number;
-                }
-            }
-            _ => {
-                return Err(ConfigError::UnknownKey {
-                    path: path.to_path_buf(),
-                    line: number,
-                    key: String::from(key),
-                });
-            }
-        }
+        apply_field(
+            &mut config,
+            &mut place,
+            path,
+            number,
+            key.trim(),
+            value.trim(),
+        )?;
     }
     config.place = finish_place(path, place)?;
     Ok(config)
+}
+
+fn record_place(
+    slot: &mut Option<String>,
+    line: &mut usize,
+    path: &Path,
+    number: usize,
+    value: &str,
+) -> Result<(), ConfigError> {
+    *slot = Some(quoted_text(path, number, value)?);
+    if *line == 0 {
+        *line = number;
+    }
+    Ok(())
+}
+
+fn quoted_token<'a>(path: &Path, number: usize, value: &'a str) -> Result<&'a str, ConfigError> {
+    strip_quotes(value).ok_or_else(|| ConfigError::Syntax {
+        path: path.to_path_buf(),
+        line: number,
+    })
+}
+
+fn apply_field(
+    config: &mut Config,
+    place: &mut PlaceFields,
+    path: &Path,
+    number: usize,
+    key: &str,
+    value: &str,
+) -> Result<(), ConfigError> {
+    let at = || path.to_path_buf();
+    match key {
+        "site" => config.site = Some(parse_site(path, number, value)?),
+        "units" => {
+            let text = quoted_token(path, number, value)?;
+            config.units = UnitSystem::parse(text).ok_or_else(|| ConfigError::InvalidUnit {
+                path: at(),
+                line: number,
+                value: String::from(text),
+            })?;
+        }
+        "theme" => {
+            let text = quoted_token(path, number, value)?;
+            config.theme = Theme::parse(text).ok_or_else(|| ConfigError::InvalidTheme {
+                path: at(),
+                line: number,
+                value: String::from(text),
+            })?;
+        }
+        "palette" => {
+            let text = quoted_token(path, number, value)?;
+            config.color_table =
+                ColorTable::parse(text).ok_or_else(|| ConfigError::InvalidPalette {
+                    path: at(),
+                    line: number,
+                    value: String::from(text),
+                })?;
+        }
+        "interpolation" => {
+            let text = quoted_token(path, number, value)?;
+            config.sampling =
+                Sampling::parse(text).ok_or_else(|| ConfigError::InvalidSampling {
+                    path: at(),
+                    line: number,
+                    value: String::from(text),
+                })?;
+        }
+        "place_name" => record_place(&mut place.name, &mut place.line, path, number, value)?,
+        "place_region" => record_place(&mut place.region, &mut place.line, path, number, value)?,
+        "place_country" => record_place(&mut place.country, &mut place.line, path, number, value)?,
+        "place_country_code" => {
+            record_place(
+                &mut place.country_code,
+                &mut place.line,
+                path,
+                number,
+                value,
+            )?;
+        }
+        "place_lat" => record_place(&mut place.lat, &mut place.line, path, number, value)?,
+        "place_lon" => record_place(&mut place.lon, &mut place.line, path, number, value)?,
+        _ => {
+            return Err(ConfigError::UnknownKey {
+                path: at(),
+                line: number,
+                key: String::from(key),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Reads `path`, reporting an absent file separately from a malformed one.
@@ -258,6 +278,7 @@ pub fn save(config: &Config, path: &Path) -> Result<(), ConfigError> {
     lines.push(format!("units = \"{}\"", config.units.token()));
     lines.push(format!("theme = \"{}\"", config.theme.token()));
     lines.push(format!("palette = \"{}\"", config.color_table.token()));
+    lines.push(format!("interpolation = \"{}\"", config.sampling.token()));
     if let Some(place) = &config.place {
         lines.push(format!("place_name = \"{}\"", place.name));
         lines.push(format!("place_region = \"{}\"", place.region));
@@ -345,6 +366,7 @@ mod tests {
                 units: UnitSystem::Metric,
                 theme: Theme::Dark,
                 color_table: ColorTable::Standard,
+                sampling: Sampling::Nearest,
             },
             &path,
         )?;
@@ -386,6 +408,7 @@ mod tests {
                 units: UnitSystem::Metric,
                 theme: Theme::Dark,
                 color_table: ColorTable::Deuteranopia,
+                sampling: Sampling::Bilinear,
             },
             &path,
         )?;

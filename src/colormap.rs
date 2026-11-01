@@ -219,24 +219,24 @@ pub fn color_for_reflectivity(dbz: f32) -> Result<[u8; 4], ColorMapError> {
 }
 
 const VELOCITY_RAMP: [(f32, [u8; 3]); 5] = [
-    (-100.0, [24, 48, 120]),
-    (-30.0, [40, 110, 210]),
+    (-64.0, [24, 48, 120]),
+    (-20.0, [40, 110, 210]),
     (0.0, [235, 235, 235]),
-    (30.0, [214, 126, 24]),
-    (100.0, [150, 24, 24]),
+    (20.0, [214, 126, 24]),
+    (64.0, [150, 24, 24]),
 ];
 const ACCESSIBLE_VELOCITY_RAMP: [(f32, [u8; 3]); 5] = [
-    (-100.0, [10, 25, 70]),
-    (-30.0, [30, 100, 180]),
+    (-64.0, [10, 25, 70]),
+    (-20.0, [30, 100, 180]),
     (0.0, [240, 240, 240]),
-    (30.0, [220, 130, 20]),
-    (100.0, [120, 40, 10]),
+    (20.0, [220, 130, 20]),
+    (64.0, [120, 40, 10]),
 ];
 const SPECTRUM_WIDTH_RAMP: [(f32, [u8; 3]); 4] = [
     (0.0, [30, 30, 38]),
-    (5.0, [90, 70, 130]),
-    (15.0, [190, 130, 90]),
-    (30.0, [245, 245, 220]),
+    (10.0, [90, 70, 130]),
+    (30.0, [190, 130, 90]),
+    (64.0, [245, 245, 220]),
 ];
 const ZDR_RAMP: [(f32, [u8; 3]); 5] = [
     (-8.0, [50, 60, 160]),
@@ -248,8 +248,8 @@ const ZDR_RAMP: [(f32, [u8; 3]); 5] = [
 const CC_RAMP: [(f32, [u8; 3]); 4] = [
     (0.0, [28, 28, 32]),
     (0.5, [100, 70, 150]),
-    (0.85, [180, 180, 210]),
-    (1.05, [250, 250, 250]),
+    (0.9, [180, 180, 210]),
+    (1.1, [250, 250, 250]),
 ];
 const PHI_RAMP: [(f32, [u8; 3]); 3] = [
     (0.0, [35, 70, 170]),
@@ -257,9 +257,9 @@ const PHI_RAMP: [(f32, [u8; 3]); 3] = [
     (360.0, [150, 40, 160]),
 ];
 const KDP_RAMP: [(f32, [u8; 3]); 3] = [
-    (-10.0, [40, 80, 170]),
+    (-32.0, [40, 80, 170]),
     (0.0, [225, 225, 225]),
-    (10.0, [200, 40, 40]),
+    (32.0, [200, 40, 40]),
 ];
 
 fn ramp_color(
@@ -378,6 +378,68 @@ pub fn color_for_product_with(
     }
     let fraction = (value - minimum) / (maximum - minimum);
     Ok(ramp_at(table_ramp(table), fraction))
+}
+
+/// A display colour, and whether the measurement fell outside the scale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MappedColor {
+    /// The value sits inside the product's scale.
+    Inside([u8; 4]),
+    /// The value is above the top of the scale and takes its top colour.
+    ClippedAbove([u8; 4]),
+    /// The value is below the bottom of the scale and has no colour.
+    ///
+    /// The bottom of a product's scale is where its noise floor sits: a
+    /// reflectivity return weaker than five decibels is receiver noise and
+    /// ground clutter, not precipitation, and painting it would bury the storm
+    /// under a wash of speckle. The gates are counted so the interface can say
+    /// how many were left out.
+    BelowScale,
+}
+
+impl MappedColor {
+    /// The colour to draw, or nothing when the value is below the scale.
+    pub const fn colour(self) -> Option<[u8; 4]> {
+        match self {
+            Self::Inside(colour) | Self::ClippedAbove(colour) => Some(colour),
+            Self::BelowScale => None,
+        }
+    }
+}
+
+/// The colour for a measurement that must be drawn.
+///
+/// A measurement outside the product scale is drawn at the scale's end colour
+/// and reported as clipped. That is a scale limit, not missing data: a fifty
+/// decibel echo above a fifty decibel scale is still a fifty decibel echo. A
+/// value that is not a finite number cannot be drawn at all and is an error.
+///
+/// # Errors
+///
+/// [`ColorMapError::OutOfRange`] when the value is NaN or infinite.
+pub fn map_display_color(
+    table: ColorTable,
+    product: RadarProduct,
+    value: f32,
+) -> Result<MappedColor, ColorMapError> {
+    if !value.is_finite() {
+        return Err(ColorMapError::OutOfRange {
+            product: product.id(),
+            value,
+        });
+    }
+    let (minimum, maximum) = product.value_range();
+    if value > maximum {
+        return Ok(MappedColor::ClippedAbove(color_for_product_with(
+            table, product, maximum,
+        )?));
+    }
+    if value < minimum {
+        return Ok(MappedColor::BelowScale);
+    }
+    Ok(MappedColor::Inside(color_for_product_with(
+        table, product, value,
+    )?))
 }
 
 pub const fn range_folded_color() -> [u8; 4] {
@@ -511,7 +573,7 @@ mod tests {
     fn every_accessible_table_keeps_reflectivity_steps_distinct() -> Result<(), TestFailure> {
         for table in ColorTable::ALL {
             let mut previous: Option<[u8; 4]> = None;
-            for dbz in [-30.0_f32, 0.0, 20.0, 40.0, 60.0, 80.0] {
+            for dbz in [5.0_f32, 15.0, 30.0, 45.0, 60.0, 85.0] {
                 let color = color_for_product_with(table, RadarProduct::Reflectivity, dbz)?;
                 if let Some(previous) = previous {
                     assert_ne!(previous, color, "{} at {dbz} dBZ", table.label());
@@ -524,7 +586,7 @@ mod tests {
 
     #[test]
     fn high_contrast_uses_equal_channels() -> Result<(), TestFailure> {
-        for dbz in [-30.0_f32, 0.0, 30.0, 60.0, 80.0] {
+        for dbz in [5.0_f32, 20.0, 40.0, 60.0, 85.0] {
             let color =
                 color_for_product_with(ColorTable::HighContrast, RadarProduct::Reflectivity, dbz)?;
             assert!(
