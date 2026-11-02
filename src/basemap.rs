@@ -7,10 +7,9 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use eframe::egui::{self, Align2, Color32, FontId, Rect};
 use walkers::sources::{Attribution, TileSource};
-use walkers::{
-    HttpOptions, HttpTiles, Map, MapMemory, MaxParallelDownloads, Style, TileId, TilePiece, Tiles,
-};
+use walkers::{Map, MapMemory, Style, TileId, TilePiece, Tiles};
 
+use crate::basemap_tiles::BasemapTiles;
 use crate::cache::Store;
 use crate::map::MapView;
 use crate::paths;
@@ -90,8 +89,9 @@ impl TileSource for OpenFreeMap {
 }
 
 struct VisibleTiles<'a> {
-    source: &'a mut HttpTiles,
+    source: &'a mut BasemapTiles<OpenFreeMap>,
     missing: usize,
+    error: Option<String>,
 }
 
 impl Tiles for VisibleTiles<'_> {
@@ -99,6 +99,9 @@ impl Tiles for VisibleTiles<'_> {
         let piece = self.source.at(tile);
         if piece.is_none() {
             self.missing = self.missing.saturating_add(1);
+            if self.error.is_none() {
+                self.error = self.source.error(tile);
+            }
         }
         piece
     }
@@ -214,8 +217,9 @@ pub struct Basemap {
     active_document: Option<serde_json::Value>,
     receiver: Option<Receiver<StyleResult>>,
     cached_style: bool,
-    tiles: Option<HttpTiles>,
+    tiles: Option<BasemapTiles<OpenFreeMap>>,
     missing_tiles: usize,
+    tile_error: Option<String>,
     memory: MapMemory,
     error: Option<String>,
 }
@@ -230,6 +234,7 @@ impl Basemap {
             cached_style: false,
             tiles: None,
             missing_tiles: 0,
+            tile_error: None,
             memory: MapMemory::default(),
             error: None,
         }
@@ -255,9 +260,20 @@ impl Basemap {
                 self.error = None;
             }
         }
-        if self.missing_tiles > 0 {
+        if let Some(error) = &self.tile_error {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("Map tile unavailable: {error}"),
+            );
+            if ui.button("Retry map tiles").clicked() {
+                if let Some(tiles) = &mut self.tiles {
+                    tiles.retry_failed();
+                }
+                self.tile_error = None;
+            }
+        } else if self.missing_tiles > 0 {
             ui.label(format!(
-                "{} visible map tiles are loading or unavailable.",
+                "{} visible map tiles are loading.",
                 self.missing_tiles
             ));
         }
@@ -298,22 +314,16 @@ impl Basemap {
                 return;
             }
         };
-        let options = HttpOptions {
-            cache: Some(path.join("basemap").join("openfreemap")),
-            user_agent: Some(walkers::HeaderValue::from_static(concat!(
-                "oxrad/",
-                env!("CARGO_PKG_VERSION"),
-                " (https://github.com/bonzupii/oxrad)"
-            ))),
-            max_parallel_downloads:
-                MaxParallelDownloads::value_manually_confirmed_with_provider_limits(4),
-        };
-        self.tiles = Some(HttpTiles::with_options_and_style(
-            OpenFreeMap,
-            options,
-            style,
-            context.clone(),
-        ));
+        if let Some(tiles) = &mut self.tiles {
+            tiles.set_style(style);
+        } else {
+            self.tiles = Some(BasemapTiles::new(
+                OpenFreeMap,
+                style,
+                &path.join("basemap").join("openfreemap"),
+                context,
+            ));
+        }
         self.active = Some(selected);
         self.active_document = Some(document);
     }
@@ -405,6 +415,7 @@ impl Basemap {
         let mut visible = VisibleTiles {
             source: tiles,
             missing: 0,
+            error: None,
         };
         ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
             Map::new(Some(&mut visible), &mut self.memory, center)
@@ -413,6 +424,11 @@ impl Basemap {
                 .show(ui, |_, _, _, _| {});
         });
         self.missing_tiles = visible.missing;
+        self.tile_error = visible.error;
+        if self.missing_tiles > 0 {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(250));
+        }
     }
 
     /// Draw attribution after overlays so it cannot be covered by map data.
@@ -431,8 +447,10 @@ impl Basemap {
         } else {
             ""
         };
-        let tile_status = if self.missing_tiles > 0 {
-            " · map tiles loading or unavailable"
+        let tile_status = if self.tile_error.is_some() {
+            " · map tile unavailable"
+        } else if self.missing_tiles > 0 {
+            " · map tiles loading"
         } else {
             ""
         };
@@ -609,7 +627,10 @@ mod tests {
         }
     }
 
-    fn wait_for_tile(tiles: &mut HttpTiles, id: TileId) -> Result<TilePiece, TestError> {
+    fn wait_for_tile(
+        tiles: &mut BasemapTiles<LocalSource>,
+        id: TileId,
+    ) -> Result<TilePiece, TestError> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
         while std::time::Instant::now() < deadline {
             if let Some(tile) = tiles.at(id) {
@@ -620,19 +641,17 @@ mod tests {
         Err(TestError::from("timed out waiting for the tile"))
     }
 
-    fn local_tiles(url: &str, path: &std::path::Path) -> Result<HttpTiles, TestError> {
-        Ok(HttpTiles::with_options_and_style(
+    fn local_tiles(
+        url: &str,
+        path: &std::path::Path,
+    ) -> Result<BasemapTiles<LocalSource>, TestError> {
+        Ok(BasemapTiles::new(
             LocalSource {
                 url: String::from(url),
             },
-            HttpOptions {
-                cache: Some(path.to_path_buf()),
-                user_agent: Some(walkers::HeaderValue::from_static("oxrad-cache-test")),
-                max_parallel_downloads:
-                    MaxParallelDownloads::value_manually_confirmed_with_provider_limits(1),
-            },
             synthetic_style()?,
-            egui::Context::default(),
+            path,
+            &egui::Context::default(),
         ))
     }
 
@@ -701,13 +720,95 @@ mod tests {
         assert!(
             request
                 .to_ascii_lowercase()
-                .contains("user-agent: oxrad-cache-test")
+                .contains(concat!("user-agent: oxrad/", env!("CARGO_PKG_VERSION")))
         );
         let mut restarted = local_tiles(&url, &root)?;
         let cached = wait_for_tile(&mut restarted, id)?;
         assert!(matches!(cached.tile, walkers::Tile::Vector(ref shapes) if !shapes.is_empty()));
         assert!(restarted.attribution().text.contains("OpenStreetMap"));
         drop(restarted);
+        std::fs::remove_dir_all(root).map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn failed_tile_reports_error_and_can_be_retried() -> Result<(), TestError> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        let (root, _) = test_store("http-retry")?;
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(|error| error.to_string())?;
+        let address = listener.local_addr().map_err(|error| error.to_string())?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| error.to_string())?;
+        let body = synthetic_tile()?;
+        let server = std::thread::spawn(move || -> Result<(), String> {
+            for response in 0..2 {
+                let deadline = Instant::now() + Duration::from_secs(8);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => return Err(error.to_string()),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .map_err(|error| error.to_string())?;
+                let mut request = [0_u8; 4096];
+                stream
+                    .read(&mut request)
+                    .map_err(|error| error.to_string())?;
+                if response == 0 {
+                    stream.write_all(b"HTTP/1.1 404 Not Found\r\nCache-Control: no-store\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").map_err(|error| error.to_string())?;
+                } else {
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    stream
+                        .write_all(header.as_bytes())
+                        .map_err(|error| error.to_string())?;
+                    stream.write_all(&body).map_err(|error| error.to_string())?;
+                }
+            }
+            Ok(())
+        });
+        let url = format!("http://{address}/4/3/7.pbf");
+        let id = TileId {
+            zoom: 4,
+            x: 3,
+            y: 7,
+        };
+        let mut tiles = local_tiles(&url, &root)?;
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let error = loop {
+            assert!(tiles.at(id).is_none());
+            if let Some(error) = tiles.error(id) {
+                break error;
+            }
+            if Instant::now() >= deadline {
+                return Err(TestError::from("tile failure was not reported"));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(error.contains("HTTP 404"), "unexpected error: {error}");
+        tiles.retry_failed();
+        let tile = wait_for_tile(&mut tiles, id)?;
+        assert!(matches!(tile.tile, walkers::Tile::Vector(ref shapes) if !shapes.is_empty()));
+        assert!(tiles.error(id).is_none());
+        server
+            .join()
+            .map_err(|_| "tile server stopped")?
+            .map_err(TestError::from)?;
+        drop(tiles);
         std::fs::remove_dir_all(root).map_err(|error| error.to_string())?;
         Ok(())
     }

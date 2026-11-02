@@ -12,10 +12,14 @@ bzip2-rs = "0.1.2"
 eframe = { version = "0.34.1", features = ["wgpu"] }
 geographiclib-rs = "0.2.7"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+http-cache-reqwest = "0.16.0"
 nexrad-decode = "0.1.2"
 quick-xml = "0.41.0"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest-middleware = "0.4.2"
 serde_json = "1.0"
 sha2 = "0.11.1"
+tokio = { version = "1", features = ["rt", "time", "net"] }
 ureq = "3.5.0"
 walkers = { version = "0.55.0", features = ["mvt"] }
 

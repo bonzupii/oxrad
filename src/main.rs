@@ -15,6 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 mod app;
 mod basemap;
+mod basemap_tiles;
 mod cache;
 mod climate;
 mod climate_layer;
