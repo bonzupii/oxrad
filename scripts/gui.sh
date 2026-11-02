@@ -105,6 +105,21 @@ if [[ -f "$root/.tools/lavapipe.json" ]]; then
     export VK_DRIVER_FILES="$root/.tools/lavapipe.json"
 fi
 
+# A scenario that only has something to show over snow, sea ice, or a mountain
+# range starts from a seeded place: OXRAD_GUI_PLACE="46.5 10.0 Alps".
+if [[ -n "${OXRAD_GUI_PLACE:-}" ]]; then
+    read -r seed_lat seed_lon seed_name <<< "$OXRAD_GUI_PLACE"
+    mkdir -p "$home/.oxrad"
+    {
+        printf 'place_name = "%s"\n' "$seed_name"
+        printf 'place_region = "Somewhere"\n'
+        printf 'place_country = "Earth"\n'
+        printf 'place_country_code = "xx"\n'
+        printf 'place_lat = "%s"\n' "$seed_lat"
+        printf 'place_lon = "%s"\n' "$seed_lon"
+    } > "$home/.oxrad/config.toml"
+fi
+
 "$binary" --site KTWX > "$log" 2>&1 < /dev/null &
 app_pid=$!
 
@@ -245,6 +260,15 @@ case "$scenario" in
         "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/observations-before.png"
         click 60 375
         sleep "${OXRAD_GUI_OBSERVATIONS_SETTLE:-12}"
+        ;;
+    snow)
+        # The rail is scrolled to its end, where the snow section keeps a fixed
+        # distance from the alert list below it whatever arrives above.
+        click 240 28
+        rail_scroll 60
+        "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/snow-before.png"
+        click 60 375
+        sleep "${OXRAD_GUI_SNOW_SETTLE:-14}"
         ;;
     pan) drag 240 0 ;;
     zoom) scroll 10 ;;
@@ -460,6 +484,24 @@ if [[ "$scenario" == "observations" ]]; then
         fail "the surface-observation section changed $changed rail samples; no stations arrived"
     fi
     printf 'gui: surface-observation section redrew %s rail samples\n' "$changed"
+fi
+
+if [[ "$scenario" == "snow" ]]; then
+    # The readout and the snowfall chart replace the one-line invitation, so a
+    # layer that never reached the provider leaves this strip unchanged.
+    snow_sample() {
+        "$tool_pngtopnm" "$1" 2>/dev/null |
+            "$tool_pamcut" -left 0 -top 380 -width 320 -height 260 2>/dev/null |
+            "$scale_pnmscale" -xsize 160 -ysize 130 2>/dev/null |
+            "$scale_pnmtoplainpnm" 2>/dev/null |
+            awk 'NR <= 3 { next } { printf "%s %s %s\n", $1, $2, $3 }'
+    }
+    changed="$(diff <(snow_sample "$output/snow-before.png") <(snow_sample "$png") |
+        grep -c '^[<>]' || true)"
+    if [[ -z "$changed" ]] || ((changed < 500)); then
+        fail "the snow section changed $changed rail samples; the snow model never answered"
+    fi
+    printf 'gui: snow section redrew %s rail samples\n' "$changed"
 fi
 
 printf 'gui: %s ok (%sx%s, %s colours) %s\n' "$scenario" "$width" "$height" "$colours" "$png"

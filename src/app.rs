@@ -52,6 +52,7 @@ use crate::radar::{ArchiveOrigin, GateValue, RetrievedVolume};
 use crate::radar_controls::{self, Selection};
 use crate::render;
 use crate::satellite::SatelliteLayer;
+use crate::snow_layer::SnowLayer;
 use crate::spaceweather_layer::SpaceWeatherLayer;
 use crate::stations::{self, SiteId, Station, StationError, StationFeed, StationOutcome};
 use crate::theme::{self, Palette, Theme};
@@ -461,6 +462,7 @@ pub struct OxradApp {
     environment: EnvironmentLayer,
     ocean: OceanLayer,
     stations_reported: ObservationLayer,
+    snowpack: SnowLayer,
     history: HistoryView,
 }
 
@@ -569,6 +571,7 @@ impl OxradApp {
             environment: EnvironmentLayer::new(),
             ocean: OceanLayer::new(),
             stations_reported: ObservationLayer::new(),
+            snowpack: SnowLayer::new(),
             history: HistoryView::new(),
         };
         if let Some(place) = &restored_place {
@@ -664,10 +667,7 @@ impl OxradApp {
         }
     }
 
-    /// Stores a new storm motion and repaints every storm-relative frame.
-    ///
-    /// The number is persisted because a chaser sets it once per storm and does
-    /// not want to retype it after a restart.
+    /// Stores a new storm motion, persists it, and repaints the frames.
     fn apply_motion(&mut self, motion: StormMotion) {
         self.config.storm_motion = motion;
         self.save_config();
@@ -969,6 +969,7 @@ impl OxradApp {
         self.ocean.update(Instant::now(), &self.map_view);
         self.stations_reported
             .update(Instant::now(), &self.map_view);
+        self.snowpack.update(Instant::now(), &self.map_view);
         self.poll_global_radar(context);
     }
 
@@ -2460,6 +2461,7 @@ impl OxradApp {
         self.environment.rail(ui, &palette);
         self.ocean.rail(ui, &palette);
         self.stations_reported.rail(ui, &palette, centre);
+        self.snowpack.rail(ui, &palette);
         self.quake_rail(ui);
     }
 

@@ -56,6 +56,8 @@ mod raster;
 mod render;
 mod retry;
 mod satellite;
+mod snow;
+mod snow_layer;
 mod spaceweather;
 mod spaceweather_layer;
 mod stations;
