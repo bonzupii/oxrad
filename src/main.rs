@@ -85,6 +85,7 @@ mod units;
 mod volcano;
 mod volcano_layer;
 mod warnings;
+mod workspaces;
 
 use std::process::ExitCode;
 

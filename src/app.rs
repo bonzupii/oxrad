@@ -52,6 +52,7 @@ use crate::stations::{self, SiteId, Station, StationError, StationFeed, StationO
 use crate::theme::{self, Palette, Theme};
 use crate::time;
 use crate::warnings::{Severity, Warning, WarningError, WarningEvent, WarningFeed};
+use crate::workspaces::{LayerVisibility as RadarLayer, MapWorkspace, RadarWorkspace};
 
 const TEXT: Color32 = Color32::from_rgb(214, 221, 232);
 const MUTED: Color32 = Color32::from_rgb(156, 168, 184);
@@ -63,7 +64,6 @@ const IDLE_REPAINT_MS: u64 = 1000;
 const RAIL_WIDTH: f32 = 320.0;
 const FORECAST_WIDTH: f32 = 340.0;
 const SEARCH_ROW_HEIGHT: f32 = 32.0;
-const MEASURE_CORNERS_MAX: usize = 24;
 const STATION_LIST_HEIGHT: f32 = 220.0;
 const VIEW_RADAR_LIMIT: usize = 3;
 const VIEW_RADAR_TIME_WINDOW_MS: u64 = 6 * 60 * 1000;
@@ -83,25 +83,6 @@ enum SceneMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RadarLayer {
-    Shown,
-    Hidden,
-}
-
-impl RadarLayer {
-    const fn is_shown(self) -> bool {
-        matches!(self, Self::Shown)
-    }
-
-    const fn toggled(self) -> Self {
-        match self {
-            Self::Shown => Self::Hidden,
-            Self::Hidden => Self::Shown,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GlobalPlayback {
     Stopped,
     Playing,
@@ -112,25 +93,6 @@ enum GlobalPlayback {
 enum Canvas {
     Map,
     Radar,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MeasureMode {
-    Off,
-    On,
-}
-
-impl MeasureMode {
-    const fn is_on(self) -> bool {
-        matches!(self, Self::On)
-    }
-
-    const fn toggled(self) -> Self {
-        match self {
-            Self::Off => Self::On,
-            Self::On => Self::Off,
-        }
-    }
 }
 
 enum GlobalState {
@@ -351,12 +313,8 @@ pub struct OxradApp {
     first_run: bool,
     scene_mode: SceneMode,
     basemap: Basemap,
-    map_view: MapView,
-    radar_view: MapView,
-    radar_fitted: Option<SiteId>,
-    map_viewport: Option<Rect>,
-    map_radar: RadarLayer,
-    map_reload_due: Option<Instant>,
+    map: MapWorkspace,
+    radar: RadarWorkspace,
     global_feed: GlobalRadarFeed,
     global_generation: u64,
     global_frames: Vec<GlobalFrameTexture>,
@@ -373,8 +331,6 @@ pub struct OxradApp {
     warnings_without_geometry: usize,
     warnings_rejected: usize,
     selected_warning: Option<String>,
-    measure: MeasureMode,
-    measure_points: Vec<(f64, f64)>,
     warning_layer: RadarLayer,
     warning_scope: WarningScope,
     warning_state: WarningState,
@@ -451,12 +407,8 @@ impl OxradApp {
             first_run: true,
             scene_mode: SceneMode::Radar,
             basemap: Basemap::new(map_style),
-            map_view: MapView::default(),
-            radar_view: MapView::default(),
-            radar_fitted: None,
-            map_viewport: None,
-            map_radar: RadarLayer::Shown,
-            map_reload_due: None,
+            map: MapWorkspace::new(),
+            radar: RadarWorkspace::new(),
             global_feed: GlobalRadarFeed::new(),
             global_generation: 0,
             global_frames: Vec::new(),
@@ -473,8 +425,6 @@ impl OxradApp {
             warnings_without_geometry: 0,
             warnings_rejected: 0,
             selected_warning: None,
-            measure: MeasureMode::Off,
-            measure_points: Vec::new(),
             warning_layer: RadarLayer::Shown,
             warning_scope: WarningScope::All,
             warning_state: WarningState::Idle,
@@ -487,7 +437,7 @@ impl OxradApp {
         };
         if let Some(place) = &restored_place {
             match MapView::focus(place.lat, place.lon, 2_200.0) {
-                Ok(view) => app.map_view = view,
+                Ok(view) => app.map.view = view,
                 Err(error) => app.notice = Some(format!("Map centre unavailable: {error}")),
             }
             app.forecast.start(place, 0);
@@ -609,7 +559,7 @@ impl OxradApp {
             return;
         };
         match MapView::focus(lat, lon, span) {
-            Ok(view) => self.map_view = view,
+            Ok(view) => self.map.view = view,
             Err(error) => self.notice = Some(format!("Map centre unavailable: {error}")),
         }
     }
@@ -621,7 +571,7 @@ impl OxradApp {
         let Some(gpu) = self.gpu.clone() else {
             return;
         };
-        let (center_lat, center_lon) = match self.map_view.center_latlon() {
+        let (center_lat, center_lon) = match self.map.view.center_latlon() {
             Ok(center) => center,
             Err(error) => {
                 self.notice = Some(format!("Viewport radar centre unavailable: {error}"));
@@ -631,7 +581,7 @@ impl OxradApp {
         let Ok(stations) = &self.stations else {
             return;
         };
-        let radius_km = self.map_view.span_km() / 2.0 + 250.0;
+        let radius_km = self.map.view.span_km() / 2.0 + 250.0;
         let sites = match nearby_station_ids(
             stations,
             center_lat,
@@ -758,7 +708,7 @@ impl OxradApp {
     fn choose_place(&mut self, place: &Place) {
         self.search.clear();
         match MapView::focus(place.lat, place.lon, 2_200.0) {
-            Ok(view) => self.map_view = view,
+            Ok(view) => self.map.view = view,
             Err(error) => self.notice = Some(format!("Map centre unavailable: {error}")),
         }
         self.place = Some(place.clone());
@@ -870,7 +820,7 @@ impl OxradApp {
         self.forecast.update(Instant::now());
         self.update_warnings();
         self.quakes.update(Instant::now());
-        self.domains.update(Instant::now(), context, &self.map_view);
+        self.domains.update(Instant::now(), context, &self.map.view);
         self.poll_global_radar(context);
     }
 
@@ -1643,15 +1593,9 @@ impl OxradApp {
         }
         let palette = self.config.theme.palette();
         let (rect, legend_rect) = legend_split(rect, self.legend_expected());
-        self.map_viewport = Some(rect);
-        let interaction = ui.interact(
-            rect,
-            ui.id().with("geographic-map"),
-            egui::Sense::click_and_drag(),
-        );
-        self.canvas_input(ui, rect, &interaction, Canvas::Map);
+        self.map.viewport = Some(rect);
         self.refresh_map_sources();
-        let transform = match self.map_view.transform(rect) {
+        let transform = match self.map.view.transform(rect) {
             Ok(transform) => transform,
             Err(error) => {
                 ui.painter().text(
@@ -1664,8 +1608,14 @@ impl OxradApp {
                 return;
             }
         };
-        let view = self.map_view;
+        let view = self.map.view;
         self.basemap.draw(ui, rect, &view);
+        let interaction = ui.interact(
+            rect,
+            ui.id().with("geographic-map"),
+            egui::Sense::click_and_drag(),
+        );
+        self.canvas_input(ui, rect, &interaction, Canvas::Map);
         if let Err(error) = map::draw_graticule(ui.painter(), &transform, rect, view.span_km()) {
             self.notice = Some(format!("Map grid unavailable: {error}"));
         }
@@ -1687,7 +1637,7 @@ impl OxradApp {
         let mut occupied = chrome_obstacles(rect, Canvas::Map).to_vec();
         self.draw_ring_labels(ui, rect, &transform, &ring_labels, &mut occupied);
         self.map_measure(ui, rect, &transform, &interaction);
-        let clicked_site = if self.measure.is_on() {
+        let clicked_site = if self.map.measure.is_on() {
             None
         } else {
             self.map_stations(ui, rect, &transform, &interaction)
@@ -1723,8 +1673,7 @@ impl OxradApp {
 
     fn refresh_map_sources(&mut self) {
         let now = Instant::now();
-        if self.map_reload_due.is_some_and(|due| now >= due) {
-            self.map_reload_due = None;
+        if self.map.take_due_reload(now) {
             self.reload_viewport_radars();
         }
         if self.global_layer.is_shown()
@@ -1746,8 +1695,8 @@ impl OxradApp {
         canvas: Canvas,
     ) {
         let view = match canvas {
-            Canvas::Map => &mut self.map_view,
-            Canvas::Radar => &mut self.radar_view,
+            Canvas::Map => &mut self.map.view,
+            Canvas::Radar => &mut self.radar.view,
         };
         let mut outcome: Result<bool, MapError> = Ok(false);
         if interaction.dragged() {
@@ -1774,14 +1723,14 @@ impl OxradApp {
     }
 
     fn schedule_viewport_reload(&mut self) {
+        self.map.schedule_reload(Duration::from_millis(700));
         let now = Instant::now();
-        self.map_reload_due = now.checked_add(Duration::from_millis(700));
         self.global_request_due = now.checked_add(Duration::from_millis(900));
     }
 
     fn request_global_radar(&mut self) {
         self.global_request_due = None;
-        let (center_lat, center_lon) = match self.map_view.center_latlon() {
+        let (center_lat, center_lon) = match self.map.view.center_latlon() {
             Ok(center) => center,
             Err(error) => {
                 self.notice = Some(format!("Global radar view unavailable: {error}"));
@@ -1790,7 +1739,7 @@ impl OxradApp {
         };
         match self
             .global_feed
-            .request(center_lat, center_lon, self.map_view.span_km())
+            .request(center_lat, center_lon, self.map.view.span_km())
         {
             Ok(generation) => {
                 self.global_generation = generation;
@@ -2047,7 +1996,7 @@ impl OxradApp {
         span_km: f64,
         include_viewport: bool,
     ) -> bool {
-        if !self.map_radar.is_shown() && include_viewport {
+        if !self.map.radar.is_shown() && include_viewport {
             return false;
         }
         let Some(gpu) = self.gpu.clone() else {
@@ -2165,83 +2114,38 @@ impl OxradApp {
         transform: &map::MapTransform,
         interaction: &egui::Response,
     ) {
-        if !self.measure.is_on() {
+        if !self.map.measure.is_on() {
             return;
         }
-        let palette = self.config.theme.palette();
         if interaction.clicked()
             && let Some(pointer) = ui.input(|input| input.pointer.hover_pos())
             && rect.contains(pointer)
         {
-            let point = match transform.latlon_at(pointer) {
-                Ok(point) => point,
+            match transform.latlon_at(pointer) {
+                Ok(point) => {
+                    if let Err(error) = self.map.measure.add(point) {
+                        self.notice = Some(error.to_string());
+                        return;
+                    }
+                }
                 Err(error) => {
                     self.notice = Some(format!("Measurement point unavailable: {error}"));
                     return;
                 }
-            };
-            if self.measure_points.len() == MEASURE_CORNERS_MAX {
-                self.notice = Some(format!(
-                    "A measurement takes at most {MEASURE_CORNERS_MAX} corners. Turn measurement off to start another."
-                ));
-                return;
-            }
-            self.measure_points.push(point);
-        }
-        let readout = match measure_readout(&self.measure_points, self.config.units) {
-            Ok(text) => text,
-            Err(error) => format!("Measurement unavailable: {error}"),
-        };
-        let painter = ui.painter();
-        let mut positions: Vec<Pos2> = Vec::with_capacity(self.measure_points.len());
-        for (lat, lon) in &self.measure_points {
-            match transform.screen(*lat, *lon) {
-                Some(position) => positions.push(position),
-                None => return,
             }
         }
-        let Some(anchor) = positions.first().copied() else {
-            return;
-        };
-        for (from, to) in positions.iter().zip(positions.iter().skip(1)) {
-            painter.line_segment([*from, *to], Stroke::new(2.0_f32, STALE));
-        }
-        if positions.len() > 2
-            && let (Some(first), Some(end)) = (positions.first(), positions.last())
-        {
-            painter.line_segment([*end, *first], Stroke::new(1.5_f32, palette.map_text));
-        }
-        for (index, position) in positions.iter().enumerate() {
-            painter.circle_filled(*position, 4.5, STALE);
-            painter.text(
-                *position + Vec2::new(8.0, 8.0),
-                Align2::LEFT_TOP,
-                (index + 1).to_string(),
-                FontId::monospace(11.0),
-                TEXT,
-            );
-        }
-        let galley = painter.layout_no_wrap(readout, FontId::monospace(10.0), TEXT);
-        let padding = Vec2::splat(6.0);
-        let size = galley.size() + 2.0 * padding;
-        // The gate readout follows the pointer, so the panel hangs off the
-        // first corner instead of the corner just clicked.
-        let origin = Pos2::new(
-            (anchor.x + 12.0).clamp(
-                rect.left() + 4.0,
-                (rect.right() - size.x - 4.0).max(rect.left() + 4.0),
-            ),
-            (anchor.y - size.y - 12.0).clamp(
-                rect.top() + 4.0,
-                (rect.bottom() - size.y - 4.0).max(rect.top() + 4.0),
-            ),
+        let palette = self.config.theme.palette();
+        self.map.measure.draw(
+            ui.painter(),
+            rect,
+            transform,
+            self.config.units,
+            crate::workspaces::MeasureColors {
+                accent: STALE,
+                text: TEXT,
+                outline: palette.map_text,
+            },
         );
-        painter.rect_filled(
-            Rect::from_min_size(origin, size),
-            CornerRadius::same(4),
-            Color32::from_black_alpha(220),
-        );
-        painter.galley(origin + padding, galley, TEXT);
     }
 
     fn map_stations(
@@ -2279,7 +2183,7 @@ impl OxradApp {
                         Color32::from_rgb(105, 202, 214)
                     },
                 );
-                if selected || self.map_view.span_km() < 1_800.0 {
+                if selected || self.map.view.span_km() < 1_800.0 {
                     ui.painter().text(
                         position + Vec2::new(7.0, -7.0),
                         Align2::LEFT_BOTTOM,
@@ -2329,7 +2233,7 @@ impl OxradApp {
 
     fn map_layer_rail(&mut self, ui: &mut egui::Ui) {
         let palette = self.config.theme.palette();
-        let centre = self.map_view.center_latlon().ok();
+        let centre = self.map.view.center_latlon().ok();
         ui.label("Basemap style");
         if let Some(style) = self.basemap.controls(ui) {
             self.config.map_style = style;
@@ -2371,7 +2275,7 @@ impl OxradApp {
         };
         match MapView::focus(lat, lon, span) {
             Ok(view) => {
-                self.map_view = view;
+                self.map.view = view;
                 self.schedule_viewport_reload();
             }
             Err(error) => self.notice = Some(format!("Map centre unavailable: {error}")),
@@ -2385,7 +2289,7 @@ impl OxradApp {
         };
         match MapView::focus(lat, lon, 1_200.0) {
             Ok(view) => {
-                self.map_view = view;
+                self.map.view = view;
                 self.schedule_viewport_reload();
             }
             Err(error) => self.notice = Some(format!("Map centre unavailable: {error}")),
@@ -2399,7 +2303,7 @@ impl OxradApp {
                 [116.0, 30.0],
                 action_button(
                     &palette,
-                    if self.map_radar.is_shown() {
+                    if self.map.radar.is_shown() {
                         "Hide radar layer"
                     } else {
                         "Show radar layer"
@@ -2408,14 +2312,14 @@ impl OxradApp {
             )
             .clicked()
         {
-            self.map_radar = self.map_radar.toggled();
+            self.map.radar = self.map.radar.toggled();
         }
         ui.horizontal(|ui| {
             if ui
                 .add_sized([34.0, 30.0], action_button(&palette, "+"))
                 .clicked()
             {
-                match self.map_view.zoom_center(1.6) {
+                match self.map.view.zoom_center(1.6) {
                     Ok(()) => self.schedule_viewport_reload(),
                     Err(error) => self.notice = Some(format!("Map zoom failed: {error}")),
                 }
@@ -2424,7 +2328,7 @@ impl OxradApp {
                 .add_sized([34.0, 30.0], action_button(&palette, "−"))
                 .clicked()
             {
-                match self.map_view.zoom_center(1.0 / 1.6) {
+                match self.map.view.zoom_center(1.0 / 1.6) {
                     Ok(()) => self.schedule_viewport_reload(),
                     Err(error) => self.notice = Some(format!("Map zoom failed: {error}")),
                 }
@@ -2498,12 +2402,12 @@ impl OxradApp {
                 [116.0, 30.0],
                 toggle_button(
                     &palette,
-                    if self.measure.is_on() {
+                    if self.map.measure.is_on() {
                         "Measure: on"
                     } else {
                         "Measure: off"
                     },
-                    self.measure.is_on(),
+                    self.map.measure.is_on(),
                 ),
             )
             .on_hover_text(
@@ -2511,8 +2415,7 @@ impl OxradApp {
             )
             .clicked()
         {
-            self.measure = self.measure.toggled();
-            self.measure_points.clear();
+            self.map.measure.toggle();
         }
     }
 
@@ -2589,7 +2492,7 @@ impl OxradApp {
             palette.map_text.b(),
             200,
         );
-        let centre = self.map_view.center_latlon().map_or_else(
+        let centre = self.map.view.center_latlon().map_or_else(
             |_| String::from("unavailable"),
             |(lat, lon)| format!("{lat:.2}, {lon:.2}"),
         );
@@ -2616,7 +2519,7 @@ impl OxradApp {
             Align2::LEFT_TOP,
             format!(
                 "Centre {centre} · {:.0} km wide · {} viewport radars",
-                self.map_view.span_km(),
+                self.map.view.span_km(),
                 self.view_radars.len()
             ),
             FontId::proportional(theme::TYPE_SMALL),
@@ -2635,7 +2538,7 @@ impl OxradApp {
         let reference = self.displayed_scan_reference();
         let mut contributing = Vec::new();
         let mut excluded = Vec::new();
-        if self.map_radar.is_shown() {
+        if self.map.radar.is_shown() {
             if self
                 .display
                 .frame
@@ -3244,10 +3147,10 @@ impl OxradApp {
         if self.warning_scope == WarningScope::All {
             return true;
         }
-        let Some(rect) = self.map_viewport else {
+        let Some(rect) = self.map.viewport else {
             return true;
         };
-        let Ok(transform) = self.map_view.transform(rect) else {
+        let Ok(transform) = self.map.view.transform(rect) else {
             return true;
         };
         warning_intersects(warning, &transform, rect)
@@ -3352,7 +3255,7 @@ impl OxradApp {
         let label = format!("{} for {}", warning.event, warning.area);
         match MapView::focus(lat, lon, 700.0) {
             Ok(view) => {
-                self.map_view = view;
+                self.map.view = view;
                 self.scene_mode = SceneMode::Map;
                 self.schedule_viewport_reload();
                 self.notice = Some(format!(
@@ -3465,18 +3368,12 @@ impl OxradApp {
             return;
         }
         let (rect, legend_rect) = legend_split(full_rect, self.legend_expected());
-        let interaction = ui.interact(
-            rect,
-            ui.id().with("radar-canvas"),
-            egui::Sense::click_and_drag(),
-        );
-        self.canvas_input(ui, rect, &interaction, Canvas::Radar);
         self.fit_radar_view();
         if self.display.frame.is_none() {
             self.empty_state(ui, rect);
             return;
         }
-        let transform = match self.radar_view.transform(rect) {
+        let transform = match self.radar.view.transform(rect) {
             Ok(transform) => transform,
             Err(error) => {
                 ui.painter().text(
@@ -3489,8 +3386,14 @@ impl OxradApp {
                 return;
             }
         };
-        let view = self.radar_view;
+        let view = self.radar.view;
         self.basemap.draw(ui, rect, &view);
+        let interaction = ui.interact(
+            rect,
+            ui.id().with("radar-canvas"),
+            egui::Sense::click_and_drag(),
+        );
+        self.canvas_input(ui, rect, &interaction, Canvas::Radar);
         if let Err(error) = map::draw_graticule(ui.painter(), &transform, rect, view.span_km()) {
             self.notice = Some(format!("Radar grid unavailable: {error}"));
         }
@@ -3634,19 +3537,17 @@ impl OxradApp {
         let Some(site) = self.site.clone() else {
             return;
         };
-        if self.radar_fitted.as_ref() == Some(&site) {
-            return;
-        }
-        let Some(frame) = self.display.frame.as_ref() else {
+        let Some((latitude, longitude, span_km)) = self.display.frame.as_ref().map(|frame| {
+            (
+                frame.geometry.site_lat,
+                frame.geometry.site_lon,
+                frame.geometry.extent_km * 2.1,
+            )
+        }) else {
             return;
         };
-        let span_km = frame.geometry.extent_km * 2.1;
-        match map::MapView::focus(frame.geometry.site_lat, frame.geometry.site_lon, span_km) {
-            Ok(view) => {
-                self.radar_view = view;
-                self.radar_fitted = Some(site);
-            }
-            Err(error) => self.notice = Some(format!("Radar view could not be fitted: {error}")),
+        if let Err(error) = self.radar.fit(&site, latitude, longitude, span_km) {
+            self.notice = Some(format!("Radar view could not be fitted: {error}"));
         }
     }
 
@@ -4301,57 +4202,23 @@ impl eframe::App for OxradApp {
     }
 }
 
-/// The readout for a path of map corners.
-///
-/// Two corners give a geodesic distance and initial bearing. Three or more
-/// also give the enclosed area and perimeter, treating the last corner as
-/// joined back to the first.
-fn measure_readout(
-    points: &[(f64, f64)],
-    units: crate::units::UnitSystem,
-) -> Result<String, crate::error::CoordinateError> {
-    match points {
-        [] => Ok(String::from("Click a corner to start measuring")),
-        [first] => Ok(format!(
-            "Corner 1 {:.4}, {:.4}\nClick a second corner",
-            first.0, first.1
-        )),
-        [first, second] => {
-            let (distance_km, bearing_deg) =
-                crate::projection::inverse(first.0, first.1, second.0, second.1)?;
-            Ok(format!(
-                "{} · {bearing_deg:.0}° {}\n{:.4}, {:.4}\nClick a third corner for area",
-                crate::units::distance(distance_km, units),
-                place::compass(bearing_deg),
-                first.0,
-                first.1
-            ))
-        }
-        [first, ..] => {
-            let (area_km2, perimeter_km) = crate::projection::polygon_area_km2(points)?;
-            let mut path_km = 0.0;
-            for (from, to) in points.iter().zip(points.iter().skip(1)) {
-                let (distance_km, _bearing) =
-                    crate::projection::inverse(from.0, from.1, to.0, to.1)?;
-                path_km += distance_km;
-            }
-            Ok(format!(
-                "{} corners · area {}\nperimeter {} · path {}\n{:.4}, {:.4}",
-                points.len(),
-                crate::units::area(area_km2, units),
-                crate::units::distance(perimeter_km, units),
-                crate::units::distance(path_km, units),
-                first.0,
-                first.1
-            ))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::TestError;
+    use crate::workspaces::Measurement;
+
+    fn measured(
+        points: &[(f64, f64)],
+        units: crate::units::UnitSystem,
+    ) -> Result<String, TestError> {
+        let mut measure = Measurement::new();
+        measure.toggle();
+        for point in points {
+            measure.add(*point).map_err(|error| error.to_string())?;
+        }
+        Ok(measure.readout(units)?)
+    }
 
     fn warning(id: &str, event: &str) -> Warning {
         Warning {
@@ -4414,7 +4281,7 @@ mod tests {
 
     #[test]
     fn two_measured_corners_report_distance_and_bearing() -> Result<(), TestError> {
-        let text = measure_readout(
+        let text = measured(
             &[(38.0, -97.0), (39.0, -97.0)],
             crate::units::UnitSystem::Metric,
         )?;
@@ -4429,7 +4296,7 @@ mod tests {
     #[test]
     fn four_measured_corners_report_the_enclosed_area() -> Result<(), TestError> {
         let square = [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)];
-        let text = measure_readout(&square, crate::units::UnitSystem::Metric)?;
+        let text = measured(&square, crate::units::UnitSystem::Metric)?;
         assert!(text.contains("4 corners"), "readout was {text}");
         assert!(text.contains("area 12309 km²"), "readout was {text}");
         assert!(text.contains("perimeter 443.8 km"), "readout was {text}");
@@ -4439,7 +4306,7 @@ mod tests {
 
     #[test]
     fn an_unstarted_measurement_asks_for_a_corner() -> Result<(), TestError> {
-        let text = measure_readout(&[], crate::units::UnitSystem::Imperial)?;
+        let text = measured(&[], crate::units::UnitSystem::Imperial)?;
         assert_eq!(text, "Click a corner to start measuring");
         Ok(())
     }
