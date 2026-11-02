@@ -20,25 +20,6 @@ use crate::units::{self, UnitSystem};
 pub const MEASURE_CORNERS_MAX: usize = 24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LayerVisibility {
-    Shown,
-    Hidden,
-}
-
-impl LayerVisibility {
-    pub const fn is_shown(self) -> bool {
-        matches!(self, Self::Shown)
-    }
-
-    pub const fn toggled(self) -> Self {
-        match self {
-            Self::Shown => Self::Hidden,
-            Self::Hidden => Self::Shown,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MeasureMode {
     Off,
     On,
@@ -233,7 +214,6 @@ impl Measurement {
 pub struct MapWorkspace {
     pub view: MapView,
     pub viewport: Option<Rect>,
-    pub radar: LayerVisibility,
     pub reload_due: Option<Instant>,
     pub measure: Measurement,
 }
@@ -243,7 +223,6 @@ impl MapWorkspace {
         Self {
             view: MapView::default(),
             viewport: None,
-            radar: LayerVisibility::Shown,
             reload_due: None,
             measure: Measurement::new(),
         }

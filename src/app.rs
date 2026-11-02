@@ -1892,7 +1892,7 @@ impl OxradApp {
         span_km: f64,
         include_viewport: bool,
     ) -> bool {
-        if !self.map.radar.is_shown() && include_viewport {
+        if !self.layers.visible(LayerId::Radar) && include_viewport {
             return false;
         }
         let Some(gpu) = self.gpu.clone() else {
@@ -2195,22 +2195,6 @@ impl OxradApp {
 
     fn map_layer_controls(&mut self, ui: &mut egui::Ui) {
         let palette = self.config.theme.palette();
-        if ui
-            .add_sized(
-                [116.0, 30.0],
-                action_button(
-                    &palette,
-                    if self.map.radar.is_shown() {
-                        "Hide radar layer"
-                    } else {
-                        "Show radar layer"
-                    },
-                ),
-            )
-            .clicked()
-        {
-            self.map.radar = self.map.radar.toggled();
-        }
         ui.horizontal(|ui| {
             if ui
                 .add_sized([34.0, 30.0], action_button(&palette, "+"))
@@ -2297,6 +2281,7 @@ impl OxradApp {
 
     fn layer_changed(&mut self, id: LayerId, visible: bool) {
         match id {
+            LayerId::Radar => {}
             LayerId::Warnings => {
                 if visible && matches!(self.warning_view.state, WarningState::Idle) {
                     self.warning_view.retry_now();
@@ -2459,7 +2444,7 @@ impl OxradApp {
         let reference = self.displayed_scan_reference();
         let mut contributing = Vec::new();
         let mut excluded = Vec::new();
-        if self.map.radar.is_shown() {
+        if self.layers.visible(LayerId::Radar) {
             if self
                 .display
                 .frame

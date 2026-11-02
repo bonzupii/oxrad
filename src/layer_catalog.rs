@@ -7,6 +7,7 @@
 /// A layer the Map workspace can draw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayerId {
+    Radar,
     GlobalComposite,
     Warnings,
 }
@@ -14,6 +15,7 @@ pub enum LayerId {
 impl LayerId {
     pub const fn label(self) -> &'static str {
         match self {
+            Self::Radar => "Radar sweeps",
             Self::GlobalComposite => "Global radar composite",
             Self::Warnings => "Active warnings",
         }
@@ -21,6 +23,7 @@ impl LayerId {
 
     pub const fn detail(self) -> &'static str {
         match self {
+            Self::Radar => "The selected radar and the sweeps around the view centre.",
             Self::GlobalComposite => "RainViewer reflectivity composite with two hours of history.",
             Self::Warnings => {
                 "Active National Weather Service warning polygons for the United States \
@@ -31,6 +34,7 @@ impl LayerId {
 
     pub const fn group(self) -> LayerGroup {
         match self {
+            Self::Radar => LayerGroup::Radar,
             Self::GlobalComposite => LayerGroup::Imagery,
             Self::Warnings => LayerGroup::Alerts,
         }
@@ -40,15 +44,17 @@ impl LayerId {
 /// The heading a layer sits under in the layer list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayerGroup {
+    Radar,
     Imagery,
     Alerts,
 }
 
 impl LayerGroup {
-    pub const ALL: [Self; 2] = [Self::Imagery, Self::Alerts];
+    pub const ALL: [Self; 3] = [Self::Radar, Self::Imagery, Self::Alerts];
 
     pub const fn label(self) -> &'static str {
         match self {
+            Self::Radar => "Radar",
             Self::Imagery => "Imagery",
             Self::Alerts => "Alerts",
         }
@@ -71,6 +77,11 @@ impl LayerCatalog {
     pub fn new() -> Self {
         Self {
             slots: vec![
+                Slot {
+                    id: LayerId::Radar,
+                    visible: true,
+                    opacity: 1.0,
+                },
                 Slot {
                     id: LayerId::GlobalComposite,
                     visible: true,
@@ -151,7 +162,7 @@ mod tests {
     #[test]
     fn every_layer_starts_shown_at_full_opacity() -> Result<(), TestError> {
         let catalog = LayerCatalog::new();
-        for id in [LayerId::GlobalComposite, LayerId::Warnings] {
+        for id in [LayerId::Radar, LayerId::GlobalComposite, LayerId::Warnings] {
             assert!(catalog.visible(id), "{} must start shown", id.label());
             assert!((catalog.opacity(id) - 1.0).abs() < f32::EPSILON);
         }
@@ -164,6 +175,7 @@ mod tests {
         let mut catalog = LayerCatalog::new();
         catalog.set_visible(LayerId::Warnings, false);
         assert!(!catalog.visible(LayerId::Warnings));
+        assert!(catalog.visible(LayerId::Radar));
         assert!(catalog.visible(LayerId::GlobalComposite));
         catalog.set_visible(LayerId::Warnings, true);
         assert!(catalog.visible(LayerId::Warnings));
@@ -195,7 +207,7 @@ mod tests {
             catalog.in_group(LayerGroup::Alerts),
             vec![LayerId::Warnings]
         );
-        assert_eq!(catalog.search("").len(), 2);
+        assert_eq!(catalog.search("").len(), 3);
         Ok(())
     }
 
@@ -203,7 +215,7 @@ mod tests {
     fn search_matches_a_label_without_regard_to_case() -> Result<(), TestError> {
         let catalog = LayerCatalog::new();
         assert_eq!(catalog.search("WARN").len(), 1);
-        assert_eq!(catalog.search("  ").len(), 2);
+        assert_eq!(catalog.search("  ").len(), 3);
         assert!(catalog.search("solar wind").is_empty());
         assert_eq!(catalog.search("composite"), vec![LayerId::GlobalComposite]);
         Ok(())
