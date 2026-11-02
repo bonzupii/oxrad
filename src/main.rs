@@ -20,6 +20,8 @@ mod climate;
 mod climate_layer;
 mod colormap;
 mod config;
+mod cyclone;
+mod cyclone_layer;
 mod derived;
 mod display;
 mod domains;

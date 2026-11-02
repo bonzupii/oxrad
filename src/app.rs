@@ -2384,6 +2384,7 @@ impl OxradApp {
             sounding: self.domains.sounding(),
             volcanoes: self.domains.volcanoes(),
             gauges: self.domains.gauges(),
+            cyclones: self.domains.cyclones(),
         };
         self.radio.update(Instant::now(), &radio_input);
         self.radio.rail(ui, &palette, &radio_input);
@@ -2395,6 +2396,8 @@ impl OxradApp {
             (lat, lon, 600.0)
         } else if let Some((lat, lon)) = self.domains.take_gauge_focus() {
             (lat, lon, 120.0)
+        } else if let Some((lat, lon)) = self.domains.take_cyclone_focus() {
+            (lat, lon, 2_500.0)
         } else {
             return;
         };
@@ -3592,6 +3595,8 @@ impl OxradApp {
                 .draw_volcanoes(ui.painter(), transform, rect, &palette);
             self.domains
                 .draw_gauges(ui.painter(), transform, rect, &palette);
+            self.domains
+                .draw_cyclones(ui.painter(), transform, rect, &palette);
             self.domains
                 .draw_stations(ui.painter(), transform, &palette);
         }

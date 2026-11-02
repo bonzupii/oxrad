@@ -340,6 +340,20 @@ case "$scenario" in
         click 140 330
         sleep "${OXRAD_GUI_HYDRO_SETTLE:-12}"
         ;;
+    cyclones)
+        # The cyclone section sits below the river gauges, so the rail is
+        # scrolled to its end and the map zoomed out to the hemisphere.
+        click 240 28
+        rail_scroll 60
+        "$tool_xwdtopnm" "$framebuffer" | "$tool_pnmtopng" > "$output/cyclones-before.png"
+        click 60 192
+        sleep "${OXRAD_GUI_CYCLONE_SETTLE:-16}"
+        "$tool_xwdtopnm" "$framebuffer" | "$tool_pnmtopng" > "$output/cyclones-list.png"
+        # Clicking a storm centres the map on it, so the map should jump half a
+        # world away from the plain it opened on.
+        click 120 320
+        sleep 5
+        ;;
     radio)
         # The radio sits at the end of the rail, below the earthquake section.
         click 240 28
@@ -631,6 +645,46 @@ if [[ "$scenario" == "radio" ]]; then
         fail "the radio changed $changed rail samples; it never played a bulletin"
     fi
     printf 'gui: radio changed %s rail samples\n' "$changed"
+fi
+
+if [[ "$scenario" == "cyclones" ]]; then
+    # The rail gains the storm list, and choosing one moves the map from the
+    # plain it opened on to that storm's own position, where its marker is
+    # drawn in the alert colour.
+    cyclone_sample() {
+        "$tool_pngtopnm" "$1" 2>/dev/null |
+            "$tool_pamcut" -left 0 -top 180 -width 340 -height 400 2>/dev/null |
+            "$scale_pnmscale" -xsize 170 -ysize 200 2>/dev/null |
+            "$scale_pnmtoplainpnm" 2>/dev/null |
+            awk 'NR <= 3 { next } { printf "%s %s %s\n", $1, $2, $3 }'
+    }
+    listed="$(diff <(cyclone_sample "$output/cyclones-before.png") <(cyclone_sample "$output/cyclones-list.png") |
+        grep -c '^[<>]' || true)"
+    if [[ -z "$listed" ]] || ((listed < 500)); then
+        fail "the cyclone section changed $listed rail samples; no storm list was read"
+    fi
+    printf 'gui: cyclone section redrew %s rail samples\n' "$listed"
+    cycled_map() {
+        "$tool_pngtopnm" "$1" 2>/dev/null |
+            "$tool_pamcut" -left 380 -top 80 -width 520 -height 460 2>/dev/null |
+            "$scale_pnmscale" -xsize 130 -ysize 115 2>/dev/null |
+            "$scale_pnmtoplainpnm" 2>/dev/null |
+            awk 'NR <= 3 { next } { printf "%s %s %s\n", $1, $2, $3 }'
+    }
+    jumped="$(diff <(cycled_map "$output/cyclones-list.png") <(cycled_map "$png") |
+        grep -c '^[<>]' || true)"
+    if [[ -z "$jumped" ]] || ((jumped < 1200)); then
+        fail "the map changed $jumped samples after a storm was clicked; it never recentred"
+    fi
+    printf 'gui: clicking a storm recentred %s map samples\n' "$jumped"
+    mark="$("$tool_pngtopnm" "$png" 2>/dev/null |
+        "$tool_pamcut" -left 590 -top 320 -width 60 -height 60 2>/dev/null |
+        "$scale_pnmtoplainpnm" 2>/dev/null |
+        awk 'NR <= 3 { next } $1 > 170 && ($1 - $3) > 80 && $2 < 210 { count++ } END { print count + 0 }')"
+    if [[ -z "$mark" ]] || ((mark < 8)); then
+        fail "the map centre holds $mark alert-coloured pixels; the storm marker never painted"
+    fi
+    printf 'gui: storm marker painted %s alert-coloured pixels at the map centre\n' "$mark"
 fi
 
 if [[ "$scenario" == "gauges" ]]; then

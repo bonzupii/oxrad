@@ -21,6 +21,7 @@
 //! record is for. When an open layer has nothing worth saying, it says nothing
 //! and the radio is shorter rather than padded.
 
+use crate::cyclone::{self, StormList};
 use crate::forecast::Forecast;
 use crate::gauge::GaugeSet;
 use crate::observations::ObservationSet;
@@ -82,6 +83,7 @@ pub struct Input<'a> {
     pub sounding: Option<&'a Sounding>,
     pub volcanoes: Option<&'a Report>,
     pub gauges: Option<&'a GaugeSet>,
+    pub cyclones: Option<&'a StormList>,
 }
 
 /// Builds the radio's running order: everything worth saying, most urgent
@@ -96,6 +98,7 @@ pub fn bulletins(input: &Input<'_>) -> Vec<Bulletin> {
     space(input, &mut sayings);
     volcanoes(input, &mut sayings);
     gauges(input, &mut sayings);
+    cyclones(input, &mut sayings);
     column(input, &mut sayings);
     sayings.sort_by(|left, right| {
         right
@@ -403,6 +406,40 @@ fn gauges(input: &Input<'_>, sayings: &mut Vec<Bulletin>) {
         text: format!(
             "Highest river stage in view {:.2} {}{provisional} at {}.",
             reading.value, reading.unit, gauge.name
+        ),
+    });
+}
+
+/// A tropical cyclone the alert service is carrying, when it is either still in
+/// progress or at the highest alert level.
+fn cyclones(input: &Input<'_>, sayings: &mut Vec<Bulletin>) {
+    let Some(list) = input.cyclones else {
+        return;
+    };
+    let Some(storm) = list
+        .cyclones
+        .iter()
+        .filter(|storm| storm.current || storm.alert == Some(cyclone::Alert::Red))
+        .max_by_key(|storm| storm.wind.map_or(0, |wind| wind as i64))
+    else {
+        return;
+    };
+    let wind = storm.wind.map_or_else(
+        || String::from("no wind published"),
+        |wind| format!("maximum wind {wind:.0} km/h"),
+    );
+    sayings.push(Bulletin {
+        source: "GDACS global disaster alerts",
+        at_ms: storm.to_ms,
+        urgency: if storm.alert == Some(cyclone::Alert::Red) {
+            Urgency::Notable
+        } else {
+            Urgency::Routine
+        },
+        text: format!(
+            "Tropical cyclone {} in {}, {wind}.",
+            storm.name,
+            storm.country.as_deref().unwrap_or("no country stated")
         ),
     });
 }

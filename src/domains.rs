@@ -26,6 +26,8 @@ use std::time::Instant;
 use eframe::egui::{self, Painter, Rect};
 
 use crate::climate_layer::ClimateLayer;
+use crate::cyclone::StormList;
+use crate::cyclone_layer::CycloneLayer;
 use crate::environment_layer::EnvironmentLayer;
 use crate::fire_layer::FireLayer;
 use crate::gauge::GaugeSet;
@@ -66,6 +68,7 @@ pub struct Domains {
     land_surface: LandLayer,
     volcanoes: VolcanoLayer,
     gauges: GaugeLayer,
+    cyclones: CycloneLayer,
 }
 
 impl Domains {
@@ -86,6 +89,7 @@ impl Domains {
             land_surface: LandLayer::new(),
             volcanoes: VolcanoLayer::new(),
             gauges: GaugeLayer::new(),
+            cyclones: CycloneLayer::new(),
         }
     }
 
@@ -106,6 +110,12 @@ impl Domains {
         self.land_surface.update(now, view);
         self.volcanoes.update(now);
         self.gauges.update(now, view);
+        self.cyclones.update(now);
+    }
+
+    /// A cyclone the reader clicked, so the shell can centre the map on it.
+    pub const fn take_cyclone_focus(&mut self) -> Option<(f64, f64)> {
+        self.cyclones.take_focus()
     }
 
     /// A gauge the reader clicked, so the shell can centre the map on it.
@@ -135,6 +145,7 @@ impl Domains {
         self.land_surface.rail(ui, palette);
         self.volcanoes.rail(ui, palette);
         self.gauges.rail(ui, palette, centre);
+        self.cyclones.rail(ui, palette);
     }
 
     /// The satellite imagery, drawn under everything else on the map.
@@ -173,6 +184,22 @@ impl Domains {
         palette: &Palette,
     ) {
         self.gauges.draw(painter, transform, rect, palette);
+    }
+
+    /// The tropical cyclones, drawn with the other point layers.
+    pub fn draw_cyclones(
+        &self,
+        painter: &Painter,
+        transform: &MapTransform,
+        rect: Rect,
+        palette: &Palette,
+    ) {
+        self.cyclones.draw(painter, transform, rect, palette);
+    }
+
+    /// The storms the alert service is carrying, for the information radio.
+    pub const fn cyclones(&self) -> Option<&StormList> {
+        self.cyclones.list()
     }
 
     /// What the river gauges are reporting, for the information radio.
