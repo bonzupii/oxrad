@@ -44,6 +44,8 @@ use crate::sounding_layer::SoundingLayer;
 use crate::spaceweather::SpaceWeather;
 use crate::spaceweather_layer::SpaceWeatherLayer;
 use crate::theme::Palette;
+use crate::volcano;
+use crate::volcano_layer::VolcanoLayer;
 
 /// Every layer that follows the map centre.
 pub struct Domains {
@@ -60,6 +62,7 @@ pub struct Domains {
     profile: SoundingLayer,
     sea_ice: SeaIceLayer,
     land_surface: LandLayer,
+    volcanoes: VolcanoLayer,
 }
 
 impl Domains {
@@ -78,6 +81,7 @@ impl Domains {
             profile: SoundingLayer::new(),
             sea_ice: SeaIceLayer::new(),
             land_surface: LandLayer::new(),
+            volcanoes: VolcanoLayer::new(),
         }
     }
 
@@ -96,6 +100,12 @@ impl Domains {
         self.profile.update(now, view);
         self.sea_ice.update(now);
         self.land_surface.update(now, view);
+        self.volcanoes.update(now);
+    }
+
+    /// A volcano the reader clicked, so the shell can centre the map on it.
+    pub const fn take_volcano_focus(&mut self) -> Option<(f64, f64)> {
+        self.volcanoes.take_focus()
     }
 
     /// The rail sections that sit above the earthquake section.
@@ -113,6 +123,7 @@ impl Domains {
         self.profile.rail(ui, palette);
         self.sea_ice.rail(ui, palette);
         self.land_surface.rail(ui, palette);
+        self.volcanoes.rail(ui, palette);
     }
 
     /// The satellite imagery, drawn under everything else on the map.
@@ -129,6 +140,17 @@ impl Domains {
         palette: &Palette,
     ) {
         self.fires.draw(painter, transform, rect, palette);
+    }
+
+    /// The raised volcanoes, drawn with the other point layers.
+    pub fn draw_volcanoes(
+        &self,
+        painter: &Painter,
+        transform: &MapTransform,
+        rect: Rect,
+        palette: &Palette,
+    ) {
+        self.volcanoes.draw(painter, transform, rect, palette);
     }
 
     /// The surface station plots, drawn with the other point layers.
@@ -149,6 +171,11 @@ impl Domains {
     /// The space-weather record, for the information radio.
     pub const fn space(&self) -> Option<&SpaceWeather> {
         self.space_weather.record()
+    }
+
+    /// The volcanic-activity report, for the information radio.
+    pub const fn volcanoes(&self) -> Option<&volcano::Report> {
+        self.volcanoes.report()
     }
 
     /// The vertical profile, for the information radio.

@@ -28,6 +28,7 @@ use crate::quality::AirQuality;
 use crate::sounding::Sounding;
 use crate::spaceweather::{KpStatus, SpaceWeather};
 use crate::time;
+use crate::volcano::{Colour, Report};
 use crate::warnings::{Severity, Warning};
 
 /// How much attention a bulletin deserves.
@@ -78,6 +79,7 @@ pub struct Input<'a> {
     pub air: Option<&'a AirQuality>,
     pub space: Option<&'a SpaceWeather>,
     pub sounding: Option<&'a Sounding>,
+    pub volcanoes: Option<&'a Report>,
 }
 
 /// Builds the radio's running order: everything worth saying, most urgent
@@ -90,6 +92,7 @@ pub fn bulletins(input: &Input<'_>) -> Vec<Bulletin> {
     trends(input, &mut sayings);
     air(input, &mut sayings);
     space(input, &mut sayings);
+    volcanoes(input, &mut sayings);
     column(input, &mut sayings);
     sayings.sort_by(|left, right| {
         right
@@ -324,6 +327,46 @@ fn space(input: &Input<'_>, sayings: &mut Vec<Bulletin>) {
             "Planetary K index {:.0} ({measured}), a {} geomagnetic storm.",
             point.kp,
             storm_grade(point.kp)
+        ),
+    });
+}
+
+/// A volcano an observatory has raised, from the volcanic-activity report.
+fn volcanoes(input: &Input<'_>, sayings: &mut Vec<Bulletin>) {
+    let Some(report) = input.volcanoes else {
+        return;
+    };
+    let Some(highest) = report.highest() else {
+        return;
+    };
+    if highest == Colour::Yellow {
+        return;
+    }
+    let Some(volcano) = report
+        .volcanoes
+        .iter()
+        .filter(|volcano| volcano.notice.colour == Some(highest))
+        .max_by_key(|volcano| volcano.notice.sent_ms)
+    else {
+        return;
+    };
+    let code = volcano.notice.colour.map_or_else(
+        || volcano.notice.colour_text.to_lowercase(),
+        |code| String::from(code.label()),
+    );
+    sayings.push(Bulletin {
+        source: "USGS Volcano Hazards Program",
+        at_ms: volcano.notice.sent_ms,
+        urgency: if highest >= Colour::Orange {
+            Urgency::Notable
+        } else {
+            Urgency::Routine
+        },
+        text: format!(
+            "{} at {} alert, aviation colour code {code} — {}.",
+            volcano.notice.volcano,
+            volcano.notice.alert_level.to_lowercase(),
+            highest.meaning()
         ),
     });
 }

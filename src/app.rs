@@ -2369,6 +2369,7 @@ impl OxradApp {
         let centre = self.map_view.center_latlon().ok();
         self.domains.rail(ui, &palette, centre);
         self.quake_rail(ui);
+        self.volcano_focus();
         let clock = time::now_unix_ms();
         let radio_input = RadioInput {
             now_ms: clock.as_ref().copied().unwrap_or(0),
@@ -2381,9 +2382,24 @@ impl OxradApp {
             air: self.domains.air(),
             space: self.domains.space(),
             sounding: self.domains.sounding(),
+            volcanoes: self.domains.volcanoes(),
         };
         self.radio.update(Instant::now(), &radio_input);
         self.radio.rail(ui, &palette, &radio_input);
+    }
+
+    /// Centres the map on a volcano the reader clicked in the rail.
+    fn volcano_focus(&mut self) {
+        let Some((lat, lon)) = self.domains.take_volcano_focus() else {
+            return;
+        };
+        match crate::volcano_layer::view_for(lat, lon) {
+            Ok(view) => {
+                self.map_view = view;
+                self.schedule_viewport_reload();
+            }
+            Err(error) => self.notice = Some(format!("Map centre unavailable: {error}")),
+        }
     }
 
     fn quake_rail(&mut self, ui: &mut egui::Ui) {
@@ -3567,6 +3583,8 @@ impl OxradApp {
             self.domains.draw_satellite(ui, transform, rect);
             self.domains
                 .draw_fires(ui.painter(), transform, rect, &palette);
+            self.domains
+                .draw_volcanoes(ui.painter(), transform, rect, &palette);
             self.domains
                 .draw_stations(ui.painter(), transform, &palette);
         }

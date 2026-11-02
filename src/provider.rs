@@ -22,6 +22,14 @@ use std::time::Duration;
 use serde_json::Value;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a connection attempt to one address may take.
+///
+/// A dual-stack host answers with an IPv6 address first, and a machine with no
+/// IPv6 route would otherwise sit on that dead address until the operating
+/// system gives up — ten seconds or more for a request that a working address
+/// answers in a tenth of one. A short connect budget makes the resolver's
+/// next address win quickly instead.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_BODY_BYTES: u64 = 4 * 1024 * 1024;
 const USER_AGENT: &str = concat!(
     "oxrad/",
@@ -173,6 +181,7 @@ fn fetch(url: &str, accept: &str, limit: u64) -> Result<Vec<u8>, JsonError> {
         .header("Accept", accept)
         .config()
         .timeout_global(Some(REQUEST_TIMEOUT))
+        .timeout_connect(Some(CONNECT_TIMEOUT))
         .http_status_as_error(false)
         .build()
         .call()

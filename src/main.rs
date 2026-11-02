@@ -76,6 +76,8 @@ mod test_support;
 mod theme;
 mod time;
 mod units;
+mod volcano;
+mod volcano_layer;
 mod warnings;
 
 use std::process::ExitCode;

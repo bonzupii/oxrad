@@ -289,6 +289,21 @@ case "$scenario" in
         click 60 203
         sleep "${OXRAD_GUI_LAND_SETTLE:-16}"
         ;;
+    volcanoes)
+        # The volcanic-activity section sits between the land surface and the
+        # earthquake section at the rail's end, and the map is widened to the
+        # Aleutians afterwards so the raised volcanoes are inside the view.
+        click 240 28
+        rail_scroll 60
+        "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/volcanoes-before.png"
+        click 60 193
+        sleep "${OXRAD_GUI_VOLCANO_SETTLE:-16}"
+        "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/volcanoes-list.png"
+        # Clicking a raised volcano centres the map on it, so the map should
+        # jump and the volcano's own marker should be drawn at its middle.
+        click 120 313
+        sleep 5
+        ;;
     radio)
         # The radio sits at the end of the rail, below the earthquake section.
         click 240 28
@@ -580,6 +595,34 @@ if [[ "$scenario" == "radio" ]]; then
         fail "the radio changed $changed rail samples; it never played a bulletin"
     fi
     printf 'gui: radio changed %s rail samples\n' "$changed"
+fi
+
+if [[ "$scenario" == "volcanoes" ]]; then
+    # Clicking a raised volcano centres the map on it, so its marker lands in
+    # the middle of the map and is drawn in its aviation colour code — orange,
+    # yellow or red, all of which are far warmer than the night map behind them.
+    # A marker that never paints leaves this count at nothing.
+    map_sample() {
+        "$tool_pngtopnm" "$1" 2>/dev/null |
+            "$tool_pamcut" -left 380 -top 80 -width 520 -height 460 2>/dev/null |
+            "$scale_pnmscale" -xsize 130 -ysize 115 2>/dev/null |
+            "$scale_pnmtoplainpnm" 2>/dev/null |
+            awk 'NR <= 3 { next } { printf "%s %s %s\n", $1, $2, $3 }'
+    }
+    jumped="$(diff <(map_sample "$output/volcanoes-list.png") <(map_sample "$png") |
+        grep -c '^[<>]' || true)"
+    if [[ -z "$jumped" ]] || ((jumped < 1200)); then
+        fail "the map changed $jumped samples after a volcano was clicked; it never recentred"
+    fi
+    printf 'gui: clicking a volcano recentred %s map samples\n' "$jumped"
+    marker="$("$tool_pngtopnm" "$png" 2>/dev/null |
+        "$tool_pamcut" -left 614 -top 339 -width 44 -height 44 2>/dev/null |
+        "$scale_pnmtoplainpnm" 2>/dev/null |
+        awk 'NR <= 3 { next } $1 > 180 && $2 > 60 && $3 < 140 { count++ } END { print count + 0 }')"
+    if [[ -z "$marker" ]] || ((marker < 8)); then
+        fail "the map centre holds $marker alert-coloured pixels; the volcano marker never painted"
+    fi
+    printf 'gui: volcano marker painted %s alert-coloured pixels at the map centre\n' "$marker"
 fi
 
 if [[ "$scenario" == "land" ]]; then

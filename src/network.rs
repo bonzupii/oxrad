@@ -30,6 +30,9 @@ const BUCKET_URL: &str = "https://unidata-nexrad-level2.s3.amazonaws.com";
 const LOOKBACK_DAYS: i64 = 3;
 const MAX_BODY_BYTES: u64 = 64 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a connection attempt to one address may take, so a dead IPv6
+/// address does not hold up a radar archive download that IPv4 can serve.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_LIST_PAGES: usize = 10_000;
 const USER_AGENT: &str = concat!(
     "oxrad/",
@@ -42,6 +45,7 @@ pub(crate) fn http_get(url: &str) -> Result<Vec<u8>, RadarError> {
         .header("User-Agent", USER_AGENT)
         .config()
         .timeout_global(Some(REQUEST_TIMEOUT))
+        .timeout_connect(Some(CONNECT_TIMEOUT))
         .http_status_as_error(false)
         .build()
         .call()
