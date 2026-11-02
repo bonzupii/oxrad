@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align2, Color32, FontId, Painter, Pos2, Rect, RichText, Stroke};
 
 use crate::app::toggle_button;
-use crate::map::{MapTransform, MapView};
+use crate::map::MapTransform;
 use crate::theme::{self, Palette};
 use crate::time;
 use crate::volcano::{self, Colour, Report, Volcano, VolcanoState, VolcanoView};
@@ -448,11 +448,6 @@ fn stamp(time_ms: u64) -> String {
     format!("{month:02}-{day:02} {hour:02}:{minute:02}Z")
 }
 
-/// Where the map should point when a volcano is clicked.
-pub fn view_for(latitude: f64, longitude: f64) -> Result<MapView, crate::map::MapError> {
-    MapView::focus(latitude, longitude, 600.0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,14 +478,6 @@ mod tests {
             stamp(20_758 * time::MS_PER_DAY + 20 * 3_600_000 + 5 * 60_000),
             "11-01 20:05Z"
         );
-    }
-
-    #[test]
-    fn a_volcano_opens_a_close_view() {
-        let Ok(view) = view_for(52.0765, -176.1109) else {
-            return;
-        };
-        assert!(view.span_km() <= 600.0);
     }
 
     #[test]

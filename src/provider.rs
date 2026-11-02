@@ -165,6 +165,16 @@ pub fn get_text(url: &str, accept: &str) -> Result<String, JsonError> {
     })
 }
 
+/// Fetches a JSON document within a stated time, for a query whose answer is
+/// known to be heavy.
+pub fn get_json_within(url: &str, accept: &str, timeout: Duration) -> Result<Value, JsonError> {
+    let body = fetch_within(url, accept, MAX_BODY_BYTES, timeout)?;
+    serde_json::from_slice(&body).map_err(|source| JsonError::Json {
+        url: String::from(url),
+        source,
+    })
+}
+
 /// Fetches a JSON document, failing on a non-success status rather than
 /// returning the provider's error page as data.
 pub fn get_json(url: &str, accept: &str) -> Result<Value, JsonError> {
@@ -176,11 +186,20 @@ pub fn get_json(url: &str, accept: &str) -> Result<Value, JsonError> {
 }
 
 fn fetch(url: &str, accept: &str, limit: u64) -> Result<Vec<u8>, JsonError> {
+    fetch_within(url, accept, limit, REQUEST_TIMEOUT)
+}
+
+fn fetch_within(
+    url: &str,
+    accept: &str,
+    limit: u64,
+    timeout: Duration,
+) -> Result<Vec<u8>, JsonError> {
     let mut response = ureq::get(url)
         .header("User-Agent", USER_AGENT)
         .header("Accept", accept)
         .config()
-        .timeout_global(Some(REQUEST_TIMEOUT))
+        .timeout_global(Some(timeout))
         .timeout_connect(Some(CONNECT_TIMEOUT))
         .http_status_as_error(false)
         .build()

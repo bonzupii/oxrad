@@ -65,8 +65,8 @@ png="$output/$scenario.png"
 xvfb_log="$output/xvfb.log"
 display_file="$output/display"
 
-# A display number per run keeps parallel runs from colliding.
-display_number=$((90 + ($$ % 60)))
+# Xvfb picks the display itself and reports it on descriptor 3, so parallel
+# runs cannot collide on a number however many are in flight.
 rm -f "$display_file"
 
 # proot and Xvfb need the extracted runtime libraries before they start.
@@ -75,7 +75,13 @@ if [[ -d "$root/.tools/root/usr/lib/x86_64-linux-gnu" ]]; then
 fi
 
 xkb="$root/.tools/root/usr/bin/xkbcomp"
-xvfb_args=(-displayfd 3 -screen 0 "${screen}x24" -nolisten tcp -ac -fbdir "$output")
+# Each run keeps its own framebuffer file: two X servers writing one file
+# corrupt each other's captures, and a server left behind by a killed run of
+# the same output directory would otherwise clobber this run's screen.
+framebuffer_dir="$output/fb.$$"
+mkdir -p "$framebuffer_dir"
+framebuffer="$framebuffer_dir/Xvfb_screen0"
+xvfb_args=(-displayfd 3 -screen 0 "${screen}x24" -nolisten tcp -ac -fbdir "$framebuffer_dir")
 if [[ -x "$xkb" ]] && [[ -x "$root/.tools/root/usr/bin/proot" ]]; then
     "$root/.tools/root/usr/bin/proot" \
         -b "$xkb:/usr/bin/xkbcomp" \
@@ -88,6 +94,10 @@ xvfb_pid=$!
 app_pid=""
 cleanup() {
     [[ -n "$app_pid" ]] && kill "$app_pid" >/dev/null 2>&1 || true
+    # Xvfb runs under proot, so the recorded pid is proot's: kill its children
+    # first as well, or the X server outlives the run and the next run's
+    # display number is already taken.
+    pkill -P "$xvfb_pid" >/dev/null 2>&1 || true
     kill "$xvfb_pid" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -99,6 +109,18 @@ done
 [[ -s "$display_file" ]] || fail "Xvfb did not report a display"
 export DISPLAY=":$(head -1 "$display_file")"
 export XAUTHORITY=/dev/null
+# The display number is reported before the server is necessarily accepting
+# connections, and an application that starts a moment too early reports that
+# it could not open the X server. Wait until a client really connects.
+ready=""
+for _ in $(seq 1 30); do
+    if "$tool_xdotool" getdisplaygeometry >/dev/null 2>&1; then
+        ready=yes
+        break
+    fi
+    sleep 1
+done
+[[ -n "$ready" ]] || fail "the X server reported display $DISPLAY but never accepted a connection"
 export HOME="$home"
 export WGPU_BACKEND="${WGPU_BACKEND:-vulkan}"
 if [[ -f "$root/.tools/lavapipe.json" ]]; then
@@ -199,13 +221,13 @@ case "$scenario" in
         ;;
     satellite)
         click 240 28
-        "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/satellite-before.png"
+        "$tool_xwdtopnm" "$framebuffer" | "$tool_pnmtopng" > "$output/satellite-before.png"
         click 46 465
         sleep "${OXRAD_GUI_SATELLITE_SETTLE:-12}"
         ;;
     rivers)
         click 240 28
-        "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/rivers-before.png"
+        "$tool_xwdtopnm" "$framebuffer" | "$tool_pnmtopng" > "$output/rivers-before.png"
         click 60 707
         sleep "${OXRAD_GUI_RIVERS_SETTLE:-14}"
         rail_scroll 6
@@ -213,35 +235,35 @@ case "$scenario" in
     space)
         click 240 28
         rail_scroll 10
-        "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/space-before.png"
+        "$tool_xwdtopnm" "$framebuffer" | "$tool_pnmtopng" > "$output/space-before.png"
         click 60 392
         sleep "${OXRAD_GUI_SPACE_SETTLE:-12}"
         ;;
     air)
         click 240 28
         rail_scroll 18
-        "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/air-before.png"
+        "$tool_xwdtopnm" "$framebuffer" | "$tool_pnmtopng" > "$output/air-before.png"
         click 60 372
         sleep "${OXRAD_GUI_AIR_SETTLE:-12}"
         ;;
     climate)
         click 240 28
         rail_scroll 22
-        "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/climate-before.png"
+        "$tool_xwdtopnm" "$framebuffer" | "$tool_pnmtopng" > "$output/climate-before.png"
         click 60 374
         sleep "${OXRAD_GUI_CLIMATE_SETTLE:-24}"
         ;;
     fires)
         click 240 28
         rail_scroll 26
-        "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/fires-before.png"
+        "$tool_xwdtopnm" "$framebuffer" | "$tool_pnmtopng" > "$output/fires-before.png"
         click 60 373
         sleep "${OXRAD_GUI_FIRES_SETTLE:-14}"
         ;;
     environment)
         click 240 28
         rail_scroll 30
-        "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/environment-before.png"
+        "$tool_xwdtopnm" "$framebuffer" | "$tool_pnmtopng" > "$output/environment-before.png"
         click 70 373
         sleep "${OXRAD_GUI_ENVIRONMENT_SETTLE:-12}"
         ;;
@@ -250,14 +272,14 @@ case "$scenario" in
         zoom_out_at 9 700 350
         zoom_in_at 9 430 430
         rail_scroll 34
-        "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/ocean-before.png"
+        "$tool_xwdtopnm" "$framebuffer" | "$tool_pnmtopng" > "$output/ocean-before.png"
         click 60 372
         sleep "${OXRAD_GUI_OCEAN_SETTLE:-14}"
         ;;
     observations)
         click 240 28
         rail_scroll 40
-        "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/observations-before.png"
+        "$tool_xwdtopnm" "$framebuffer" | "$tool_pnmtopng" > "$output/observations-before.png"
         click 60 375
         sleep "${OXRAD_GUI_OBSERVATIONS_SETTLE:-12}"
         ;;
@@ -266,7 +288,7 @@ case "$scenario" in
         # distance from the alert list below it whatever arrives above.
         click 240 28
         rail_scroll 60
-        "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/snow-before.png"
+        "$tool_xwdtopnm" "$framebuffer" | "$tool_pnmtopng" > "$output/snow-before.png"
         click 60 375
         sleep "${OXRAD_GUI_SNOW_SETTLE:-14}"
         ;;
@@ -275,7 +297,7 @@ case "$scenario" in
         # the rail is scrolled a little short of its end.
         click 240 28
         rail_scroll 42
-        "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/seaice-before.png"
+        "$tool_xwdtopnm" "$framebuffer" | "$tool_pnmtopng" > "$output/seaice-before.png"
         click 60 205
         click 60 245
         sleep "${OXRAD_GUI_SEAICE_SETTLE:-14}"
@@ -285,7 +307,7 @@ case "$scenario" in
         # section, so the rail is scrolled to its end and then back a little.
         click 240 28
         rail_scroll 60
-        "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/land-before.png"
+        "$tool_xwdtopnm" "$framebuffer" | "$tool_pnmtopng" > "$output/land-before.png"
         click 60 203
         sleep "${OXRAD_GUI_LAND_SETTLE:-16}"
         ;;
@@ -295,20 +317,34 @@ case "$scenario" in
         # Aleutians afterwards so the raised volcanoes are inside the view.
         click 240 28
         rail_scroll 60
-        "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/volcanoes-before.png"
+        "$tool_xwdtopnm" "$framebuffer" | "$tool_pnmtopng" > "$output/volcanoes-before.png"
         click 60 193
         sleep "${OXRAD_GUI_VOLCANO_SETTLE:-16}"
-        "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/volcanoes-list.png"
+        "$tool_xwdtopnm" "$framebuffer" | "$tool_pnmtopng" > "$output/volcanoes-list.png"
         # Clicking a raised volcano centres the map on it, so the map should
         # jump and the volcano's own marker should be drawn at its middle.
         click 120 313
         sleep 5
         ;;
+    gauges)
+        # The river-gauge section sits below the volcano section at the rail's
+        # end. It is only meaningful where the service has gauges, so the run
+        # starts over the Arkansas river at Wichita.
+        click 240 28
+        rail_scroll 60
+        "$tool_xwdtopnm" "$framebuffer" | "$tool_pnmtopng" > "$output/gauges-before.png"
+        click 60 208
+        sleep "${OXRAD_GUI_GAUGE_SETTLE:-16}"
+        # Choosing a gauge centres the map on it and reads its week, so the
+        # hydrograph appears under the list.
+        click 140 330
+        sleep "${OXRAD_GUI_HYDRO_SETTLE:-12}"
+        ;;
     radio)
         # The radio sits at the end of the rail, below the earthquake section.
         click 240 28
         rail_scroll 60
-        "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/radio-before.png"
+        "$tool_xwdtopnm" "$framebuffer" | "$tool_pnmtopng" > "$output/radio-before.png"
         # The radio sits a little higher or lower depending on how many alerts
         # arrived while the rail settled, so both candidates are clicked: one
         # is the play control and the other a label or the card beside it.
@@ -321,7 +357,7 @@ case "$scenario" in
         # section above the alert list.
         click 240 28
         rail_scroll 60
-        "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/profile-before.png"
+        "$tool_xwdtopnm" "$framebuffer" | "$tool_pnmtopng" > "$output/profile-before.png"
         click 60 375
         sleep "${OXRAD_GUI_PROFILE_SETTLE:-14}"
         rail_scroll 10
@@ -340,7 +376,7 @@ width="$(printf '%s\n' "$geometry" | sed -n 's/^WIDTH=//p')"
 height="$(printf '%s\n' "$geometry" | sed -n 's/^HEIGHT=//p')"
 
 set -o pipefail
-"$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$png" ||
+"$tool_xwdtopnm" "$framebuffer" | "$tool_pnmtopng" > "$png" ||
     fail "the framebuffer could not be captured"
 
 kill -0 "$app_pid" 2>/dev/null || fail "the application exited while being driven"
@@ -595,6 +631,33 @@ if [[ "$scenario" == "radio" ]]; then
         fail "the radio changed $changed rail samples; it never played a bulletin"
     fi
     printf 'gui: radio changed %s rail samples\n' "$changed"
+fi
+
+if [[ "$scenario" == "gauges" ]]; then
+    # The list replaces the invitation, and the chosen gauge's week is drawn as
+    # a water-blue line inside the rail. Neither happens if the service answer
+    # never arrives, so an empty count is a failure rather than a quiet run.
+    gauge_sample() {
+        "$tool_pngtopnm" "$1" 2>/dev/null |
+            "$tool_pamcut" -left 0 -top 200 -width 340 -height 480 2>/dev/null |
+            "$scale_pnmscale" -xsize 170 -ysize 240 2>/dev/null |
+            "$scale_pnmtoplainpnm" 2>/dev/null |
+            awk 'NR <= 3 { next } { printf "%s %s %s\n", $1, $2, $3 }'
+    }
+    listed="$(diff <(gauge_sample "$output/gauges-before.png") <(gauge_sample "$png") |
+        grep -c '^[<>]' || true)"
+    if [[ -z "$listed" ]] || ((listed < 500)); then
+        fail "the river-gauge section changed $listed rail samples; no gauge was read"
+    fi
+    printf 'gui: river-gauge section redrew %s rail samples\n' "$listed"
+    hydro="$("$tool_pngtopnm" "$png" 2>/dev/null |
+        "$tool_pamcut" -left 0 -top 200 -width 340 -height 600 2>/dev/null |
+        "$scale_pnmtoplainpnm" 2>/dev/null |
+        awk 'NR <= 3 { next } $3 > 100 && ($3 - $1) > 40 { count++ } END { print count + 0 }')"
+    if [[ -z "$hydro" ]] || ((hydro < 150)); then
+        fail "the rail holds $hydro hydrograph pixels; the week of readings never drew"
+    fi
+    printf 'gui: hydrograph drew %s water-coloured pixels\n' "$hydro"
 fi
 
 if [[ "$scenario" == "volcanoes" ]]; then

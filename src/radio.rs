@@ -22,6 +22,7 @@
 //! and the radio is shorter rather than padded.
 
 use crate::forecast::Forecast;
+use crate::gauge::GaugeSet;
 use crate::observations::ObservationSet;
 use crate::quake::Quakes;
 use crate::quality::AirQuality;
@@ -80,6 +81,7 @@ pub struct Input<'a> {
     pub space: Option<&'a SpaceWeather>,
     pub sounding: Option<&'a Sounding>,
     pub volcanoes: Option<&'a Report>,
+    pub gauges: Option<&'a GaugeSet>,
 }
 
 /// Builds the radio's running order: everything worth saying, most urgent
@@ -93,6 +95,7 @@ pub fn bulletins(input: &Input<'_>) -> Vec<Bulletin> {
     air(input, &mut sayings);
     space(input, &mut sayings);
     volcanoes(input, &mut sayings);
+    gauges(input, &mut sayings);
     column(input, &mut sayings);
     sayings.sort_by(|left, right| {
         right
@@ -367,6 +370,39 @@ fn volcanoes(input: &Input<'_>, sayings: &mut Vec<Bulletin>) {
             volcano.notice.volcano,
             volcano.notice.alert_level.to_lowercase(),
             highest.meaning()
+        ),
+    });
+}
+
+/// The highest river stage in view. This is what the gauge publishes, not a
+/// flood threshold: the radio never says a river is flooding on its own.
+fn gauges(input: &Input<'_>, sayings: &mut Vec<Bulletin>) {
+    let Some(set) = input.gauges else {
+        return;
+    };
+    let highest = set
+        .gauges
+        .iter()
+        .filter_map(|gauge| {
+            let reading = gauge.stage.as_ref()?;
+            Some((reading, gauge))
+        })
+        .max_by(|left, right| left.0.value.total_cmp(&right.0.value));
+    let Some((reading, gauge)) = highest else {
+        return;
+    };
+    let provisional = if reading.provisional {
+        ", provisional"
+    } else {
+        ""
+    };
+    sayings.push(Bulletin {
+        source: "USGS National Water Information System",
+        at_ms: Some(reading.at_ms),
+        urgency: Urgency::Routine,
+        text: format!(
+            "Highest river stage in view {:.2} {}{provisional} at {}.",
+            reading.value, reading.unit, gauge.name
         ),
     });
 }

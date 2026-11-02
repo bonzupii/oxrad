@@ -28,6 +28,8 @@ use eframe::egui::{self, Painter, Rect};
 use crate::climate_layer::ClimateLayer;
 use crate::environment_layer::EnvironmentLayer;
 use crate::fire_layer::FireLayer;
+use crate::gauge::GaugeSet;
+use crate::gauge_layer::GaugeLayer;
 use crate::hydro_layer::HydroLayer;
 use crate::land_layer::LandLayer;
 use crate::map::{MapTransform, MapView};
@@ -63,6 +65,7 @@ pub struct Domains {
     sea_ice: SeaIceLayer,
     land_surface: LandLayer,
     volcanoes: VolcanoLayer,
+    gauges: GaugeLayer,
 }
 
 impl Domains {
@@ -82,6 +85,7 @@ impl Domains {
             sea_ice: SeaIceLayer::new(),
             land_surface: LandLayer::new(),
             volcanoes: VolcanoLayer::new(),
+            gauges: GaugeLayer::new(),
         }
     }
 
@@ -101,6 +105,12 @@ impl Domains {
         self.sea_ice.update(now);
         self.land_surface.update(now, view);
         self.volcanoes.update(now);
+        self.gauges.update(now, view);
+    }
+
+    /// A gauge the reader clicked, so the shell can centre the map on it.
+    pub const fn take_gauge_focus(&mut self) -> Option<(f64, f64)> {
+        self.gauges.take_focus()
     }
 
     /// A volcano the reader clicked, so the shell can centre the map on it.
@@ -124,6 +134,7 @@ impl Domains {
         self.sea_ice.rail(ui, palette);
         self.land_surface.rail(ui, palette);
         self.volcanoes.rail(ui, palette);
+        self.gauges.rail(ui, palette, centre);
     }
 
     /// The satellite imagery, drawn under everything else on the map.
@@ -151,6 +162,22 @@ impl Domains {
         palette: &Palette,
     ) {
         self.volcanoes.draw(painter, transform, rect, palette);
+    }
+
+    /// The river gauges, drawn with the other point layers.
+    pub fn draw_gauges(
+        &self,
+        painter: &Painter,
+        transform: &MapTransform,
+        rect: Rect,
+        palette: &Palette,
+    ) {
+        self.gauges.draw(painter, transform, rect, palette);
+    }
+
+    /// What the river gauges are reporting, for the information radio.
+    pub const fn gauges(&self) -> Option<&GaugeSet> {
+        self.gauges.gauges()
     }
 
     /// The surface station plots, drawn with the other point layers.

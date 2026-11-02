@@ -29,6 +29,8 @@ mod error;
 mod fire;
 mod fire_layer;
 mod forecast;
+mod gauge;
+mod gauge_layer;
 mod global_radar;
 mod gpu;
 mod history;

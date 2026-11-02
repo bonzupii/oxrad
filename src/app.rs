@@ -2369,7 +2369,7 @@ impl OxradApp {
         let centre = self.map_view.center_latlon().ok();
         self.domains.rail(ui, &palette, centre);
         self.quake_rail(ui);
-        self.volcano_focus();
+        self.domain_focus();
         let clock = time::now_unix_ms();
         let radio_input = RadioInput {
             now_ms: clock.as_ref().copied().unwrap_or(0),
@@ -2383,17 +2383,22 @@ impl OxradApp {
             space: self.domains.space(),
             sounding: self.domains.sounding(),
             volcanoes: self.domains.volcanoes(),
+            gauges: self.domains.gauges(),
         };
         self.radio.update(Instant::now(), &radio_input);
         self.radio.rail(ui, &palette, &radio_input);
     }
 
-    /// Centres the map on a volcano the reader clicked in the rail.
-    fn volcano_focus(&mut self) {
-        let Some((lat, lon)) = self.domains.take_volcano_focus() else {
+    /// Centres the map on a volcano or gauge the reader clicked in the rail.
+    fn domain_focus(&mut self) {
+        let (lat, lon, span) = if let Some((lat, lon)) = self.domains.take_volcano_focus() {
+            (lat, lon, 600.0)
+        } else if let Some((lat, lon)) = self.domains.take_gauge_focus() {
+            (lat, lon, 120.0)
+        } else {
             return;
         };
-        match crate::volcano_layer::view_for(lat, lon) {
+        match MapView::focus(lat, lon, span) {
             Ok(view) => {
                 self.map_view = view;
                 self.schedule_viewport_reload();
@@ -3585,6 +3590,8 @@ impl OxradApp {
                 .draw_fires(ui.painter(), transform, rect, &palette);
             self.domains
                 .draw_volcanoes(ui.painter(), transform, rect, &palette);
+            self.domains
+                .draw_gauges(ui.painter(), transform, rect, &palette);
             self.domains
                 .draw_stations(ui.painter(), transform, &palette);
         }

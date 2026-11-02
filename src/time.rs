@@ -76,6 +76,12 @@ pub fn parse_iso_utc(text: &str) -> Option<u64> {
         Some((minute, second)) => (minute, second),
         None => (rest, "0"),
     };
+    // A provider may write fractional seconds, as the water-services API does
+    // with its ``.000``; the whole second is the instant that matters here.
+    let second_text = match second_text.split_once('.') {
+        Some((whole, _fraction)) => whole,
+        None => second_text,
+    };
     let mut date = day_text.split('-');
     let year = date.next()?.parse::<i32>().ok()?;
     let month = date.next()?.parse::<u32>().ok()?;
@@ -154,6 +160,16 @@ mod tests {
             Ok(text) => text,
             Err(error) => format!("<{error}>"),
         }
+    }
+
+    #[test]
+    fn reads_a_time_written_with_fractional_seconds() {
+        // The water-services API writes milliseconds and an offset, as in
+        // 2026-11-01T22:15:00.000-06:00, which is 2026-11-02T04:15Z.
+        let fraction = parse_iso_utc("2026-11-01T22:15:00.000-06:00");
+        let whole = parse_iso_utc("2026-11-02T04:15:00Z");
+        assert_eq!(fraction, whole);
+        assert!(fraction.is_some(), "a fractional second must parse");
     }
 
     #[test]
