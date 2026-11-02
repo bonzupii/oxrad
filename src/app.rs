@@ -29,6 +29,7 @@ use crate::colormap::ColorTable;
 use crate::config::{self, Config};
 use crate::derived::StormMotion;
 use crate::display::{Display, DisplayState, Frame};
+use crate::environment_layer::EnvironmentLayer;
 use crate::fire_layer::FireLayer;
 use crate::forecast::{Forecast, ForecastPeriod, ForecastState, ForecastView};
 use crate::global_radar::{
@@ -455,6 +456,7 @@ pub struct OxradApp {
     air: AirLayer,
     climate: ClimateLayer,
     fires: FireLayer,
+    environment: EnvironmentLayer,
     history: HistoryView,
 }
 
@@ -560,6 +562,7 @@ impl OxradApp {
             air: AirLayer::new(),
             climate: ClimateLayer::new(),
             fires: FireLayer::new(),
+            environment: EnvironmentLayer::new(),
             history: HistoryView::new(),
         };
         if let Some(place) = &restored_place {
@@ -956,6 +959,7 @@ impl OxradApp {
         self.air.update(Instant::now(), &self.map_view);
         self.climate.update(Instant::now(), &self.map_view);
         self.fires.update(Instant::now());
+        self.environment.update(Instant::now(), &self.map_view);
         self.poll_global_radar(context);
     }
 
@@ -2444,6 +2448,7 @@ impl OxradApp {
         self.climate.rail(ui, &palette);
         let centre = self.map_view.center_latlon().ok();
         self.fires.rail(ui, &palette, centre);
+        self.environment.rail(ui, &palette);
         self.quake_rail(ui);
     }
 

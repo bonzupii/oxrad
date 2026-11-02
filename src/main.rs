@@ -22,6 +22,8 @@ mod colormap;
 mod config;
 mod derived;
 mod display;
+mod environment;
+mod environment_layer;
 mod error;
 mod fire;
 mod fire_layer;

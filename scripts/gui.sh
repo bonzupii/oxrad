@@ -205,6 +205,13 @@ case "$scenario" in
         click 60 373
         sleep "${OXRAD_GUI_FIRES_SETTLE:-14}"
         ;;
+    environment)
+        click 240 28
+        rail_scroll 30
+        "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/environment-before.png"
+        click 70 373
+        sleep "${OXRAD_GUI_ENVIRONMENT_SETTLE:-12}"
+        ;;
     pan) drag 240 0 ;;
     zoom) scroll 10 ;;
     small)
@@ -367,6 +374,23 @@ if [[ "$scenario" == "fires" ]]; then
         fail "the wildfire section changed $changed rail samples; no perimeters arrived"
     fi
     printf 'gui: wildfire section redrew %s rail samples\n' "$changed"
+fi
+
+if [[ "$scenario" == "environment" ]]; then
+    # The energy chart and readout only exist once the fields have arrived.
+    environment_sample() {
+        "$tool_pngtopnm" "$1" 2>/dev/null |
+            "$tool_pamcut" -left 0 -top 330 -width 320 -height 250 2>/dev/null |
+            "$scale_pnmscale" -xsize 160 -ysize 125 2>/dev/null |
+            "$scale_pnmtoplainpnm" 2>/dev/null |
+            awk 'NR <= 3 { next } { printf "%s %s %s\n", $1, $2, $3 }'
+    }
+    changed="$(diff <(environment_sample "$output/environment-before.png") <(environment_sample "$png") |
+        grep -c '^[<>]' || true)"
+    if [[ -z "$changed" ]] || ((changed < 500)); then
+        fail "the storm-environment section changed $changed rail samples; no fields arrived"
+    fi
+    printf 'gui: storm-environment section redrew %s rail samples\n' "$changed"
 fi
 
 printf 'gui: %s ok (%sx%s, %s colours) %s\n' "$scenario" "$width" "$height" "$colours" "$png"
