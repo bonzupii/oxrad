@@ -37,7 +37,7 @@ use crate::gpu::RadarGpu;
 use crate::history::{self, HistoryError, HistoryEvent, HistoryFeed};
 use crate::map::{self, MapError, MapView};
 use crate::overlay;
-use crate::overlay_select::{nearby_station_ids, retain_warning_selection, warning_intersects};
+use crate::overlay_select::{nearby_station_ids, warning_intersects};
 use crate::pipeline::{Pipeline, PipelineState};
 use crate::place::{self, Place, SearchInteraction, SearchState};
 use crate::product::RadarProduct;
@@ -51,7 +51,8 @@ use crate::render;
 use crate::stations::{self, SiteId, Station, StationError, StationFeed, StationOutcome};
 use crate::theme::{self, Palette, Theme};
 use crate::time;
-use crate::warnings::{Severity, Warning, WarningError, WarningEvent, WarningFeed};
+use crate::warning_view::{WarningScope, WarningState, WarningView};
+use crate::warnings::{Severity, Warning};
 use crate::workspaces::{LayerVisibility as RadarLayer, MapWorkspace, RadarWorkspace};
 
 const TEXT: Color32 = Color32::from_rgb(214, 221, 232);
@@ -73,8 +74,6 @@ const GLOBAL_REFRESH_SECS: u64 = 5 * 60;
 const GLOBAL_RETRY_SECS: u64 = 60;
 const GLOBAL_PLAYBACK_MS: u64 = 650;
 const HISTORY_FRAME_MS: u64 = 900;
-const WARNING_REFRESH_SECS: u64 = 5 * 60;
-const WARNING_RETRY_SECS: u64 = 2 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SceneMode {
@@ -100,20 +99,6 @@ enum GlobalState {
     Loading,
     Ready,
     Failed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WarningState {
-    Idle,
-    Loading,
-    Ready,
-    Failed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WarningScope {
-    All,
-    Viewport,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,17 +310,7 @@ pub struct OxradApp {
     global_request_due: Option<Instant>,
     global_refresh_due: Option<Instant>,
     global_state: GlobalState,
-    warning_feed: WarningFeed,
-    warning_generation: u64,
-    warnings: Vec<Warning>,
-    warnings_without_geometry: usize,
-    warnings_rejected: usize,
-    selected_warning: Option<String>,
-    warning_layer: RadarLayer,
-    warning_scope: WarningScope,
-    warning_state: WarningState,
-    warning_request_due: Option<Instant>,
-    warning_refresh_due: Option<Instant>,
+    warning_view: WarningView,
     quakes: QuakeLayer,
     domains: Domains,
     radio: Radio,
@@ -419,17 +394,7 @@ impl OxradApp {
             global_request_due: None,
             global_refresh_due: None,
             global_state: GlobalState::Idle,
-            warning_feed: WarningFeed::new(),
-            warning_generation: 0,
-            warnings: Vec::new(),
-            warnings_without_geometry: 0,
-            warnings_rejected: 0,
-            selected_warning: None,
-            warning_layer: RadarLayer::Shown,
-            warning_scope: WarningScope::All,
-            warning_state: WarningState::Idle,
-            warning_request_due: Some(Instant::now()),
-            warning_refresh_due: None,
+            warning_view: WarningView::new(),
             quakes: QuakeLayer::new(),
             domains: Domains::new(),
             radio: Radio::new(),
@@ -631,80 +596,6 @@ impl OxradApp {
         }
     }
 
-    fn request_warnings(&mut self) {
-        self.warning_request_due = None;
-        let generation = self.warning_generation.wrapping_add(1);
-        match self.warning_feed.request(generation) {
-            Ok(()) => {
-                self.warning_generation = generation;
-                self.warning_state = WarningState::Loading;
-            }
-            Err(error) => self.warning_failure(&error),
-        }
-    }
-
-    fn warning_failure(&mut self, error: &WarningError) {
-        self.warning_state = WarningState::Failed;
-        self.warning_refresh_due = Some(Instant::now() + Duration::from_secs(WARNING_RETRY_SECS));
-        self.notice = Some(format!("Active warnings are unavailable: {error}"));
-    }
-
-    fn poll_warnings(&mut self) {
-        loop {
-            match self.warning_feed.poll() {
-                Ok(Some(event)) => self.apply_warning_event(event),
-                Ok(None) => break,
-                Err(error) => {
-                    self.warning_failure(&error);
-                    break;
-                }
-            }
-        }
-    }
-
-    fn update_warnings(&mut self) {
-        let warning_due = self
-            .warning_request_due
-            .is_some_and(|due| Instant::now() >= due)
-            || self
-                .warning_refresh_due
-                .is_some_and(|due| Instant::now() >= due);
-        if self.scene_mode == SceneMode::Map
-            && (matches!(self.warning_state, WarningState::Idle) || warning_due)
-        {
-            self.request_warnings();
-        }
-        self.poll_warnings();
-    }
-
-    fn apply_warning_event(&mut self, event: WarningEvent) {
-        match event {
-            WarningEvent::Ready { generation, set } if generation == self.warning_generation => {
-                let rejected = set.rejected;
-                self.warnings = set.warnings;
-                self.warnings_without_geometry = set.without_geometry;
-                self.warnings_rejected = rejected.len();
-                retain_warning_selection(&mut self.selected_warning, &self.warnings);
-                if let Some(message) = rejected.first() {
-                    self.notice = Some(format!(
-                        "{} active alerts could not be read. First problem: {message}",
-                        rejected.len()
-                    ));
-                }
-                self.warning_state = WarningState::Ready;
-                self.warning_refresh_due =
-                    Some(Instant::now() + Duration::from_secs(WARNING_REFRESH_SECS));
-            }
-            WarningEvent::Failed { generation, error } if generation == self.warning_generation => {
-                self.warning_state = WarningState::Failed;
-                self.warning_refresh_due =
-                    Some(Instant::now() + Duration::from_secs(WARNING_RETRY_SECS));
-                self.notice = Some(format!("Active warnings are unavailable: {error}"));
-            }
-            WarningEvent::Ready { .. } | WarningEvent::Failed { .. } => {}
-        }
-    }
-
     fn choose_place(&mut self, place: &Place) {
         self.search.clear();
         match MapView::focus(place.lat, place.lon, 2_200.0) {
@@ -818,7 +709,9 @@ impl OxradApp {
         }
         self.search.update(Instant::now());
         self.forecast.update(Instant::now());
-        self.update_warnings();
+        if let Some(message) = self.warning_view.update(self.scene_mode == SceneMode::Map) {
+            self.notice = Some(message);
+        }
         self.quakes.update(Instant::now());
         self.domains.update(Instant::now(), context, &self.map.view);
         self.poll_global_radar(context);
@@ -2066,11 +1959,11 @@ impl OxradApp {
     }
 
     fn map_warnings(&self, ui: &egui::Ui, rect: Rect, transform: &map::MapTransform) {
-        if !self.warning_layer.is_shown() {
+        if !self.warning_view.layer.is_shown() {
             return;
         }
-        for warning in &self.warnings {
-            if self.warning_scope == WarningScope::Viewport
+        for warning in &self.warning_view.list {
+            if self.warning_view.scope == WarningScope::Viewport
                 && !warning_intersects(warning, transform, rect)
             {
                 continue;
@@ -2096,7 +1989,7 @@ impl OxradApp {
                     continue;
                 }
                 let (width, colour) =
-                    if self.selected_warning.as_deref() == Some(warning.id.as_str()) {
+                    if self.warning_view.selected.as_deref() == Some(warning.id.as_str()) {
                         (4.0_f32, TEXT)
                     } else {
                         (2.0_f32, colour)
@@ -2247,7 +2140,7 @@ impl OxradApp {
             now_ms: clock.as_ref().copied().unwrap_or(0),
             clock_read: clock.is_ok(),
             place: self.place.as_ref().map(|place| place.name.as_str()),
-            warnings: &self.warnings,
+            warnings: &self.warning_view.list,
             quakes: self.quakes.events(),
             stations: self.domains.stations(),
             forecast: self.forecast.forecast(),
@@ -2358,20 +2251,22 @@ impl OxradApp {
                 [116.0, 30.0],
                 toggle_button(
                     &palette,
-                    if self.warning_layer.is_shown() {
+                    if self.warning_view.layer.is_shown() {
                         "Hide warnings"
                     } else {
                         "Show warnings"
                     },
-                    self.warning_layer.is_shown(),
+                    self.warning_view.layer.is_shown(),
                 ),
             )
             .on_hover_text("Show active National Weather Service warning polygons for the United States and territories.")
             .clicked()
         {
-            self.warning_layer = self.warning_layer.toggled();
-            if self.warning_layer.is_shown() && matches!(self.warning_state, WarningState::Idle) {
-                self.warning_request_due = Some(Instant::now());
+            self.warning_view.layer = self.warning_view.layer.toggled();
+            if self.warning_view.layer.is_shown()
+                && matches!(self.warning_view.state, WarningState::Idle)
+            {
+                self.warning_view.retry_now();
             }
         }
         if ui
@@ -2453,7 +2348,7 @@ impl OxradApp {
                                             .weak(),
                                     );
                                 }
-                                if self.warning_layer.is_shown()
+                                if self.warning_view.layer.is_shown()
                                     && let Some(warning) = self.most_severe_warning()
                                 {
                                     ui.label(
@@ -2582,12 +2477,12 @@ impl OxradApp {
         };
         if contributing.is_empty()
             && !self.global_layer.is_shown()
-            && !self.warning_layer.is_shown()
+            && !self.warning_view.layer.is_shown()
         {
             return None;
         }
         let warnings = self.warning_layer_summary();
-        let scope = if self.warning_scope == WarningScope::Viewport {
+        let scope = if self.warning_view.scope == WarningScope::Viewport {
             " · warnings in view"
         } else {
             ""
@@ -2598,19 +2493,19 @@ impl OxradApp {
     }
 
     fn warning_layer_summary(&self) -> String {
-        if !self.warning_layer.is_shown() {
+        if !self.warning_view.layer.is_shown() {
             return String::from(" · warnings off");
         }
-        match self.warning_state {
+        match self.warning_view.state {
             WarningState::Idle => String::new(),
             WarningState::Loading => String::from(" · warnings loading"),
             WarningState::Ready => {
-                let mut text = format!(" · {} warnings", self.warnings.len());
-                if (self.warnings_without_geometry > 0 || self.warnings_rejected > 0)
+                let mut text = format!(" · {} warnings", self.warning_view.list.len());
+                if (self.warning_view.without_geometry > 0 || self.warning_view.rejected > 0)
                     && write!(
                         text,
                         " · {} without polygons · {} unreadable",
-                        self.warnings_without_geometry, self.warnings_rejected
+                        self.warning_view.without_geometry, self.warning_view.rejected
                     )
                     .is_err()
                 {
@@ -2623,7 +2518,8 @@ impl OxradApp {
     }
 
     fn most_severe_warning(&self) -> Option<&Warning> {
-        self.warnings
+        self.warning_view
+            .list
             .iter()
             .max_by_key(|warning| severity_rank(warning.severity))
     }
@@ -3055,7 +2951,7 @@ impl OxradApp {
     }
 
     fn warning_section(&mut self, ui: &mut egui::Ui) {
-        if !self.warning_layer.is_shown() || self.warnings.is_empty() {
+        if !self.warning_view.layer.is_shown() || self.warning_view.list.is_empty() {
             return;
         }
         ui.add_space(theme::SPACE_M);
@@ -3070,23 +2966,29 @@ impl OxradApp {
                 .weak(),
         );
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.warning_scope, WarningScope::All, "All active");
             ui.selectable_value(
-                &mut self.warning_scope,
+                &mut self.warning_view.scope,
+                WarningScope::All,
+                "All active",
+            );
+            ui.selectable_value(
+                &mut self.warning_view.scope,
                 WarningScope::Viewport,
                 "Visible map",
             );
         });
-        let mut order: Vec<usize> = (0..self.warnings.len()).collect();
+        let mut order: Vec<usize> = (0..self.warning_view.list.len()).collect();
         order.sort_by_key(|index| {
-            self.warnings
+            self.warning_view
+                .list
                 .get(*index)
                 .map_or(0, |warning| severity_rank(warning.severity))
         });
         order.reverse();
-        if self.warning_scope == WarningScope::Viewport {
+        if self.warning_view.scope == WarningScope::Viewport {
             order.retain(|index| {
-                self.warnings
+                self.warning_view
+                    .list
                     .get(*index)
                     .is_some_and(|warning| self.warning_visible(warning))
             });
@@ -3098,10 +3000,11 @@ impl OxradApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for index in order.into_iter().take(40) {
-                    let Some(warning) = self.warnings.get(index) else {
+                    let Some(warning) = self.warning_view.list.get(index) else {
                         continue;
                     };
-                    let selected = self.selected_warning.as_deref() == Some(warning.id.as_str());
+                    let selected =
+                        self.warning_view.selected.as_deref() == Some(warning.id.as_str());
                     let label = format!(
                         "{} · {}\n{} · expires {}",
                         warning.event,
@@ -3127,11 +3030,11 @@ impl OxradApp {
                     .weak(),
             );
         }
-        if self.warnings.len() > 40 {
+        if self.warning_view.list.len() > 40 {
             ui.label(
                 RichText::new(format!(
                     "Showing 40 most severe of {} active alerts.",
-                    self.warnings.len()
+                    self.warning_view.list.len()
                 ))
                 .size(theme::TYPE_SMALL)
                 .weak(),
@@ -3144,7 +3047,7 @@ impl OxradApp {
     }
 
     fn warning_visible(&self, warning: &Warning) -> bool {
-        if self.warning_scope == WarningScope::All {
+        if self.warning_view.scope == WarningScope::All {
             return true;
         }
         let Some(rect) = self.map.viewport else {
@@ -3157,11 +3060,7 @@ impl OxradApp {
     }
 
     fn warning_detail(&self, ui: &mut egui::Ui) {
-        let Some(warning) = self
-            .selected_warning
-            .as_deref()
-            .and_then(|id| self.warnings.iter().find(|warning| warning.id == id))
-        else {
+        let Some(warning) = self.warning_view.selected_warning() else {
             return;
         };
         ui.add_space(10.0);
@@ -3227,11 +3126,11 @@ impl OxradApp {
     }
 
     fn focus_warning(&mut self, index: usize) {
-        let Some(warning) = self.warnings.get(index) else {
+        let Some(warning) = self.warning_view.list.get(index) else {
             self.notice = Some(String::from("That warning is no longer available."));
             return;
         };
-        self.selected_warning = Some(warning.id.clone());
+        self.warning_view.selected = Some(warning.id.clone());
         let Some(ring) = warning.polygons.first() else {
             self.notice = Some(format!(
                 "Warning {} has no mapped polygon; its area is {}.",
@@ -4240,7 +4139,7 @@ mod tests {
     fn warning_selection_survives_reordering_and_clears_when_removed() {
         let mut selected = Some(String::from("alert-b"));
         let refreshed = vec![warning("alert-b", "Updated"), warning("alert-a", "Other")];
-        retain_warning_selection(&mut selected, &refreshed);
+        crate::overlay_select::retain_warning_selection(&mut selected, &refreshed);
         assert_eq!(selected.as_deref(), Some("alert-b"));
         assert_eq!(
             refreshed
@@ -4249,7 +4148,10 @@ mod tests {
                 .map(|warning| warning.event.as_str()),
             Some("Updated")
         );
-        retain_warning_selection(&mut selected, &[warning("alert-a", "Other")]);
+        crate::overlay_select::retain_warning_selection(
+            &mut selected,
+            &[warning("alert-a", "Other")],
+        );
         assert_eq!(selected, None);
     }
 

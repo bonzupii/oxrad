@@ -662,7 +662,7 @@ mod tests {
     #[test]
     fn the_newest_past_hour_is_what_the_air_is_doing() -> Result<(), EnvironmentError> {
         let record = record()?;
-        let now = record.hours[1].time_ms + 1800_000;
+        let now = record.hours[1].time_ms + 1_800_000;
         let current = record.at(now).ok_or(shape("an hour at that time"))?;
         assert_eq!(current.cape, Some(1800.0));
         assert_eq!(record.at(0), None, "no hour is before the first one");

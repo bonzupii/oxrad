@@ -84,6 +84,7 @@ mod time;
 mod units;
 mod volcano;
 mod volcano_layer;
+mod warning_view;
 mod warnings;
 mod workspaces;
 
