@@ -35,6 +35,8 @@ mod hydro;
 mod hydro_layer;
 mod map;
 mod network;
+mod observations;
+mod observations_layer;
 mod ocean;
 mod ocean_layer;
 mod overlay;

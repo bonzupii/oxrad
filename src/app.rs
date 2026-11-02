@@ -39,6 +39,7 @@ use crate::gpu::RadarGpu;
 use crate::history::{self, HistoryError, HistoryEvent, HistoryFeed};
 use crate::hydro_layer::HydroLayer;
 use crate::map::{self, MapError, MapView, WorldMap};
+use crate::observations_layer::ObservationLayer;
 use crate::ocean_layer::OceanLayer;
 use crate::overlay;
 use crate::pipeline::{Pipeline, PipelineState};
@@ -459,6 +460,7 @@ pub struct OxradApp {
     fires: FireLayer,
     environment: EnvironmentLayer,
     ocean: OceanLayer,
+    stations_reported: ObservationLayer,
     history: HistoryView,
 }
 
@@ -566,6 +568,7 @@ impl OxradApp {
             fires: FireLayer::new(),
             environment: EnvironmentLayer::new(),
             ocean: OceanLayer::new(),
+            stations_reported: ObservationLayer::new(),
             history: HistoryView::new(),
         };
         if let Some(place) = &restored_place {
@@ -964,6 +967,8 @@ impl OxradApp {
         self.fires.update(Instant::now());
         self.environment.update(Instant::now(), &self.map_view);
         self.ocean.update(Instant::now(), &self.map_view);
+        self.stations_reported
+            .update(Instant::now(), &self.map_view);
         self.poll_global_radar(context);
     }
 
@@ -2454,6 +2459,7 @@ impl OxradApp {
         self.fires.rail(ui, &palette, centre);
         self.environment.rail(ui, &palette);
         self.ocean.rail(ui, &palette);
+        self.stations_reported.rail(ui, &palette, centre);
         self.quake_rail(ui);
     }
 
@@ -3637,6 +3643,8 @@ impl OxradApp {
         if canvas == Canvas::Map {
             self.satellite.draw(ui, transform, rect);
             self.fires.draw(ui.painter(), transform, rect, &palette);
+            self.stations_reported
+                .draw(ui.painter(), transform, &palette);
         }
         self.map_global(ui, transform);
         let include_viewport = canvas == Canvas::Map;

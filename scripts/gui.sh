@@ -239,6 +239,13 @@ case "$scenario" in
         click 60 372
         sleep "${OXRAD_GUI_OCEAN_SETTLE:-14}"
         ;;
+    observations)
+        click 240 28
+        rail_scroll 40
+        "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/observations-before.png"
+        click 60 375
+        sleep "${OXRAD_GUI_OBSERVATIONS_SETTLE:-12}"
+        ;;
     pan) drag 240 0 ;;
     zoom) scroll 10 ;;
     small)
@@ -436,6 +443,23 @@ if [[ "$scenario" == "ocean" ]]; then
         fail "the ocean section changed $changed rail samples; no sea state arrived"
     fi
     printf 'gui: ocean section redrew %s rail samples\n' "$changed"
+fi
+
+if [[ "$scenario" == "observations" ]]; then
+    # The station list only exists once the feed has answered.
+    observations_sample() {
+        "$tool_pngtopnm" "$1" 2>/dev/null |
+            "$tool_pamcut" -left 0 -top 330 -width 320 -height 250 2>/dev/null |
+            "$scale_pnmscale" -xsize 160 -ysize 125 2>/dev/null |
+            "$scale_pnmtoplainpnm" 2>/dev/null |
+            awk 'NR <= 3 { next } { printf "%s %s %s\n", $1, $2, $3 }'
+    }
+    changed="$(diff <(observations_sample "$output/observations-before.png") <(observations_sample "$png") |
+        grep -c '^[<>]' || true)"
+    if [[ -z "$changed" ]] || ((changed < 500)); then
+        fail "the surface-observation section changed $changed rail samples; no stations arrived"
+    fi
+    printf 'gui: surface-observation section redrew %s rail samples\n' "$changed"
 fi
 
 printf 'gui: %s ok (%sx%s, %s colours) %s\n' "$scenario" "$width" "$height" "$colours" "$png"
