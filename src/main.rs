@@ -44,6 +44,8 @@ mod raster;
 mod render;
 mod retry;
 mod satellite;
+mod spaceweather;
+mod spaceweather_layer;
 mod stations;
 #[cfg(test)]
 mod test_support;

@@ -59,6 +59,31 @@ pub const fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
     (era as i64) * 146_097 + day_of_era - 719_468
 }
 
+/// Reads `YYYY-MM-DDTHH:MM:SS` with an optional trailing `Z` into milliseconds
+/// since the epoch. Anything else is not a timestamp this program can order.
+pub fn parse_iso_utc(text: &str) -> Option<u64> {
+    let text = text.trim_end_matches('Z');
+    let (day_text, time_text) = text.split_once('T')?;
+    let (hour_text, rest) = time_text.split_once(':')?;
+    let (minute_text, second_text) = rest.split_once(':')?;
+    let mut date = day_text.split('-');
+    let year = date.next()?.parse::<i32>().ok()?;
+    let month = date.next()?.parse::<u32>().ok()?;
+    let day = date.next()?.parse::<u32>().ok()?;
+    if date.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let hour = hour_text.parse::<u64>().ok()?;
+    let minute = minute_text.parse::<u64>().ok()?;
+    let second = second_text.parse::<u64>().ok()?;
+    if hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let days = u64::try_from(days_from_civil(year, month, day)).ok()?;
+    let of_day = hour * 3_600_000 + minute * 60_000 + second * 1_000;
+    days.checked_mul(MS_PER_DAY)?.checked_add(of_day)
+}
+
 pub fn format_utc(unix_ms: u64) -> Result<String, RadarError> {
     let days =
         i64::try_from(unix_ms / MS_PER_DAY).map_err(|source| RadarError::DateRange { source })?;
@@ -125,6 +150,20 @@ mod tests {
         assert_eq!(days_from_civil(2000, 1, 1), 10_957);
         assert_eq!(days_from_civil(2026, 11, 1), 20_758);
         assert_eq!(days_from_civil(2026, 10, 29), 20_755);
+    }
+
+    #[test]
+    fn iso_timestamps_are_read_and_refused() {
+        assert_eq!(parse_iso_utc("1970-01-01T00:00:00"), Some(0));
+        assert_eq!(
+            parse_iso_utc("2026-11-01T20:24:00Z"),
+            Some(20_758 * MS_PER_DAY + 20 * 3_600_000 + 24 * 60_000)
+        );
+        assert_eq!(parse_iso_utc("2026-11-01"), None);
+        assert_eq!(parse_iso_utc("2026-11-01T24:00:00"), None);
+        assert_eq!(parse_iso_utc("2026-13-01T00:00:00"), None);
+        assert_eq!(parse_iso_utc("2026-11-01T00:00"), None);
+        assert_eq!(parse_iso_utc("not a time"), None);
     }
 
     #[test]

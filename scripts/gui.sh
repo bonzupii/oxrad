@@ -177,6 +177,13 @@ case "$scenario" in
         sleep "${OXRAD_GUI_RIVERS_SETTLE:-14}"
         rail_scroll 6
         ;;
+    space)
+        click 240 28
+        rail_scroll 10
+        "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/space-before.png"
+        click 60 392
+        sleep "${OXRAD_GUI_SPACE_SETTLE:-12}"
+        ;;
     pan) drag 240 0 ;;
     zoom) scroll 10 ;;
     small)
@@ -268,6 +275,24 @@ if [[ "$scenario" == "rivers" ]]; then
         fail "the river section changed $changed rail samples; the hydrograph never arrived"
     fi
     printf 'gui: river section redrew %s rail samples\n' "$changed"
+fi
+
+if [[ "$scenario" == "space" ]]; then
+    # The Kp chart is drawn under the toggle, so an index that never arrives
+    # leaves that strip exactly as it was.
+    space_sample() {
+        "$tool_pngtopnm" "$1" 2>/dev/null |
+            "$tool_pamcut" -left 0 -top 330 -width 320 -height 260 2>/dev/null |
+            "$scale_pnmscale" -xsize 160 -ysize 130 2>/dev/null |
+            "$scale_pnmtoplainpnm" 2>/dev/null |
+            awk 'NR <= 3 { next } { printf "%s %s %s\n", $1, $2, $3 }'
+    }
+    changed="$(diff <(space_sample "$output/space-before.png") <(space_sample "$png") |
+        grep -c '^[<>]' || true)"
+    if [[ -z "$changed" ]] || ((changed < 500)); then
+        fail "the geomagnetic section changed $changed rail samples; the Kp chart never arrived"
+    fi
+    printf 'gui: geomagnetic section redrew %s rail samples\n' "$changed"
 fi
 
 printf 'gui: %s ok (%sx%s, %s colours) %s\n' "$scenario" "$width" "$height" "$colours" "$png"

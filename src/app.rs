@@ -46,6 +46,7 @@ use crate::radar::{ArchiveOrigin, GateValue, RetrievedVolume};
 use crate::radar_controls::{self, Selection};
 use crate::render;
 use crate::satellite::SatelliteLayer;
+use crate::spaceweather_layer::SpaceWeatherLayer;
 use crate::stations::{self, SiteId, Station, StationError, StationFeed, StationOutcome};
 use crate::theme::{self, Palette, Theme};
 use crate::time;
@@ -447,14 +448,14 @@ pub struct OxradApp {
     quakes: QuakeLayer,
     satellite: SatelliteLayer,
     hydro: HydroLayer,
+    space_weather: SpaceWeatherLayer,
     history: HistoryView,
 }
 
 impl OxradApp {
     pub fn new(gpu: Option<RadarGpu>, initial: Option<SiteId>) -> Self {
         let mut config = Config::default();
-        let mut config_writable = true;
-        let mut notice = None;
+        let (mut config_writable, mut notice) = (true, None::<String>);
         match config::load_default() {
             Ok(None) => {}
             Ok(Some(loaded)) => config = loaded,
@@ -465,9 +466,8 @@ impl OxradApp {
         }
         let restored_site = initial.or_else(|| config.site.clone());
         let restored_place = config.place.clone();
-        let color_table = config.color_table;
-        let sampling = config.sampling;
-        let motion = config.storm_motion;
+        let (color_table, sampling, motion) =
+            (config.color_table, config.sampling, config.storm_motion);
         let stations = match stations::load_cache() {
             Ok(Some(cached)) => Ok(cached),
             Ok(None) => Err(StationError::NoStations),
@@ -530,6 +530,7 @@ impl OxradApp {
             quakes: QuakeLayer::new(),
             satellite: SatelliteLayer::new(),
             hydro: HydroLayer::new(),
+            space_weather: SpaceWeatherLayer::new(),
             history: HistoryView::new(),
         };
         if let Some(place) = &restored_place {
@@ -543,6 +544,7 @@ impl OxradApp {
             && let Ok(list) = &app.stations
         {
             if stations::find(list, &id).is_some() {
+                // a discovered station
                 app.open_site(id, false);
                 app.pending_site = None;
             } else {
@@ -933,6 +935,7 @@ impl OxradApp {
         self.quakes.update(Instant::now());
         self.satellite.update(context, &self.map_view);
         self.hydro.update(Instant::now(), &self.map_view);
+        self.space_weather.update(Instant::now());
         self.poll_global_radar(context);
     }
 
@@ -2419,6 +2422,7 @@ impl OxradApp {
         let palette = self.config.theme.palette();
         self.satellite.rail(ui, &palette);
         self.hydro.rail(ui, &palette);
+        self.space_weather.rail(ui, &palette);
         self.quake_rail(ui);
     }
 
@@ -3635,11 +3639,6 @@ impl OxradApp {
 
     /// Draws the basemap under everything else, reporting its failure where the
     /// map would have been rather than in a corner.
-    ///
-    /// The view is passed in because each workspace keeps its own: the radar
-    /// canvas is fitted to its station while the geographic one is wherever the
-    /// user left it, and a basemap drawn from the wrong view puts an ocean under
-    /// a Kansas supercell.
     fn draw_basemap(&self, ui: &egui::Ui, rect: Rect, view: &map::MapView, palette: &Palette) {
         match &self.map {
             Ok(world) => {
