@@ -1650,19 +1650,7 @@ impl OxradApp {
             egui::Sense::click_and_drag(),
         );
         self.canvas_input(ui, rect, &interaction, Canvas::Map);
-        let now = Instant::now();
-        if self.map_reload_due.is_some_and(|due| now >= due) {
-            self.map_reload_due = None;
-            self.reload_viewport_radars();
-        }
-        if self.global_layer.is_shown()
-            && (self.global_request_due.is_some_and(|due| now >= due)
-                || self.global_refresh_due.is_some_and(|due| now >= due)
-                || matches!(self.global_state, GlobalState::Idle))
-        {
-            self.global_refresh_due = None;
-            self.request_global_radar();
-        }
+        self.refresh_map_sources();
         let transform = match self.map_view.transform(rect) {
             Ok(transform) => transform,
             Err(error) => {
@@ -1677,8 +1665,36 @@ impl OxradApp {
             }
         };
         let view = self.map_view;
-        let (radar_visible, clicked_site) =
-            self.draw_geographic_stack(ui, rect, &view, &transform, &interaction, Canvas::Map);
+        self.basemap.draw(ui, rect, &view);
+        if let Err(error) = map::draw_graticule(ui.painter(), &transform, rect, view.span_km()) {
+            self.notice = Some(format!("Map grid unavailable: {error}"));
+        }
+        self.domains.draw_satellite(ui, &transform, rect);
+        self.domains
+            .draw_fires(ui.painter(), &transform, rect, &palette);
+        self.domains
+            .draw_volcanoes(ui.painter(), &transform, rect, &palette);
+        self.domains
+            .draw_gauges(ui.painter(), &transform, rect, &palette);
+        self.domains
+            .draw_cyclones(ui.painter(), &transform, rect, &palette);
+        self.domains
+            .draw_stations(ui.painter(), &transform, &palette);
+        self.map_global(ui, &transform);
+        let radar_visible = self.radars(ui, rect, &transform, view.span_km(), true);
+        let ring_labels = self.draw_rings(ui, rect, &transform);
+        self.map_warnings(ui, rect, &transform);
+        let mut occupied = chrome_obstacles(rect, Canvas::Map).to_vec();
+        self.draw_ring_labels(ui, rect, &transform, &ring_labels, &mut occupied);
+        self.map_measure(ui, rect, &transform, &interaction);
+        let clicked_site = if self.measure.is_on() {
+            None
+        } else {
+            self.map_stations(ui, rect, &transform, &interaction)
+        };
+        self.map_place(ui, &transform);
+        map::draw_scale(ui.painter(), rect, &transform, &palette);
+        self.map_readout(ui, rect, &transform, radar_visible);
         if radar_visible && let Some(legend) = legend_rect {
             ui.painter()
                 .rect_filled(legend, CornerRadius::ZERO, palette.canvas);
@@ -1699,8 +1715,25 @@ impl OxradApp {
             interaction.clicked(),
         );
         self.map_status(ui, rect);
+        self.basemap.draw_attribution(ui, rect);
         if let Some(id) = clicked_site {
             self.choose_site(id);
+        }
+    }
+
+    fn refresh_map_sources(&mut self) {
+        let now = Instant::now();
+        if self.map_reload_due.is_some_and(|due| now >= due) {
+            self.map_reload_due = None;
+            self.reload_viewport_radars();
+        }
+        if self.global_layer.is_shown()
+            && (self.global_request_due.is_some_and(|due| now >= due)
+                || self.global_refresh_due.is_some_and(|due| now >= due)
+                || matches!(self.global_state, GlobalState::Idle))
+        {
+            self.global_refresh_due = None;
+            self.request_global_radar();
         }
     }
 
@@ -3421,8 +3454,8 @@ impl OxradApp {
         painter.galley(origin + padding, galley, TEXT);
     }
 
-    /// The radar workspace: the same projection and layer stack, fitted to the
-    /// selected station, so a chaser can pan to the road under the storm.
+    /// The radar workspace is fitted to the selected station and does not draw
+    /// the map workspace's environmental layers or global composite.
     fn radar_scene(&mut self, ui: &mut egui::Ui) {
         let full_rect = ui.max_rect();
         let palette = self.config.theme.palette();
@@ -3457,8 +3490,18 @@ impl OxradApp {
             }
         };
         let view = self.radar_view;
-        let (radar_visible, clicked_site) =
-            self.draw_geographic_stack(ui, rect, &view, &transform, &interaction, Canvas::Radar);
+        self.basemap.draw(ui, rect, &view);
+        if let Err(error) = map::draw_graticule(ui.painter(), &transform, rect, view.span_km()) {
+            self.notice = Some(format!("Radar grid unavailable: {error}"));
+        }
+        let radar_visible = self.radars(ui, rect, &transform, view.span_km(), false);
+        let ring_labels = self.draw_rings(ui, rect, &transform);
+        self.map_warnings(ui, rect, &transform);
+        let mut occupied = chrome_obstacles(rect, Canvas::Radar).to_vec();
+        self.draw_ring_labels(ui, rect, &transform, &ring_labels, &mut occupied);
+        let clicked_site = self.map_stations(ui, rect, &transform, &interaction);
+        self.map_place(ui, &transform);
+        map::draw_scale(ui.painter(), rect, &transform, &palette);
         if radar_visible && let Some(legend) = legend_rect {
             ui.painter()
                 .rect_filled(legend, CornerRadius::ZERO, palette.canvas);
@@ -3484,58 +3527,10 @@ impl OxradApp {
             }
         }
         self.map_readout(ui, rect, &transform, radar_visible);
+        self.basemap.draw_attribution(ui, rect);
         if let Some(id) = clicked_site {
             self.choose_site(id);
         }
-    }
-
-    /// Draws every geographic layer, bottom to top, for whichever workspace is
-    /// asking: geography, then the echo, then warnings, then labels.
-    fn draw_geographic_stack(
-        &mut self,
-        ui: &mut egui::Ui,
-        rect: Rect,
-        view: &map::MapView,
-        transform: &map::MapTransform,
-        interaction: &egui::Response,
-        canvas: Canvas,
-    ) -> (bool, Option<SiteId>) {
-        let palette = self.config.theme.palette();
-        let span_km = view.span_km();
-        self.basemap.draw(ui, rect, view);
-        if let Err(error) = map::draw_graticule(ui.painter(), transform, rect, span_km) {
-            self.notice = Some(format!("Map grid unavailable: {error}"));
-        }
-        if canvas == Canvas::Map {
-            self.domains.draw_satellite(ui, transform, rect);
-            self.domains
-                .draw_fires(ui.painter(), transform, rect, &palette);
-            self.domains
-                .draw_volcanoes(ui.painter(), transform, rect, &palette);
-            self.domains
-                .draw_gauges(ui.painter(), transform, rect, &palette);
-            self.domains
-                .draw_cyclones(ui.painter(), transform, rect, &palette);
-            self.domains
-                .draw_stations(ui.painter(), transform, &palette);
-        }
-        self.map_global(ui, transform);
-        let include_viewport = canvas == Canvas::Map;
-        let radar_visible = self.radars(ui, rect, transform, span_km, include_viewport);
-        let ring_labels = self.draw_rings(ui, rect, transform);
-        self.map_warnings(ui, rect, transform);
-        let mut occupied: Vec<Rect> = chrome_obstacles(rect, canvas).to_vec();
-        self.draw_ring_labels(ui, rect, transform, &ring_labels, &mut occupied);
-        self.map_measure(ui, rect, transform, interaction);
-        let clicked_site = if self.measure.is_on() {
-            None
-        } else {
-            self.map_stations(ui, rect, transform, interaction)
-        };
-        self.map_place(ui, transform);
-        map::draw_scale(ui.painter(), rect, transform, &palette);
-        self.map_readout(ui, rect, transform, radar_visible);
-        (radar_visible, clicked_site)
     }
 
     fn draw_rings(
@@ -4125,18 +4120,22 @@ fn map_caption(painter: &egui::Painter, rect: Rect, frame: &Frame) {
         frame.volume.sweep.elevation_number,
         frame.volume.sweep.elevation_deg
     );
-    painter.text(
-        Pos2::new(rect.left() + 16.0, rect.top() + 14.0),
-        Align2::LEFT_TOP,
-        label,
-        FontId::proportional(12.0),
-        TEXT,
-    );
+    let position = Pos2::new(rect.left() + 16.0, rect.top() + 14.0);
+    let galley = painter.layout_no_wrap(label, FontId::proportional(12.0), TEXT);
+    let background = Rect::from_min_size(position, galley.size()).expand2(Vec2::new(5.0, 3.0));
+    let painter = painter.with_clip_rect(rect);
+    painter.rect_filled(background, 3.0, Color32::from_black_alpha(220));
+    painter.galley(position, galley, TEXT);
 }
 
 fn north_marker(painter: &egui::Painter, rect: Rect) {
     let x = rect.center().x;
     let top = rect.top() + 12.0;
+    painter.rect_filled(
+        Rect::from_min_size(Pos2::new(x - 9.0, top - 3.0), Vec2::new(18.0, 36.0)),
+        3.0,
+        Color32::from_black_alpha(220),
+    );
     painter.text(
         Pos2::new(x, top),
         Align2::CENTER_TOP,

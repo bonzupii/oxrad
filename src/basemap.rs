@@ -7,7 +7,9 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use eframe::egui::{self, Align2, Color32, FontId, Rect};
 use walkers::sources::{Attribution, TileSource};
-use walkers::{HttpOptions, HttpTiles, Map, MapMemory, MaxParallelDownloads, Style, TileId};
+use walkers::{
+    HttpOptions, HttpTiles, Map, MapMemory, MaxParallelDownloads, Style, TileId, TilePiece, Tiles,
+};
 
 use crate::cache::Store;
 use crate::map::MapView;
@@ -84,6 +86,29 @@ impl TileSource for OpenFreeMap {
     }
     fn max_zoom(&self) -> u8 {
         14
+    }
+}
+
+struct VisibleTiles<'a> {
+    source: &'a mut HttpTiles,
+    missing: usize,
+}
+
+impl Tiles for VisibleTiles<'_> {
+    fn at(&mut self, tile: TileId) -> Option<TilePiece> {
+        let piece = self.source.at(tile);
+        if piece.is_none() {
+            self.missing = self.missing.saturating_add(1);
+        }
+        piece
+    }
+
+    fn attribution(&self) -> Attribution {
+        self.source.attribution()
+    }
+
+    fn tile_size(&self) -> u32 {
+        self.source.tile_size()
     }
 }
 
@@ -190,6 +215,7 @@ pub struct Basemap {
     receiver: Option<Receiver<StyleResult>>,
     cached_style: bool,
     tiles: Option<HttpTiles>,
+    missing_tiles: usize,
     memory: MapMemory,
     error: Option<String>,
 }
@@ -203,6 +229,7 @@ impl Basemap {
             receiver: None,
             cached_style: false,
             tiles: None,
+            missing_tiles: 0,
             memory: MapMemory::default(),
             error: None,
         }
@@ -219,6 +246,7 @@ impl Basemap {
             });
         if self.selected != previous {
             self.receiver = None;
+            self.cached_style = false;
             self.error = None;
         }
         if let Some(error) = &self.error {
@@ -226,6 +254,12 @@ impl Basemap {
             if ui.button("Retry basemap").clicked() {
                 self.error = None;
             }
+        }
+        if self.missing_tiles > 0 {
+            ui.label(format!(
+                "{} visible map tiles are loading or unavailable.",
+                self.missing_tiles
+            ));
         }
         ui.hyperlink_to(CREDIT, "https://www.openstreetmap.org/copyright");
         (self.selected != previous).then_some(self.selected)
@@ -368,13 +402,27 @@ impl Basemap {
         }
         let center = walkers::lat_lon(latitude, longitude);
         self.memory.center_at(center);
+        let mut visible = VisibleTiles {
+            source: tiles,
+            missing: 0,
+        };
         ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
-            Map::new(Some(tiles), &mut self.memory, center)
+            Map::new(Some(&mut visible), &mut self.memory, center)
                 .zoom_gesture(false)
                 .panning(false)
                 .show(ui, |_, _, _, _| {});
         });
-        let status = if self.error.is_some() && self.cached_style {
+        self.missing_tiles = visible.missing;
+    }
+
+    /// Draw attribution after overlays so it cannot be covered by map data.
+    pub fn draw_attribution(&self, ui: &egui::Ui, rect: Rect) {
+        if self.tiles.is_none() {
+            return;
+        }
+        let status = if self.error.is_some() && self.active != Some(self.selected) {
+            " · selected style unavailable"
+        } else if self.error.is_some() && self.cached_style {
             " · cached style; refresh failed"
         } else if self.cached_style {
             " · cached style; refreshing"
@@ -383,7 +431,12 @@ impl Basemap {
         } else {
             ""
         };
-        let attribution = format!("{CREDIT}{status}");
+        let tile_status = if self.missing_tiles > 0 {
+            " · map tiles loading or unavailable"
+        } else {
+            ""
+        };
+        let attribution = format!("{CREDIT}{status}{tile_status}");
         let galley =
             ui.painter()
                 .layout_no_wrap(attribution, FontId::proportional(10.0), Color32::WHITE);
