@@ -146,6 +146,17 @@ pub fn get_bytes(url: &str, accept: &str, limit: u64) -> Result<Vec<u8>, JsonErr
     fetch(url, accept, limit)
 }
 
+/// Fetches a document that is not JSON, such as a comma-separated index, and
+/// returns it as text. A body that is not UTF-8 is a shape failure, not a
+/// document to read.
+pub fn get_text(url: &str, accept: &str) -> Result<String, JsonError> {
+    let body = fetch(url, accept, MAX_BODY_BYTES)?;
+    String::from_utf8(body).map_err(|_| JsonError::Shape {
+        url: String::from(url),
+        field: "a body written as text",
+    })
+}
+
 /// Fetches a JSON document, failing on a non-success status rather than
 /// returning the provider's error page as data.
 pub fn get_json(url: &str, accept: &str) -> Result<Value, JsonError> {

@@ -270,6 +270,16 @@ case "$scenario" in
         click 60 375
         sleep "${OXRAD_GUI_SNOW_SETTLE:-14}"
         ;;
+    seaice)
+        # The sea-ice section sits between the profile and the earthquakes, so
+        # the rail is scrolled a little short of its end.
+        click 240 28
+        rail_scroll 42
+        "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/seaice-before.png"
+        click 60 205
+        click 60 245
+        sleep "${OXRAD_GUI_SEAICE_SETTLE:-14}"
+        ;;
     radio)
         # The radio sits at the end of the rail, below the earthquake section.
         click 240 28
@@ -561,6 +571,24 @@ if [[ "$scenario" == "radio" ]]; then
         fail "the radio changed $changed rail samples; it never played a bulletin"
     fi
     printf 'gui: radio changed %s rail samples\n' "$changed"
+fi
+
+if [[ "$scenario" == "seaice" ]]; then
+    # The extent, the anomaly, and the record go in where the invitation was,
+    # so an index that never arrived leaves this strip as it was.
+    seaice_sample() {
+        "$tool_pngtopnm" "$1" 2>/dev/null |
+            "$tool_pamcut" -left 0 -top 230 -width 320 -height 380 2>/dev/null |
+            "$scale_pnmscale" -xsize 160 -ysize 190 2>/dev/null |
+            "$scale_pnmtoplainpnm" 2>/dev/null |
+            awk 'NR <= 3 { next } { printf "%s %s %s\n", $1, $2, $3 }'
+    }
+    changed="$(diff <(seaice_sample "$output/seaice-before.png") <(seaice_sample "$png") |
+        grep -c '^[<>]' || true)"
+    if [[ -z "$changed" ]] || ((changed < 500)); then
+        fail "the sea-ice section changed $changed rail samples; the index never arrived"
+    fi
+    printf 'gui: sea-ice section redrew %s rail samples\n' "$changed"
 fi
 
 printf 'gui: %s ok (%sx%s, %s colours) %s\n' "$scenario" "$width" "$height" "$colours" "$png"

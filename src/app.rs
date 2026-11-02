@@ -55,6 +55,7 @@ use crate::radio::Input as RadioInput;
 use crate::radio_layer::Radio;
 use crate::render;
 use crate::satellite::SatelliteLayer;
+use crate::seaice_layer::SeaIceLayer;
 use crate::snow_layer::SnowLayer;
 use crate::sounding_layer::SoundingLayer;
 use crate::spaceweather_layer::SpaceWeatherLayer;
@@ -416,6 +417,7 @@ pub struct OxradApp {
     snowpack: SnowLayer,
     profile: SoundingLayer,
     radio: Radio,
+    sea_ice: SeaIceLayer,
     history: HistoryView,
 }
 
@@ -527,6 +529,7 @@ impl OxradApp {
             snowpack: SnowLayer::new(),
             profile: SoundingLayer::new(),
             radio: Radio::new(),
+            sea_ice: SeaIceLayer::new(),
             history: HistoryView::new(),
         };
         if let Some(place) = &restored_place {
@@ -926,6 +929,7 @@ impl OxradApp {
             .update(Instant::now(), &self.map_view);
         self.snowpack.update(Instant::now(), &self.map_view);
         self.profile.update(Instant::now(), &self.map_view);
+        self.sea_ice.update(Instant::now());
         self.poll_global_radar(context);
     }
 
@@ -2419,6 +2423,7 @@ impl OxradApp {
         self.stations_reported.rail(ui, &palette, centre);
         self.snowpack.rail(ui, &palette);
         self.profile.rail(ui, &palette);
+        self.sea_ice.rail(ui, &palette);
         self.quake_rail(ui);
         let clock = time::now_unix_ms();
         let radio_input = RadioInput {

@@ -59,6 +59,8 @@ mod raster;
 mod render;
 mod retry;
 mod satellite;
+mod seaice;
+mod seaice_layer;
 mod snow;
 mod snow_layer;
 mod sounding;
