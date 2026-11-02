@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 
 use crate::overlay_select::retain_warning_selection;
 use crate::warnings::{Warning, WarningError, WarningEvent, WarningFeed};
-use crate::workspaces::LayerVisibility;
 
 /// How long a successful warning set stays current.
 const REFRESH_SECS: u64 = 5 * 60;
@@ -36,7 +35,6 @@ pub struct WarningView {
     pub without_geometry: usize,
     pub rejected: usize,
     pub selected: Option<String>,
-    pub layer: LayerVisibility,
     pub scope: WarningScope,
     pub state: WarningState,
     request_due: Option<Instant>,
@@ -52,7 +50,6 @@ impl WarningView {
             without_geometry: 0,
             rejected: 0,
             selected: None,
-            layer: LayerVisibility::Shown,
             scope: WarningScope::All,
             state: WarningState::Idle,
             request_due: Some(Instant::now()),

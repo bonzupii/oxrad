@@ -35,6 +35,7 @@ use crate::global_radar::{
 };
 use crate::gpu::RadarGpu;
 use crate::history::{self, HistoryError, HistoryEvent, HistoryFeed};
+use crate::layer_catalog::{LayerCatalog, LayerGroup, LayerId};
 use crate::map::{self, MapError, MapView};
 use crate::overlay;
 use crate::overlay_select::{nearby_station_ids, warning_intersects};
@@ -53,7 +54,7 @@ use crate::theme::{self, Palette, Theme};
 use crate::time;
 use crate::warning_view::{WarningScope, WarningState, WarningView};
 use crate::warnings::{Severity, Warning};
-use crate::workspaces::{LayerVisibility as RadarLayer, MapWorkspace, RadarWorkspace};
+use crate::workspaces::{MapWorkspace, RadarWorkspace};
 
 const TEXT: Color32 = Color32::from_rgb(214, 221, 232);
 const MUTED: Color32 = Color32::from_rgb(156, 168, 184);
@@ -304,7 +305,8 @@ pub struct OxradApp {
     global_generation: u64,
     global_frames: Vec<GlobalFrameTexture>,
     global_index: usize,
-    global_layer: RadarLayer,
+    layers: LayerCatalog,
+    layer_query: String,
     global_playback: GlobalPlayback,
     global_next_frame: Option<Instant>,
     global_request_due: Option<Instant>,
@@ -388,7 +390,8 @@ impl OxradApp {
             global_generation: 0,
             global_frames: Vec::new(),
             global_index: 0,
-            global_layer: RadarLayer::Shown,
+            layers: LayerCatalog::new(),
+            layer_query: String::new(),
             global_playback: GlobalPlayback::Stopped,
             global_next_frame: None,
             global_request_due: None,
@@ -1477,7 +1480,7 @@ impl OxradApp {
             CornerRadius::ZERO,
             self.config.theme.palette().background,
         );
-        if self.global_layer.is_shown() && !self.global_frames.is_empty() {
+        if self.layers.visible(LayerId::GlobalComposite) && !self.global_frames.is_empty() {
             self.global_history(ui);
         }
         let rect = ui.available_rect_before_wrap();
@@ -1569,7 +1572,7 @@ impl OxradApp {
         if self.map.take_due_reload(now) {
             self.reload_viewport_radars();
         }
-        if self.global_layer.is_shown()
+        if self.layers.visible(LayerId::GlobalComposite)
             && (self.global_request_due.is_some_and(|due| now >= due)
                 || self.global_refresh_due.is_some_and(|due| now >= due)
                 || matches!(self.global_state, GlobalState::Idle))
@@ -1750,7 +1753,7 @@ impl OxradApp {
     }
 
     fn map_global(&self, ui: &egui::Ui, transform: &map::MapTransform) -> bool {
-        if !self.global_layer.is_shown() {
+        if !self.layers.visible(LayerId::GlobalComposite) {
             return false;
         }
         let Some(frame) = self.global_frames.get(self.global_index) else {
@@ -1772,7 +1775,7 @@ impl OxradApp {
                 tile.texture.id(),
                 image_rect,
                 Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                Color32::WHITE,
+                Color32::from_white_alpha(self.layers.alpha(LayerId::GlobalComposite)),
             );
             drew = true;
         }
@@ -1959,7 +1962,7 @@ impl OxradApp {
     }
 
     fn map_warnings(&self, ui: &egui::Ui, rect: Rect, transform: &map::MapTransform) {
-        if !self.warning_view.layer.is_shown() {
+        if !self.layers.visible(LayerId::Warnings) {
             return;
         }
         for warning in &self.warning_view.list {
@@ -1988,11 +1991,12 @@ impl OxradApp {
                 if width > rect.width() * 4.0 {
                     continue;
                 }
+                let alpha = self.layers.opacity(LayerId::Warnings);
                 let (width, colour) =
                     if self.warning_view.selected.as_deref() == Some(warning.id.as_str()) {
-                        (4.0_f32, TEXT)
+                        (4.0_f32, TEXT.gamma_multiply(alpha))
                     } else {
-                        (2.0_f32, colour)
+                        (2.0_f32, colour.gamma_multiply(alpha))
                     };
                 ui.painter()
                     .add(Shape::closed_line(points, Stroke::new(width, colour)));
@@ -2244,54 +2248,76 @@ impl OxradApp {
         }
     }
 
+    fn layer_list(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Layers").size(theme::TYPE_LABEL).strong());
+        ui.add(
+            egui::TextEdit::singleline(&mut self.layer_query)
+                .hint_text("Filter layers")
+                .desired_width(f32::INFINITY)
+                .margin(Vec2::new(8.0, 5.0)),
+        );
+        let matching = self.layers.search(&self.layer_query);
+        for group in LayerGroup::ALL {
+            let ids: Vec<LayerId> = self
+                .layers
+                .in_group(group)
+                .into_iter()
+                .filter(|id| matching.contains(id))
+                .collect();
+            if ids.is_empty() {
+                continue;
+            }
+            ui.add_space(theme::SPACE_S);
+            ui.label(RichText::new(group.label()).size(theme::TYPE_SMALL).weak());
+            for id in ids {
+                let mut visible = self.layers.visible(id);
+                let mut opacity = self.layers.opacity(id);
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut visible, id.label())
+                        .on_hover_text(id.detail());
+                    if visible {
+                        ui.add(
+                            egui::Slider::new(&mut opacity, 0.1..=1.0)
+                                .show_value(false)
+                                .trailing_fill(true),
+                        )
+                        .on_hover_text("Layer opacity");
+                    }
+                });
+                if visible != self.layers.visible(id) {
+                    self.layers.set_visible(id, visible);
+                    self.layer_changed(id, visible);
+                }
+                if (self.layers.opacity(id) - opacity).abs() > 1e-6 {
+                    self.layers.set_opacity(id, opacity);
+                }
+            }
+        }
+    }
+
+    fn layer_changed(&mut self, id: LayerId, visible: bool) {
+        match id {
+            LayerId::Warnings => {
+                if visible && matches!(self.warning_view.state, WarningState::Idle) {
+                    self.warning_view.retry_now();
+                }
+            }
+            LayerId::GlobalComposite => {
+                if visible {
+                    if self.global_frames.is_empty() {
+                        self.request_global_radar();
+                    }
+                } else {
+                    self.global_playback = GlobalPlayback::Stopped;
+                }
+            }
+        }
+    }
+
     fn map_overlay_controls(&mut self, ui: &mut egui::Ui) {
         let palette = self.config.theme.palette();
-        if ui
-            .add_sized(
-                [116.0, 30.0],
-                toggle_button(
-                    &palette,
-                    if self.warning_view.layer.is_shown() {
-                        "Hide warnings"
-                    } else {
-                        "Show warnings"
-                    },
-                    self.warning_view.layer.is_shown(),
-                ),
-            )
-            .on_hover_text("Show active National Weather Service warning polygons for the United States and territories.")
-            .clicked()
-        {
-            self.warning_view.layer = self.warning_view.layer.toggled();
-            if self.warning_view.layer.is_shown()
-                && matches!(self.warning_view.state, WarningState::Idle)
-            {
-                self.warning_view.retry_now();
-            }
-        }
-        if ui
-            .add_sized(
-                [158.0, 30.0],
-                toggle_button(
-                    &palette,
-                    if self.global_layer.is_shown() {
-                        "Global radar: on"
-                    } else {
-                        "Global radar: off"
-                    },
-                    self.global_layer.is_shown(),
-                ),
-            )
-            .on_hover_text("RainViewer global reflectivity composite with two hours of history.")
-            .clicked()
-        {
-            self.global_layer = self.global_layer.toggled();
-            if !self.global_layer.is_shown() {
-                self.global_playback = GlobalPlayback::Stopped;
-            } else if self.global_frames.is_empty() {
-                self.request_global_radar();
-            }
-        }
+        self.layer_list(ui);
+        ui.add_space(theme::SPACE_M);
         if ui
             .add_sized(
                 [116.0, 30.0],
@@ -2348,7 +2374,7 @@ impl OxradApp {
                                             .weak(),
                                     );
                                 }
-                                if self.warning_view.layer.is_shown()
+                                if self.layers.visible(LayerId::Warnings)
                                     && let Some(warning) = self.most_severe_warning()
                                 {
                                     ui.label(
@@ -2465,7 +2491,7 @@ impl OxradApp {
         } else {
             format!(" · time-excluded: {}", excluded.join(", "))
         };
-        let global = if self.global_layer.is_shown() {
+        let global = if self.layers.visible(LayerId::GlobalComposite) {
             match &self.global_state {
                 GlobalState::Idle => String::new(),
                 GlobalState::Loading => String::from(" · global loading"),
@@ -2476,8 +2502,8 @@ impl OxradApp {
             String::from(" · global off")
         };
         if contributing.is_empty()
-            && !self.global_layer.is_shown()
-            && !self.warning_view.layer.is_shown()
+            && !self.layers.visible(LayerId::GlobalComposite)
+            && !self.layers.visible(LayerId::Warnings)
         {
             return None;
         }
@@ -2493,7 +2519,7 @@ impl OxradApp {
     }
 
     fn warning_layer_summary(&self) -> String {
-        if !self.warning_view.layer.is_shown() {
+        if !self.layers.visible(LayerId::Warnings) {
             return String::from(" · warnings off");
         }
         match self.warning_view.state {
@@ -2951,7 +2977,7 @@ impl OxradApp {
     }
 
     fn warning_section(&mut self, ui: &mut egui::Ui) {
-        if !self.warning_view.layer.is_shown() || self.warning_view.list.is_empty() {
+        if !self.layers.visible(LayerId::Warnings) || self.warning_view.list.is_empty() {
             return;
         }
         ui.add_space(theme::SPACE_M);

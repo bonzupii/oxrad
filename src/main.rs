@@ -41,6 +41,7 @@ mod hydro;
 mod hydro_layer;
 mod land;
 mod land_layer;
+mod layer_catalog;
 mod map;
 mod network;
 mod observations;
