@@ -42,6 +42,7 @@ use crate::place::{self, Place, SearchInteraction, SearchState};
 use crate::product::RadarProduct;
 use crate::provider::timestamp_label;
 use crate::quake_layer::QuakeLayer;
+use crate::quality_layer::AirLayer;
 use crate::radar::{ArchiveOrigin, GateValue, RetrievedVolume};
 use crate::radar_controls::{self, Selection};
 use crate::render;
@@ -449,6 +450,7 @@ pub struct OxradApp {
     satellite: SatelliteLayer,
     hydro: HydroLayer,
     space_weather: SpaceWeatherLayer,
+    air: AirLayer,
     history: HistoryView,
 }
 
@@ -531,6 +533,7 @@ impl OxradApp {
             satellite: SatelliteLayer::new(),
             hydro: HydroLayer::new(),
             space_weather: SpaceWeatherLayer::new(),
+            air: AirLayer::new(),
             history: HistoryView::new(),
         };
         if let Some(place) = &restored_place {
@@ -936,6 +939,7 @@ impl OxradApp {
         self.satellite.update(context, &self.map_view);
         self.hydro.update(Instant::now(), &self.map_view);
         self.space_weather.update(Instant::now());
+        self.air.update(Instant::now(), &self.map_view);
         self.poll_global_radar(context);
     }
 
@@ -2423,6 +2427,7 @@ impl OxradApp {
         self.satellite.rail(ui, &palette);
         self.hydro.rail(ui, &palette);
         self.space_weather.rail(ui, &palette);
+        self.air.rail(ui, &palette);
         self.quake_rail(ui);
     }
 

@@ -38,6 +38,8 @@ mod projection;
 mod provider;
 mod quake;
 mod quake_layer;
+mod quality;
+mod quality_layer;
 mod radar;
 mod radar_controls;
 mod raster;

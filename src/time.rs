@@ -65,7 +65,12 @@ pub fn parse_iso_utc(text: &str) -> Option<u64> {
     let text = text.trim_end_matches('Z');
     let (day_text, time_text) = text.split_once('T')?;
     let (hour_text, rest) = time_text.split_once(':')?;
-    let (minute_text, second_text) = rest.split_once(':')?;
+    // A provider that reports whole hours omits the seconds; the hour is then
+    // the same instant as it would be written with them.
+    let (minute_text, second_text) = match rest.split_once(':') {
+        Some((minute, second)) => (minute, second),
+        None => (rest, "0"),
+    };
     let mut date = day_text.split('-');
     let year = date.next()?.parse::<i32>().ok()?;
     let month = date.next()?.parse::<u32>().ok()?;
@@ -162,7 +167,12 @@ mod tests {
         assert_eq!(parse_iso_utc("2026-11-01"), None);
         assert_eq!(parse_iso_utc("2026-11-01T24:00:00"), None);
         assert_eq!(parse_iso_utc("2026-13-01T00:00:00"), None);
-        assert_eq!(parse_iso_utc("2026-11-01T00:00"), None);
+        assert_eq!(
+            parse_iso_utc("2026-11-01T00:00"),
+            Some(20_758 * MS_PER_DAY),
+            "an hour reported without seconds is that minute"
+        );
+        assert_eq!(parse_iso_utc("2026-11-01T00:00:00:00"), None);
         assert_eq!(parse_iso_utc("not a time"), None);
     }
 
