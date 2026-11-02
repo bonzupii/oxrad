@@ -55,6 +55,11 @@ impl ObservationLayer {
         }
     }
 
+    /// The stations the layer is holding, for anything else that reports them.
+    pub const fn stations(&self) -> Option<&crate::observations::ObservationSet> {
+        self.view.stations()
+    }
+
     /// Keeps the observations current while the layer is on.
     pub fn update(&mut self, now: Instant, view: &map::MapView) {
         let retry_due = self.view.update(now);

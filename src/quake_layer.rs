@@ -79,6 +79,11 @@ impl QuakeLayer {
         }
     }
 
+    /// The events the layer is holding, for anything else that reports them.
+    pub const fn events(&self) -> Option<&crate::quake::Quakes> {
+        self.view.events()
+    }
+
     /// Polls the worker and keeps the request cadence. Nothing is requested
     /// while the layer is hidden.
     pub fn update(&mut self, now: Instant) {

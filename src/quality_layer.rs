@@ -52,6 +52,12 @@ impl AirLayer {
         }
     }
 
+    /// The air quality record the layer is holding, for anything else that
+    /// reports it.
+    pub const fn record(&self) -> Option<&crate::quality::AirQuality> {
+        self.view.record()
+    }
+
     /// Follows the map centre while the layer is on, and takes in the worker's
     /// answers.
     pub fn update(&mut self, now: Instant, view: &MapView) {

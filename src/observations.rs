@@ -445,6 +445,12 @@ pub struct ObservationView {
 }
 
 impl ObservationView {
+    /// The stations worth drawing: the newest feed, or the last one if a
+    /// refresh is under way or failed.
+    pub const fn stations(&self) -> Option<&ObservationSet> {
+        self.state.last()
+    }
+
     pub fn new() -> Self {
         Self {
             feed: ObservationFeed::new(),

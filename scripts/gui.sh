@@ -270,6 +270,18 @@ case "$scenario" in
         click 60 375
         sleep "${OXRAD_GUI_SNOW_SETTLE:-14}"
         ;;
+    radio)
+        # The radio sits at the end of the rail, below the earthquake section.
+        click 240 28
+        rail_scroll 60
+        "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/radio-before.png"
+        # The radio sits a little higher or lower depending on how many alerts
+        # arrived while the rail settled, so both candidates are clicked: one
+        # is the play control and the other a label or the card beside it.
+        click 60 435
+        click 60 500
+        sleep "${OXRAD_GUI_RADIO_SETTLE:-20}"
+        ;;
     profile)
         # The same end-of-rail scroll puts the vertical-profile section one
         # section above the alert list.
@@ -530,6 +542,25 @@ if [[ "$scenario" == "profile" ]]; then
         fail "the profile section changed $changed rail samples; the column never arrived"
     fi
     printf 'gui: profile section redrew %s rail samples\n' "$changed"
+fi
+
+if [[ "$scenario" == "radio" ]]; then
+    # Playing the radio must change what it is reading out. The strip holds the
+    # play control and the bulletin card, so a radio that never opened a
+    # bulletin, or never advanced past the first, leaves it unchanged.
+    radio_sample() {
+        "$tool_pngtopnm" "$1" 2>/dev/null |
+            "$tool_pamcut" -left 0 -top 420 -width 320 -height 240 2>/dev/null |
+            "$scale_pnmscale" -xsize 160 -ysize 120 2>/dev/null |
+            "$scale_pnmtoplainpnm" 2>/dev/null |
+            awk 'NR <= 3 { next } { printf "%s %s %s\n", $1, $2, $3 }'
+    }
+    changed="$(diff <(radio_sample "$output/radio-before.png") <(radio_sample "$png") |
+        grep -c '^[<>]' || true)"
+    if [[ -z "$changed" ]] || ((changed < 400)); then
+        fail "the radio changed $changed rail samples; it never played a bulletin"
+    fi
+    printf 'gui: radio changed %s rail samples\n' "$changed"
 fi
 
 printf 'gui: %s ok (%sx%s, %s colours) %s\n' "$scenario" "$width" "$height" "$colours" "$png"

@@ -469,6 +469,17 @@ impl ForecastView {
         }
     }
 
+    /// The forecast on screen, for anything else that reports it.
+    pub const fn forecast(&self) -> Option<&Forecast> {
+        match &self.state {
+            ForecastState::Ready { forecast } => Some(forecast),
+            ForecastState::Loading { last, .. } | ForecastState::Failed { last, .. } => {
+                last.as_ref()
+            }
+            ForecastState::Empty => None,
+        }
+    }
+
     pub const fn state(&self) -> &ForecastState {
         &self.state
     }

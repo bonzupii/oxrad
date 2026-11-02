@@ -44,6 +44,12 @@ impl SpaceWeatherLayer {
         }
     }
 
+    /// The geomagnetic record the layer is holding, for anything else that
+    /// reports it.
+    pub const fn record(&self) -> Option<&crate::spaceweather::SpaceWeather> {
+        self.view.record()
+    }
+
     pub fn update(&mut self, now: Instant) {
         if !self.shown {
             return;

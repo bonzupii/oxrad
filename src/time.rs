@@ -64,6 +64,11 @@ pub const fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
 pub fn parse_iso_utc(text: &str) -> Option<u64> {
     let text = text.trim_end_matches('Z');
     let (day_text, time_text) = text.split_once('T')?;
+    // A provider may state the offset the time was written in, as the \n    // weather service does for its warnings.
+    let (time_text, offset_ms) = match split_offset(time_text) {
+        Some((time, offset)) => (time, offset),
+        None => (time_text, 0_i64),
+    };
     let (hour_text, rest) = time_text.split_once(':')?;
     // A provider that reports whole hours omits the seconds; the hour is then
     // the same instant as it would be written with them.
@@ -86,7 +91,28 @@ pub fn parse_iso_utc(text: &str) -> Option<u64> {
     }
     let days = u64::try_from(days_from_civil(year, month, day)).ok()?;
     let of_day = hour * 3_600_000 + minute * 60_000 + second * 1_000;
-    days.checked_mul(MS_PER_DAY)?.checked_add(of_day)
+    let local = days.checked_mul(MS_PER_DAY)?.checked_add(of_day)?;
+    let shifted = i128::from(local).checked_sub(i128::from(offset_ms))?;
+    u64::try_from(shifted).ok()
+}
+
+/// Splits a written offset from a time and returns it in milliseconds east of
+/// UTC, so the instant can be taken back out of local time.
+fn split_offset(time_text: &str) -> Option<(&str, i64)> {
+    let position = time_text
+        .char_indices()
+        .find(|(_, character)| *character == '+' || *character == '-')
+        .map(|(position, _)| position)?;
+    let (clock, offset) = time_text.split_at(position);
+    let sign = if offset.starts_with('-') { -1_i64 } else { 1 };
+    let digits = offset.get(1..)?;
+    let (hours, minutes) = digits.split_once(':')?;
+    let hours = hours.parse::<i64>().ok()?;
+    let minutes = minutes.parse::<i64>().ok()?;
+    if hours > 14 || minutes > 59 {
+        return None;
+    }
+    Some((clock, sign * (hours * 3_600_000 + minutes * 60_000)))
 }
 
 pub fn format_utc(unix_ms: u64) -> Result<String, RadarError> {
@@ -174,6 +200,16 @@ mod tests {
         );
         assert_eq!(parse_iso_utc("2026-11-01T00:00:00:00"), None);
         assert_eq!(parse_iso_utc("not a time"), None);
+    }
+
+    #[test]
+    fn a_written_offset_is_taken_back_out_of_the_local_time() {
+        let utc = parse_iso_utc("2026-11-02T08:00:00Z");
+        let offset = parse_iso_utc("2026-11-02T02:00:00-06:00");
+        assert_eq!(offset, utc);
+        let east = parse_iso_utc("2026-11-02T10:00:00+02:00");
+        assert_eq!(east, utc);
+        assert_eq!(parse_iso_utc("2026-11-02T02:00:00-15:00"), None);
     }
 
     #[test]

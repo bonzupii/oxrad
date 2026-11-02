@@ -86,6 +86,11 @@ impl SoundingLayer {
         }
     }
 
+    /// The column the layer is holding, for anything else that reports it.
+    pub const fn record(&self) -> Option<&Sounding> {
+        self.view.record()
+    }
+
     /// The rail section for the layer.
     pub fn rail(&mut self, ui: &mut egui::Ui, palette: &Palette) {
         ui.add_space(theme::SPACE_M);

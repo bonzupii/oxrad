@@ -42,6 +42,7 @@ use crate::map::{self, MapError, MapView, WorldMap};
 use crate::observations_layer::ObservationLayer;
 use crate::ocean_layer::OceanLayer;
 use crate::overlay;
+use crate::overlay_select::{nearby_station_ids, retain_warning_selection, warning_intersects};
 use crate::pipeline::{Pipeline, PipelineState};
 use crate::place::{self, Place, SearchInteraction, SearchState};
 use crate::product::RadarProduct;
@@ -50,6 +51,8 @@ use crate::quake_layer::QuakeLayer;
 use crate::quality_layer::AirLayer;
 use crate::radar::{ArchiveOrigin, GateValue, RetrievedVolume};
 use crate::radar_controls::{self, Selection};
+use crate::radio::Input as RadioInput;
+use crate::radio_layer::Radio;
 use crate::render;
 use crate::satellite::SatelliteLayer;
 use crate::snow_layer::SnowLayer;
@@ -340,59 +343,6 @@ fn scale_band(rect: Rect) -> Rect {
     )
 }
 
-fn retain_warning_selection(selected: &mut Option<String>, warnings: &[Warning]) {
-    if selected
-        .as_ref()
-        .is_some_and(|id| !warnings.iter().any(|warning| &warning.id == id))
-    {
-        *selected = None;
-    }
-}
-
-fn warning_intersects(warning: &Warning, transform: &map::MapTransform, rect: Rect) -> bool {
-    warning.polygons.iter().any(|ring| {
-        let bounds = ring
-            .iter()
-            .filter_map(|(lat, lon)| transform.screen(*lat, *lon))
-            .fold(None, |bounds: Option<Rect>, point| {
-                Some(bounds.map_or_else(
-                    || Rect::from_min_max(point, point),
-                    |bounds| {
-                        Rect::from_min_max(
-                            Pos2::new(bounds.min.x.min(point.x), bounds.min.y.min(point.y)),
-                            Pos2::new(bounds.max.x.max(point.x), bounds.max.y.max(point.y)),
-                        )
-                    },
-                ))
-            });
-        bounds.is_some_and(|bounds| bounds.intersects(rect))
-    })
-}
-
-fn nearby_station_ids(
-    stations: &[Station],
-    center_lat: f64,
-    center_lon: f64,
-    radius_km: f64,
-    excluded: Option<&SiteId>,
-    limit: usize,
-) -> Result<Vec<SiteId>, crate::error::CoordinateError> {
-    let mut candidates: Vec<(f64, SiteId)> = Vec::new();
-    for station in stations {
-        if excluded == Some(&station.id) {
-            continue;
-        }
-        let (distance_km, _) =
-            crate::projection::inverse(center_lat, center_lon, station.lat, station.lon)?;
-        if distance_km <= radius_km {
-            candidates.push((distance_km, station.id.clone()));
-        }
-    }
-    candidates.sort_by(|left, right| left.0.total_cmp(&right.0));
-    candidates.truncate(limit);
-    Ok(candidates.into_iter().map(|(_, id)| id).collect())
-}
-
 struct ViewRadar {
     site: SiteId,
     pipeline: Pipeline,
@@ -465,6 +415,7 @@ pub struct OxradApp {
     stations_reported: ObservationLayer,
     snowpack: SnowLayer,
     profile: SoundingLayer,
+    radio: Radio,
     history: HistoryView,
 }
 
@@ -575,6 +526,7 @@ impl OxradApp {
             stations_reported: ObservationLayer::new(),
             snowpack: SnowLayer::new(),
             profile: SoundingLayer::new(),
+            radio: Radio::new(),
             history: HistoryView::new(),
         };
         if let Some(place) = &restored_place {
@@ -2468,6 +2420,21 @@ impl OxradApp {
         self.snowpack.rail(ui, &palette);
         self.profile.rail(ui, &palette);
         self.quake_rail(ui);
+        let clock = time::now_unix_ms();
+        let radio_input = RadioInput {
+            now_ms: clock.as_ref().copied().unwrap_or(0),
+            clock_read: clock.is_ok(),
+            place: self.place.as_ref().map(|place| place.name.as_str()),
+            warnings: &self.warnings,
+            quakes: self.quakes.events(),
+            stations: self.stations_reported.stations(),
+            forecast: self.forecast.forecast(),
+            air: self.air.record(),
+            space: self.space_weather.record(),
+            sounding: self.profile.record(),
+        };
+        self.radio.update(Instant::now(), &radio_input);
+        self.radio.rail(ui, &palette, &radio_input);
     }
 
     fn quake_rail(&mut self, ui: &mut egui::Ui) {
