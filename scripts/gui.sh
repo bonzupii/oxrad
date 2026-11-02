@@ -191,6 +191,13 @@ case "$scenario" in
         click 60 372
         sleep "${OXRAD_GUI_AIR_SETTLE:-12}"
         ;;
+    climate)
+        click 240 28
+        rail_scroll 22
+        "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/climate-before.png"
+        click 60 374
+        sleep "${OXRAD_GUI_CLIMATE_SETTLE:-24}"
+        ;;
     pan) drag 240 0 ;;
     zoom) scroll 10 ;;
     small)
@@ -318,6 +325,24 @@ if [[ "$scenario" == "air" ]]; then
         fail "the air-quality section changed $changed rail samples; the index chart never arrived"
     fi
     printf 'gui: air-quality section redrew %s rail samples\n' "$changed"
+fi
+
+if [[ "$scenario" == "climate" ]]; then
+    # Decades of reanalysis take longer to arrive than a single request, so the
+    # wait is longer; the strip is unchanged until the record lands.
+    climate_sample() {
+        "$tool_pngtopnm" "$1" 2>/dev/null |
+            "$tool_pamcut" -left 0 -top 330 -width 320 -height 250 2>/dev/null |
+            "$scale_pnmscale" -xsize 160 -ysize 125 2>/dev/null |
+            "$scale_pnmtoplainpnm" 2>/dev/null |
+            awk 'NR <= 3 { next } { printf "%s %s %s\n", $1, $2, $3 }'
+    }
+    changed="$(diff <(climate_sample "$output/climate-before.png") <(climate_sample "$png") |
+        grep -c '^[<>]' || true)"
+    if [[ -z "$changed" ]] || ((changed < 500)); then
+        fail "the climate section changed $changed rail samples; the reanalysis never arrived"
+    fi
+    printf 'gui: climate section redrew %s rail samples\n' "$changed"
 fi
 
 printf 'gui: %s ok (%sx%s, %s colours) %s\n' "$scenario" "$width" "$height" "$colours" "$png"

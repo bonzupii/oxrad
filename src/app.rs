@@ -24,6 +24,7 @@ use eframe::egui::{
 };
 
 use crate::basemap::{BasemapError, BasemapLayers};
+use crate::climate_layer::ClimateLayer;
 use crate::colormap::ColorTable;
 use crate::config::{self, Config};
 use crate::derived::StormMotion;
@@ -451,7 +452,26 @@ pub struct OxradApp {
     hydro: HydroLayer,
     space_weather: SpaceWeatherLayer,
     air: AirLayer,
+    climate: ClimateLayer,
     history: HistoryView,
+}
+
+/// Opens the site the configuration remembered, or says why it did not.
+fn restore_site(app: &mut OxradApp, restored: Option<SiteId>) {
+    let Some(id) = restored else {
+        return;
+    };
+    let Ok(list) = &app.stations else {
+        return;
+    };
+    if stations::find(list, &id).is_some() {
+        app.open_site(id, false);
+        app.pending_site = None;
+    } else {
+        app.notice = Some(format!(
+            "Site {id} is not in the discovered radar source; choose a station."
+        ));
+    }
 }
 
 impl OxradApp {
@@ -466,8 +486,10 @@ impl OxradApp {
                 notice = Some(format!("Configuration ignored: {error}"));
             }
         }
-        let restored_site = initial.or_else(|| config.site.clone());
-        let restored_place = config.place.clone();
+        let (restored_site, restored_place) = (
+            initial.or_else(|| config.site.clone()),
+            config.place.clone(),
+        );
         let (color_table, sampling, motion) =
             (config.color_table, config.sampling, config.storm_motion);
         let stations = match stations::load_cache() {
@@ -534,6 +556,7 @@ impl OxradApp {
             hydro: HydroLayer::new(),
             space_weather: SpaceWeatherLayer::new(),
             air: AirLayer::new(),
+            climate: ClimateLayer::new(),
             history: HistoryView::new(),
         };
         if let Some(place) = &restored_place {
@@ -543,19 +566,7 @@ impl OxradApp {
             }
             app.forecast.start(place, 0);
         }
-        if let Some(id) = restored_site
-            && let Ok(list) = &app.stations
-        {
-            if stations::find(list, &id).is_some() {
-                // a discovered station
-                app.open_site(id, false);
-                app.pending_site = None;
-            } else {
-                app.notice = Some(format!(
-                    "Site {id} is not in the discovered radar source; choose a station."
-                ));
-            }
-        }
+        restore_site(&mut app, restored_site);
         app
     }
 
@@ -940,6 +951,7 @@ impl OxradApp {
         self.hydro.update(Instant::now(), &self.map_view);
         self.space_weather.update(Instant::now());
         self.air.update(Instant::now(), &self.map_view);
+        self.climate.update(Instant::now(), &self.map_view);
         self.poll_global_radar(context);
     }
 
@@ -2428,6 +2440,7 @@ impl OxradApp {
         self.hydro.rail(ui, &palette);
         self.space_weather.rail(ui, &palette);
         self.air.rail(ui, &palette);
+        self.climate.rail(ui, &palette);
         self.quake_rail(ui);
     }
 
@@ -3589,13 +3602,7 @@ impl OxradApp {
     }
 
     /// Draws every geographic layer, bottom to top, for whichever workspace is
-    /// asking.
-    ///
-    /// One stack, in one place, so a layer's position is deliberate rather than
-    /// an accident of which scene drew it: the basemap and its lines, then roads
-    /// and water, then the radar over them, then warnings, then the labels and
-    /// markers that have to stay readable above the echo. Both workspaces get
-    /// the same geography; only which radars they include differs.
+    /// asking: geography, then the echo, then warnings, then labels.
     fn draw_geographic_stack(
         &mut self,
         ui: &egui::Ui,

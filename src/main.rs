@@ -16,6 +16,8 @@
 mod app;
 mod basemap;
 mod cache;
+mod climate;
+mod climate_layer;
 mod colormap;
 mod config;
 mod derived;
