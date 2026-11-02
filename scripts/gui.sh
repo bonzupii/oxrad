@@ -198,6 +198,13 @@ case "$scenario" in
         click 60 374
         sleep "${OXRAD_GUI_CLIMATE_SETTLE:-24}"
         ;;
+    fires)
+        click 240 28
+        rail_scroll 26
+        "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/fires-before.png"
+        click 60 373
+        sleep "${OXRAD_GUI_FIRES_SETTLE:-14}"
+        ;;
     pan) drag 240 0 ;;
     zoom) scroll 10 ;;
     small)
@@ -343,6 +350,23 @@ if [[ "$scenario" == "climate" ]]; then
         fail "the climate section changed $changed rail samples; the reanalysis never arrived"
     fi
     printf 'gui: climate section redrew %s rail samples\n' "$changed"
+fi
+
+if [[ "$scenario" == "fires" ]]; then
+    # The list of nearest perimeters only exists once the service has answered.
+    fires_sample() {
+        "$tool_pngtopnm" "$1" 2>/dev/null |
+            "$tool_pamcut" -left 0 -top 330 -width 320 -height 250 2>/dev/null |
+            "$scale_pnmscale" -xsize 160 -ysize 125 2>/dev/null |
+            "$scale_pnmtoplainpnm" 2>/dev/null |
+            awk 'NR <= 3 { next } { printf "%s %s %s\n", $1, $2, $3 }'
+    }
+    changed="$(diff <(fires_sample "$output/fires-before.png") <(fires_sample "$png") |
+        grep -c '^[<>]' || true)"
+    if [[ -z "$changed" ]] || ((changed < 500)); then
+        fail "the wildfire section changed $changed rail samples; no perimeters arrived"
+    fi
+    printf 'gui: wildfire section redrew %s rail samples\n' "$changed"
 fi
 
 printf 'gui: %s ok (%sx%s, %s colours) %s\n' "$scenario" "$width" "$height" "$colours" "$png"

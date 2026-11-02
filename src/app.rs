@@ -29,6 +29,7 @@ use crate::colormap::ColorTable;
 use crate::config::{self, Config};
 use crate::derived::StormMotion;
 use crate::display::{Display, DisplayState, Frame};
+use crate::fire_layer::FireLayer;
 use crate::forecast::{Forecast, ForecastPeriod, ForecastState, ForecastView};
 use crate::global_radar::{
     self, DecodedTile, GlobalEvent, GlobalRadarError, GlobalRadarFeed, TileBounds, TileImage,
@@ -453,6 +454,7 @@ pub struct OxradApp {
     space_weather: SpaceWeatherLayer,
     air: AirLayer,
     climate: ClimateLayer,
+    fires: FireLayer,
     history: HistoryView,
 }
 
@@ -557,6 +559,7 @@ impl OxradApp {
             space_weather: SpaceWeatherLayer::new(),
             air: AirLayer::new(),
             climate: ClimateLayer::new(),
+            fires: FireLayer::new(),
             history: HistoryView::new(),
         };
         if let Some(place) = &restored_place {
@@ -952,6 +955,7 @@ impl OxradApp {
         self.space_weather.update(Instant::now());
         self.air.update(Instant::now(), &self.map_view);
         self.climate.update(Instant::now(), &self.map_view);
+        self.fires.update(Instant::now());
         self.poll_global_radar(context);
     }
 
@@ -2202,11 +2206,8 @@ impl OxradApp {
         drew
     }
 
-    /// Whether this workspace will draw a radar legend this frame.
-    ///
-    /// The scenes reserve the legend's strip before they know what the stack
-    /// will draw, so the question is answered here from the same conditions the
-    /// stack uses rather than from its result.
+    /// Whether this workspace will draw a radar legend this frame, answered
+    /// from the conditions the stack uses because the strip is reserved first.
     fn legend_expected(&self) -> bool {
         let selected = self
             .display
@@ -2441,6 +2442,8 @@ impl OxradApp {
         self.space_weather.rail(ui, &palette);
         self.air.rail(ui, &palette);
         self.climate.rail(ui, &palette);
+        let centre = self.map_view.center_latlon().ok();
+        self.fires.rail(ui, &palette, centre);
         self.quake_rail(ui);
     }
 
@@ -3528,13 +3531,8 @@ impl OxradApp {
         painter.galley(origin + padding, galley, TEXT);
     }
 
-    /// The radar workspace.
-    ///
-    /// It is the geographic workspace locked to the selected station rather
-    /// than a second, non-geographic canvas: the same projection, the same
-    /// layer stack, the same pan and zoom, and the same pointer readout. A
-    /// storm-chaser view that cannot pan or zoom is a view that cannot be used
-    /// to find a road under the storm.
+    /// The radar workspace: the same projection and layer stack, fitted to the
+    /// selected station, so a chaser can pan to the road under the storm.
     fn radar_scene(&mut self, ui: &mut egui::Ui) {
         let full_rect = ui.max_rect();
         let palette = self.config.theme.palette();
@@ -3628,6 +3626,7 @@ impl OxradApp {
         self.map_supplemental_roads(ui, rect, transform, span_km);
         if canvas == Canvas::Map {
             self.satellite.draw(ui, transform, rect);
+            self.fires.draw(ui.painter(), transform, rect, &palette);
         }
         self.map_global(ui, transform);
         let include_viewport = canvas == Canvas::Map;

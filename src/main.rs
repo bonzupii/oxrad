@@ -23,6 +23,8 @@ mod config;
 mod derived;
 mod display;
 mod error;
+mod fire;
+mod fire_layer;
 mod forecast;
 mod global_radar;
 mod gpu;
