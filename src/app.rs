@@ -39,6 +39,7 @@ use crate::gpu::RadarGpu;
 use crate::history::{self, HistoryError, HistoryEvent, HistoryFeed};
 use crate::hydro_layer::HydroLayer;
 use crate::map::{self, MapError, MapView, WorldMap};
+use crate::ocean_layer::OceanLayer;
 use crate::overlay;
 use crate::pipeline::{Pipeline, PipelineState};
 use crate::place::{self, Place, SearchInteraction, SearchState};
@@ -457,6 +458,7 @@ pub struct OxradApp {
     climate: ClimateLayer,
     fires: FireLayer,
     environment: EnvironmentLayer,
+    ocean: OceanLayer,
     history: HistoryView,
 }
 
@@ -563,6 +565,7 @@ impl OxradApp {
             climate: ClimateLayer::new(),
             fires: FireLayer::new(),
             environment: EnvironmentLayer::new(),
+            ocean: OceanLayer::new(),
             history: HistoryView::new(),
         };
         if let Some(place) = &restored_place {
@@ -960,6 +963,7 @@ impl OxradApp {
         self.climate.update(Instant::now(), &self.map_view);
         self.fires.update(Instant::now());
         self.environment.update(Instant::now(), &self.map_view);
+        self.ocean.update(Instant::now(), &self.map_view);
         self.poll_global_radar(context);
     }
 
@@ -2449,6 +2453,7 @@ impl OxradApp {
         let centre = self.map_view.center_latlon().ok();
         self.fires.rail(ui, &palette, centre);
         self.environment.rail(ui, &palette);
+        self.ocean.rail(ui, &palette);
         self.quake_rail(ui);
     }
 

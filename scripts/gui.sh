@@ -131,6 +131,24 @@ scroll() {
     done
     sleep 2
 }
+zoom_out_at() {
+    local steps="$1" x="$2" y="$3"
+    "$tool_xdotool" mousemove "$x" "$y"
+    for _ in $(seq 1 "$steps"); do
+        "$tool_xdotool" click 5
+        sleep 0.2
+    done
+    sleep 2
+}
+zoom_in_at() {
+    local steps="$1" x="$2" y="$3"
+    "$tool_xdotool" mousemove "$x" "$y"
+    for _ in $(seq 1 "$steps"); do
+        "$tool_xdotool" click 4
+        sleep 0.2
+    done
+    sleep 2
+}
 rail_scroll() {
     local steps="$1"
     "$tool_xdotool" mousemove 150 500
@@ -211,6 +229,15 @@ case "$scenario" in
         "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/environment-before.png"
         click 70 373
         sleep "${OXRAD_GUI_ENVIRONMENT_SETTLE:-12}"
+        ;;
+    ocean)
+        click 240 28
+        zoom_out_at 9 700 350
+        zoom_in_at 9 430 430
+        rail_scroll 34
+        "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/ocean-before.png"
+        click 60 372
+        sleep "${OXRAD_GUI_OCEAN_SETTLE:-14}"
         ;;
     pan) drag 240 0 ;;
     zoom) scroll 10 ;;
@@ -391,6 +418,24 @@ if [[ "$scenario" == "environment" ]]; then
         fail "the storm-environment section changed $changed rail samples; no fields arrived"
     fi
     printf 'gui: storm-environment section redrew %s rail samples\n' "$changed"
+fi
+
+if [[ "$scenario" == "ocean" ]]; then
+    # The scenario ends over open Pacific water, so the section has to show a
+    # sea state rather than the inland message.
+    ocean_sample() {
+        "$tool_pngtopnm" "$1" 2>/dev/null |
+            "$tool_pamcut" -left 0 -top 330 -width 320 -height 250 2>/dev/null |
+            "$scale_pnmscale" -xsize 160 -ysize 125 2>/dev/null |
+            "$scale_pnmtoplainpnm" 2>/dev/null |
+            awk 'NR <= 3 { next } { printf "%s %s %s\n", $1, $2, $3 }'
+    }
+    changed="$(diff <(ocean_sample "$output/ocean-before.png") <(ocean_sample "$png") |
+        grep -c '^[<>]' || true)"
+    if [[ -z "$changed" ]] || ((changed < 500)); then
+        fail "the ocean section changed $changed rail samples; no sea state arrived"
+    fi
+    printf 'gui: ocean section redrew %s rail samples\n' "$changed"
 fi
 
 printf 'gui: %s ok (%sx%s, %s colours) %s\n' "$scenario" "$width" "$height" "$colours" "$png"
