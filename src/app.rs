@@ -53,6 +53,7 @@ use crate::radar_controls::{self, Selection};
 use crate::render;
 use crate::satellite::SatelliteLayer;
 use crate::snow_layer::SnowLayer;
+use crate::sounding_layer::SoundingLayer;
 use crate::spaceweather_layer::SpaceWeatherLayer;
 use crate::stations::{self, SiteId, Station, StationError, StationFeed, StationOutcome};
 use crate::theme::{self, Palette, Theme};
@@ -463,6 +464,7 @@ pub struct OxradApp {
     ocean: OceanLayer,
     stations_reported: ObservationLayer,
     snowpack: SnowLayer,
+    profile: SoundingLayer,
     history: HistoryView,
 }
 
@@ -572,6 +574,7 @@ impl OxradApp {
             ocean: OceanLayer::new(),
             stations_reported: ObservationLayer::new(),
             snowpack: SnowLayer::new(),
+            profile: SoundingLayer::new(),
             history: HistoryView::new(),
         };
         if let Some(place) = &restored_place {
@@ -970,6 +973,7 @@ impl OxradApp {
         self.stations_reported
             .update(Instant::now(), &self.map_view);
         self.snowpack.update(Instant::now(), &self.map_view);
+        self.profile.update(Instant::now(), &self.map_view);
         self.poll_global_radar(context);
     }
 
@@ -2462,6 +2466,7 @@ impl OxradApp {
         self.ocean.rail(ui, &palette);
         self.stations_reported.rail(ui, &palette, centre);
         self.snowpack.rail(ui, &palette);
+        self.profile.rail(ui, &palette);
         self.quake_rail(ui);
     }
 

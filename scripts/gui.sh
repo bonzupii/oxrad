@@ -270,6 +270,16 @@ case "$scenario" in
         click 60 375
         sleep "${OXRAD_GUI_SNOW_SETTLE:-14}"
         ;;
+    profile)
+        # The same end-of-rail scroll puts the vertical-profile section one
+        # section above the alert list.
+        click 240 28
+        rail_scroll 60
+        "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/profile-before.png"
+        click 60 375
+        sleep "${OXRAD_GUI_PROFILE_SETTLE:-14}"
+        rail_scroll 10
+        ;;
     pan) drag 240 0 ;;
     zoom) scroll 10 ;;
     small)
@@ -502,6 +512,24 @@ if [[ "$scenario" == "snow" ]]; then
         fail "the snow section changed $changed rail samples; the snow model never answered"
     fi
     printf 'gui: snow section redrew %s rail samples\n' "$changed"
+fi
+
+if [[ "$scenario" == "profile" ]]; then
+    # The readout, the skewed chart, and the hodograph replace the one-line
+    # invitation, so a column that never arrived leaves this strip unchanged.
+    profile_sample() {
+        "$tool_pngtopnm" "$1" 2>/dev/null |
+            "$tool_pamcut" -left 0 -top 300 -width 320 -height 220 2>/dev/null |
+            "$scale_pnmscale" -xsize 160 -ysize 110 2>/dev/null |
+            "$scale_pnmtoplainpnm" 2>/dev/null |
+            awk 'NR <= 3 { next } { printf "%s %s %s\n", $1, $2, $3 }'
+    }
+    changed="$(diff <(profile_sample "$output/profile-before.png") <(profile_sample "$png") |
+        grep -c '^[<>]' || true)"
+    if [[ -z "$changed" ]] || ((changed < 500)); then
+        fail "the profile section changed $changed rail samples; the column never arrived"
+    fi
+    printf 'gui: profile section redrew %s rail samples\n' "$changed"
 fi
 
 printf 'gui: %s ok (%sx%s, %s colours) %s\n' "$scenario" "$width" "$height" "$colours" "$png"
