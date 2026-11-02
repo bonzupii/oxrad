@@ -103,20 +103,49 @@ enum StyleResult {
     },
 }
 
+fn cached_style(store: &Store, url: &str) -> Result<Option<serde_json::Value>, String> {
+    let Some(entry) = store.load(url).map_err(|error| error.to_string())? else {
+        return Ok(None);
+    };
+    let document: serde_json::Value =
+        serde_json::from_slice(&entry.body).map_err(|error| error.to_string())?;
+    serde_json::from_value::<Style>(document.clone()).map_err(|error| error.to_string())?;
+    Ok(Some(document))
+}
+
 fn load_style(style: MapStyle, sender: &mpsc::Sender<StyleResult>) -> bool {
+    let cache = paths::cache_directory()
+        .map(|path| Store::at(path.join("basemap").join("styles")))
+        .map_err(|error| error.to_string());
+    load_style_with(style, sender, &cache, |url| {
+        provider::get_json(url, "application/json").map_err(|error| error.to_string())
+    })
+}
+
+fn load_style_with(
+    style: MapStyle,
+    sender: &mpsc::Sender<StyleResult>,
+    cache: &Result<Store, String>,
+    fetch: impl FnOnce(&str) -> Result<serde_json::Value, String>,
+) -> bool {
     let url = format!("https://tiles.openfreemap.org/styles/{}", style.token());
-    let cache = paths::cache_directory().map(|path| Store::at(path.join("basemap").join("styles")));
-    if let Ok(store) = &cache
-        && let Ok(Some(entry)) = store.load(&url)
-        && let Ok(document) = serde_json::from_slice::<serde_json::Value>(&entry.body)
-        && serde_json::from_value::<Style>(document.clone()).is_ok()
-        && sender
-            .send(StyleResult::Cached { style, document })
-            .is_err()
-    {
-        return false;
-    }
-    let result = match provider::get_json(&url, "application/json") {
+    let cache_read_error = match cache {
+        Ok(store) => match cached_style(store, &url) {
+            Ok(Some(document)) => {
+                if sender
+                    .send(StyleResult::Cached { style, document })
+                    .is_err()
+                {
+                    return false;
+                }
+                None
+            }
+            Ok(None) => None,
+            Err(error) => Some(error),
+        },
+        Err(error) => Some(error.clone()),
+    };
+    let result = match fetch(&url) {
         Ok(document) if serde_json::from_value::<Style>(document.clone()).is_err() => {
             StyleResult::Failed {
                 style,
@@ -124,7 +153,7 @@ fn load_style(style: MapStyle, sender: &mpsc::Sender<StyleResult>) -> bool {
             }
         }
         Ok(document) => {
-            let cache_error = match &cache {
+            let cache_error = match cache {
                 Ok(store) => match serde_json::to_vec(&document) {
                     Ok(bytes) => store
                         .store(&url, &bytes)
@@ -142,7 +171,12 @@ fn load_style(style: MapStyle, sender: &mpsc::Sender<StyleResult>) -> bool {
         }
         Err(error) => StyleResult::Failed {
             style,
-            error: error.to_string(),
+            error: match cache_read_error {
+                Some(cache_error) => {
+                    format!("{error}; cached style could not be read: {cache_error}")
+                }
+                None => error,
+            },
         },
     };
     sender.send(result).is_ok()
@@ -152,6 +186,7 @@ fn load_style(style: MapStyle, sender: &mpsc::Sender<StyleResult>) -> bool {
 pub struct Basemap {
     selected: MapStyle,
     active: Option<MapStyle>,
+    active_document: Option<serde_json::Value>,
     receiver: Option<Receiver<StyleResult>>,
     cached_style: bool,
     tiles: Option<HttpTiles>,
@@ -164,6 +199,7 @@ impl Basemap {
         Self {
             selected,
             active: None,
+            active_document: None,
             receiver: None,
             cached_style: false,
             tiles: None,
@@ -208,7 +244,13 @@ impl Basemap {
         selected: MapStyle,
         document: serde_json::Value,
     ) {
-        let style = match serde_json::from_value::<Style>(document) {
+        if self.tiles.is_some()
+            && self.active == Some(selected)
+            && self.active_document.as_ref() == Some(&document)
+        {
+            return;
+        }
+        let style = match serde_json::from_value::<Style>(document.clone()) {
             Ok(style) => style,
             Err(error) => {
                 self.error = Some(format!("Basemap style could not be parsed: {error}"));
@@ -239,6 +281,7 @@ impl Basemap {
             context.clone(),
         ));
         self.active = Some(selected);
+        self.active_document = Some(document);
     }
 
     fn poll(&mut self, context: &egui::Context) {
@@ -266,7 +309,7 @@ impl Basemap {
         match result {
             StyleResult::Cached { style, document } => {
                 self.install_style(context, style, document);
-                self.cached_style = true;
+                self.cached_style = self.active == Some(style) && self.error.is_none();
                 context.request_repaint_after(std::time::Duration::from_millis(250));
             }
             StyleResult::Refreshed {
@@ -363,6 +406,132 @@ impl Basemap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestError;
+
+    fn test_store(name: &str) -> Result<(std::path::PathBuf, Store), TestError> {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let root = std::path::PathBuf::from("target").join(format!(
+            "basemap-test-{name}-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+        Ok((root.clone(), Store::at(root)))
+    }
+
+    #[test]
+    fn cached_style_survives_a_failed_refresh() -> Result<(), TestError> {
+        let (root, store) = test_store("offline")?;
+        let url = "https://tiles.openfreemap.org/styles/liberty";
+        let original = serde_json::json!({"layers": []});
+        store.store(
+            url,
+            &serde_json::to_vec(&original).map_err(|error| error.to_string())?,
+        )?;
+        let (sender, receiver) = mpsc::channel();
+        assert!(load_style_with(
+            MapStyle::Liberty,
+            &sender,
+            &Ok(store),
+            |_| { Err(String::from("network unavailable")) }
+        ));
+        match receiver.try_recv().map_err(|error| error.to_string())? {
+            StyleResult::Cached { style, document } => {
+                assert_eq!(style, MapStyle::Liberty);
+                assert_eq!(document, original);
+            }
+            _ => return Err(TestError::from("expected the cached style first")),
+        }
+        match receiver.try_recv().map_err(|error| error.to_string())? {
+            StyleResult::Failed { style, error } => {
+                assert_eq!(style, MapStyle::Liberty);
+                assert_eq!(error, "network unavailable");
+            }
+            _ => return Err(TestError::from("expected a refresh failure")),
+        }
+        std::fs::remove_dir_all(root).map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_refreshed_style_does_not_replace_cached_style() -> Result<(), TestError> {
+        let (root, store) = test_store("invalid")?;
+        let url = "https://tiles.openfreemap.org/styles/liberty";
+        let original = serde_json::json!({"layers": []});
+        store.store(
+            url,
+            &serde_json::to_vec(&original).map_err(|error| error.to_string())?,
+        )?;
+        let (sender, receiver) = mpsc::channel();
+        assert!(load_style_with(
+            MapStyle::Liberty,
+            &sender,
+            &Ok(store),
+            |_| { Ok(serde_json::json!({"not_layers": []})) }
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(StyleResult::Cached { .. })
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(StyleResult::Failed { .. })
+        ));
+        assert_eq!(
+            cached_style(&Store::at(root.clone()), url).map_err(TestError::from)?,
+            Some(original)
+        );
+        std::fs::remove_dir_all(root).map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_cache_and_failed_refresh_report_both_errors() -> Result<(), TestError> {
+        let (root, store) = test_store("corrupt")?;
+        let url = "https://tiles.openfreemap.org/styles/liberty";
+        store.store(url, b"not json")?;
+        let (sender, receiver) = mpsc::channel();
+        assert!(load_style_with(
+            MapStyle::Liberty,
+            &sender,
+            &Ok(store),
+            |_| { Err(String::from("network unavailable")) }
+        ));
+        match receiver.try_recv().map_err(|error| error.to_string())? {
+            StyleResult::Failed { error, .. } => {
+                assert!(error.contains("network unavailable"));
+                assert!(error.contains("cached style could not be read"));
+            }
+            _ => return Err(TestError::from("expected both failures")),
+        }
+        std::fs::remove_dir_all(root).map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn generated_vector_tile_decodes_into_renderable_shapes() -> Result<(), TestError> {
+        // One synthetic line in an MVT layer named "road": (0, 0) to (10, 10).
+        let feature = [0x18, 0x02, 0x22, 0x06, 0x09, 0x00, 0x00, 0x0a, 0x14, 0x14];
+        let mut layer = vec![0x0a, 0x04, b'r', b'o', b'a', b'd', 0x12, 0x0a];
+        layer.extend_from_slice(&feature);
+        layer.extend_from_slice(&[0x28, 0x80, 0x20, 0x78, 0x02]);
+        let mut tile = vec![
+            0x1a,
+            u8::try_from(layer.len()).map_err(|error| error.to_string())?,
+        ];
+        tile.extend_from_slice(&layer);
+        let style: Style = serde_json::from_value(serde_json::json!({
+            "layers": [{"type": "line", "source-layer": "road", "paint": {"line-color": "#000000", "line-width": 1}}]
+        })).map_err(|error| error.to_string())?;
+        match walkers::Tile::from_mvt(&tile, &style, 4).map_err(|error| error.to_string())? {
+            walkers::Tile::Vector(shapes) => assert!(!shapes.is_empty(), "line was not rendered"),
+            walkers::Tile::Raster(_) => {
+                return Err(TestError::from("vector tile decoded as raster"));
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn openfreemap_tile_urls_preserve_xyz_coordinates() {
