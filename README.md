@@ -112,7 +112,7 @@ Requests identify the client as `oxrad/<version> (https://github.com/bonzupii/ox
 ## Limitations
 
 - Radar moments outside the United States are not decoded. No DWD, ECCC, BoM, JMA, CMA, IMD, OPERA, or ODIM reader exists.
-- OpenFreeMap vector tiles use a partial MapLibre-style renderer. Terrain, sprite icons, cross-tile label collision and complete style fidelity are not supported. Tile errors and cache freshness are not yet fully visible; bounded eviction and offline restart behavior remain unverified.
+- OpenFreeMap vector tiles use a partial MapLibre-style renderer. Terrain, sprite icons, cross-tile label collision and complete style fidelity are not supported. Tile errors and cache freshness are not yet fully visible, and tile-cache eviction is not bounded. A controlled test verifies fresh tile reuse by a restarted tile source; full application offline restart and expired-tile behavior remain unverified.
 - Sunrise and sunset results are requested manually and are not cached across restarts. The displayed date and coordinates identify the requested result; refresh after changing the map centre or local date.
 - Range rings and spokes render in map view; the product grid remains radar-canvas only.
 - The earthquake layer shows what the USGS summary feeds publish, which is not the same as every earthquake: the day feed starts at M2.5 and the week feed at M4.5, so small events are absent by the provider's own cut. Events the feed lists without a usable magnitude, position, or origin time are counted in the rail instead of being placed at a guessed coordinate.

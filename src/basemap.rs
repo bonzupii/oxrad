@@ -562,8 +562,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn generated_vector_tile_decodes_into_renderable_shapes() -> Result<(), TestError> {
+    fn synthetic_tile() -> Result<Vec<u8>, TestError> {
         // One synthetic line in an MVT layer named "road": (0, 0) to (10, 10).
         let feature = [0x18, 0x02, 0x22, 0x06, 0x09, 0x00, 0x00, 0x0a, 0x14, 0x14];
         let mut layer = vec![0x0a, 0x04, b'r', b'o', b'a', b'd', 0x12, 0x0a];
@@ -574,15 +573,142 @@ mod tests {
             u8::try_from(layer.len()).map_err(|error| error.to_string())?,
         ];
         tile.extend_from_slice(&layer);
-        let style: Style = serde_json::from_value(serde_json::json!({
+        Ok(tile)
+    }
+
+    fn synthetic_style() -> Result<Style, TestError> {
+        serde_json::from_value(serde_json::json!({
             "layers": [{"type": "line", "source-layer": "road", "paint": {"line-color": "#000000", "line-width": 1}}]
-        })).map_err(|error| error.to_string())?;
+        })).map_err(|error| TestError::from(error.to_string()))
+    }
+
+    #[test]
+    fn generated_vector_tile_decodes_into_renderable_shapes() -> Result<(), TestError> {
+        let tile = synthetic_tile()?;
+        let style = synthetic_style()?;
         match walkers::Tile::from_mvt(&tile, &style, 4).map_err(|error| error.to_string())? {
             walkers::Tile::Vector(shapes) => assert!(!shapes.is_empty(), "line was not rendered"),
             walkers::Tile::Raster(_) => {
                 return Err(TestError::from("vector tile decoded as raster"));
             }
         }
+        Ok(())
+    }
+
+    struct LocalSource {
+        url: String,
+    }
+
+    impl TileSource for LocalSource {
+        fn tile_url(&self, _: TileId) -> String {
+            self.url.clone()
+        }
+
+        fn attribution(&self) -> Attribution {
+            OpenFreeMap.attribution()
+        }
+    }
+
+    fn wait_for_tile(tiles: &mut HttpTiles, id: TileId) -> Result<TilePiece, TestError> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while std::time::Instant::now() < deadline {
+            if let Some(tile) = tiles.at(id) {
+                return Ok(tile);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        Err(TestError::from("timed out waiting for the tile"))
+    }
+
+    fn local_tiles(url: &str, path: &std::path::Path) -> Result<HttpTiles, TestError> {
+        Ok(HttpTiles::with_options_and_style(
+            LocalSource {
+                url: String::from(url),
+            },
+            HttpOptions {
+                cache: Some(path.to_path_buf()),
+                user_agent: Some(walkers::HeaderValue::from_static("oxrad-cache-test")),
+                max_parallel_downloads:
+                    MaxParallelDownloads::value_manually_confirmed_with_provider_limits(1),
+            },
+            synthetic_style()?,
+            egui::Context::default(),
+        ))
+    }
+
+    #[test]
+    fn fresh_http_tile_is_reused_after_tile_source_restart() -> Result<(), TestError> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        let (root, _) = test_store("http-restart")?;
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(|error| error.to_string())?;
+        let address = listener.local_addr().map_err(|error| error.to_string())?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| error.to_string())?;
+        let body = synthetic_tile()?;
+        let server = std::thread::spawn(move || -> Result<String, String> {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .map_err(|error| error.to_string())?;
+            let mut request = [0_u8; 4096];
+            let length = stream
+                .read(&mut request)
+                .map_err(|error| error.to_string())?;
+            let request =
+                String::from_utf8_lossy(request.get(..length).ok_or("invalid request length")?)
+                    .into_owned();
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.mapbox-vector-tile\r\nCache-Control: public, max-age=3600\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(header.as_bytes())
+                .map_err(|error| error.to_string())?;
+            stream.write_all(&body).map_err(|error| error.to_string())?;
+            Ok(request)
+        });
+        let url = format!("http://{address}/4/3/7.pbf");
+        let id = TileId {
+            zoom: 4,
+            x: 3,
+            y: 7,
+        };
+        let mut first = local_tiles(&url, &root)?;
+        let first_tile = wait_for_tile(&mut first, id)?;
+        assert!(matches!(first_tile.tile, walkers::Tile::Vector(ref shapes) if !shapes.is_empty()));
+        drop(first);
+        let request = server
+            .join()
+            .map_err(|_| "tile server stopped")?
+            .map_err(TestError::from)?;
+        assert!(request.starts_with("GET /4/3/7.pbf HTTP/1.1"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("user-agent: oxrad-cache-test")
+        );
+        let mut restarted = local_tiles(&url, &root)?;
+        let cached = wait_for_tile(&mut restarted, id)?;
+        assert!(matches!(cached.tile, walkers::Tile::Vector(ref shapes) if !shapes.is_empty()));
+        assert!(restarted.attribution().text.contains("OpenStreetMap"));
+        drop(restarted);
+        std::fs::remove_dir_all(root).map_err(|error| error.to_string())?;
         Ok(())
     }
 
