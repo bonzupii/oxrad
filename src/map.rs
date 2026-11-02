@@ -481,7 +481,7 @@ impl MapTransform {
     /// placed at all.
     ///
     /// The latitude is clamped into the Mercator domain first, so the only
-    /// rejection left is a longitude the projection refuses — and there is no
+    /// rejection left is a longitude the projection refuses, and there is no
     /// position to report for one. That is an unplottable coordinate, not a
     /// failure of this view, and callers treat it like a point off screen.
     pub fn screen(&self, lat: f64, lon: f64) -> Option<Pos2> {

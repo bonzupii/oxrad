@@ -23,8 +23,8 @@
 //! hurricane scale, so the layer says which is which and never renders one as
 //! the other.
 //!
-//! The list is global — the western Pacific, the Indian Ocean, the Atlantic and
-//! the eastern Pacific all arrive in the same response — so a storm that no
+//! The list is global: the western Pacific, the Indian Ocean, the Atlantic and
+//! the eastern Pacific all arrive in the same response, so a storm that no
 //! American agency is tracking still appears.
 
 use std::error::Error;

@@ -369,7 +369,7 @@ fn volcanoes(input: &Input<'_>, sayings: &mut Vec<Bulletin>) {
             Urgency::Routine
         },
         text: format!(
-            "{} at {} alert, aviation colour code {code} — {}.",
+            "{} at {} alert, aviation colour code {code}: {}.",
             volcano.notice.volcano,
             volcano.notice.alert_level.to_lowercase(),
             highest.meaning()

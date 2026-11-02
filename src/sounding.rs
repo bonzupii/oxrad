@@ -18,8 +18,8 @@
 //!
 //! The profile is a forecast-model column, not a balloon: it is the model's
 //! temperature, humidity, and wind on each pressure level above the grid point
-//! for one hour. Everything derived here — precipitable water, the freezing
-//! level, bulk shear, the Bunkers storm motion, storm-relative helicity — is
+//! for one hour. Everything derived here, precipitable water, the freezing
+//! level, bulk shear, the Bunkers storm motion, storm-relative helicity, is
 //! computed from those levels, so the rail can name the assumptions it made.
 
 use std::error::Error;

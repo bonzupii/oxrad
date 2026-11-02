@@ -134,7 +134,7 @@ impl ClimateLayer {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label(
-                        RichText::new("Reading the reanalysis — this asks for decades of days…")
+                        RichText::new("Reading the reanalysis: this asks for decades of days…")
                             .size(theme::TYPE_SMALL)
                             .weak(),
                     );

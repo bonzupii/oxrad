@@ -62,8 +62,8 @@ pub const LIST_LIMIT: usize = 10;
 /// The value the service writes where it has no measurement.
 ///
 /// A gauge that cannot report still appears in the response, with this number
-/// where a stage should be. It is not a measurement — a river is never a
-/// million feet below its datum — so a reading at or beyond it is treated as no
+/// where a stage should be. It is not a measurement: a river is never a
+/// million feet below its datum, so a reading at or beyond it is treated as no
 /// reading at all rather than listed as one.
 pub const NO_DATA: f64 = -999_999.0;
 
@@ -416,8 +416,8 @@ fn reading_of(entry: &Map<String, Value>) -> Option<Reading> {
 
 /// The box the request asks for, from the map view.
 ///
-/// The service refuses any box larger than a few degrees on a side — a request
-/// for an eleven-degree box comes back as a plain 400 — so the box is capped
+/// The service refuses any box larger than a few degrees on a side: a request
+/// for an eleven-degree box comes back as a plain 400, so the box is capped
 /// well inside that limit instead of asking for the whole viewport.
 pub fn bounds(centre_lat: f64, centre_lon: f64, span_km: f64) -> (f64, f64, f64, f64) {
     let half_lat = (span_km / 2.0 / 111.0).clamp(0.2, MAX_HALF_DEG);

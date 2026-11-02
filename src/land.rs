@@ -17,8 +17,8 @@
 //! out of it, and how much sun and ultraviolet reach it.
 //!
 //! Every value here is a forecast-model field for the grid box under the map
-//! centre. Soil moisture is volumetric water content — cubic metres of water
-//! per cubic metre of soil — so it is a fraction, not a depth, and it is not
+//! centre. Soil moisture is volumetric water content, in cubic metres of water
+//! per cubic metre of soil, so it is a fraction, not a depth, and it is not
 //! comparable between a sand and a clay without the soil's own properties.
 
 use std::collections::BTreeMap;

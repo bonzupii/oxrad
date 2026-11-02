@@ -26,7 +26,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// A dual-stack host answers with an IPv6 address first, and a machine with no
 /// IPv6 route would otherwise sit on that dead address until the operating
-/// system gives up — ten seconds or more for a request that a working address
+/// system gives up: ten seconds or more for a request that a working address
 /// answers in a tenth of one. A short connect budget makes the resolver's
 /// next address win quickly instead.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
