@@ -100,7 +100,7 @@ impl Tiles for VisibleTiles<'_> {
         if piece.is_none() {
             self.missing = self.missing.saturating_add(1);
             if self.error.is_none() {
-                self.error = self.source.error(tile);
+                self.error = self.source.error(tile).map(|error| error.to_string());
             }
         }
         piece
@@ -792,14 +792,14 @@ mod tests {
         let error = loop {
             assert!(tiles.at(id).is_none());
             if let Some(error) = tiles.error(id) {
-                break error;
+                break error.to_string();
             }
             if Instant::now() >= deadline {
                 return Err(TestError::from("tile failure was not reported"));
             }
             std::thread::sleep(Duration::from_millis(20));
         };
-        assert!(error.contains("HTTP 404"), "unexpected error: {error}");
+        assert!(error.contains("returned 404"), "unexpected error: {error}");
         tiles.retry_failed();
         let tile = wait_for_tile(&mut tiles, id)?;
         assert!(matches!(tile.tile, walkers::Tile::Vector(ref shapes) if !shapes.is_empty()));
