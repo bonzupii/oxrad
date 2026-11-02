@@ -280,6 +280,15 @@ case "$scenario" in
         click 60 245
         sleep "${OXRAD_GUI_SEAICE_SETTLE:-14}"
         ;;
+    land)
+        # The land-surface section sits between the sea ice and the earthquake
+        # section, so the rail is scrolled to its end and then back a little.
+        click 240 28
+        rail_scroll 60
+        "$tool_xwdtopnm" "$output/Xvfb_screen0" | "$tool_pnmtopng" > "$output/land-before.png"
+        click 60 203
+        sleep "${OXRAD_GUI_LAND_SETTLE:-16}"
+        ;;
     radio)
         # The radio sits at the end of the rail, below the earthquake section.
         click 240 28
@@ -571,6 +580,24 @@ if [[ "$scenario" == "radio" ]]; then
         fail "the radio changed $changed rail samples; it never played a bulletin"
     fi
     printf 'gui: radio changed %s rail samples\n' "$changed"
+fi
+
+if [[ "$scenario" == "land" ]]; then
+    # The soil, the water leaving it, and the hourly chart replace the
+    # invitation, so a record that never arrived leaves this strip as it was.
+    land_sample() {
+        "$tool_pngtopnm" "$1" 2>/dev/null |
+            "$tool_pamcut" -left 0 -top 215 -width 320 -height 430 2>/dev/null |
+            "$scale_pnmscale" -xsize 160 -ysize 215 2>/dev/null |
+            "$scale_pnmtoplainpnm" 2>/dev/null |
+            awk 'NR <= 3 { next } { printf "%s %s %s\n", $1, $2, $3 }'
+    }
+    changed="$(diff <(land_sample "$output/land-before.png") <(land_sample "$png") |
+        grep -c '^[<>]' || true)"
+    if [[ -z "$changed" ]] || ((changed < 500)); then
+        fail "the land-surface section changed $changed rail samples; the record never arrived"
+    fi
+    printf 'gui: land-surface section redrew %s rail samples\n' "$changed"
 fi
 
 if [[ "$scenario" == "seaice" ]]; then

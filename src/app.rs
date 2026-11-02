@@ -24,23 +24,18 @@ use eframe::egui::{
 };
 
 use crate::basemap::{BasemapError, BasemapLayers};
-use crate::climate_layer::ClimateLayer;
 use crate::colormap::ColorTable;
 use crate::config::{self, Config};
 use crate::derived::StormMotion;
 use crate::display::{Display, DisplayState, Frame};
-use crate::environment_layer::EnvironmentLayer;
-use crate::fire_layer::FireLayer;
+use crate::domains::Domains;
 use crate::forecast::{Forecast, ForecastPeriod, ForecastState, ForecastView};
 use crate::global_radar::{
     self, DecodedTile, GlobalEvent, GlobalRadarError, GlobalRadarFeed, TileBounds, TileImage,
 };
 use crate::gpu::RadarGpu;
 use crate::history::{self, HistoryError, HistoryEvent, HistoryFeed};
-use crate::hydro_layer::HydroLayer;
 use crate::map::{self, MapError, MapView, WorldMap};
-use crate::observations_layer::ObservationLayer;
-use crate::ocean_layer::OceanLayer;
 use crate::overlay;
 use crate::overlay_select::{nearby_station_ids, retain_warning_selection, warning_intersects};
 use crate::pipeline::{Pipeline, PipelineState};
@@ -48,17 +43,11 @@ use crate::place::{self, Place, SearchInteraction, SearchState};
 use crate::product::RadarProduct;
 use crate::provider::timestamp_label;
 use crate::quake_layer::QuakeLayer;
-use crate::quality_layer::AirLayer;
 use crate::radar::{ArchiveOrigin, GateValue, RetrievedVolume};
 use crate::radar_controls::{self, Selection};
 use crate::radio::Input as RadioInput;
 use crate::radio_layer::Radio;
 use crate::render;
-use crate::satellite::SatelliteLayer;
-use crate::seaice_layer::SeaIceLayer;
-use crate::snow_layer::SnowLayer;
-use crate::sounding_layer::SoundingLayer;
-use crate::spaceweather_layer::SpaceWeatherLayer;
 use crate::stations::{self, SiteId, Station, StationError, StationFeed, StationOutcome};
 use crate::theme::{self, Palette, Theme};
 use crate::time;
@@ -405,19 +394,8 @@ pub struct OxradApp {
     warning_request_due: Option<Instant>,
     warning_refresh_due: Option<Instant>,
     quakes: QuakeLayer,
-    satellite: SatelliteLayer,
-    hydro: HydroLayer,
-    space_weather: SpaceWeatherLayer,
-    air: AirLayer,
-    climate: ClimateLayer,
-    fires: FireLayer,
-    environment: EnvironmentLayer,
-    ocean: OceanLayer,
-    stations_reported: ObservationLayer,
-    snowpack: SnowLayer,
-    profile: SoundingLayer,
+    domains: Domains,
     radio: Radio,
-    sea_ice: SeaIceLayer,
     history: HistoryView,
 }
 
@@ -517,19 +495,8 @@ impl OxradApp {
             warning_request_due: Some(Instant::now()),
             warning_refresh_due: None,
             quakes: QuakeLayer::new(),
-            satellite: SatelliteLayer::new(),
-            hydro: HydroLayer::new(),
-            space_weather: SpaceWeatherLayer::new(),
-            air: AirLayer::new(),
-            climate: ClimateLayer::new(),
-            fires: FireLayer::new(),
-            environment: EnvironmentLayer::new(),
-            ocean: OceanLayer::new(),
-            stations_reported: ObservationLayer::new(),
-            snowpack: SnowLayer::new(),
-            profile: SoundingLayer::new(),
+            domains: Domains::new(),
             radio: Radio::new(),
-            sea_ice: SeaIceLayer::new(),
             history: HistoryView::new(),
         };
         if let Some(place) = &restored_place {
@@ -917,19 +884,7 @@ impl OxradApp {
         self.forecast.update(Instant::now());
         self.update_warnings();
         self.quakes.update(Instant::now());
-        self.satellite.update(context, &self.map_view);
-        self.hydro.update(Instant::now(), &self.map_view);
-        self.space_weather.update(Instant::now());
-        self.air.update(Instant::now(), &self.map_view);
-        self.climate.update(Instant::now(), &self.map_view);
-        self.fires.update(Instant::now());
-        self.environment.update(Instant::now(), &self.map_view);
-        self.ocean.update(Instant::now(), &self.map_view);
-        self.stations_reported
-            .update(Instant::now(), &self.map_view);
-        self.snowpack.update(Instant::now(), &self.map_view);
-        self.profile.update(Instant::now(), &self.map_view);
-        self.sea_ice.update(Instant::now());
+        self.domains.update(Instant::now(), context, &self.map_view);
         self.poll_global_radar(context);
     }
 
@@ -2411,19 +2366,8 @@ impl OxradApp {
 
     fn map_layer_rail(&mut self, ui: &mut egui::Ui) {
         let palette = self.config.theme.palette();
-        self.satellite.rail(ui, &palette);
-        self.hydro.rail(ui, &palette);
-        self.space_weather.rail(ui, &palette);
-        self.air.rail(ui, &palette);
-        self.climate.rail(ui, &palette);
         let centre = self.map_view.center_latlon().ok();
-        self.fires.rail(ui, &palette, centre);
-        self.environment.rail(ui, &palette);
-        self.ocean.rail(ui, &palette);
-        self.stations_reported.rail(ui, &palette, centre);
-        self.snowpack.rail(ui, &palette);
-        self.profile.rail(ui, &palette);
-        self.sea_ice.rail(ui, &palette);
+        self.domains.rail(ui, &palette, centre);
         self.quake_rail(ui);
         let clock = time::now_unix_ms();
         let radio_input = RadioInput {
@@ -2432,11 +2376,11 @@ impl OxradApp {
             place: self.place.as_ref().map(|place| place.name.as_str()),
             warnings: &self.warnings,
             quakes: self.quakes.events(),
-            stations: self.stations_reported.stations(),
+            stations: self.domains.stations(),
             forecast: self.forecast.forecast(),
-            air: self.air.record(),
-            space: self.space_weather.record(),
-            sounding: self.profile.record(),
+            air: self.domains.air(),
+            space: self.domains.space(),
+            sounding: self.domains.sounding(),
         };
         self.radio.update(Instant::now(), &radio_input);
         self.radio.rail(ui, &palette, &radio_input);
@@ -3620,10 +3564,11 @@ impl OxradApp {
         self.map_supplemental_lines(ui, rect, transform, span_km);
         self.map_supplemental_roads(ui, rect, transform, span_km);
         if canvas == Canvas::Map {
-            self.satellite.draw(ui, transform, rect);
-            self.fires.draw(ui.painter(), transform, rect, &palette);
-            self.stations_reported
-                .draw(ui.painter(), transform, &palette);
+            self.domains.draw_satellite(ui, transform, rect);
+            self.domains
+                .draw_fires(ui.painter(), transform, rect, &palette);
+            self.domains
+                .draw_stations(ui.painter(), transform, &palette);
         }
         self.map_global(ui, transform);
         let include_viewport = canvas == Canvas::Map;
