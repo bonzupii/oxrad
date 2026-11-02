@@ -11,7 +11,7 @@ The binary is one crate. `main.rs` parses arguments and constructs the applicati
 | `render` | 951 | Gate corner geometry, overlay geometry, screen transform |
 | `global_radar` | 869 | RainViewer manifest, tiles, playback |
 | `error` | 838 | Application error enums |
-| `map` | 889 | Natural Earth basemap, projections, station markers |
+| `map` | 889 | Web Mercator projections, range rings, geographic transforms |
 | `place` | 799 | Place identity, search, nearest station |
 | `pipeline` | 636 | Fetch and decode workers for one site |
 | `forecast` | 627 | Open-Meteo forecast |

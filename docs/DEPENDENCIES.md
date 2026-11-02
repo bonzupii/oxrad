@@ -12,11 +12,12 @@ This is the direct dependency record required by `STYLE.md`. It records what eac
 | `quick-xml` | 0.41.0 | S3 listing XML parsing | No | MIT/Apache-2.0 | Direct dependency; input comes from `network.rs`; parses whitespace, entities, and pagination fields |
 | `serde_json` | 1.0 | JSON parsing for station, place, forecast, and warning providers; cache metadata | No | MIT/Apache-2.0 | Provider documents are parsed into oxrad's own types at the adapter boundary |
 | `sha2` | 0.11.1 | Stable cache keys and body-integrity verification | No | MIT/Apache-2.0 | Direct dependency used by `cache.rs`; also verifies the pinned archive in tests |
+| `walkers` | 0.55.0 | Vector tile decoding and map rendering | Yes, OpenFreeMap HTTPS | MIT | Partial MapLibre style support; HTTP disk cache |
 | `ureq` | 3.5.0 | HTTPS client | Yes | MIT/Apache-2.0 | Confined to `provider.rs`, `network.rs`, and `global_radar.rs`; timeouts and body limits are set in `provider.rs` or `network.rs` |
 
 ## Data assets
 
-The embedded Natural Earth layers are public domain: 1:110m Admin 0 Countries, 1:10m Populated Places, 1:10m major highways (filtered), 1:50m Admin 1 boundary lines, and 1:50m Rivers and Lake Centerlines. They are compiled into the binary with `include_str!` and parsed with `serde_json`; they are not a tile service and have no network or attribution requirement. Their provenance and licence are recorded in `assets/README.md`.
+The basemap requests OpenFreeMap tiles and styles at runtime. OpenStreetMap attribution is displayed on the map.
 
 ## Dependency boundaries
 

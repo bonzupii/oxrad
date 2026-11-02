@@ -1,7 +1,6 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
-use crate::basemap::BasemapError;
 use crate::cache::CacheError;
 use crate::error::{
     ColorMapError, CoordinateError, DerivedError, MomentError, RadarError, RenderError, SiteIdError,
@@ -16,7 +15,6 @@ use crate::warnings::WarningError;
 #[derive(Debug)]
 pub enum TestError {
     Message(String),
-    Basemap(BasemapError),
     SiteId(SiteIdError),
     Coordinate(CoordinateError),
     Moment(MomentError),
@@ -38,7 +36,6 @@ impl Display for TestError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Message(message) => formatter.write_str(message),
-            Self::Basemap(error) => Display::fmt(error, formatter),
             Self::SiteId(error) => Display::fmt(error, formatter),
             Self::Coordinate(error) => Display::fmt(error, formatter),
             Self::Moment(error) => Display::fmt(error, formatter),
@@ -61,7 +58,6 @@ impl Display for TestError {
 impl Error for TestError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Basemap(error) => Some(error),
             Self::SiteId(error) => Some(error),
             Self::Coordinate(error) => Some(error),
             Self::Moment(error) => Some(error),
@@ -91,12 +87,6 @@ impl From<&str> for TestError {
 impl From<String> for TestError {
     fn from(value: String) -> Self {
         Self::Message(value)
-    }
-}
-
-impl From<BasemapError> for TestError {
-    fn from(value: BasemapError) -> Self {
-        Self::Basemap(value)
     }
 }
 

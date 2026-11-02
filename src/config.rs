@@ -19,6 +19,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
+use crate::basemap::MapStyle;
 use crate::colormap::ColorTable;
 use crate::derived::StormMotion;
 use crate::error::ConfigError;
@@ -41,6 +42,8 @@ pub struct Config {
     pub units: UnitSystem,
     /// The colour theme for the interface.
     pub theme: Theme,
+    /// The independent OpenFreeMap style.
+    pub map_style: MapStyle,
     /// The radar color table, including color-vision-safe options.
     pub color_table: ColorTable,
     /// How radar gates are sampled onto the screen.
@@ -227,6 +230,15 @@ fn apply_field(
                 value: String::from(text),
             })?;
         }
+        "map_style" => {
+            let text = quoted_token(path, number, value)?;
+            config.map_style =
+                MapStyle::parse(text).ok_or_else(|| ConfigError::InvalidMapStyle {
+                    path: at(),
+                    line: number,
+                    value: String::from(text),
+                })?;
+        }
         "palette" => {
             let text = quoted_token(path, number, value)?;
             config.color_table =
@@ -322,6 +334,7 @@ pub fn save(config: &Config, path: &Path) -> Result<(), ConfigError> {
     }
     lines.push(format!("units = \"{}\"", config.units.token()));
     lines.push(format!("theme = \"{}\"", config.theme.token()));
+    lines.push(format!("map_style = \"{}\"", config.map_style.token()));
     lines.push(format!("palette = \"{}\"", config.color_table.token()));
     lines.push(format!("interpolation = \"{}\"", config.sampling.token()));
     lines.push(format!(
@@ -443,6 +456,7 @@ mod tests {
                 place: None,
                 units: UnitSystem::Metric,
                 theme: Theme::Dark,
+                map_style: MapStyle::Liberty,
                 color_table: ColorTable::Standard,
                 sampling: Sampling::Nearest,
                 storm_motion: StormMotion::default(),
@@ -486,6 +500,7 @@ mod tests {
                 place: Some(place),
                 units: UnitSystem::Metric,
                 theme: Theme::Dark,
+                map_style: MapStyle::Liberty,
                 color_table: ColorTable::Deuteranopia,
                 sampling: Sampling::Bilinear,
                 storm_motion: StormMotion::default(),
@@ -542,6 +557,24 @@ mod tests {
                 ..
             }) if value == "nws"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn map_style_round_trips_and_rejects_unknown_values() -> Result<(), ConfigError> {
+        for style in [
+            MapStyle::Bright,
+            MapStyle::Positron,
+            MapStyle::Liberty,
+            MapStyle::Dark,
+            MapStyle::Fiord,
+        ] {
+            let config = parse(&format!("map_style = \"{}\"\n", style.token()))?;
+            assert_eq!(config.map_style, style);
+        }
+        assert!(
+            matches!(parse("map_style = \"unsupported\"\n"), Err(ConfigError::InvalidMapStyle { line: 1, ref value, .. }) if value == "unsupported")
+        );
         Ok(())
     }
 

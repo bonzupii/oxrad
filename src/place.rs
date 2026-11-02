@@ -905,18 +905,34 @@ mod tests {
         ));
     }
 
-    const PHOTON_RESPONSE: &str = include_str!("../tests/fixtures/photon_kansas.json");
-    const PHOTON_URL: &str = "https://photon.komoot.io/api/?q=fixture";
+    const PHOTON_URL: &str = "https://example.invalid/search";
 
     fn fixture_places(query: &str) -> Result<Vec<Place>, TestError> {
-        let document = serde_json::from_str(PHOTON_RESPONSE)
-            .map_err(|error| TestError::from(format!("fixture is not JSON: {error}")))?;
+        let feature = |name: &str, region: &str, lat: f64, lon: f64| {
+            serde_json::json!({
+                "properties": {
+                    "name": name,
+                    "state": region,
+                    "country": "United States",
+                    "countrycode": "US"
+                },
+                "geometry": {"type": "Point", "coordinates": [lon, lat]}
+            })
+        };
+        let document = serde_json::json!({
+            "type": "FeatureCollection",
+            "features": [
+                feature("Emporia", "Kansas", EMPORIA_LAT, EMPORIA_LON),
+                feature("Emporia", "Virginia", 36.7, -77.5),
+                feature("Springfield", "Missouri", 37.2, -93.3),
+                feature("Springfield", "Illinois", 39.8, -89.6),
+                feature("Unrelated", "Kansas", 38.0, -96.0)
+            ]
+        });
         Ok(places_from_document(&document, PHOTON_URL, query)?)
     }
 
-    /// Asserts the geocoder's parse, rank, and station resolution against a
-    /// document in Photon's response shape, so the gate never depends on the
-    /// provider being reachable.
+    /// Tests parsing, ranking, and station selection with a generated response.
     #[test]
     fn a_place_search_resolves_towns_against_the_provider_document() -> Result<(), TestError> {
         let stations = catalog()?;

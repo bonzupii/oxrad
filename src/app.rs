@@ -23,7 +23,7 @@ use eframe::egui::{
     Stroke, Vec2,
 };
 
-use crate::basemap::{BasemapError, BasemapLayers};
+use crate::basemap::Basemap;
 use crate::colormap::ColorTable;
 use crate::config::{self, Config};
 use crate::derived::StormMotion;
@@ -35,7 +35,7 @@ use crate::global_radar::{
 };
 use crate::gpu::RadarGpu;
 use crate::history::{self, HistoryError, HistoryEvent, HistoryFeed};
-use crate::map::{self, MapError, MapView, WorldMap};
+use crate::map::{self, MapError, MapView};
 use crate::overlay;
 use crate::overlay_select::{nearby_station_ids, retain_warning_selection, warning_intersects};
 use crate::pipeline::{Pipeline, PipelineState};
@@ -222,18 +222,6 @@ fn due_after(delay: Duration) -> Instant {
     now.checked_add(delay).unwrap_or(now)
 }
 
-fn load_basemap(notice: Option<String>) -> (Result<BasemapLayers, BasemapError>, Option<String>) {
-    let layers = BasemapLayers::load();
-    let notice = match &layers {
-        Ok(_) => notice,
-        Err(error) => Some(notice.map_or_else(
-            || format!("Supplemental map layers unavailable: {error}"),
-            |existing| format!("{existing} Supplemental map layers unavailable: {error}"),
-        )),
-    };
-    (layers, notice)
-}
-
 const fn scans_align(reference_ms: u64, scan_ms: u64) -> bool {
     reference_ms.abs_diff(scan_ms) <= VIEW_RADAR_TIME_WINDOW_MS
 }
@@ -362,12 +350,11 @@ pub struct OxradApp {
     station_picker_open: bool,
     first_run: bool,
     scene_mode: SceneMode,
-    map: Result<WorldMap, MapError>,
+    basemap: Basemap,
     map_view: MapView,
     radar_view: MapView,
     radar_fitted: Option<SiteId>,
     map_viewport: Option<Rect>,
-    basemap_layers: Result<BasemapLayers, BasemapError>,
     map_radar: RadarLayer,
     map_reload_due: Option<Instant>,
     global_feed: GlobalRadarFeed,
@@ -435,12 +422,12 @@ impl OxradApp {
         );
         let (color_table, sampling, motion) =
             (config.color_table, config.sampling, config.storm_motion);
+        let map_style = config.map_style;
         let stations = match stations::load_cache() {
             Ok(Some(cached)) => Ok(cached),
             Ok(None) => Err(StationError::NoStations),
             Err(error) => Err(error),
         };
-        let (basemap_layers, notice) = load_basemap(notice);
         let mut app = Self {
             gpu: gpu.clone(),
             view_radars: Vec::new(),
@@ -463,12 +450,11 @@ impl OxradApp {
             station_picker_open: restored_site.is_none(),
             first_run: true,
             scene_mode: SceneMode::Radar,
-            map: WorldMap::load(),
+            basemap: Basemap::new(map_style),
             map_view: MapView::default(),
             radar_view: MapView::default(),
             radar_fitted: None,
             map_viewport: None,
-            basemap_layers,
             map_radar: RadarLayer::Shown,
             map_reload_due: None,
             global_feed: GlobalRadarFeed::new(),
@@ -1718,62 +1704,6 @@ impl OxradApp {
         }
     }
 
-    fn map_supplemental_lines(
-        &self,
-        ui: &egui::Ui,
-        rect: Rect,
-        transform: &map::MapTransform,
-        span_km: f64,
-    ) {
-        if let Ok(layers) = &self.basemap_layers {
-            layers.draw_lines(
-                ui.painter(),
-                transform,
-                rect,
-                span_km,
-                &self.config.theme.palette(),
-            );
-        }
-    }
-
-    fn map_supplemental_roads(
-        &self,
-        ui: &egui::Ui,
-        rect: Rect,
-        transform: &map::MapTransform,
-        span_km: f64,
-    ) {
-        if let Ok(layers) = &self.basemap_layers {
-            layers.draw_roads(
-                ui.painter(),
-                transform,
-                rect,
-                span_km,
-                &self.config.theme.palette(),
-            );
-        }
-    }
-
-    fn map_supplemental_places(
-        &self,
-        ui: &egui::Ui,
-        rect: Rect,
-        transform: &map::MapTransform,
-        span_km: f64,
-        occupied: &mut Vec<Rect>,
-    ) {
-        if let Ok(layers) = &self.basemap_layers {
-            layers.draw_places(
-                ui.painter(),
-                transform,
-                rect,
-                span_km,
-                &self.config.theme.palette(),
-                occupied,
-            );
-        }
-    }
-
     /// Drag to pan and scroll to zoom, on whichever canvas the pointer is in.
     fn canvas_input(
         &mut self,
@@ -2367,6 +2297,11 @@ impl OxradApp {
     fn map_layer_rail(&mut self, ui: &mut egui::Ui) {
         let palette = self.config.theme.palette();
         let centre = self.map_view.center_latlon().ok();
+        ui.label("Basemap style");
+        if let Some(style) = self.basemap.controls(ui) {
+            self.config.map_style = style;
+            self.save_config();
+        }
         self.domains.rail(ui, &palette, centre);
         self.quake_rail(ui);
         self.domain_focus();
@@ -2613,7 +2548,6 @@ impl OxradApp {
     }
 
     fn map_status(&self, ui: &mut egui::Ui, rect: Rect) {
-        let countries = self.map.as_ref().map_or(0, WorldMap::country_count);
         self.map_status_details(ui, rect);
         let palette = self.config.theme.palette();
         let secondary = Color32::from_rgba_unmultiplied(
@@ -2648,7 +2582,7 @@ impl OxradApp {
             panel.left_top() + Vec2::new(10.0, 29.0),
             Align2::LEFT_TOP,
             format!(
-                "Centre {centre} · {countries} countries · {:.0} km wide · {} viewport radars",
+                "Centre {centre} · {:.0} km wide · {} viewport radars",
                 self.map_view.span_km(),
                 self.view_radars.len()
             ),
@@ -2659,13 +2593,6 @@ impl OxradApp {
             panel.left_top() + Vec2::new(10.0, 44.0),
             Align2::LEFT_TOP,
             "Drag to pan · scroll to zoom · click a radar site",
-            FontId::proportional(theme::TYPE_SMALL),
-            secondary,
-        );
-        ui.painter().text(
-            Pos2::new(rect.right() - 12.0, rect.bottom() - 12.0),
-            Align2::RIGHT_BOTTOM,
-            "Natural Earth 1:110m · public domain",
             FontId::proportional(theme::TYPE_SMALL),
             secondary,
         );
@@ -3566,7 +3493,7 @@ impl OxradApp {
     /// asking: geography, then the echo, then warnings, then labels.
     fn draw_geographic_stack(
         &mut self,
-        ui: &egui::Ui,
+        ui: &mut egui::Ui,
         rect: Rect,
         view: &map::MapView,
         transform: &map::MapTransform,
@@ -3575,18 +3502,10 @@ impl OxradApp {
     ) -> (bool, Option<SiteId>) {
         let palette = self.config.theme.palette();
         let span_km = view.span_km();
-        self.draw_basemap(ui, rect, view, &palette);
-        if let Err(error) = &self.basemap_layers {
-            ui.painter().text(
-                Pos2::new(rect.left() + 16.0, rect.top() + 34.0),
-                Align2::LEFT_TOP,
-                format!("Roads, water, and place names could not be loaded: {error}"),
-                FontId::proportional(12.0),
-                ERROR,
-            );
+        self.basemap.draw(ui, rect, view);
+        if let Err(error) = map::draw_graticule(ui.painter(), transform, rect, span_km) {
+            self.notice = Some(format!("Map grid unavailable: {error}"));
         }
-        self.map_supplemental_lines(ui, rect, transform, span_km);
-        self.map_supplemental_roads(ui, rect, transform, span_km);
         if canvas == Canvas::Map {
             self.domains.draw_satellite(ui, transform, rect);
             self.domains
@@ -3606,7 +3525,6 @@ impl OxradApp {
         let ring_labels = self.draw_rings(ui, rect, transform);
         self.map_warnings(ui, rect, transform);
         let mut occupied: Vec<Rect> = chrome_obstacles(rect, canvas).to_vec();
-        self.map_supplemental_places(ui, rect, transform, span_km, &mut occupied);
         self.draw_ring_labels(ui, rect, transform, &ring_labels, &mut occupied);
         self.map_measure(ui, rect, transform, interaction);
         let clicked_site = if self.measure.is_on() {
@@ -3618,33 +3536,6 @@ impl OxradApp {
         map::draw_scale(ui.painter(), rect, transform, &palette);
         self.map_readout(ui, rect, transform, radar_visible);
         (radar_visible, clicked_site)
-    }
-
-    /// Draws the basemap under everything else, reporting its failure where the
-    /// map would have been rather than in a corner.
-    fn draw_basemap(&self, ui: &egui::Ui, rect: Rect, view: &map::MapView, palette: &Palette) {
-        match &self.map {
-            Ok(world) => {
-                if let Err(error) = world.draw(ui.painter(), view, rect, palette) {
-                    ui.painter().text(
-                        rect.center(),
-                        Align2::CENTER_CENTER,
-                        format!("The basemap could not be drawn: {error}"),
-                        FontId::proportional(14.0),
-                        ERROR,
-                    );
-                }
-            }
-            Err(error) => {
-                ui.painter().text(
-                    rect.center(),
-                    Align2::CENTER_CENTER,
-                    format!("The basemap could not be loaded: {error}"),
-                    FontId::proportional(14.0),
-                    ERROR,
-                );
-            }
-        }
     }
 
     fn draw_rings(

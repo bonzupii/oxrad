@@ -15,12 +15,9 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 //! Radar gate geometry, overlay geometry, and the screen transform.
 //!
-//! A frame is a texel per gate plus a lattice that carries both the geodesic
-//! position of every lattice corner and its coordinate in the raster. The GPU
-//! interpolates the lattice and filters the raster, so gate placement is the
-//! WGS84 direct solution while the image itself is drawn in one pass. Building
-//! a textured quad per gate instead cost tens of megabytes per frame and made
-//! every redraw and zoom pay for a million triangles.
+//! A frame is a texel per gate plus a mesh that carries the geodesic position
+//! and raster coordinate of each radial boundary. Each radial has independent
+//! edges, so an angular gap remains uncovered.
 //!
 //! Lattice vertices carry kilometre offsets from the site, which the shader
 //! scales into the viewport, so one frame serves every window size. The pointer
@@ -37,7 +34,7 @@ use crate::error::DerivedError;
 use crate::error::{CoordinateError, RenderError};
 use crate::product::RadarProduct;
 use crate::projection;
-use crate::radar::{GateValue, RadarVolume, RadialBins, RetrievedVolume};
+use crate::radar::{GateValue, RadarVolume, RetrievedVolume};
 use crate::raster::{self, GateGrid, RadarRaster};
 
 /// Bytes per lattice vertex: position and texture coordinate.
@@ -496,23 +493,10 @@ pub fn place_offset(lat: f64, lon: f64, site_x: f64, site_y: f64) -> Result<Pos2
     ))
 }
 
-/// The azimuth and elevation of the lattice column at `column`.
-fn column_angles(radials: &[RadialBins], column: usize) -> Option<(f64, f64)> {
-    radials.get(column).map_or_else(
-        || {
-            radials
-                .last()
-                .map(|last| (last.azimuth_right_deg, last.elevation_deg))
-        },
-        |radial| Some((radial.azimuth_left_deg, radial.elevation_deg)),
-    )
-}
-
-/// The vertex count of a lattice with `columns` radial boundaries and `rows`
-/// range subdivisions.
+/// Two boundary columns per radial preserve independent beam footprints.
 fn lattice_shape(radials: usize, grid: GateGrid) -> (usize, usize) {
     let rows = LATTICE_RANGE_STEPS.min(grid.gate_count.max(1));
-    (radials.saturating_add(1), rows)
+    (radials.saturating_mul(2), rows)
 }
 
 fn build_lattice(
@@ -532,12 +516,18 @@ fn build_lattice(
     }
     let mut extent_km: f64 = 0.0;
     for column in 0..columns {
-        let Some((azimuth_deg, elevation_deg)) = column_angles(radials, column) else {
+        let Some(radial) = radials.get(column / 2) else {
             continue;
         };
+        let azimuth_deg = if column % 2 == 0 {
+            radial.azimuth_left_deg
+        } else {
+            radial.azimuth_right_deg
+        };
+        let elevation_deg = radial.elevation_deg;
         let path = projection::GeodesicPath::new(volume.site_lat, volume.site_lon, azimuth_deg)
             .map_err(|source| RenderError::Coordinate { source })?;
-        let v = column as f32 / columns.saturating_sub(1) as f32;
+        let v = (column / 2 + column % 2) as f32 / radials.len() as f32;
         for row in 0..=rows {
             let fraction = row as f32 / rows as f32;
             let gate = f64::from(fraction) * grid.gate_count as f64;
@@ -558,9 +548,12 @@ fn build_lattice(
     let row_stride = u32::try_from(rows.saturating_add(1)).map_err(|_| RenderError::MeshSize {
         vertices: lattice.vertices.len() / LATTICE_STRIDE,
     })?;
-    for column in 0..columns.saturating_sub(1) {
+    for radial in 0..radials.len() {
         for row in 0..rows {
-            let base = column.saturating_mul(rows + 1).saturating_add(row);
+            let base = radial
+                .saturating_mul(2)
+                .saturating_mul(rows + 1)
+                .saturating_add(row);
             let base = u32::try_from(base).map_err(|_| RenderError::MeshSize {
                 vertices: lattice.vertices.len() / LATTICE_STRIDE,
             })?;
@@ -1006,7 +999,7 @@ mod tests {
         let raster = &geometry.raster;
         assert_eq!(raster.gates as usize, gates, "raster width");
         assert_eq!(raster.radials, 3, "raster height");
-        let columns = 4;
+        let columns = 6;
         let rows = LATTICE_RANGE_STEPS.min(gates);
         for column in 0..columns {
             for row in 0..=rows {
@@ -1018,7 +1011,7 @@ mod tests {
                     .clamp(0.0, (raster.radials - 1) as f32) as usize;
                 assert_eq!(
                     radial,
-                    column.min(raster.radials as usize - 1),
+                    (column / 2 + column % 2).min(raster.radials as usize - 1),
                     "column {column} sampled radial {radial}"
                 );
                 let start = (radial * gates + gate) * 4;
@@ -1027,6 +1020,39 @@ mod tests {
                 assert_eq!(alpha, expected, "column {column} row {row}");
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn independent_radial_edges_preserve_an_angular_gap() -> Result<(), TestError> {
+        let (_, geometry) = build(
+            vec![
+                radial(359.0, 0.0, 0.5, vec![GateValue::Measured(20.0)]),
+                radial(2.0, 3.0, 1.0, vec![GateValue::Measured(30.0)]),
+            ],
+            75.0,
+        )?;
+        let (site_x, site_y) = projection::mercator(SITE_LAT, SITE_LON)?;
+        for (column, azimuth, elevation) in
+            [(0, 359.0, 0.5), (1, 0.0, 0.5), (2, 2.0, 1.0), (3, 3.0, 1.0)]
+        {
+            let range = projection::ground_range(75.0, elevation)?;
+            let (lat, lon) = projection::forward(range, azimuth, SITE_LAT, SITE_LON)?;
+            let expected = place_offset(lat, lon, site_x, site_y)?;
+            let actual = geometry.lattice.position(column * 2 + 1).ok_or("corner")?;
+            assert!(
+                (actual - expected).length() < 0.001,
+                "column {column}: expected {expected:?}, got {actual:?}"
+            );
+        }
+        let indices: Result<Vec<u32>, _> = geometry
+            .lattice
+            .indices
+            .chunks_exact(4)
+            .map(|bytes| <[u8; 4]>::try_from(bytes).map(u32::from_le_bytes))
+            .collect();
+        let indices = indices.map_err(|error| format!("invalid index: {error}"))?;
+        assert_eq!(indices, vec![0, 1, 3, 0, 3, 2, 4, 5, 7, 4, 7, 6]);
         Ok(())
     }
 
@@ -1040,7 +1066,7 @@ mod tests {
             ],
             75.0,
         )?;
-        let columns = 3;
+        let columns = 4;
         let rows = LATTICE_RANGE_STEPS.min(8);
         let vertices = (columns) * (rows + 1);
         assert_eq!(geometry.lattice.vertices.len() / LATTICE_STRIDE, vertices);

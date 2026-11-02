@@ -47,6 +47,7 @@ use crate::sounding::Sounding;
 use crate::sounding_layer::SoundingLayer;
 use crate::spaceweather::SpaceWeather;
 use crate::spaceweather_layer::SpaceWeatherLayer;
+use crate::sun::SunView;
 use crate::theme::Palette;
 use crate::volcano;
 use crate::volcano_layer::VolcanoLayer;
@@ -56,6 +57,7 @@ pub struct Domains {
     satellite: SatelliteLayer,
     hydro: HydroLayer,
     space_weather: SpaceWeatherLayer,
+    sun: SunView,
     air: AirLayer,
     climate: ClimateLayer,
     fires: FireLayer,
@@ -77,6 +79,7 @@ impl Domains {
             satellite: SatelliteLayer::new(),
             hydro: HydroLayer::new(),
             space_weather: SpaceWeatherLayer::new(),
+            sun: SunView::new(),
             air: AirLayer::new(),
             climate: ClimateLayer::new(),
             fires: FireLayer::new(),
@@ -98,6 +101,7 @@ impl Domains {
         self.satellite.update(context, view);
         self.hydro.update(now, view);
         self.space_weather.update(now);
+        self.sun.update(now);
         self.air.update(now, view);
         self.climate.update(now, view);
         self.fires.update(now);
@@ -133,6 +137,7 @@ impl Domains {
         self.satellite.rail(ui, palette);
         self.hydro.rail(ui, palette);
         self.space_weather.rail(ui, palette);
+        self.sun.rail(ui, centre);
         self.air.rail(ui, palette);
         self.climate.rail(ui, palette);
         self.fires.rail(ui, palette, centre);

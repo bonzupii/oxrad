@@ -147,14 +147,6 @@ pub struct Palette {
     pub warning: Color32,
     /// Radar canvas background, dark in both themes.
     pub canvas: Color32,
-    /// Ocean fill in map mode.
-    pub ocean: Color32,
-    /// Land fill in map mode.
-    pub land: Color32,
-    /// Coastline stroke in map mode.
-    pub coast: Color32,
-    /// Graticule stroke in map mode.
-    pub graticule: Color32,
     /// Range rings and azimuth lines over the dark radar canvas.
     pub ring: Color32,
     /// Text drawn over the dark radar canvas.
@@ -175,10 +167,6 @@ const DARK: Palette = Palette {
     error: Color32::from_rgb(255, 122, 122),
     warning: Color32::from_rgb(255, 196, 64),
     canvas: Color32::from_rgb(8, 10, 14),
-    ocean: Color32::from_rgb(8, 18, 27),
-    land: Color32::from_rgb(26, 39, 35),
-    coast: Color32::from_rgb(72, 102, 91),
-    graticule: Color32::from_rgb(43, 60, 69),
     ring: Color32::from_rgb(174, 184, 197),
     canvas_text: Color32::from_rgb(206, 214, 226),
     legend: Color32::from_rgb(12, 16, 22),
@@ -195,10 +183,6 @@ const LIGHT: Palette = Palette {
     error: Color32::from_rgb(163, 35, 27),
     warning: Color32::from_rgb(122, 78, 0),
     canvas: Color32::from_rgb(8, 10, 14),
-    ocean: Color32::from_rgb(207, 224, 238),
-    land: Color32::from_rgb(231, 239, 228),
-    coast: Color32::from_rgb(110, 134, 152),
-    graticule: Color32::from_rgb(180, 198, 212),
     ring: Color32::from_rgb(174, 184, 197),
     canvas_text: Color32::from_rgb(206, 214, 226),
     legend: Color32::from_rgb(12, 16, 22),

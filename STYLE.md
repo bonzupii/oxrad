@@ -2,9 +2,9 @@
 
 ## Purpose and scope
 
-This guide governs how oxrad code and technical prose are written. It complements [ROADMAP.md](ROADMAP.md), which owns product behavior, system architecture, data contracts, runtime guarantees, and the development roadmap.
+This guide governs how oxrad code and technical prose are written. Direct lead-developer instructions define product behavior, architecture, and acceptance criteria.
 
-This guide does not define product scope, decide which features ship, or authorize exceptions to architectural requirements. It does not contain a roadmap. The architecture document does not contain this guide's Rust conventions, naming rules, comment conventions, lint configuration, or prose guidance.
+This guide does not define product scope or decide which features ship. Other repository documents describe existing behavior and do not override direct lead-developer instructions.
 
 The rules below distinguish hard, mechanically enforceable constraints from engineering principles and contextual style guidance. A hard constraint is absolute. An engineering principle directs implementation and requires a reasoned design. A style principle guides judgment and is applied according to whether it improves clarity and usefulness. Do not turn contextual guidance into a universal prohibition, and do not soften a hard constraint into a preference.
 

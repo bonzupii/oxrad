@@ -21,7 +21,7 @@ Only behavior observed in the running binary is listed as verified.
 | Global place search | Verified | Photon live results; partial and transposed names, ranked; proximity bias absent |
 | Global forecast | Verified | Open-Meteo current, hourly, daily, retry, stale labeling |
 | Station discovery | Verified | Runtime NWS directory, disk cache, six-hour refresh |
-| Map basemap | Verified | Natural Earth 1:110m countries; 1:10m settlements and major highways; 1:50m admin-1 boundaries and rivers; labels, graticule, scale |
+| Map basemap | Partial | OpenFreeMap vector tiles; partial style rendering and HTTP cache; offline behavior, error states and full style fidelity remain unverified |
 | Map radar geometry | Verified | Geodesic 50 km rings, eight spokes, unit-aware labels, 1/5/15 degree adaptive graticule |
 | Map station overlays | Verified | Selected plus three nearby stations within a six-minute window |
 | Map measurement | Partially verified | Two-point geodesic distance and bearing; no area |

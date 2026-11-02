@@ -156,9 +156,8 @@ impl Store {
         })
     }
 
-    /// Uses an explicit directory for tests.
-    #[cfg(test)]
-    pub fn at(root: PathBuf) -> Self {
+    /// Uses an explicit cache namespace directory.
+    pub const fn at(root: PathBuf) -> Self {
         Self { root }
     }
 

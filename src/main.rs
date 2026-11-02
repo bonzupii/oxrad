@@ -75,6 +75,7 @@ mod sounding_layer;
 mod spaceweather;
 mod spaceweather_layer;
 mod stations;
+mod sun;
 #[cfg(test)]
 mod test_support;
 mod theme;

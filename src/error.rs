@@ -211,6 +211,11 @@ pub enum ConfigError {
         line: usize,
         value: String,
     },
+    InvalidMapStyle {
+        path: PathBuf,
+        line: usize,
+        value: String,
+    },
     InvalidPalette {
         path: PathBuf,
         line: usize,
@@ -275,6 +280,10 @@ impl ConfigError {
             ),
             Self::InvalidTheme { path, line, value } => format!(
                 "{} line {line} sets the theme to {value:?}, which is not dark or light.",
+                path.display()
+            ),
+            Self::InvalidMapStyle { path, line, value } => format!(
+                "{} line {line} sets an unsupported map style {value:?}.",
                 path.display()
             ),
             Self::InvalidPalette { path, line, value } => format!(
@@ -342,6 +351,7 @@ impl Error for ConfigError {
             Self::Syntax { .. }
             | Self::InvalidUnit { .. }
             | Self::InvalidTheme { .. }
+            | Self::InvalidMapStyle { .. }
             | Self::InvalidPalette { .. }
             | Self::InvalidSampling { .. }
             | Self::StormMotion { .. }

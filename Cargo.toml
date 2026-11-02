@@ -17,6 +17,7 @@ quick-xml = "0.41.0"
 serde_json = "1.0"
 sha2 = "0.11.1"
 ureq = "3.5.0"
+walkers = { version = "0.55.0", features = ["mvt"] }
 
 [dev-dependencies]
 naga = { version = "29.0.4", features = ["wgsl-in"] }

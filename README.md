@@ -2,9 +2,6 @@
 
 A free desktop weather, radar, and environmental observation workstation, written in Rust.
 
-![Historical screenshot](screenshot.png)
-
-The screenshot is historical and does not show the current build.
 
 oxrad runs on Linux, macOS, and Windows through `eframe` and `wgpu`. It has no account, subscription, advertisement, or paid tier. It is licensed under GPLv3.
 
@@ -17,7 +14,7 @@ This is a pre-release build. The radar display works. The product around it does
 | NEXRAD Level II decode and display | Working |
 | Radar products and tilts | Working: seven moment products and every complete sweep, plus vertically integrated liquid and echo tops computed from the whole volume, and storm-relative velocity against a storm motion the chaser sets |
 | Radar history and playback | Working: eight recent volumes, loop, scrub |
-| Offline vector basemap | Working: countries, settlements, admin-1 boundaries, rivers, major highways |
+| OpenFreeMap vector basemap | Partial: runtime tiles and selectable styles; offline reuse and full style fidelity remain unverified |
 | Global radar composite | Working: RainViewer, two-hour loop |
 | Forecast | Working: Open-Meteo, global |
 | Place search | Working: live partial and transposed names via Photon; proximity ranking absent |
@@ -26,6 +23,7 @@ This is a pre-release build. The radar display works. The product around it does
 | River discharge | Working: Open-Meteo flood service (GloFAS) at the map centre, three weeks behind and one week ahead, drawn as a hydrograph with the forecast and the ensemble range |
 | Satellite imagery | Working: ten NASA GIBS layers — true colour, cloud-top temperature and height, aerosol optical depth, IMERG precipitation, land-surface and sea-surface temperature, ocean chlorophyll, snow cover, and vegetation index — each a provider composite over six days of archive, drawn under the vector map |
 | Geomagnetic activity | Working: NOAA planetary K index for two days past and two days ahead, with measured, estimated, and predicted values drawn differently, the storm scale, and the live solar wind at L1 |
+| Sunrise and sunset | Implemented, not GUI-verified: request the local calendar day's solar events at the map centre from Sunrise-Sunset.org; the result names its date, timezone, and coordinates |
 | Air quality | Working: Open-Meteo CAMS modelled concentrations at the map centre — the United States and European indices, PM2.5, PM10, ozone, nitrogen dioxide, sulphur dioxide, and carbon monoxide — with an hourly index chart for the day behind and two days ahead |
 | Climate | Working: ERA5 reanalysis at the map centre since 1991, with this calendar month's mean, its departure from a baseline computed from 1991–2020 in the same record, its rank among the years, precipitation against the normal, and a chart of every year's departure |
 | Wildfires | Working: NIFC WFIGS mapped perimeters for current incidents — drawn as outlines where they are large enough to see and as markers where they are not, with the nearest fires, their acreage and containment, and the largest in the country |
@@ -42,14 +40,14 @@ This is a pre-release build. The radar display works. The product around it does
 | Snowpack | Working: snow depth on the ground at the map centre with the grid elevation the model answered for, what fell in the last day, what the next three days add, the heaviest hour, and an hour-by-hour snowfall chart for the whole record |
 | Radar outside the United States | RainViewer composite only; no national Level II adapter |
 | Units selection | Partial: distance and temperature convert; other quantities do not |
-| Light theme | Implemented for chrome, basemap, and radar canvas; two map controls keep their dark fill |
+| Light theme | Implemented for chrome and radar canvas; basemap style is selected independently |
 | Layer management | Not implemented |
 | Radar color tables | Implemented: five tables, persisted; the global raster keeps its provider palette |
 | Performance measurement | Not taken |
 
 Do not use this build for safety decisions. Coverage, warnings, and geographic detail are incomplete.
 
-The authoritative status record is [ROADMAP.md](ROADMAP.md). Requirements are in [docs/PRODUCT_REQUIREMENTS.md](docs/PRODUCT_REQUIREMENTS.md). Architecture is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+The existing [roadmap](ROADMAP.md), [product notes](docs/PRODUCT_REQUIREMENTS.md), and [architecture notes](docs/ARCHITECTURE.md) may be stale. They do not define the current reconstruction requirements.
 
 ## Build
 
@@ -89,8 +87,9 @@ The header Colors control selects the radar color table: Standard, Deuteranopia,
 | `~/.oxrad/config.toml` | Selected site and saved place |
 | `~/.oxrad/stations.json` | Last station directory and its save time |
 | `~/.oxrad/cache/responses/v1` | Bounded, integrity-checked response cache |
+| `~/.oxrad/cache/basemap` | HTTP tile cache and cached style documents |
 
-The cache holds up to 256 entries and 128 MiB. Every body is verified against its SHA-256 digest before use.
+The response cache holds up to 256 entries and 128 MiB, and verifies bodies against their SHA-256 digests. The basemap tile cache has separate behavior and does not yet have a configurable storage budget.
 
 ## Data sources
 
@@ -101,7 +100,8 @@ The cache holds up to 256 entries and 128 MiB. Every body is verified against it
 | National Weather Service active alerts | Warnings | United States and territories | Public domain |
 | Open-Meteo | Forecast | Global | CC BY 4.0 |
 | OpenStreetMap contributors, Photon | Place search | Global | ODbL |
-| Natural Earth | Offline basemap | Global | Public domain |
+| OpenFreeMap / OpenMapTiles / OpenStreetMap contributors | Vector basemap | Global | ODbL and provider attribution requirements |
+| [Sunrise-Sunset.org](https://sunrise-sunset.org) | Sunrise, sunset, and solar noon | Global | Free API with attribution; no data license specified |
 | USGS Earthquake Hazards Program | Earthquakes | Global | Public domain |
 | RainViewer | Reflectivity composite | 1,200 or more radars, 150 or more countries | Free terms, attribution required |
 
@@ -112,7 +112,8 @@ Requests identify the client as `oxrad/<version> (https://github.com/bonzupii/ox
 ## Limitations
 
 - Radar moments outside the United States are not decoded. No DWD, ECCC, BoM, JMA, CMA, IMD, OPERA, or ODIM reader exists.
-- The basemap has no street-level roads or terrain. Settlements, admin-1 boundaries, major rivers, and major highways are embedded Natural Earth layers.
+- OpenFreeMap vector tiles use a partial MapLibre-style renderer. Terrain, sprite icons, cross-tile label collision and complete style fidelity are not supported. Tile errors and cache freshness are not yet fully visible; bounded eviction and offline restart behavior remain unverified.
+- Sunrise and sunset results are requested manually and are not cached across restarts. The displayed date and coordinates identify the requested result; refresh after changing the map centre or local date.
 - Range rings and spokes render in map view; the product grid remains radar-canvas only.
 - The earthquake layer shows what the USGS summary feeds publish, which is not the same as every earthquake: the day feed starts at M2.5 and the week feed at M4.5, so small events are absent by the provider's own cut. Events the feed lists without a usable magnitude, position, or origin time are counted in the rail instead of being placed at a guessed coordinate.
 - Satellite imagery is a provider composite, not a single satellite pass, and each product states its own limitation in the rail. A product whose composite for the chosen day has not been built yet answers the provider with nothing; the layer then asks for the day before and says which day it settled on, rather than showing an empty map or an outage. The vegetation layer is an eight-day composite, so it usually trails today by a day or more.

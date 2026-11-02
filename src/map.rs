@@ -11,26 +11,18 @@
 // GNU General Public License for more details.
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
-//! The offline vector basemap and its geographic view.
-//!
-//! Natural Earth 1:110m country geometry is compiled into the binary. It is
-//! public-domain data, so the map has no tile account, network dependency, or
-//! attribution-to-a-tile-server problem. Country rings are filled with a
-//! small ear-clipping triangulator and drawn in Web Mercator.
+//! Geographic views, coordinate transforms, scale and radar range rings.
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
-use eframe::egui::{
-    self, Align2, Color32, CornerRadius, FontId, Mesh, Pos2, Rect, Shape, Stroke, Vec2,
-};
+use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Shape, Stroke, Vec2};
 
 use crate::error::CoordinateError;
 use crate::projection;
 use crate::theme::Palette;
 use crate::units::{self, UnitSystem};
 
-const COUNTRIES: &str = include_str!("../assets/ne_110m_admin_0_countries.geojson");
 const MIN_SPAN_KM: f64 = 80.0;
 const MAX_SPAN_KM: f64 = 40_075.0;
 const MERCATOR_LIMIT_DEG: f64 = 85.0;
@@ -47,20 +39,12 @@ const MAP_SPOKES: u32 = 8;
 
 #[derive(Debug)]
 pub enum MapError {
-    Json { source: serde_json::Error },
-    Shape { detail: &'static str },
-    Feature { index: usize, detail: &'static str },
     Coordinate { source: CoordinateError },
 }
 
 impl MapError {
     fn message(&self) -> String {
         match self {
-            Self::Json { source } => format!("The embedded basemap is not valid JSON: {source}"),
-            Self::Shape { detail } => format!("The embedded basemap is missing {detail}."),
-            Self::Feature { index, detail } => {
-                format!("Basemap feature {index} has an invalid {detail}.")
-            }
             Self::Coordinate { source } => format!("The basemap could not be projected: {source}"),
         }
     }
@@ -75,340 +59,9 @@ impl Display for MapError {
 impl Error for MapError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Json { source } => Some(source),
             Self::Coordinate { source } => Some(source),
-            Self::Shape { .. } | Self::Feature { .. } => None,
         }
     }
-}
-
-#[derive(Debug, Clone)]
-struct Country {
-    name: String,
-    label: Option<(f64, f64)>,
-    label_rank: u32,
-    rings: Vec<Vec<(f64, f64)>>,
-}
-
-#[derive(Debug)]
-pub struct WorldMap {
-    countries: Vec<Country>,
-}
-
-fn coordinate(pair: Option<&serde_json::Value>, index: usize) -> Result<(f64, f64), MapError> {
-    let values = pair
-        .and_then(serde_json::Value::as_array)
-        .ok_or(MapError::Feature {
-            index,
-            detail: "coordinate pair",
-        })?;
-    let lon = values
-        .first()
-        .and_then(serde_json::Value::as_f64)
-        .ok_or(MapError::Feature {
-            index,
-            detail: "longitude",
-        })?;
-    let lat = values
-        .get(1)
-        .and_then(serde_json::Value::as_f64)
-        .ok_or(MapError::Feature {
-            index,
-            detail: "latitude",
-        })?;
-    if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
-        return Err(MapError::Feature {
-            index,
-            detail: "coordinate range",
-        });
-    }
-    Ok((lat, lon))
-}
-
-fn ring(value: &serde_json::Value, feature: usize) -> Result<Vec<(f64, f64)>, MapError> {
-    let points = value.as_array().ok_or(MapError::Feature {
-        index: feature,
-        detail: "ring",
-    })?;
-    let mut result = Vec::with_capacity(points.len());
-    for pair in points {
-        result.push(coordinate(Some(pair), feature)?);
-    }
-    if result.len() < 3 {
-        return Err(MapError::Feature {
-            index: feature,
-            detail: "ring with at least three points",
-        });
-    }
-    Ok(result)
-}
-
-fn polygons(value: &serde_json::Value, feature: usize) -> Result<Vec<Vec<(f64, f64)>>, MapError> {
-    let kind = value
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .ok_or(MapError::Feature {
-            index: feature,
-            detail: "geometry type",
-        })?;
-    let coordinates = value.get("coordinates").ok_or(MapError::Feature {
-        index: feature,
-        detail: "geometry coordinates",
-    })?;
-    match kind {
-        "Polygon" => {
-            let outer = coordinates
-                .as_array()
-                .and_then(|rings| rings.first())
-                .ok_or(MapError::Feature {
-                    index: feature,
-                    detail: "polygon ring",
-                })?;
-            Ok(vec![ring(outer, feature)?])
-        }
-        "MultiPolygon" => {
-            let parts = coordinates.as_array().ok_or(MapError::Feature {
-                index: feature,
-                detail: "multipolygon",
-            })?;
-            let mut rings = Vec::new();
-            for part in parts {
-                let first =
-                    part.as_array()
-                        .and_then(|value| value.first())
-                        .ok_or(MapError::Feature {
-                            index: feature,
-                            detail: "polygon",
-                        })?;
-                rings.push(ring(first, feature)?);
-            }
-            Ok(rings)
-        }
-        _ => Ok(Vec::new()),
-    }
-}
-
-fn property_text(properties: &serde_json::Value, key: &str) -> Option<String> {
-    properties
-        .get(key)
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(String::from)
-}
-
-impl WorldMap {
-    /// Parses the compiled-in Natural Earth country collection.
-    pub fn load() -> Result<Self, MapError> {
-        let document: serde_json::Value =
-            serde_json::from_str(COUNTRIES).map_err(|source| MapError::Json { source })?;
-        let features = document
-            .get("features")
-            .and_then(serde_json::Value::as_array)
-            .ok_or(MapError::Shape {
-                detail: "the feature collection",
-            })?;
-        let mut countries = Vec::with_capacity(features.len());
-        for (index, feature) in features.iter().enumerate() {
-            let properties = feature.get("properties").ok_or(MapError::Feature {
-                index,
-                detail: "properties",
-            })?;
-            let Some(name) = property_text(properties, "NAME")
-                .or_else(|| property_text(properties, "ADMIN"))
-                .or_else(|| property_text(properties, "SOVEREIGNT"))
-            else {
-                continue;
-            };
-            // Natural Earth names these fields by axis: LABEL_X is longitude.
-            // Storing them as (latitude, longitude) requires Y first.
-            let label = properties
-                .get("LABEL_Y")
-                .and_then(serde_json::Value::as_f64)
-                .zip(
-                    properties
-                        .get("LABEL_X")
-                        .and_then(serde_json::Value::as_f64),
-                );
-            let label_rank = properties
-                .get("LABELRANK")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|value| u32::try_from(value).ok())
-                .unwrap_or(8);
-            let geometry = feature.get("geometry").ok_or(MapError::Feature {
-                index,
-                detail: "geometry",
-            })?;
-            let rings = polygons(geometry, index)?;
-            if !rings.is_empty() {
-                countries.push(Country {
-                    name,
-                    label,
-                    label_rank,
-                    rings,
-                });
-            }
-        }
-        if countries.is_empty() {
-            return Err(MapError::Shape {
-                detail: "usable country features",
-            });
-        }
-        Ok(Self { countries })
-    }
-
-    pub const fn country_count(&self) -> usize {
-        self.countries.len()
-    }
-
-    pub fn draw(
-        &self,
-        painter: &egui::Painter,
-        view: &MapView,
-        rect: Rect,
-        palette: &Palette,
-    ) -> Result<(), MapError> {
-        let transform = view.transform(rect)?;
-        painter.rect_filled(rect, CornerRadius::ZERO, palette.ocean);
-        draw_graticule(painter, &transform, rect, view.span_km, palette)?;
-        let mut labels = Vec::new();
-        for country in &self.countries {
-            for ring in &country.rings {
-                let points: Vec<Pos2> = ring
-                    .iter()
-                    .filter_map(|(lat, lon)| transform.screen(*lat, *lon))
-                    .collect();
-                if points.len() < 3 {
-                    continue;
-                }
-                let Some(first) = points.first() else {
-                    continue;
-                };
-                let width = points
-                    .iter()
-                    .fold(0.0_f32, |width, point| width.max((point.x - first.x).abs()));
-                if width > rect.width() * 3.0 {
-                    continue;
-                }
-                if let Some(mesh) = filled_mesh(&points, palette.land) {
-                    painter.add(Shape::mesh(mesh));
-                }
-                painter.add(Shape::closed_line(
-                    points,
-                    Stroke::new(0.7_f32, palette.coast),
-                ));
-            }
-            if let Some((lat, lon)) = country.label {
-                labels.push((country.name.as_str(), country.label_rank, lat, lon));
-            }
-        }
-        if view.span_km >= 2_000.0 {
-            draw_labels(painter, &transform, rect, &labels, view.span_km, palette);
-        }
-        Ok(())
-    }
-}
-
-fn filled_mesh(points: &[Pos2], colour: Color32) -> Option<Mesh> {
-    let triangles = triangulate(points)?;
-    let mut mesh = Mesh::default();
-    for point in points {
-        mesh.colored_vertex(*point, colour);
-    }
-    for triangle in triangles {
-        mesh.add_triangle(triangle[0], triangle[1], triangle[2]);
-    }
-    Some(mesh)
-}
-
-fn cross(a: Pos2, b: Pos2, c: Pos2) -> f32 {
-    (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
-}
-
-fn in_triangle(point: Pos2, a: Pos2, b: Pos2, c: Pos2) -> bool {
-    let ab = cross(a, b, point);
-    let bc = cross(b, c, point);
-    let ca = cross(c, a, point);
-    (ab >= 0.0 && bc >= 0.0 && ca >= 0.0) || (ab <= 0.0 && bc <= 0.0 && ca <= 0.0)
-}
-
-/// Ear clipping for a simple, hole-free Geographic ring. Returns `None` when
-/// the ring is degenerate or self-intersecting instead of filling nonsense.
-fn triangulate(points: &[Pos2]) -> Option<Vec<[u32; 3]>> {
-    if points.len() < 3 {
-        return None;
-    }
-    let area: f32 = points
-        .iter()
-        .zip(points.iter().cycle().skip(1))
-        .map(|(a, b)| a.x * b.y - b.x * a.y)
-        .sum();
-    if area.abs() < 1e-6 {
-        return None;
-    }
-    let mut indices: Vec<usize> = (0..points.len()).collect();
-    if area < 0.0 {
-        indices.reverse();
-    }
-    let mut triangles = Vec::with_capacity(indices.len().saturating_sub(2));
-    let mut attempts = 0_usize;
-    while indices.len() > 3 {
-        if attempts > indices.len() * indices.len() {
-            return None;
-        }
-        attempts += 1;
-        let mut ear = None;
-        for position in 0..indices.len() {
-            let previous = position.checked_sub(1).unwrap_or(indices.len() - 1);
-            let next = (position + 1) % indices.len();
-            let (Some(a_index), Some(b_index), Some(c_index)) = (
-                indices.get(previous),
-                indices.get(position),
-                indices.get(next),
-            ) else {
-                return None;
-            };
-            let (Some(a), Some(b), Some(c)) = (
-                points.get(*a_index),
-                points.get(*b_index),
-                points.get(*c_index),
-            ) else {
-                return None;
-            };
-            if cross(*a, *b, *c) <= 0.0 {
-                continue;
-            }
-            let contains = indices.iter().enumerate().any(|(other_position, index)| {
-                if other_position == previous
-                    || other_position == position
-                    || other_position == next
-                {
-                    return false;
-                }
-                points
-                    .get(*index)
-                    .is_some_and(|point| in_triangle(*point, *a, *b, *c))
-            });
-            if !contains {
-                ear = Some((position, *a_index, *b_index, *c_index));
-                break;
-            }
-        }
-        let (position, a, b, c) = ear?;
-        triangles.push([
-            u32::try_from(a).ok()?,
-            u32::try_from(b).ok()?,
-            u32::try_from(c).ok()?,
-        ]);
-        indices.remove(position);
-    }
-    if let [a, b, c] = indices.as_slice() {
-        triangles.push([
-            u32::try_from(*a).ok()?,
-            u32::try_from(*b).ok()?,
-            u32::try_from(*c).ok()?,
-        ]);
-    }
-    Some(triangles)
 }
 
 fn graticule_step_degrees(span_km: f64) -> f64 {
@@ -421,14 +74,13 @@ fn graticule_step_degrees(span_km: f64) -> f64 {
     }
 }
 
-fn draw_graticule(
+pub fn draw_graticule(
     painter: &egui::Painter,
     transform: &MapTransform,
     rect: Rect,
     span_km: f64,
-    palette: &Palette,
 ) -> Result<(), MapError> {
-    let stroke = Stroke::new(0.5_f32, palette.graticule);
+    let stroke = Stroke::new(0.5_f32, Color32::from_rgba_unmultiplied(135, 145, 155, 90));
     let step = graticule_step_degrees(span_km);
     let (north, _) = transform.clipped_latlon_at(Pos2::new(rect.center().x, rect.top()))?;
     let (south, _) = transform.clipped_latlon_at(Pos2::new(rect.center().x, rect.bottom()))?;
@@ -681,58 +333,6 @@ pub fn draw_ring_labels(
         ring_label(context, *label, occupied)?;
     }
     Ok(())
-}
-
-fn draw_labels(
-    painter: &egui::Painter,
-    transform: &MapTransform,
-    rect: Rect,
-    labels: &[(&str, u32, f64, f64)],
-    span_km: f64,
-    palette: &Palette,
-) {
-    let rank_limit = if span_km > 12_000.0 {
-        2
-    } else if span_km > 5_000.0 {
-        4
-    } else if span_km > 1_500.0 {
-        6
-    } else {
-        10
-    };
-    let mut used: Vec<Rect> = Vec::new();
-    for (name, rank, lat, lon) in labels {
-        if *rank > rank_limit {
-            continue;
-        }
-        let Some(position) = transform.screen(*lat, *lon) else {
-            continue;
-        };
-        if !rect.shrink(8.0).contains(position) {
-            continue;
-        }
-        let galley = painter.layout_no_wrap(
-            String::from(*name),
-            FontId::proportional(11.0),
-            palette.map_text,
-        );
-        let box_rect = Rect::from_center_size(position, galley.size() + Vec2::new(6.0, 2.0));
-        if used.iter().any(|other| other.intersects(box_rect)) {
-            continue;
-        }
-        used.push(box_rect);
-        painter.text(
-            position + Vec2::new(0.7, 0.7),
-            Align2::CENTER_CENTER,
-            String::from(*name),
-            FontId::proportional(11.0),
-            palette.surface,
-        );
-        painter.galley(position - galley.size() / 2.0, galley, palette.map_text);
-        if used.len() >= 70 {
-            break;
-        }
-    }
 }
 
 /// Immutable geographic view. The centre is kept in Mercator kilometres so
@@ -1035,41 +635,6 @@ mod tests {
         // would draw coverage that does not exist.
         let plan = RingPlan::for_view(1_250.0, 150.0);
         assert!(plan.outermost_km() <= 150.0);
-    }
-
-    #[test]
-    fn embedded_world_has_the_natural_earth_countries() -> Result<(), TestError> {
-        let map = WorldMap::load()?;
-        assert_eq!(map.country_count(), 177);
-        Ok(())
-    }
-
-    #[test]
-    fn country_labels_use_latitude_before_longitude() -> Result<(), TestError> {
-        let map = WorldMap::load()?;
-        let france = map
-            .countries
-            .iter()
-            .find(|country| country.name == "France")
-            .ok_or("France missing")?;
-        let (lat, lon) = france.label.ok_or("France label missing")?;
-        assert!((40.0..=53.0).contains(&lat), "France label latitude {lat}");
-        assert!((-6.0..=10.0).contains(&lon), "France label longitude {lon}");
-        Ok(())
-    }
-
-    #[test]
-    fn triangulates_a_concave_square() -> Result<(), TestError> {
-        let points = [
-            Pos2::new(0.0, 0.0),
-            Pos2::new(4.0, 0.0),
-            Pos2::new(4.0, 4.0),
-            Pos2::new(2.0, 2.0),
-            Pos2::new(0.0, 4.0),
-        ];
-        let triangles = triangulate(&points).ok_or("concave ring failed")?;
-        assert_eq!(triangles.len(), 3);
-        Ok(())
     }
 
     #[test]
