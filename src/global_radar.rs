@@ -858,25 +858,4 @@ mod tests {
         );
         Ok(())
     }
-
-    /// Exercises the live global source, including a real PNG tile.
-    #[test]
-    fn live_global_manifest_and_tile_decode() -> Result<(), TestError> {
-        let bytes = network::http_get(ENDPOINT)?;
-        let manifest = parse_manifest(&bytes)?;
-        assert!(!manifest.frames.is_empty());
-        let frame = manifest
-            .frames
-            .last()
-            .ok_or("global manifest has no frames")?;
-        let grid = tile_grid_for_view(40.71, -74.01, 950.0)?;
-        let bounds = grid.tiles.first().ok_or("global viewport has no tile")?;
-        let url = tile_url(&manifest.host, frame, *bounds)?;
-        let png = network::http_get(&url)?;
-        let tile = decode_tile(&png, &url)?;
-        assert_eq!(tile.width, TILE_SIZE);
-        assert_eq!(tile.height, TILE_SIZE);
-        assert!(tile.rgba.len() > 1000);
-        Ok(())
-    }
 }

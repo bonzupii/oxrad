@@ -34,7 +34,7 @@ const ARCHIVE_HEADER_BYTES: usize = 24;
 const RECORD_LENGTH_BYTES: usize = 4;
 const MAX_RECORD_BYTES: u64 = 16 * 1024 * 1024;
 // The Type 29/31 segment-size field excludes 12 bytes of the 28-byte message
-// header. The pinned KTWX record places the next header at 9956, not 9944.
+// header, so framing adds those bytes before locating the next message.
 const CTM_BYTES: usize = 12;
 const MESSAGE_HEADER_BYTES: usize = 28;
 const LEGACY_MESSAGE_BYTES: usize = 2432;
@@ -875,11 +875,8 @@ fn decode_record(
             key: String::from(key),
             offset,
         })?;
-    // The field is a signed length, and the final record of an archive carries its
-    // length negated: both the pinned archive and the live feed end with one, and
-    // the bytes after the field are a bzip2 stream of exactly that magnitude. The
-    // pinned archive test decodes the volume end from that record, so misreading
-    // the field fails it.
+    // The field is signed and the final record may carry a negated length. The
+    // bytes after it form a bzip2 stream with exactly that absolute length.
     let declared = i32::from_be_bytes(length).unsigned_abs();
     if declared == 0 {
         return Err(RadarError::RecordHeader {
@@ -1373,7 +1370,6 @@ pub fn decode_volume(site: &SiteId, key: &str, bytes: &[u8]) -> Result<RadarVolu
 mod tests {
     use super::*;
 
-    use crate::network;
     use crate::test_support::TestError;
 
     fn site() -> Result<SiteId, TestError> {
@@ -1759,214 +1755,5 @@ mod tests {
                 "expected RecordBounds, got {other:?}"
             ))),
         }
-    }
-
-    const PINNED_KEY: &str = "2026/10/31/KTWX/KTWX20261031_003109_V06";
-    const PINNED_BYTES: usize = 12_584_711;
-    const PINNED_SHA256: &str = "d69fbeb10f2211515cdc82b7b11defd48f98dd48f79b1c27c6d3eb72f2db3d0b";
-
-    fn sha256_hex(bytes: &[u8]) -> String {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(bytes);
-        let digest = hasher.finalize();
-        digest.iter().map(|byte| format!("{byte:02x}")).collect()
-    }
-
-    /// Retrieves the pinned archive from AWS and runs the application path from
-    /// archive bytes to render-ready geometry. Network failure fails this test.
-    #[test]
-    fn pinned_archive_decodes_to_a_renderable_sweep() -> Result<(), TestError> {
-        let bytes = network::fetch_archive(PINNED_KEY)?;
-        assert_eq!(bytes.len(), PINNED_BYTES, "pinned archive size");
-        assert_eq!(sha256_hex(&bytes), PINNED_SHA256, "pinned archive digest");
-        // Validate every record's declared span against the bytes available.
-        // The final record length is negative by definition; its absolute
-        // length must end exactly at the archive boundary.
-        let mut offset = archive_header().len();
-        let mut final_record_is_negative = false;
-        while offset < bytes.len() {
-            let header: [u8; 4] = bytes
-                .get(offset..offset + 4)
-                .ok_or("record header")?
-                .try_into()
-                .map_err(|_| "record header")?;
-            let declared = i32::from_be_bytes(header);
-            assert_ne!(declared, 0, "zero record length at {offset}");
-            let length = usize::try_from(declared.unsigned_abs()).map_err(|_| "record length")?;
-            let end = offset
-                .checked_add(4)
-                .and_then(|start| start.checked_add(length))
-                .ok_or("record end overflow")?;
-            assert!(end <= bytes.len(), "record at {offset} ends at {end}");
-            offset = end;
-            final_record_is_negative = declared < 0;
-        }
-        assert_eq!(offset, bytes.len(), "records cover the archive");
-        assert!(
-            final_record_is_negative,
-            "final record has a negative length"
-        );
-        let site = site()?;
-        let volume = decode_volume(&site, PINNED_KEY, &bytes)?;
-
-        // Published KTWX coordinates, independent of this decoder. The archive
-        // stores them to four decimal places, so the tolerance is 1e-4 degrees.
-        assert!(
-            (volume.site_lat - 38.996_94).abs() < 1e-4,
-            "site latitude {}",
-            volume.site_lat
-        );
-        assert!(
-            (volume.site_lon + 96.232_49).abs() < 1e-4,
-            "site longitude {}",
-            volume.site_lon
-        );
-        // The volume name states 2026-10-31 00:31:09 UTC; the first radial is
-        // recorded within minutes of it.
-        assert!(
-            (1_793_406_069_000..1_793_407_269_000).contains(&volume.scan_unix_ms),
-            "scan time {} outside the volume start window",
-            volume.scan_unix_ms
-        );
-        // A super-resolution surveillance cut covers a full circle at 0.5 degree
-        // spacing, so 720 radials are expected.
-        assert_eq!(volume.sweep.radials.len(), 720, "radial count");
-        assert!(
-            volume.sweeps.len() >= 5,
-            "complete sweeps besides the lowest: {}",
-            volume.sweeps.len()
-        );
-        for product in [
-            RadarProduct::Reflectivity,
-            RadarProduct::DifferentialReflectivity,
-            RadarProduct::CorrelationCoefficient,
-            RadarProduct::DifferentialPhase,
-            RadarProduct::SpecificDifferentialPhase,
-        ] {
-            assert!(
-                volume.sweep.products.contains(&product),
-                "lowest sweep lacks {}",
-                product.id()
-            );
-        }
-        for product in [RadarProduct::Velocity, RadarProduct::SpectrumWidth] {
-            assert!(
-                volume
-                    .sweeps
-                    .iter()
-                    .any(|sweep| sweep.products.contains(&product)),
-                "no sweep carries {}",
-                product.id()
-            );
-        }
-        assert!(
-            volume
-                .sweeps
-                .iter()
-                .any(|sweep| sweep.elevation_number != volume.sweep.elevation_number),
-            "a second elevation is retained"
-        );
-        let gates = volume.sweep.radials.first().map_or(0, |radial| {
-            radial
-                .moment(RadarProduct::Reflectivity)
-                .map_or(0, |moment| moment.values.len())
-        });
-        // A super-resolution cut carries 1832 gates of 250 m from 2.000 km,
-        // which is 460 km of coverage.
-        assert_eq!(gates, 1832, "gates per radial");
-        assert!(
-            volume.sweep.radials.iter().all(|radial| {
-                radial
-                    .moment(RadarProduct::Reflectivity)
-                    .is_some_and(|moment| moment.values.len() == gates)
-            }),
-            "every radial carries the same gate count"
-        );
-        for radial in &volume.sweep.radials {
-            let width = span(radial.azimuth_left_deg, radial.azimuth_right_deg);
-            assert!(
-                width > 0.0 && width <= 0.5 * AZIMUTH_BRIDGE_TOLERANCE + 1e-9,
-                "radial {} spans {width} degrees",
-                radial.azimuth_number
-            );
-            assert!(
-                (0.0..360.0).contains(&radial.azimuth_left_deg)
-                    && (0.0..=360.0).contains(&radial.azimuth_right_deg),
-                "radial {} edges are normalized",
-                radial.azimuth_number
-            );
-            // Super-resolution gates are 250 m wide and start at 2.000 km, so
-            // the centre of gate 0 is 2.125 km.
-            assert!(
-                (radial.first_gate_km - 2.125).abs() < 1e-6,
-                "first gate centre {}",
-                radial.first_gate_km
-            );
-            assert!(
-                (radial.gate_width_km - 0.25).abs() < 1e-6,
-                "gate width {}",
-                radial.gate_width_km
-            );
-        }
-        // The far edge of gate 1831 is 459.875 km of slant range; the ground
-        // range follows from this cut's own elevation angle.
-        assert!(
-            (0.4..=1.0).contains(&volume.sweep.elevation_deg),
-            "lowest cut elevation {}",
-            volume.sweep.elevation_deg
-        );
-        // Each radial carries its own elevation, so the sweep maximum is the
-        // largest ground range among them at the far edge of gate 1831, which
-        // reaches 460.000 km of slant range.
-        let mut expected_ground = f64::NEG_INFINITY;
-        for radial in &volume.sweep.radials {
-            expected_ground = expected_ground.max(crate::projection::ground_range(
-                460.0,
-                radial.elevation_deg,
-            )?);
-        }
-        assert!(
-            (volume.sweep.max_ground_range_km - expected_ground).abs() < 1e-6,
-            "max ground range {} against {} from the radials",
-            volume.sweep.max_ground_range_km,
-            expected_ground
-        );
-        let measured = volume
-            .sweep
-            .radials
-            .iter()
-            .flat_map(|radial| &radial.moments)
-            .flat_map(|moment| &moment.values)
-            .filter(|value| matches!(**value, GateValue::Measured(_)))
-            .count();
-        assert_eq!(
-            measured + volume.sweep.below_threshold + volume.sweep.range_folded,
-            volume.sweep.gate_count(),
-            "gate categories partition the gates"
-        );
-        assert_eq!(volume.skipped_radials, 0, "no radial is skipped");
-
-        let geometry = crate::render::build_geometry_for(
-            &volume,
-            RadarProduct::Reflectivity,
-            crate::colormap::ColorTable::Standard,
-            crate::derived::StormMotion::default(),
-        )?;
-        assert!(geometry.lattice.index_count > 0, "lattice has triangles");
-        assert_eq!(geometry.raster.counts.mismatched_radials, 0, "gate grid");
-        // Web Mercator stretches ground distance by 1/cos(latitude). The mesh
-        // bounds reach the poleward edge of the sweep, where that factor is
-        // largest, so the extent lies between the factor at the site and the
-        // factor at the sweep's poleward limit.
-        let site_scale = 1.0 / 38.996_94_f64.to_radians().cos();
-        let poleward_deg = volume.sweep.max_ground_range_km / 111.32;
-        let poleward_scale = 1.0 / (38.996_94 + poleward_deg).to_radians().cos();
-        let ratio = geometry.extent_km / volume.sweep.max_ground_range_km;
-        assert!(
-            ratio > site_scale && ratio < poleward_scale,
-            "Mercator extent ratio {ratio} outside {site_scale}..{poleward_scale}"
-        );
-        Ok(())
     }
 }

@@ -638,4 +638,35 @@ mod tests {
         };
         assert_eq!(fault.retry_in(), Some(RETRY_DELAY));
     }
+
+    #[test]
+    fn a_missing_tile_is_visible_until_the_user_retries_it() -> Result<(), TestError> {
+        let root = directory("missing")?;
+        let mut tiles = owner(&root, 14);
+        let id = TileId {
+            zoom: 4,
+            x: 3,
+            y: 7,
+        };
+        tiles.complete(Completion {
+            id,
+            result: Err(TileError::Status {
+                url: String::from("https://example.test/4/3/7.pbf"),
+                code: 404,
+                retry_after: None,
+            }),
+        });
+        assert!(matches!(
+            tiles.error(id),
+            Some(TileError::Status { code: 404, .. })
+        ));
+        tiles.retry_failed();
+        assert!(
+            tiles.error(id).is_none(),
+            "the retry must clear a 404 state"
+        );
+        drop(tiles);
+        std::fs::remove_dir_all(root).map_err(|error| error.to_string())?;
+        Ok(())
+    }
 }

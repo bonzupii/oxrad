@@ -11,7 +11,7 @@ This is the direct dependency record required by `STYLE.md`. It records what eac
 | `nexrad-decode` | 0.1.2 | NEXRAD Level II message and moment parsing | No | MIT | Confined to `radar.rs`; framing, bzip2, and validation remain oxrad's responsibility |
 | `quick-xml` | 0.41.0 | S3 listing XML parsing | No | MIT/Apache-2.0 | Direct dependency; input comes from `network.rs`; parses whitespace, entities, and pagination fields |
 | `serde_json` | 1.0 | JSON parsing for station, place, forecast, and warning providers; cache metadata | No | MIT/Apache-2.0 | Provider documents are parsed into oxrad's own types at the adapter boundary |
-| `sha2` | 0.11.1 | Stable cache keys and body-integrity verification | No | MIT/Apache-2.0 | Direct dependency used by `cache.rs`; also verifies the pinned archive in tests |
+| `sha2` | 0.11.1 | Stable cache keys and body-integrity verification | No | MIT/Apache-2.0 | Direct dependency used by `cache.rs` |
 | `walkers` | 0.55.0 | Vector tile decoding and map rendering | Yes, OpenFreeMap HTTPS | MIT | Partial MapLibre style support; HTTP disk cache |
 | `ureq` | 3.5.0 | HTTPS client | Yes | MIT/Apache-2.0 | Confined to `provider.rs`, `network.rs`, and `global_radar.rs`; timeouts and body limits are set in `provider.rs` or `network.rs` |
 
@@ -24,7 +24,7 @@ The basemap requests OpenFreeMap tiles and styles at runtime. OpenStreetMap attr
 - `nexrad-decode` types do not cross out of `radar.rs`. The application receives `RadarVolume`, `RadarSweep`, `RadialBins`, and `GateValue`.
 - `geographiclib-rs` is used only in `projection.rs`.
 - `serde_json` is used at JSON provider boundaries. The station, forecast, and warning modules convert into application types immediately; warning geometry is reduced to validated latitude/longitude rings.
-- `sha2` is used by `cache.rs` for URL-derived file names and body digests, and by the pinned-archive acceptance test.
+- `sha2` is used by `cache.rs` for URL-derived file names and body digests.
 - `ureq` is used by `provider.rs`, `network.rs`, and `global_radar.rs`; the last reuses the bounded NEXRAD HTTP helper.
 - `image` is used only to decode RainViewer PNG tiles into RGBA pixels before egui texture upload.
 - `eframe` is the window and GPU boundary. `gpu.rs` owns the wgpu pipeline and buffers; `app.rs` owns UI state.

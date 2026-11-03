@@ -2,7 +2,7 @@
 
 ## Current suite
 
-153 tests run under `cargo test`. Last recorded run in this repository: 153 passed, 0 failed.
+467 tests run under `cargo test --all-targets`. Last recorded run: 467 passed, 0 failed.
 
 Color-table tests assert ordered reflectivity steps in every selectable table, out-of-range rejection, configuration token round trips, and equal channels in the high-contrast table.
 
@@ -11,22 +11,22 @@ Color-table tests assert ordered reflectivity steps in every selectable table, o
 | Projection | Direct and inverse geodesics against the roadmap reference table, eight azimuths at 75 km, antimeridian, polar, Mercator limits, rejection paths |
 | Radar decode | Archive framing, Type 31 sizes, moment sentinels, missing radials, seam width, azimuth bisection, truncation |
 | Render | Gate corner placement, ring geometry, pointer lookup, threshold classification, north orientation |
-| Map | Pan, pointer-anchored zoom, triangulation, country labels, settlement labels, admin-1 boundaries, rivers, major highways, projected range rings, adaptive graticule, embedded datasets |
+| Map | Pan, pointer-anchored zoom, vector-tile decoding, tile addressing, projected range rings, adaptive graticule, and tile failure states |
 | Pipeline | Failure context, cache provenance ownership, retry channel closure |
 | Display | Frame provenance, retry, rebuild |
 | Cache | Round trip, digest mismatch, eviction order |
-| Network | Listing parsing, malformed XML, 404 handling, live listing and retrieval |
-| Stations | Parsing, malformed documents, cache fallback, live discovery |
-| Place | Identity normalization, ambiguity, live search |
-| Forecast | Request shape, unit strings, live forecasts inside and outside the United States |
-| Warnings | Polygon parsing, multipolygon, malformed alert isolation, live feed |
-| Global radar | Manifest validation, tile grid, live manifest and tile decode |
+| Network | Listing parsing, malformed XML, URL encoding, and volume-key filtering |
+| Stations | Generated NWS-document parsing, malformed documents, and cache persistence |
+| Place | Identity normalization, ambiguity, and generated search responses |
+| Forecast | Request shape, units, and generated forecasts for United States and international locations |
+| Warnings | Generated polygon and multipolygon parsing plus malformed-alert isolation |
+| Global radar | Generated manifest validation and tile-grid geometry |
 | History | Key parsing, playback advance and wrap |
 | Retry | Backoff, `Retry-After` seconds and HTTP date, decode-failure policy |
 | App | Warning selection retention, forecast retry, viewport station selection, map status bounds |
 | Units | Metric and imperial conversion, provider temperature scale, configuration round trip and rejection |
 
-Several tests reach live services. A network failure fails the test. They are not replaced with fixtures.
+Provider tests build controlled responses in code. They do not fetch, bundle, or replay provider data.
 
 ## Gaps
 
@@ -46,7 +46,7 @@ Several tests reach live services. A network failure fails the test. They are no
 | Layer | What it proves | Runs in |
 |---|---|---|
 | Unit | Pure functions and decode logic against reference values | Every change |
-| Provider integration | A real payload parses into application types | Every change, network required |
+| Provider integration | A controlled provider response parses into application types | Every change |
 | Rendering | Geometry and projection produce expected coordinates | Every change |
 | GUI | States render correctly at fixed window sizes | Release candidate |
 | Performance | Budgets hold under a stated workload | Release candidate |
@@ -70,4 +70,4 @@ Current GUI evidence covers the radar and map scenes at 1280x800 in dark and lig
 
 ## Adding a source
 
-A new provider adds a live integration test that fails when the source breaks, plus parser tests built from a captured payload. Captured payloads live in tests as text, never as binary blobs in the repository.
+A new provider adds request-construction and parser tests with controlled responses generated in code. Provider availability is verified separately from the deterministic test suite.

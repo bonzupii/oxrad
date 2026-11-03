@@ -516,18 +516,24 @@ pub fn find<'a>(stations: &'a [Station], id: &SiteId) -> Option<&'a Station> {
 mod tests {
     use super::*;
 
-    fn live_document() -> Result<Value, StationError> {
-        fetch_document()
+    fn station_document() -> Value {
+        json!({
+            "features": [{
+                "properties": {
+                    "id": "KTWX", "name": "Topeka", "stationType": "WSR-88D",
+                    "elevation": 411.0, "rda": {"properties": {"status": "Online"}},
+                    "time": {"last_received": "2026-11-03T12:00:00+00:00"}
+                },
+                "geometry": {"type": "Point", "coordinates": [-96.23249, 38.99694]}
+            }]
+        })
     }
 
     #[test]
-    fn live_discovery_returns_nws_radar_stations() -> Result<(), StationError> {
-        let stations = parse_document(&live_document()?)?;
-        assert!(
-            stations.len() >= 150,
-            "live station count {}",
-            stations.len()
-        );
+    fn a_nws_station_document_retains_identity_location_and_capabilities()
+    -> Result<(), StationError> {
+        let stations = parse_document(&station_document())?;
+        assert_eq!(stations.len(), 1);
         let kpah = SiteId::parse("KTWX").map_err(|_| shape("KTWX identifier"))?;
         let station = find(&stations, &kpah).ok_or(StationError::NoStations)?;
         assert_eq!(station.name, "Topeka");
@@ -569,8 +575,9 @@ mod tests {
     }
 
     #[test]
-    fn a_cached_document_survives_without_the_network() -> Result<(), StationError> {
-        let document = live_document()?;
+    fn a_cached_station_document_survives_a_later_unavailable_network() -> Result<(), StationError>
+    {
+        let document = station_document();
         let directory =
             std::env::temp_dir().join(format!("oxrad-station-cache-test-{}", std::process::id()));
         fs::create_dir(&directory).map_err(|source| StationError::CacheWrite {

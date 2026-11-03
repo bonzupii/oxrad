@@ -508,11 +508,13 @@ mod tests {
     }
 
     #[test]
-    fn live_active_warning_feed_parses() -> Result<(), TestError> {
-        let set = fetch()?;
+    fn a_warning_collection_parses_without_a_provider_request() -> Result<(), TestError> {
+        let set = parse_collection(&json!({
+            "features": [warning_feature(Value::Null)]
+        }))?;
         assert!(
             set.warnings.iter().all(|warning| !warning.event.is_empty()),
-            "the live feed returned an empty event name"
+            "a parsed warning has an empty event name"
         );
         Ok(())
     }

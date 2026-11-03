@@ -688,6 +688,38 @@ mod tests {
 
     use crate::test_support::TestError;
 
+    fn forecast_document(timezone: &str) -> Value {
+        serde_json::json!({
+            "timezone": timezone,
+            "timezone_abbreviation": "CDT",
+            "current_units": {
+                "temperature_2m": "°C", "apparent_temperature": "°C",
+                "wind_speed_10m": "km/h", "precipitation": "mm"
+            },
+            "hourly_units": {"temperature_2m": "°C", "wind_speed_10m": "km/h"},
+            "daily_units": {
+                "temperature_2m_max": "°C", "temperature_2m_min": "°C"
+            },
+            "current": {
+                "time": "2026-11-03T12:00", "temperature_2m": 18.0,
+                "apparent_temperature": 17.0, "relative_humidity_2m": 71.0,
+                "precipitation": 0.2, "weather_code": 3,
+                "wind_speed_10m": 21.0, "wind_direction_10m": 180.0
+            },
+            "hourly": {
+                "time": ["2026-11-03T12:00", "2026-11-03T13:00"],
+                "temperature_2m": [18.0, 19.0], "wind_speed_10m": [21.0, 23.0],
+                "weather_code": [3, 61], "precipitation_probability": [30, null]
+            },
+            "daily": {
+                "time": ["2026-11-03", "2026-11-04"],
+                "temperature_2m_max": [21.0, 19.0],
+                "temperature_2m_min": [11.0, 8.0], "weather_code": [3, 61],
+                "precipitation_probability_max": [30, 60]
+            }
+        })
+    }
+
     fn emporia() -> Result<Place, TestError> {
         Ok(Place::new(
             "Emporia",
@@ -800,11 +832,10 @@ mod tests {
         ));
     }
 
-    /// Exercises the real global provider with the searched town's coordinates.
     #[test]
-    fn the_live_forecast_belongs_to_the_searched_town() -> Result<(), TestError> {
+    fn a_parsed_forecast_keeps_its_requested_location_and_time_metadata() -> Result<(), TestError> {
         let place = emporia()?;
-        let forecast = fetch(&place)?;
+        let forecast = parse_document(&place, &forecast_document("America/Chicago"))?;
         assert_eq!(forecast.place, place, "the forecast carries its place");
         assert_eq!(forecast.provider, "Open-Meteo");
         assert!(
@@ -836,12 +867,12 @@ mod tests {
         Ok(())
     }
 
-    /// The same provider serves places outside the United States.
     #[test]
-    fn a_non_united_states_place_gets_a_live_forecast() -> Result<(), TestError> {
+    fn a_parsed_forecast_supports_a_place_outside_the_united_states() -> Result<(), TestError> {
         let place = Place::new("Dublin", "Leinster", "Ireland", "ie", 53.349_8, -6.260_3)?;
-        let forecast = fetch(&place)?;
+        let forecast = parse_document(&place, &forecast_document("Europe/Dublin"))?;
         assert_eq!(forecast.provider, "Open-Meteo");
+        assert_eq!(forecast.timezone, "Europe/Dublin");
         assert!(
             !forecast.daily.is_empty(),
             "Dublin received no daily periods"

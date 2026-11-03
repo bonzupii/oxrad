@@ -181,6 +181,6 @@ cargo build
 cargo build --release --locked
 ```
 
-`cargo test` includes live network tests. A network failure fails the suite.
+`cargo test` uses generated provider responses and does not require live network access.
 
 Copyright (C) 2026 Micah Ostrow <bonzupii@protonmail.com>. GPLv3.

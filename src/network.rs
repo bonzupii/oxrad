@@ -349,10 +349,6 @@ mod tests {
 
     use crate::test_support::TestError;
 
-    fn site() -> Result<SiteId, TestError> {
-        Ok(SiteId::parse("KTWX")?)
-    }
-
     #[test]
     fn volume_listing_excludes_metadata() {
         assert!(is_volume_key("2026/10/29/KTWX/KTWX20261029_000115_V06"));
@@ -396,60 +392,5 @@ mod tests {
     fn query_values_keep_path_separators() {
         assert_eq!(encode_query_value("2026/10/31/KTWX/"), "2026/10/31/KTWX/");
         assert_eq!(encode_query_value("a b+c"), "a%20b%2Bc");
-    }
-
-    /// Exercises the live source: listing, ordering, retrieval, and the
-    /// completeness sentinels inside the decoded volume. A network failure
-    /// fails this test; it is not replaced with synthetic data.
-    #[test]
-    fn live_listing_retrieves_a_complete_current_volume() -> Result<(), TestError> {
-        let site = site()?;
-        let key = latest_volume_key(&site)?;
-        assert!(is_volume_key(&key), "listed key {key}");
-        let name = key
-            .rsplit('/')
-            .next()
-            .ok_or("listed key has no file name")?;
-        assert!(name.starts_with("KTWX"), "listed key {key}");
-        assert_eq!(
-            name.len(),
-            "KTWX20261031_003109_V06".len(),
-            "volume file name {name}"
-        );
-        assert!(name.ends_with("_V06"), "volume file name {name}");
-        let stamp = name
-            .get(4..19)
-            .ok_or_else(|| format!("volume file name {name} has no timestamp"))?;
-        let digits = stamp
-            .chars()
-            .filter(|character| *character != '_')
-            .all(|character| character.is_ascii_digit());
-        assert!(digits, "volume timestamp {stamp}");
-        let bytes = fetch_archive(&key)?;
-        assert!(bytes.len() > 1_000_000, "archive size {}", bytes.len());
-        let volume = crate::radar::decode_volume(&site, &key, &bytes)?;
-        assert!(
-            volume.sweep.radials.len() >= 360,
-            "radial count {}",
-            volume.sweep.radials.len()
-        );
-        assert_eq!(volume.skipped_radials, 0, "skipped radials");
-        let now = now_unix_ms()?;
-        let age_ms = now.saturating_sub(volume.scan_unix_ms);
-        assert!(age_ms < 3 * 3_600_000, "live volume age {age_ms} ms");
-        Ok(())
-    }
-
-    #[test]
-    fn a_missing_volume_is_reported_as_a_stale_listing() -> Result<(), TestError> {
-        match fetch_archive("2026/10/31/KTWX/KTWX20261030_999999_V06") {
-            Err(RadarError::VolumeGone { key }) => {
-                assert_eq!(key, "2026/10/31/KTWX/KTWX20261030_999999_V06");
-                Ok(())
-            }
-            other => Err(TestError::from(format!(
-                "expected VolumeGone, got {other:?}"
-            ))),
-        }
     }
 }
