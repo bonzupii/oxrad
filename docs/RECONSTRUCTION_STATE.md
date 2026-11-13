@@ -51,7 +51,7 @@ States: not started, in progress, verified, blocked.
 | A24 | GUI workflows run and visually inspected | blocked | no display; `.tools/root` absent |
 | A25 | Settings and acquired data persist across restarts | not started | |
 | A26 | Documentation reflects actual behavior, no stale AI document as authority | not started | |
-| A27 | Implementation committed and pushed to the managed development branch | in progress | branch `freebuff/9adade3717017f6ce0f6c608` |
+| A27 | Implementation committed and pushed to the managed development branch | verified | `238b1fb` and `849e2d3` pushed to `freebuff/9adade3717017f6ce0f6c608` |
 
 ## Pass log
 
@@ -61,6 +61,8 @@ States: not started, in progress, verified, blocked.
 - Baseline gates: `cargo check --all-targets` green in 22.57s, `cargo fmt --all -- --check` green, `cargo test --all-targets` 467 passed and 0 failed, `cargo build` green.
 - `cargo clippy -- -D warnings` failed at HEAD on three `map(...).unwrap_or_default()` sites in `src/gauge.rs` and `src/radar.rs`. Replaced with `map_or_default`, which returns the same value without the defaulting call STYLE.md prohibits. The gate exits 0.
 - Recorded gate gap: `cargo clippy --all-targets` reports 280 errors, all `panic_in_result_fn` from `assert_eq!` inside tests that return `Result`. The documented gate excludes test targets, so they never block a run. Next action: choose between tests that return `Result` with assertions and tests that do not return `Result`, then extend the gate to test targets.
+- Release build: `cargo build --release --locked` green in 120s, binary at `target/release/oxrad`.
+- Committed `238b1fb` and `849e2d3` and pushed to `freebuff/9adade3717017f6ce0f6c608`. The `dev` branch was not modified.
 
 ## Known gate gaps
 
