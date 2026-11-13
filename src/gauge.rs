@@ -396,14 +396,13 @@ fn reading_of(entry: &Map<String, Value>) -> Option<Reading> {
     let qualifiers: Vec<String> = last
         .get("qualifiers")
         .and_then(Value::as_array)
-        .map(|codes| {
+        .map_or_default(|codes| {
             codes
                 .iter()
                 .filter_map(Value::as_str)
                 .map(String::from)
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     let provisional = qualifiers.iter().any(|qualifier| qualifier == "P");
     Some(Reading {
         value,
@@ -552,14 +551,13 @@ fn readings_of(entry: &Map<String, Value>) -> Vec<Reading> {
         let qualifiers: Vec<String> = value
             .get("qualifiers")
             .and_then(Value::as_array)
-            .map(|codes| {
+            .map_or_default(|codes| {
                 codes
                     .iter()
                     .filter_map(Value::as_str)
                     .map(String::from)
                     .collect()
-            })
-            .unwrap_or_default();
+            });
         let provisional = qualifiers.iter().any(|qualifier| qualifier == "P");
         readings.push(Reading {
             value: number,

@@ -248,8 +248,7 @@ impl RadarVolume {
                 .sweeps
                 .iter()
                 .find(|sweep| sweep.elevation_number == lowest)
-                .map(|sweep| vec![(lowest, sweep.elevation_deg, false)])
-                .unwrap_or_default();
+                .map_or_default(|sweep| vec![(lowest, sweep.elevation_deg, false)]);
         }
         let mut options: Vec<(u8, f64, bool)> = self
             .sweeps
