@@ -344,7 +344,7 @@ pub fn discover(acquire: &Acquire) -> Result<Served<Vec<Station>>, StationError>
 }
 
 pub enum StationOutcome {
-    Ready(Served<Vec<Station>>),
+    Ready(Box<Served<Vec<Station>>>),
     Failed(StationError),
 }
 
@@ -361,7 +361,7 @@ impl StationFeed {
         // has stopped is reported as a stopped feed.
         let stopped = feed
             .request(|acquire| match discover(acquire) {
-                Ok(discovery) => StationOutcome::Ready(discovery),
+                Ok(discovery) => StationOutcome::Ready(Box::new(discovery)),
                 Err(error) => StationOutcome::Failed(error),
             })
             .is_err();

@@ -29,8 +29,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
-use crate::acquire::Transport;
-use crate::cache::{CacheError, Store};
+use sha2::{Digest, Sha256};
+
+use crate::acquire::{
+    CancelToken, Checksum, TransferFailure, TransferRequest, TransferResponse, Transport,
+};
+use crate::cache::{CacheError, Store, Validators};
 use crate::config::EnabledProviders;
 use crate::provider::FetchError;
 use crate::retry;
@@ -60,6 +64,9 @@ pub(crate) struct RequestSpec {
     /// A cache lifetime override. `None` uses the registry refresh cadence.
     pub(crate) ttl: Option<Duration>,
     pub(crate) store: bool,
+    /// Whether the response has no meaning without a declared whole length or
+    /// a checksum, as for a radar archive or an image.
+    pub(crate) verify_whole: bool,
 }
 
 impl RequestSpec {
@@ -82,6 +89,8 @@ impl RequestSpec {
             scan_unix_ms: None,
             ttl: None,
             store: true,
+            verify_whole: matches!(accept, "application/octet-stream" | "application/zip")
+                || accept.starts_with("image/"),
         }
     }
 
@@ -158,20 +167,35 @@ impl RequestSpec {
     }
 }
 
-/// Where a served body came from.
+/// Where a served body came from and how fresh it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CacheState {
+    /// Fetched over the network and stored when storage was available.
     Network,
+    /// Served from a fresh cache entry without a request.
     Cached,
+    /// Served from cache after the origin answered 304.
+    Refreshed,
+    /// Served from cache after revalidation or a refetch failed.
+    Stale,
+    /// The cache is being checked or refreshed; a display-only state.
+    Refreshing,
+    /// The caller asked for no storage.
     NotStored,
+    /// Storage was requested but is not available or failed.
+    Unavailable,
 }
 
 impl CacheState {
     pub(crate) const fn label(self) -> &'static str {
         match self {
-            Self::Network => "network",
-            Self::Cached => "cache",
+            Self::Network => "live",
+            Self::Cached => "cached",
+            Self::Refreshed => "refreshed",
+            Self::Stale => "stale",
+            Self::Refreshing => "refreshing",
             Self::NotStored => "not stored",
+            Self::Unavailable => "unavailable",
         }
     }
 }
@@ -369,6 +393,7 @@ pub(crate) struct Record {
     pub(crate) cache: CacheState,
     pub(crate) attempts: u32,
     pub(crate) bytes: usize,
+    pub(crate) resumed_from: u64,
     pub(crate) served_at_unix_ms: Option<u64>,
     pub(crate) age_ms: Option<u64>,
 }
@@ -392,6 +417,7 @@ impl Record {
             "age_ms": self.age_ms,
             "attempts": self.attempts,
             "bytes": self.bytes,
+            "resumed_from": self.resumed_from,
             "served_at_unix_ms": self.served_at_unix_ms,
             "rate_limit_seconds": self.provenance.rate_limit_seconds,
         })
@@ -502,6 +528,7 @@ impl EngineState {
 pub(crate) enum Command {
     Fetch {
         spec: RequestSpec,
+        cancel: CancelToken,
         reply: Sender<Result<Fetched, FetchError>>,
     },
     Report(Sender<Value>),
@@ -515,11 +542,43 @@ pub(crate) enum Command {
 
 /// A non-blocking snapshot of the engine, published after every command so a
 /// drawing thread never waits on a request in flight.
+/// What a transfer is doing right now, published before it completes.
+#[derive(Debug, Clone)]
+pub(crate) struct ActiveTransfer {
+    pub(crate) subject: String,
+    pub(crate) cache: CacheState,
+    pub(crate) received: u64,
+    pub(crate) total: Option<u64>,
+    pub(crate) resumed_from: u64,
+}
+
+impl ActiveTransfer {
+    pub(crate) fn describe(&self) -> String {
+        let total = self
+            .total
+            .map_or_else(String::new, |total| format!(" / {total}"));
+        let resumed = if self.resumed_from > 0 {
+            format!(" · resumed from {}", self.resumed_from)
+        } else {
+            String::new()
+        };
+        format!(
+            "{} · {} · {}{}{}",
+            self.subject,
+            self.cache.label(),
+            self.received,
+            total,
+            resumed
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Status {
     pub(crate) requests: usize,
     pub(crate) summary: Option<String>,
     pub(crate) cache_error: Option<String>,
+    pub(crate) active: Option<ActiveTransfer>,
 }
 
 /// The receiving end of the engine's status snapshots.
@@ -557,8 +616,12 @@ pub(crate) fn serve(
     publish(updates, &state);
     while let Ok(command) = receiver.recv() {
         match command {
-            Command::Fetch { spec, reply } => {
-                let result = state.fetch(&spec, enabled, transport);
+            Command::Fetch {
+                spec,
+                cancel,
+                reply,
+            } => {
+                let result = state.fetch(&spec, enabled, transport, &cancel, updates);
                 if reply.send(result).is_err() {
                     return;
                 }
@@ -597,6 +660,7 @@ fn publish(updates: Option<&Sender<Status>>, state: &EngineState) {
             requests: state.records.len(),
             summary: state.summary(),
             cache_error: state.cache_error.clone(),
+            active: None,
         })
         .is_err()
     {}
@@ -608,11 +672,19 @@ impl EngineState {
         spec: &RequestSpec,
         enabled: &EnabledProviders,
         transport: &Transport,
+        cancel: &CancelToken,
+        updates: Option<&Sender<Status>>,
     ) -> Result<Fetched, FetchError> {
+        let requests = self.records.len();
+        let mut progress = |update: TransferProgress| {
+            publish_progress(updates, requests, spec, update);
+        };
         execute(
             self,
-            |url| transport.get(enabled, spec.source, url, spec.accept),
+            |mut request| transport.get(enabled, spec.source, &mut request),
             spec,
+            cancel,
+            &mut progress,
         )
     }
 
@@ -621,12 +693,18 @@ impl EngineState {
             let age = record.age_ms.map_or_else(String::new, |millis| {
                 format!(" · cached {:.1} s ago", millis as f64 / 1000.0)
             });
+            let resumed = if record.resumed_from > 0 {
+                format!(" · resumed from {}", record.resumed_from)
+            } else {
+                String::new()
+            };
             format!(
-                "{} · {} · {}{} · {} attempt{} · {}",
+                "{} · {} · {}{}{} · {} attempt{} · {}",
                 record.provenance.subject,
                 record.provenance.source_name,
                 record.cache.label(),
                 age,
+                resumed,
                 record.attempts,
                 if record.attempts == 1 { "" } else { "s" },
                 record.provenance.credit
@@ -647,6 +725,7 @@ impl EngineState {
 /// A body read from the store, with the age the engine needs for its TTL.
 pub(crate) struct Aged {
     pub(crate) body: Vec<u8>,
+    pub(crate) validators: Validators,
     pub(crate) age: Duration,
 }
 
@@ -659,6 +738,7 @@ pub(crate) fn load_aged(store: &Store, key: &str) -> Result<Option<Aged>, CacheE
     let age_ms = now.saturating_sub(entry.fetched_at_unix_ms);
     Ok(Some(Aged {
         body: entry.body,
+        validators: entry.validators,
         age: Duration::from_millis(age_ms),
     }))
 }
@@ -697,6 +777,42 @@ pub(crate) fn backoff(error: &FetchError, attempt: u32, seed: u64) -> Option<Dur
     Some(base.saturating_add(Duration::from_millis(spread)))
 }
 
+/// One progress observation while a transfer is running.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TransferProgress {
+    pub(crate) state: CacheState,
+    pub(crate) received: u64,
+    pub(crate) total: Option<u64>,
+    pub(crate) resumed_from: u64,
+}
+
+fn publish_progress(
+    updates: Option<&Sender<Status>>,
+    requests: usize,
+    spec: &RequestSpec,
+    update: TransferProgress,
+) {
+    let Some(updates) = updates else {
+        return;
+    };
+    let active = ActiveTransfer {
+        subject: spec.subject.clone(),
+        cache: update.state,
+        received: update.received,
+        total: update.total,
+        resumed_from: update.resumed_from,
+    };
+    if updates
+        .send(Status {
+            requests,
+            summary: Some(active.describe()),
+            cache_error: None,
+            active: Some(active),
+        })
+        .is_err()
+    {}
+}
+
 /// Records one served request.
 fn observe(
     state: &mut EngineState,
@@ -704,6 +820,7 @@ fn observe(
     cache: CacheState,
     attempts: u32,
     bytes: usize,
+    resumed_from: u64,
     age: Option<Duration>,
 ) {
     let age_ms = age.and_then(|value| u64::try_from(value.as_millis()).ok());
@@ -714,6 +831,7 @@ fn observe(
             cache,
             attempts,
             bytes,
+            resumed_from,
             served_at_unix_ms: now_unix_ms().ok(),
             age_ms,
         },
@@ -721,86 +839,452 @@ fn observe(
 }
 
 /// Stores a body, reporting a cache failure without replacing live bytes.
-fn store_body(state: &mut EngineState, spec: &RequestSpec, body: &[u8]) -> CacheState {
+fn store_body(
+    state: &mut EngineState,
+    spec: &RequestSpec,
+    body: &[u8],
+    validators: &Validators,
+) -> CacheState {
     if !spec.store {
         return CacheState::NotStored;
     }
     let Some(store) = state.store() else {
-        return CacheState::NotStored;
+        return CacheState::Unavailable;
     };
-    match store.store(&spec.key, body) {
+    match store.store_with(&spec.key, body, validators) {
         Ok(()) => CacheState::Network,
         Err(error) => {
             state.note_cache_error(&error);
-            CacheState::NotStored
+            CacheState::Unavailable
         }
     }
 }
 
-/// Serves a cached body when it is younger than the source's cache lifetime.
-fn cached(state: &mut EngineState, spec: &RequestSpec) -> Option<Fetched> {
+/// Reads a cached entry, removing one that failed integrity checking.
+fn cached_entry(state: &mut EngineState, spec: &RequestSpec) -> Option<Aged> {
     if !spec.store {
         return None;
     }
     let store = state.store()?;
     match load_aged(&store, &spec.key) {
-        Ok(Some(aged)) if aged.age < spec.cache_ttl() => {
-            let bytes = aged.body.len();
-            observe(state, spec, CacheState::Cached, 0, bytes, Some(aged.age));
-            Some(Fetched {
-                body: aged.body,
-                provenance: spec.provenance(),
-                cache: CacheState::Cached,
-            })
-        }
-        Ok(Some(_)) | Ok(None) => None,
+        Ok(entry) => entry,
         Err(error) => {
             state.note_cache_error(&error);
+            if let Err(remove) = store.remove(&spec.key) {
+                state.note_cache_error(&remove);
+            }
             None
         }
     }
 }
 
-/// Runs one request to a body: cache first, then paced network attempts.
-pub(crate) fn execute(
-    state: &mut EngineState,
-    fetch: impl Fn(&str) -> Result<Vec<u8>, FetchError>,
-    spec: &RequestSpec,
-) -> Result<Fetched, FetchError> {
-    if let Some(hit) = cached(state, spec) {
-        return Ok(hit);
+fn validators_from(aged: Option<&Aged>) -> Validators {
+    aged.map_or_else(Validators::default, |entry| entry.validators.clone())
+}
+
+fn checksum_matches(body: &[u8], checksum: &Checksum) -> bool {
+    let digest = Sha256::digest(body);
+    digest.as_slice() == checksum.digest()
+}
+
+fn sleep_or_cancel(delay: Duration, cancel: &CancelToken) -> bool {
+    let mut remaining = delay;
+    while !remaining.is_zero() {
+        if cancel.is_cancelled() {
+            return false;
+        }
+        let step = remaining.min(Duration::from_millis(100));
+        std::thread::sleep(step);
+        remaining = remaining.saturating_sub(step);
     }
+    !cancel.is_cancelled()
+}
+
+/// Runs one request to a body: cache first, conditional revalidation, resumable
+/// binary attempts, and a stale fallback only when the cache holds a whole body.
+pub(crate) fn execute<F>(
+    state: &mut EngineState,
+    fetch: F,
+    spec: &RequestSpec,
+    cancel: &CancelToken,
+    progress: &mut dyn FnMut(TransferProgress),
+) -> Result<Fetched, FetchError>
+where
+    F: for<'a> Fn(TransferRequest<'a>) -> Result<TransferResponse, TransferFailure>,
+{
+    let mut entry = cached_entry(state, spec);
+    if let Some(aged) = &entry
+        && aged.age < spec.cache_ttl()
+    {
+        let bytes = aged.body.len();
+        observe(state, spec, CacheState::Cached, 0, bytes, 0, Some(aged.age));
+        let value = entry.take().ok_or(FetchError::WorkerStopped)?;
+        return Ok(Fetched {
+            body: value.body,
+            provenance: spec.provenance(),
+            cache: CacheState::Cached,
+        });
+    }
+    let mut run = TransferRun::new(validators_from(entry.as_ref()));
     let mut attempt = 0_u32;
     loop {
+        if cancel.is_cancelled() {
+            observe(state, spec, CacheState::Unavailable, attempt, 0, 0, None);
+            return Err(FetchError::Cancelled);
+        }
         attempt = attempt.saturating_add(1);
         let wait = state.pace(spec.source);
-        if !wait.is_zero() {
-            std::thread::sleep(wait);
+        if !wait.is_zero() && !sleep_or_cancel(wait, cancel) {
+            observe(state, spec, CacheState::Unavailable, attempt, 0, 0, None);
+            return Err(FetchError::Cancelled);
         }
-        match fetch(&spec.url) {
-            Ok(body) => {
-                let cache = store_body(state, spec, &body);
-                observe(state, spec, cache, attempt, body.len(), None);
-                return Ok(Fetched {
-                    body,
-                    provenance: spec.provenance(),
-                    cache,
-                });
+        let offset = run.offset();
+        let state_label = if entry.is_some() && run.body.is_empty() {
+            CacheState::Refreshing
+        } else {
+            CacheState::Network
+        };
+        progress(TransferProgress {
+            state: state_label,
+            received: offset,
+            total: run.total,
+            resumed_from: run.resumed_from,
+        });
+        let mut on_read = |chunk: u64| {
+            progress(TransferProgress {
+                state: state_label,
+                received: offset.saturating_add(chunk),
+                total: run.total,
+                resumed_from: run.resumed_from,
+            });
+        };
+        let request = TransferRequest {
+            url: &spec.url,
+            accept: spec.accept,
+            etag: run.etag(),
+            last_modified: run.last_modified(),
+            offset,
+            cancel,
+            on_read: &mut on_read,
+        };
+        match fetch(request) {
+            Ok(response) if response.status == 304 => {
+                return serve_revalidated(state, spec, entry, response, attempt);
             }
-            Err(error) => {
-                if let Some(delay) = backoff(&error, attempt, jitter_seed(&spec.key)) {
-                    #[cfg(test)]
-                    if state.immediate_retries {
-                        continue;
-                    }
-                    std::thread::sleep(delay);
-                    continue;
+            Ok(response) => return finish_transfer(state, spec, &mut run, response, attempt),
+            Err(failure) => {
+                if let Some(fetched) =
+                    handle_failure(state, spec, &mut run, &mut entry, failure, attempt, cancel)?
+                {
+                    return Ok(fetched);
                 }
-                observe(state, spec, CacheState::NotStored, attempt, 0, None);
-                return Err(error);
             }
         }
     }
+}
+
+struct TransferRun {
+    body: Vec<u8>,
+    total: Option<u64>,
+    checksum: Option<Checksum>,
+    range_supported: bool,
+    resumed_from: u64,
+    validators: Validators,
+}
+
+impl TransferRun {
+    const fn new(validators: Validators) -> Self {
+        Self {
+            body: Vec::new(),
+            total: None,
+            checksum: None,
+            range_supported: false,
+            resumed_from: 0,
+            validators,
+        }
+    }
+
+    fn offset(&mut self) -> u64 {
+        if !self.range_supported {
+            return 0;
+        }
+        let offset = u64::try_from(self.body.len()).unwrap_or(u64::MAX);
+        if offset > 0 && self.resumed_from == 0 {
+            self.resumed_from = offset;
+        }
+        offset
+    }
+
+    fn etag(&self) -> Option<&str> {
+        if self.body.is_empty() {
+            self.validators.etag.as_deref()
+        } else {
+            None
+        }
+    }
+
+    fn last_modified(&self) -> Option<&str> {
+        if self.body.is_empty() {
+            self.validators.last_modified.as_deref()
+        } else {
+            None
+        }
+    }
+
+    fn absorb(&mut self, failure: &TransferFailure) {
+        self.range_supported = self.range_supported || failure.accept_ranges;
+        self.total = failure.total_length.or(self.total);
+        self.checksum = failure.checksum.clone().or_else(|| self.checksum.clone());
+        if self.range_supported && !failure.partial.is_empty() {
+            self.body.extend_from_slice(&failure.partial);
+        } else if !self.range_supported {
+            self.body.clear();
+        }
+    }
+}
+
+fn serve_revalidated(
+    state: &mut EngineState,
+    spec: &RequestSpec,
+    entry: Option<Aged>,
+    response: TransferResponse,
+    attempt: u32,
+) -> Result<Fetched, FetchError> {
+    let Some(cached) = entry else {
+        observe(state, spec, CacheState::Unavailable, attempt, 0, 0, None);
+        return Err(FetchError::Integrity {
+            url: spec.url.clone(),
+            detail: "the origin answered 304 without a cached body",
+        });
+    };
+    let refreshed = Validators {
+        etag: response.etag.or(cached.validators.etag),
+        last_modified: response.last_modified.or(cached.validators.last_modified),
+    };
+    let cache = state.store().map_or(CacheState::Unavailable, |store| {
+        match store.revalidated(&spec.key, &refreshed) {
+            Ok(true) => CacheState::Refreshed,
+            Ok(false) => {
+                state.note_cache_error(&CacheError::Corrupt {
+                    key: spec.key.clone(),
+                    detail: "revalidation found no metadata",
+                });
+                CacheState::Cached
+            }
+            Err(error) => {
+                state.note_cache_error(&error);
+                CacheState::Cached
+            }
+        }
+    });
+    let bytes = cached.body.len();
+    observe(state, spec, cache, attempt, bytes, 0, Some(Duration::ZERO));
+    Ok(Fetched {
+        body: cached.body,
+        provenance: spec.provenance(),
+        cache,
+    })
+}
+
+fn finish_transfer(
+    state: &mut EngineState,
+    spec: &RequestSpec,
+    run: &mut TransferRun,
+    response: TransferResponse,
+    attempt: u32,
+) -> Result<Fetched, FetchError> {
+    let resumed_response = response.status == 206;
+    if resumed_response {
+        if response.range_start != Some(run.offset()) {
+            observe(
+                state,
+                spec,
+                CacheState::Unavailable,
+                attempt,
+                run.body.len(),
+                run.resumed_from,
+                None,
+            );
+            return Err(FetchError::Range {
+                url: spec.url.clone(),
+                detail: "the resumed response does not start at the requested offset",
+            });
+        }
+        if let (Some(known), Some(observed)) = (run.total, response.total_length)
+            && known != observed
+        {
+            observe(
+                state,
+                spec,
+                CacheState::Unavailable,
+                attempt,
+                run.body.len(),
+                run.resumed_from,
+                None,
+            );
+            return Err(FetchError::Range {
+                url: spec.url.clone(),
+                detail: "the resumed response declares a different total length",
+            });
+        }
+        run.body.extend_from_slice(&response.body);
+        run.total = response.total_length.or(run.total);
+        run.checksum = response.checksum.clone().or_else(|| run.checksum.clone());
+    } else {
+        run.body = response.body;
+        run.resumed_from = 0;
+        run.total = response.total_length;
+        run.checksum = response.checksum.clone();
+    }
+    verify_run(state, spec, run, attempt)?;
+    let stored = if resumed_response {
+        Validators {
+            etag: response.etag.or_else(|| run.validators.etag.clone()),
+            last_modified: response
+                .last_modified
+                .or_else(|| run.validators.last_modified.clone()),
+        }
+    } else {
+        Validators {
+            etag: response.etag,
+            last_modified: response.last_modified,
+        }
+    };
+    let cache = store_body(state, spec, &run.body, &stored);
+    observe(
+        state,
+        spec,
+        cache,
+        attempt,
+        run.body.len(),
+        run.resumed_from,
+        None,
+    );
+    Ok(Fetched {
+        body: std::mem::take(&mut run.body),
+        provenance: spec.provenance(),
+        cache,
+    })
+}
+
+fn verify_run(
+    state: &mut EngineState,
+    spec: &RequestSpec,
+    run: &TransferRun,
+    attempt: u32,
+) -> Result<(), FetchError> {
+    let fail = |detail: &'static str| FetchError::Integrity {
+        url: spec.url.clone(),
+        detail,
+    };
+    if spec.verify_whole && run.total.is_none() && run.checksum.is_none() {
+        observe(
+            state,
+            spec,
+            CacheState::Unavailable,
+            attempt,
+            run.body.len(),
+            run.resumed_from,
+            None,
+        );
+        return Err(fail(
+            "a binary response needs a declared length or a checksum",
+        ));
+    }
+    if let Some(expected) = run.total
+        && run.body.len() as u64 != expected
+    {
+        observe(
+            state,
+            spec,
+            CacheState::Unavailable,
+            attempt,
+            run.body.len(),
+            run.resumed_from,
+            None,
+        );
+        return Err(fail(
+            "the assembled body length does not match the declared length",
+        ));
+    }
+    if let Some(expected) = &run.checksum
+        && !checksum_matches(&run.body, expected)
+    {
+        observe(
+            state,
+            spec,
+            CacheState::Unavailable,
+            attempt,
+            run.body.len(),
+            run.resumed_from,
+            None,
+        );
+        return Err(fail(
+            "the assembled body checksum does not match the origin",
+        ));
+    }
+    Ok(())
+}
+
+fn handle_failure(
+    state: &mut EngineState,
+    spec: &RequestSpec,
+    run: &mut TransferRun,
+    entry: &mut Option<Aged>,
+    failure: TransferFailure,
+    attempt: u32,
+    cancel: &CancelToken,
+) -> Result<Option<Fetched>, FetchError> {
+    if matches!(failure.error.as_ref(), FetchError::Cancelled) || cancel.is_cancelled() {
+        observe(
+            state,
+            spec,
+            CacheState::Unavailable,
+            attempt,
+            run.body.len(),
+            run.resumed_from,
+            None,
+        );
+        return Err(FetchError::Cancelled);
+    }
+    run.absorb(&failure);
+    if let Some(delay) = backoff(&failure.error, attempt, jitter_seed(&spec.key)) {
+        #[cfg(test)]
+        if state.immediate_retries {
+            return Ok(None);
+        }
+        if !sleep_or_cancel(delay, cancel) {
+            observe(
+                state,
+                spec,
+                CacheState::Unavailable,
+                attempt,
+                run.body.len(),
+                run.resumed_from,
+                None,
+            );
+            return Err(FetchError::Cancelled);
+        }
+        return Ok(None);
+    }
+    if failure.error.is_transient()
+        && let Some(cached) = entry.take()
+    {
+        let bytes = cached.body.len();
+        observe(state, spec, CacheState::Stale, attempt, bytes, 0, None);
+        return Ok(Some(Fetched {
+            body: cached.body,
+            provenance: spec.provenance(),
+            cache: CacheState::Stale,
+        }));
+    }
+    let cache = if spec.store {
+        CacheState::Unavailable
+    } else {
+        CacheState::NotStored
+    };
+    observe(state, spec, cache, attempt, 0, run.resumed_from, None);
+    Err(*failure.error)
 }
 
 const fn template_error(
@@ -909,6 +1393,57 @@ mod tests {
         )
     }
 
+    fn response(body: &[u8]) -> TransferResponse {
+        TransferResponse {
+            status: 200,
+            body: body.to_vec(),
+            etag: None,
+            last_modified: None,
+            total_length: Some(body.len() as u64),
+            range_start: None,
+            checksum: None,
+        }
+    }
+
+    fn failure(error: FetchError) -> TransferFailure {
+        TransferFailure {
+            error: Box::new(error),
+            partial: Vec::new(),
+            accept_ranges: false,
+            total_length: None,
+            checksum: None,
+        }
+    }
+
+    fn run<F>(state: &mut EngineState, fetch: F, spec: &RequestSpec) -> Result<Fetched, FetchError>
+    where
+        F: for<'a> Fn(TransferRequest<'a>) -> Result<TransferResponse, TransferFailure>,
+    {
+        let cancel = CancelToken::new();
+        execute(state, fetch, spec, &cancel, &mut |_update| {})
+    }
+
+    #[test]
+    fn cache_states_have_distinct_reader_labels() {
+        let labels = [
+            CacheState::Network.label(),
+            CacheState::Cached.label(),
+            CacheState::Refreshed.label(),
+            CacheState::Stale.label(),
+            CacheState::Refreshing.label(),
+            CacheState::Unavailable.label(),
+        ];
+        assert_eq!(labels[0], "live");
+        for (index, label) in labels.iter().enumerate() {
+            assert!(
+                labels
+                    .iter()
+                    .enumerate()
+                    .all(|(other, candidate)| other == index || candidate != label)
+            );
+        }
+    }
+
     #[test]
     fn a_status_snapshot_is_kept_between_frames() -> Result<(), TestError> {
         let (sender, receiver) = channel();
@@ -918,6 +1453,7 @@ mod tests {
                 requests: 2,
                 summary: Some(String::from("2 requests")),
                 cache_error: None,
+                active: None,
             })
             .map_err(|_| TestError::from("the status channel closed"))?;
         assert_eq!(status.latest().map(|snapshot| snapshot.requests), Some(2));
@@ -942,14 +1478,14 @@ mod tests {
     fn a_transient_failure_is_retried_until_a_body_arrives() -> Result<(), FetchError> {
         let mut state = EngineState::test_with_store(temporary_store("retry"));
         let calls = AtomicU32::new(0);
-        let fetched = execute(
+        let fetched = run(
             &mut state,
-            |_url| {
+            |_request| {
                 let attempt = calls.fetch_add(1, Ordering::SeqCst);
                 if attempt < 2 {
-                    Err(status(503))
+                    Err(failure(status(503)))
                 } else {
-                    Ok(br#"{"ok":true}"#.to_vec())
+                    Ok(response(br#"{"ok":true}"#))
                 }
             },
             &spec().without_store(),
@@ -968,13 +1504,13 @@ mod tests {
     fn a_fresh_cache_entry_is_served_without_a_second_request() -> Result<(), FetchError> {
         let mut state = EngineState::test_with_store(temporary_store("cache"));
         let calls = AtomicU32::new(0);
-        let fetch = |_url: &str| {
+        let fetch = |_request: TransferRequest<'_>| {
             calls.fetch_add(1, Ordering::SeqCst);
-            Ok(br#"{"value":7}"#.to_vec())
+            Ok(response(br#"{"value":7}"#))
         };
-        let first = execute(&mut state, fetch, &spec())?;
+        let first = run(&mut state, fetch, &spec())?;
         assert_eq!(first.cache, CacheState::Network);
-        let second = execute(&mut state, fetch, &spec())?;
+        let second = run(&mut state, fetch, &spec())?;
         assert_eq!(second.cache, CacheState::Cached);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         Ok(())
@@ -988,7 +1524,7 @@ mod tests {
             .product("reflectivity")
             .scan(1_793_600_000_000)
             .without_store();
-        execute(&mut state, |_url| Ok(b"{}".to_vec()), &request)?;
+        run(&mut state, |_request| Ok(response(b"{}")), &request)?;
         let report = state.provenance_json();
         let entry = &report["requests"][0];
         assert_eq!(entry["source"], "nifc-wfigs");
@@ -1016,14 +1552,473 @@ mod tests {
     #[test]
     fn a_served_request_reports_its_credit_in_the_status_summary() -> Result<(), FetchError> {
         let mut state = EngineState::test_with_store(temporary_store("summary"));
-        execute(
+        run(
             &mut state,
-            |_url| Ok(b"{}".to_vec()),
+            |_request| Ok(response(b"{}")),
             &spec().without_store(),
         )?;
         let summary = state.summary().ok_or(FetchError::WorkerStopped)?;
         assert!(summary.contains(sources::NIFC_WFIGS.credit));
         assert!(summary.contains("1 attempt"));
+        Ok(())
+    }
+
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    use crate::acquire::{MAX_BINARY_BYTES, MAX_DOCUMENT_BYTES, TransferPolicy, live_get};
+
+    fn read_request(stream: &mut TcpStream) -> Result<String, TestError> {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .map_err(|error| TestError::from(error.to_string()))?;
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+            let count = stream
+                .read(&mut buffer)
+                .map_err(|error| TestError::from(error.to_string()))?;
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+        }
+        String::from_utf8(bytes).map_err(|error| TestError::from(error.to_string()))
+    }
+
+    fn request_header(request: &str, name: &str) -> Option<String> {
+        request.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case(name)
+                .then(|| String::from(value.trim()))
+        })
+    }
+
+    fn send(
+        stream: &mut TcpStream,
+        status: u16,
+        extra: &str,
+        body: &[u8],
+    ) -> Result<(), TestError> {
+        let head = format!(
+            "HTTP/1.1 {status} OK\r\nConnection: close\r\nContent-Length: {}\r\n{extra}\r\n",
+            body.len()
+        );
+        stream
+            .write_all(head.as_bytes())
+            .map_err(|error| TestError::from(error.to_string()))?;
+        stream
+            .write_all(body)
+            .map_err(|error| TestError::from(error.to_string()))?;
+        stream
+            .flush()
+            .map_err(|error| TestError::from(error.to_string()))
+    }
+
+    fn send_partial(
+        stream: &mut TcpStream,
+        full: &[u8],
+        partial: usize,
+        extra: &str,
+    ) -> Result<(), TestError> {
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n{extra}\r\n",
+            full.len()
+        );
+        stream
+            .write_all(head.as_bytes())
+            .map_err(|error| TestError::from(error.to_string()))?;
+        stream
+            .write_all(&full[..partial])
+            .map_err(|error| TestError::from(error.to_string()))?;
+        stream
+            .flush()
+            .map_err(|error| TestError::from(error.to_string()))
+    }
+
+    fn hex_digest(bytes: &[u8]) -> String {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    #[test]
+    fn a_304_revalidation_returns_the_cached_body_without_a_second_transfer()
+    -> Result<(), TestError> {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").map_err(|error| TestError::from(error.to_string()))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| TestError::from(error.to_string()))?;
+        let server = std::thread::spawn(move || -> Result<(), TestError> {
+            let (mut first, _) = listener
+                .accept()
+                .map_err(|error| TestError::from(error.to_string()))?;
+            let request = read_request(&mut first)?;
+            if request_header(&request, "if-none-match").is_some() {
+                return Err(TestError::from("the first request was conditional"));
+            }
+            send(
+                &mut first,
+                200,
+                "ETag: \"v1\"\r\nLast-Modified: Wed, 12 Nov 2026 10:00:00 GMT\r\nAccept-Ranges: bytes\r\n",
+                b"cached payload",
+            )?;
+            let (mut second, _) = listener
+                .accept()
+                .map_err(|error| TestError::from(error.to_string()))?;
+            let request = read_request(&mut second)?;
+            if request_header(&request, "if-none-match").as_deref() != Some("\"v1\"") {
+                return Err(TestError::from("the revalidation omitted If-None-Match"));
+            }
+            if request_header(&request, "if-modified-since").as_deref()
+                != Some("Wed, 12 Nov 2026 10:00:00 GMT")
+            {
+                return Err(TestError::from(
+                    "the revalidation omitted If-Modified-Since",
+                ));
+            }
+            send(&mut second, 304, "ETag: \"v1\"\r\n", b"")
+        });
+        let url = format!("http://{address}/conditional");
+        let mut request =
+            RequestSpec::for_source(&sources::NIFC_WFIGS, url.clone(), "application/json");
+        request.ttl = Some(Duration::ZERO);
+        let store = temporary_store("revalidate");
+        let mut state = EngineState::test_with_store(store.clone());
+        let cancel = CancelToken::new();
+        let policy = TransferPolicy::for_source(&sources::NIFC_WFIGS);
+        let limit = MAX_DOCUMENT_BYTES;
+        let fetch = |mut request: TransferRequest<'_>| live_get(&mut request, policy, limit);
+        let mut progress = |_update| {};
+        let first = execute(&mut state, fetch, &request, &cancel, &mut progress)?;
+        assert_eq!(first.cache, CacheState::Network);
+        let mut updates = Vec::new();
+        let second = {
+            let mut progress = |update| updates.push(update);
+            execute(&mut state, fetch, &request, &cancel, &mut progress)?
+        };
+        assert_eq!(second.cache, CacheState::Refreshed);
+        assert_eq!(second.body, b"cached payload");
+        assert!(
+            updates
+                .iter()
+                .any(|update| update.state == CacheState::Refreshing),
+            "the in-flight revalidation was not reported as refreshing"
+        );
+        request.ttl = Some(Duration::from_secs(3600));
+        let mut progress = |_update| {};
+        let third = execute(&mut state, fetch, &request, &cancel, &mut progress)?;
+        assert_eq!(third.cache, CacheState::Cached);
+        server
+            .join()
+            .map_err(|_| TestError::from("the conditional server thread panicked"))??;
+        let entry = store
+            .load_aged(&url)
+            .map_err(|error| TestError::from(error.to_string()))?
+            .ok_or_else(|| TestError::from("the 304 lost the cached entry"))?;
+        assert_eq!(entry.validators.etag.as_deref(), Some("\"v1\""));
+        assert_eq!(
+            entry.validators.last_modified.as_deref(),
+            Some("Wed, 12 Nov 2026 10:00:00 GMT")
+        );
+        assert_eq!(entry.body, b"cached payload");
+        Ok(())
+    }
+
+    #[test]
+    fn a_dropped_binary_body_resumes_with_a_range_and_verifies_the_whole_file()
+    -> Result<(), TestError> {
+        let full: Vec<u8> = (0..4096).map(|index| (index % 251) as u8).collect();
+        let expected = full.clone();
+        let digest = hex_digest(&expected);
+        let listener =
+            TcpListener::bind("127.0.0.1:0").map_err(|error| TestError::from(error.to_string()))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| TestError::from(error.to_string()))?;
+        let server_full = full;
+        let server_digest = digest;
+        let server = std::thread::spawn(move || -> Result<(), TestError> {
+            let (mut first, _) = listener
+                .accept()
+                .map_err(|error| TestError::from(error.to_string()))?;
+            let request = read_request(&mut first)?;
+            if request_header(&request, "range").is_some() {
+                return Err(TestError::from(
+                    "the first request already asked for a range",
+                ));
+            }
+            let extra = format!("Accept-Ranges: bytes\r\nX-Checksum-SHA256: {server_digest}\r\n");
+            send_partial(&mut first, &server_full, 512, &extra)?;
+            drop(first);
+            let (mut second, _) = listener
+                .accept()
+                .map_err(|error| TestError::from(error.to_string()))?;
+            let request = read_request(&mut second)?;
+            if request_header(&request, "range").as_deref() != Some("bytes=512-") {
+                return Err(TestError::from("the retry did not resume at 512"));
+            }
+            let remaining = &server_full[512..];
+            let extra = format!(
+                "Content-Range: bytes 512-{}/4096\r\nX-Checksum-SHA256: {server_digest}\r\n",
+                server_full.len().saturating_sub(1)
+            );
+            send(&mut second, 206, &extra, remaining)
+        });
+        let url = format!("http://{address}/volume");
+        let request = RequestSpec::for_source(
+            &sources::NEXRAD_LEVEL_TWO,
+            url.clone(),
+            "application/octet-stream",
+        );
+        let store = temporary_store("resume");
+        let mut state = EngineState::test_with_store(store.clone());
+        let cancel = CancelToken::new();
+        let policy = TransferPolicy::for_source(&sources::NEXRAD_LEVEL_TWO);
+        let limit = MAX_BINARY_BYTES;
+        let fetch = |mut request: TransferRequest<'_>| live_get(&mut request, policy, limit);
+        let mut updates = Vec::new();
+        let mut progress = |update| updates.push(update);
+        let fetched = execute(&mut state, fetch, &request, &cancel, &mut progress)?;
+        assert_eq!(fetched.body, expected);
+        assert_eq!(fetched.cache, CacheState::Network);
+        assert!(
+            updates
+                .iter()
+                .any(|update| update.resumed_from == 512 && update.received >= 512),
+            "progress did not report the resumed offset"
+        );
+        let record = state
+            .records()
+            .get(&url)
+            .ok_or_else(|| TestError::from("the resumed request left no record"))?;
+        assert_eq!(record.resumed_from, 512);
+        server
+            .join()
+            .map_err(|_| TestError::from("the resume server thread panicked"))??;
+        let entry = store
+            .load_aged(&url)
+            .map_err(|error| TestError::from(error.to_string()))?
+            .ok_or_else(|| TestError::from("the resumed body was not cached"))?;
+        assert_eq!(entry.body, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn an_origin_without_range_support_restarts_cleanly() -> Result<(), TestError> {
+        let full: Vec<u8> = (0..2048).map(|index| (index % 239) as u8).collect();
+        let expected = full.clone();
+        let listener =
+            TcpListener::bind("127.0.0.1:0").map_err(|error| TestError::from(error.to_string()))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| TestError::from(error.to_string()))?;
+        let server_full = full;
+        let server = std::thread::spawn(move || -> Result<(), TestError> {
+            let (mut first, _) = listener
+                .accept()
+                .map_err(|error| TestError::from(error.to_string()))?;
+            let _request = read_request(&mut first)?;
+            send_partial(&mut first, &server_full, 256, "")?;
+            drop(first);
+            let (mut second, _) = listener
+                .accept()
+                .map_err(|error| TestError::from(error.to_string()))?;
+            let request = read_request(&mut second)?;
+            if request_header(&request, "range").is_some() {
+                return Err(TestError::from(
+                    "the retry asked for a range without support",
+                ));
+            }
+            send(&mut second, 200, "", &server_full)
+        });
+        let url = format!("http://{address}/plain");
+        let request = RequestSpec::for_source(
+            &sources::NEXRAD_LEVEL_TWO,
+            url.clone(),
+            "application/octet-stream",
+        );
+        let store = temporary_store("restart");
+        let mut state = EngineState::test_with_store(store.clone());
+        let cancel = CancelToken::new();
+        let policy = TransferPolicy::for_source(&sources::NEXRAD_LEVEL_TWO);
+        let limit = MAX_BINARY_BYTES;
+        let fetch = |mut request: TransferRequest<'_>| live_get(&mut request, policy, limit);
+        let mut progress = |_update| {};
+        let fetched = execute(&mut state, fetch, &request, &cancel, &mut progress)?;
+        assert_eq!(fetched.body, expected);
+        server
+            .join()
+            .map_err(|_| TestError::from("the restart server thread panicked"))??;
+        assert_eq!(
+            store
+                .load_aged(&url)
+                .map_err(|error| TestError::from(error.to_string()))?
+                .ok_or_else(|| TestError::from("the restarted body was not cached"))?
+                .body,
+            expected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cancelling_a_transfer_leaves_no_cache_entry() -> Result<(), TestError> {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").map_err(|error| TestError::from(error.to_string()))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| TestError::from(error.to_string()))?;
+        let server = std::thread::spawn(move || -> Result<(), TestError> {
+            let (mut stream, _) = listener
+                .accept()
+                .map_err(|error| TestError::from(error.to_string()))?;
+            let _request = read_request(&mut stream)?;
+            let head = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 4096\r\n\r\n";
+            if stream.write_all(head.as_bytes()).is_err() {
+                return Ok(());
+            }
+            let chunk = [7_u8; 64];
+            for _ in 0..64 {
+                if stream.write_all(&chunk).is_err() || stream.flush().is_err() {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(16));
+            }
+            Ok(())
+        });
+        let url = format!("http://{address}/slow-body");
+        let request = RequestSpec::for_source(
+            &sources::NEXRAD_LEVEL_TWO,
+            url.clone(),
+            "application/octet-stream",
+        );
+        let store = temporary_store("cancel");
+        let mut state = EngineState::test_with_store(store.clone());
+        let cancel = CancelToken::new();
+        let canceller = cancel.clone();
+        let cancelling = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            canceller.cancel();
+        });
+        let policy = TransferPolicy::for_source(&sources::NEXRAD_LEVEL_TWO);
+        let limit = MAX_BINARY_BYTES;
+        let fetch = |mut request: TransferRequest<'_>| live_get(&mut request, policy, limit);
+        let mut progress = |_update| {};
+        let result = execute(&mut state, fetch, &request, &cancel, &mut progress);
+        cancelling
+            .join()
+            .map_err(|_| TestError::from("the cancelling thread panicked"))?;
+        server
+            .join()
+            .map_err(|_| TestError::from("the cancelled server thread panicked"))??;
+        assert!(matches!(result, Err(FetchError::Cancelled)));
+        assert!(
+            store
+                .load_aged(&url)
+                .map_err(|error| TestError::from(error.to_string()))?
+                .is_none(),
+            "a cancelled transfer left a readable cache entry"
+        );
+        Ok(())
+    }
+    #[test]
+    fn a_200_revalidation_replaces_the_body_and_validators_atomically() -> Result<(), TestError> {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").map_err(|error| TestError::from(error.to_string()))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| TestError::from(error.to_string()))?;
+        let server = std::thread::spawn(move || -> Result<(), TestError> {
+            let (mut first, _) = listener
+                .accept()
+                .map_err(|error| TestError::from(error.to_string()))?;
+            let _request = read_request(&mut first)?;
+            send(
+                &mut first,
+                200,
+                "ETag: \"old\"\r\nLast-Modified: Wed, 12 Nov 2026 09:00:00 GMT\r\n",
+                b"old bytes",
+            )?;
+            let (mut second, _) = listener
+                .accept()
+                .map_err(|error| TestError::from(error.to_string()))?;
+            let request = read_request(&mut second)?;
+            if request_header(&request, "if-none-match").as_deref() != Some("\"old\"") {
+                return Err(TestError::from("the replacement omitted If-None-Match"));
+            }
+            send(
+                &mut second,
+                200,
+                "ETag: \"new\"\r\nLast-Modified: Thu, 13 Nov 2026 09:00:00 GMT\r\n",
+                b"new bytes",
+            )
+        });
+        let url = format!("http://{address}/replace");
+        let mut request =
+            RequestSpec::for_source(&sources::NIFC_WFIGS, url.clone(), "application/json");
+        request.ttl = Some(Duration::ZERO);
+        let store = temporary_store("replace");
+        let mut state = EngineState::test_with_store(store.clone());
+        let cancel = CancelToken::new();
+        let policy = TransferPolicy::for_source(&sources::NIFC_WFIGS);
+        let limit = MAX_DOCUMENT_BYTES;
+        let fetch = |mut request: TransferRequest<'_>| live_get(&mut request, policy, limit);
+        let mut progress = |_update| {};
+        let first = execute(&mut state, fetch, &request, &cancel, &mut progress)?;
+        assert_eq!(first.cache, CacheState::Network);
+        let second = execute(&mut state, fetch, &request, &cancel, &mut progress)?;
+        assert_eq!(second.cache, CacheState::Network);
+        assert_eq!(second.body, b"new bytes");
+        request.ttl = Some(Duration::from_secs(3600));
+        let third = execute(&mut state, fetch, &request, &cancel, &mut progress)?;
+        assert_eq!(third.cache, CacheState::Cached);
+        assert_eq!(third.body, b"new bytes");
+        server
+            .join()
+            .map_err(|_| TestError::from("the replacement server thread panicked"))??;
+        let entry = store
+            .load_aged(&url)
+            .map_err(|error| TestError::from(error.to_string()))?
+            .ok_or_else(|| TestError::from("the replacement was not cached"))?;
+        assert_eq!(entry.body, b"new bytes");
+        assert_eq!(entry.validators.etag.as_deref(), Some("\"new\""));
+        assert_eq!(
+            entry.validators.last_modified.as_deref(),
+            Some("Thu, 13 Nov 2026 09:00:00 GMT")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_revalidation_serves_a_stale_body_and_says_so() -> Result<(), TestError> {
+        let url = String::from("https://example.test/stale");
+        let store = temporary_store("stale");
+        store
+            .store_with(
+                &url,
+                b"stale bytes",
+                &Validators {
+                    etag: Some(String::from("\"v1\"")),
+                    last_modified: None,
+                },
+            )
+            .map_err(|error| TestError::from(error.to_string()))?;
+        let mut state = EngineState::test_with_store(store);
+        let mut request = RequestSpec::for_source(&sources::NIFC_WFIGS, url, "application/json");
+        request.ttl = Some(Duration::ZERO);
+        let calls = AtomicU32::new(0);
+        let fetch = |_request: TransferRequest<'_>| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(failure(status(503)))
+        };
+        let cancel = CancelToken::new();
+        let mut progress = |_update| {};
+        let fetched = execute(&mut state, fetch, &request, &cancel, &mut progress)?;
+        assert_eq!(fetched.cache, CacheState::Stale);
+        assert_eq!(fetched.body, b"stale bytes");
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
         Ok(())
     }
 }

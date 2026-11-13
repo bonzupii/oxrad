@@ -339,7 +339,10 @@ pub fn fetch_archive_cached(
         bytes: fetched.body,
         provenance: fetched.provenance,
         cache: fetched.cache,
-        from_cache: fetched.cache == CacheState::Cached,
+        from_cache: matches!(
+            fetched.cache,
+            CacheState::Cached | CacheState::Refreshed | CacheState::Stale
+        ),
         cache_warning: acquire.cache_error(),
     })
 }
@@ -420,7 +423,7 @@ mod tests {
             record.label.as_deref(),
             Some("discovery listing 2026/11/13/KTWX/")
         );
-        assert_eq!(record.cache, CacheState::NotStored);
+        assert_eq!(record.cache, CacheState::Unavailable);
         Ok(())
     }
 }

@@ -329,10 +329,6 @@ fn decode_failure(site: &SiteId) -> FetchFailure {
     }
 }
 
-#[expect(
-    clippy::result_large_err,
-    reason = "the failure carries the operation, typed error and cache context"
-)]
 fn fetch(
     state: &mut FetchState,
     acquire: &Acquire,

@@ -334,14 +334,14 @@ mod tests {
                 "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/wmts.cgi?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER={layer}&STYLE=default&TILEMATRIXSET=GoogleMapsCompatible_Level{level}&TILEMATRIX={zoom}&TILEROW={y}&TILECOL={x}&FORMAT={raw:format}&TIME={raw:time}"
             ]
         );
-        assert_eq!(report.cache_counts(), vec![("cache", 1), ("network", 1)]);
+        assert_eq!(report.cache_counts(), vec![("cached", 1), ("live", 1)]);
         let text = report.text();
         assert!(text.contains("tile z4 x3 y6"));
         assert!(text.contains("credit NASA EOSDIS GIBS"));
         assert!(text.contains("licence NASA open data, no key required"));
         assert!(text.contains("licence_url https://nasa-gibs.github.io/gibs-api-docs/"));
-        assert!(text.contains("cache cache"));
-        assert!(text.contains("cache network"));
+        assert!(text.contains("cache cached"));
+        assert!(text.contains("cache live"));
         Ok(())
     }
 
@@ -385,8 +385,8 @@ mod tests {
         assert!(text.contains("credit NOAA NEXRAD, distributed by Unidata"));
         assert!(text.contains("licence US Government work, public domain"));
         assert!(text.contains("licence_url https://www.usa.gov/government-copyright"));
-        assert!(text.contains("cache network"));
-        assert!(text.contains("cache cache"));
+        assert!(text.contains("cache live"));
+        assert!(text.contains("cache cached"));
         Ok(())
     }
 
@@ -426,8 +426,8 @@ mod tests {
         assert!(text.contains("credit OpenFreeMap, OpenMapTiles, OpenStreetMap contributors"));
         assert!(text.contains("licence OpenStreetMap data, ODbL 1.0"));
         assert!(text.contains("licence_url https://www.openstreetmap.org/copyright"));
-        assert!(text.contains("cache cache"));
-        assert!(text.contains("cache network"));
+        assert!(text.contains("cache cached"));
+        assert!(text.contains("cache live"));
         Ok(())
     }
 
@@ -481,8 +481,8 @@ mod tests {
         assert!(text.contains("credit Weather data by RainViewer"));
         assert!(text.contains("licence RainViewer free terms, attribution required"));
         assert!(text.contains("licence_url https://www.rainviewer.com/api.html"));
-        assert!(text.contains("cache cache"));
-        assert!(text.contains("cache network"));
+        assert!(text.contains("cache cached"));
+        assert!(text.contains("cache live"));
         Ok(())
     }
 
@@ -508,7 +508,7 @@ mod tests {
             Some(12)
         );
         assert_eq!(report.samples(3).len(), 3);
-        assert!(report.samples(3)[0].contains("cache cache"));
+        assert!(report.samples(3)[0].contains("cache cached"));
         assert_eq!(report.hosts(), vec![String::from("tiles.openfreemap.org")]);
         Ok(())
     }

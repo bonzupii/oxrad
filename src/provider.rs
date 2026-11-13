@@ -29,7 +29,7 @@ pub enum FetchError {
     },
     Request {
         url: String,
-        source: ureq::Error,
+        source: Box<ureq::Error>,
     },
     Status {
         url: String,
@@ -38,8 +38,17 @@ pub enum FetchError {
     },
     Body {
         url: String,
-        source: ureq::Error,
+        source: std::io::Error,
     },
+    Range {
+        url: String,
+        detail: &'static str,
+    },
+    Integrity {
+        url: String,
+        detail: &'static str,
+    },
+    Cancelled,
     Json {
         url: String,
         source: serde_json::Error,
@@ -115,6 +124,13 @@ impl FetchError {
             Self::Body { url, source } => {
                 format!("The response from {url} could not be read: {source}")
             }
+            Self::Range { url, detail } => {
+                format!("The ranged response from {url} is not usable: {detail}.")
+            }
+            Self::Integrity { url, detail } => {
+                format!("The response from {url} failed integrity checking: {detail}.")
+            }
+            Self::Cancelled => String::from("The transfer was cancelled by the reader."),
             Self::Json { url, source } => {
                 format!("The response from {url} is not valid JSON: {source}")
             }
@@ -143,12 +159,16 @@ impl Display for FetchError {
 impl Error for FetchError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Request { source, .. } | Self::Body { source, .. } => Some(source),
+            Self::Request { source, .. } => Some(source),
+            Self::Body { source, .. } => Some(source),
             Self::Json { source, .. } => Some(source),
             Self::Template { error, .. } => Some(error),
             Self::Disabled { .. }
             | Self::Status { .. }
+            | Self::Range { .. }
+            | Self::Integrity { .. }
             | Self::Shape { .. }
+            | Self::Cancelled
             | Self::WorkerStopped => None,
         }
     }

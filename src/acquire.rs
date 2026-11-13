@@ -22,9 +22,12 @@
 //! The gate is a handle to one engine thread, which owns the cache, pacing
 //! clock and request records. Callers send a spec and wait for the body.
 
+use std::io::Read as _;
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::{Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -77,11 +80,83 @@ impl TransferPolicy {
         }
     }
 }
+/// One transfer's conditional and range request.
+pub(crate) struct TransferRequest<'a> {
+    pub(crate) url: &'a str,
+    pub(crate) accept: &'a str,
+    pub(crate) etag: Option<&'a str>,
+    pub(crate) last_modified: Option<&'a str>,
+    pub(crate) offset: u64,
+    pub(crate) cancel: &'a CancelToken,
+    pub(crate) on_read: &'a mut dyn FnMut(u64),
+}
+
+/// A whole or ranged response, with the headers the cache must retain.
+#[derive(Debug)]
+pub(crate) struct TransferResponse {
+    pub(crate) status: u16,
+    pub(crate) body: Vec<u8>,
+    pub(crate) etag: Option<String>,
+    pub(crate) last_modified: Option<String>,
+    pub(crate) total_length: Option<u64>,
+    pub(crate) range_start: Option<u64>,
+    pub(crate) checksum: Option<Checksum>,
+}
+
+/// A transfer that stopped after its headers arrived, keeping the bytes already
+/// read so the engine can ask for the remainder.
+#[derive(Debug)]
+pub(crate) struct TransferFailure {
+    pub(crate) error: Box<FetchError>,
+    pub(crate) partial: Vec<u8>,
+    pub(crate) accept_ranges: bool,
+    pub(crate) total_length: Option<u64>,
+    pub(crate) checksum: Option<Checksum>,
+}
+
+/// A digest the origin supplied for the whole representation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Checksum {
+    digest: Vec<u8>,
+}
+
+impl Checksum {
+    pub(crate) fn digest(&self) -> &[u8] {
+        &self.digest
+    }
+}
+
+/// A reader-owned cancellation flag. The engine checks it between reads and
+/// before every attempt, so a cancelled transfer never reaches the cache.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CancelToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancelToken {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.cancelled, &other.cancelled)
+    }
+}
+
 /// A handle to the engine thread and the sources this configuration enables.
 #[derive(Clone)]
 pub struct Acquire {
     commands: Sender<Command>,
     jobs: Option<Sender<Job>>,
+    active: Arc<Mutex<Option<CancelToken>>>,
 }
 
 impl Acquire {
@@ -104,6 +179,7 @@ impl Acquire {
         updates: Option<Sender<Status>>,
     ) -> Self {
         let (commands, receiver) = channel();
+        let active = Arc::new(Mutex::new(None));
         std::thread::spawn(move || {
             engine::serve(
                 &receiver,
@@ -115,10 +191,12 @@ impl Acquire {
         });
         let (jobs, job_receiver) = channel::<Job>();
         let worker_commands = commands.clone();
+        let worker_active = Arc::clone(&active);
         std::thread::spawn(move || {
             let worker = Self {
                 commands: worker_commands,
                 jobs: None,
+                active: worker_active,
             };
             while let Ok(job) = job_receiver.recv() {
                 job(&worker);
@@ -127,6 +205,7 @@ impl Acquire {
         Self {
             commands,
             jobs: Some(jobs),
+            active,
         }
     }
 
@@ -146,14 +225,46 @@ impl Acquire {
 
     /// Runs one request through the engine: cache, pacing, retry and record.
     pub fn fetch(&self, spec: &RequestSpec) -> Result<Fetched, FetchError> {
+        self.fetch_cancellable(spec, &CancelToken::new())
+    }
+
+    /// Runs one request with a reader-owned cancellation flag. Cancellation is
+    /// checked between reads and during backoff, and never commits a body.
+    pub fn fetch_cancellable(
+        &self,
+        spec: &RequestSpec,
+        cancel: &CancelToken,
+    ) -> Result<Fetched, FetchError> {
+        if let Ok(mut slot) = self.active.lock() {
+            *slot = Some(cancel.clone());
+        }
         let (reply, receiver) = channel();
-        self.commands
+        let result = self
+            .commands
             .send(Command::Fetch {
                 spec: spec.clone(),
+                cancel: cancel.clone(),
                 reply,
             })
-            .map_err(|_| FetchError::WorkerStopped)?;
-        receiver.recv().map_err(|_| FetchError::WorkerStopped)?
+            .map_err(|_| FetchError::WorkerStopped)
+            .and_then(|()| receiver.recv().map_err(|_| FetchError::WorkerStopped))?;
+        if let Ok(mut slot) = self.active.lock()
+            && slot.as_ref().is_some_and(|active| active.same(cancel))
+        {
+            *slot = None;
+        }
+        result
+    }
+
+    /// Cancels the transfer this handle last started, if it is still running.
+    /// The engine checks the flag between reads and during backoff.
+    pub fn cancel_active(&self) -> bool {
+        self.active.lock().ok().is_some_and(|slot| {
+            slot.as_ref().is_some_and(|cancel| {
+                cancel.cancel();
+                true
+            })
+        })
     }
 
     /// Requests one named registry operation and returns its served body.
@@ -234,30 +345,55 @@ impl Transport {
         &self,
         enabled: &EnabledProviders,
         source: &'static Source,
-        url: &str,
-        accept: &str,
-    ) -> Result<Vec<u8>, FetchError> {
+        request: &mut TransferRequest<'_>,
+    ) -> Result<TransferResponse, TransferFailure> {
         if !enabled.enables(source.id.as_str()) {
-            return Err(FetchError::Disabled { id: source.id });
+            return Err(TransferFailure {
+                error: Box::new(FetchError::Disabled { id: source.id }),
+                partial: Vec::new(),
+                accept_ranges: false,
+                total_length: None,
+                checksum: None,
+            });
         }
         match self {
             Self::Live => live_get(
-                url,
-                accept,
+                request,
                 TransferPolicy::for_source(source),
                 body_limit(source),
             ),
             #[cfg(test)]
-            Self::Offline => Err(FetchError::WorkerStopped),
+            Self::Offline => Err(TransferFailure {
+                error: Box::new(FetchError::WorkerStopped),
+                partial: Vec::new(),
+                accept_ranges: false,
+                total_length: None,
+                checksum: None,
+            }),
             #[cfg(test)]
             Self::Scripted { body, observed } => {
                 observed
                     .send(Observed {
                         source: source.id,
-                        url: String::from(url),
+                        url: String::from(request.url),
                     })
-                    .map_err(|_| FetchError::WorkerStopped)?;
-                Ok(body.to_vec())
+                    .map_err(|_| TransferFailure {
+                        error: Box::new(FetchError::WorkerStopped),
+                        partial: Vec::new(),
+                        accept_ranges: false,
+                        total_length: None,
+                        checksum: None,
+                    })?;
+                (request.on_read)(body.len() as u64);
+                Ok(TransferResponse {
+                    status: 200,
+                    body: body.to_vec(),
+                    etag: None,
+                    last_modified: None,
+                    total_length: Some(body.len() as u64),
+                    range_start: None,
+                    checksum: None,
+                })
             }
         }
     }
@@ -302,15 +438,66 @@ impl Acquire {
     }
 }
 
-fn live_get(
-    url: &str,
-    accept: &str,
+/// Carries one request with its conditional and range headers. Bytes already
+/// read are returned with a read failure so the caller can resume them.
+pub(crate) fn live_get(
+    request: &mut TransferRequest<'_>,
     policy: TransferPolicy,
     limit: u64,
-) -> Result<Vec<u8>, FetchError> {
-    let mut response = ureq::get(url)
+) -> Result<TransferResponse, TransferFailure> {
+    if request.cancel.is_cancelled() {
+        return Err(cancelled_failure());
+    }
+    let response = call_transfer(request, policy)?;
+    let status = response.status().as_u16();
+    let meta = response_meta(&response)?;
+    if status == 304 {
+        return Ok(TransferResponse {
+            status,
+            body: Vec::new(),
+            etag: meta.etag.or_else(|| request.etag.map(String::from)),
+            last_modified: meta
+                .last_modified
+                .or_else(|| request.last_modified.map(String::from)),
+            total_length: None,
+            range_start: None,
+            checksum: None,
+        });
+    }
+    if !(200..300).contains(&status) {
+        let retry_after = header_text(response.headers(), "retry-after");
+        return Err(fail(
+            FetchError::Status {
+                url: String::from(request.url),
+                status,
+                retry_after,
+            },
+            &meta,
+            Vec::new(),
+        ));
+    }
+    let range_start = checked_range_start(&meta, status, request.offset, request.url)?;
+    read_transfer_body(response, request, limit, meta, status, range_start)
+}
+
+fn call_transfer(
+    request: &TransferRequest<'_>,
+    policy: TransferPolicy,
+) -> Result<ureq::http::Response<ureq::Body>, TransferFailure> {
+    let mut builder = ureq::get(request.url)
         .header("User-Agent", crate::sources::USER_AGENT)
-        .header("Accept", accept)
+        .header("Accept", request.accept);
+    if let Some(etag) = request.etag {
+        builder = builder.header("If-None-Match", etag);
+    }
+    if let Some(modified) = request.last_modified {
+        builder = builder.header("If-Modified-Since", modified);
+    }
+    let range = format!("bytes={}-", request.offset);
+    if request.offset > 0 {
+        builder = builder.header("Range", &range);
+    }
+    builder
         .config()
         .timeout_resolve(Some(policy.resolve))
         .timeout_connect(Some(policy.connect))
@@ -322,31 +509,321 @@ fn live_get(
         .http_status_as_error(false)
         .build()
         .call()
-        .map_err(|source| FetchError::Request {
-            url: String::from(url),
-            source,
-        })?;
-    let status = response.status().as_u16();
-    if !(200..300).contains(&status) {
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned());
-        return Err(FetchError::Status {
-            url: String::from(url),
-            status,
-            retry_after,
-        });
-    }
-    response
-        .body_mut()
-        .with_config()
-        .limit(limit)
-        .read_to_vec()
-        .map_err(|source| FetchError::Body {
-            url: String::from(url),
-            source,
+        .map_err(|source| TransferFailure {
+            error: Box::new(FetchError::Request {
+                url: String::from(request.url),
+                source: Box::new(source),
+            }),
+            partial: Vec::new(),
+            accept_ranges: false,
+            total_length: None,
+            checksum: None,
         })
+}
+
+struct TransferMeta {
+    etag: Option<String>,
+    last_modified: Option<String>,
+    accept_ranges: bool,
+    content_length: Option<u64>,
+    content_range: Option<String>,
+    checksum: Option<Checksum>,
+}
+
+impl TransferMeta {
+    fn total_length(&self) -> Option<u64> {
+        self.content_range
+            .as_deref()
+            .and_then(parse_content_range)
+            .map(|(_start, total)| total)
+            .or(self.content_length)
+    }
+}
+
+fn fail(error: FetchError, meta: &TransferMeta, partial: Vec<u8>) -> TransferFailure {
+    TransferFailure {
+        error: Box::new(error),
+        partial,
+        accept_ranges: meta.accept_ranges,
+        total_length: meta.total_length(),
+        checksum: meta.checksum.clone(),
+    }
+}
+
+fn response_meta(
+    response: &ureq::http::Response<ureq::Body>,
+) -> Result<TransferMeta, TransferFailure> {
+    let accept_ranges = header_text(response.headers(), "accept-ranges")
+        .is_some_and(|value| value.split(',').any(|part| part.trim() == "bytes"));
+    let encoded = header_text(response.headers(), "content-encoding")
+        .is_some_and(|value| !value.is_empty() && !value.eq_ignore_ascii_case("identity"));
+    let content_length = if encoded {
+        None
+    } else {
+        header_text(response.headers(), "content-length")
+            .and_then(|value| value.parse::<u64>().ok())
+    };
+    let mut meta = TransferMeta {
+        etag: header_text(response.headers(), "etag"),
+        last_modified: header_text(response.headers(), "last-modified"),
+        accept_ranges,
+        content_length,
+        content_range: header_text(response.headers(), "content-range"),
+        checksum: None,
+    };
+    meta.checksum = match checksum_from_headers(response.headers()) {
+        Ok(checksum) => checksum,
+        Err(error) => return Err(fail(error, &meta, Vec::new())),
+    };
+    Ok(meta)
+}
+
+fn checked_range_start(
+    meta: &TransferMeta,
+    status: u16,
+    offset: u64,
+    url: &str,
+) -> Result<Option<u64>, TransferFailure> {
+    if status != 206 {
+        return Ok(None);
+    }
+    let Some((start, _total)) = meta.content_range.as_deref().and_then(parse_content_range) else {
+        return Err(fail(
+            FetchError::Range {
+                url: String::from(url),
+                detail: "a 206 response needs a valid Content-Range",
+            },
+            meta,
+            Vec::new(),
+        ));
+    };
+    if start != offset {
+        return Err(fail(
+            FetchError::Range {
+                url: String::from(url),
+                detail: "the response starts at a different offset than the request",
+            },
+            meta,
+            Vec::new(),
+        ));
+    }
+    Ok(Some(start))
+}
+
+fn read_transfer_body(
+    mut response: ureq::http::Response<ureq::Body>,
+    request: &mut TransferRequest<'_>,
+    limit: u64,
+    meta: TransferMeta,
+    status: u16,
+    range_start: Option<u64>,
+) -> Result<TransferResponse, TransferFailure> {
+    if meta.content_length.is_some_and(|length| length > limit) {
+        return Err(fail(
+            FetchError::Integrity {
+                url: String::from(request.url),
+                detail: "the declared body length exceeds the request limit",
+            },
+            &meta,
+            Vec::new(),
+        ));
+    }
+    let mut reader = response.body_mut().as_reader();
+    let mut body = Vec::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        if request.cancel.is_cancelled() {
+            return Err(fail(FetchError::Cancelled, &meta, body));
+        }
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                let received = request
+                    .offset
+                    .saturating_add(body.len() as u64)
+                    .saturating_add(count as u64);
+                if received > limit {
+                    return Err(fail(
+                        FetchError::Integrity {
+                            url: String::from(request.url),
+                            detail: "the body grew past the request limit",
+                        },
+                        &meta,
+                        body,
+                    ));
+                }
+                let Some(chunk) = buffer.get(..count) else {
+                    return Err(fail(
+                        FetchError::Integrity {
+                            url: String::from(request.url),
+                            detail: "the read count exceeded the buffer",
+                        },
+                        &meta,
+                        body,
+                    ));
+                };
+                body.extend_from_slice(chunk);
+                (request.on_read)(body.len() as u64);
+            }
+            Err(source) => {
+                return Err(fail(
+                    FetchError::Body {
+                        url: String::from(request.url),
+                        source,
+                    },
+                    &meta,
+                    body,
+                ));
+            }
+        }
+    }
+    if let Some(expected) = meta.content_length {
+        if body.len() as u64 > expected {
+            return Err(fail(
+                FetchError::Integrity {
+                    url: String::from(request.url),
+                    detail: "the body is longer than the declared length",
+                },
+                &meta,
+                body,
+            ));
+        }
+        if (body.len() as u64) < expected {
+            return Err(fail(
+                FetchError::Body {
+                    url: String::from(request.url),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "the origin closed before the declared body length",
+                    ),
+                },
+                &meta,
+                body,
+            ));
+        }
+    }
+    let total_length = meta.total_length();
+    Ok(TransferResponse {
+        status,
+        body,
+        etag: meta.etag,
+        last_modified: meta.last_modified,
+        total_length,
+        range_start,
+        checksum: meta.checksum,
+    })
+}
+
+fn cancelled_failure() -> TransferFailure {
+    TransferFailure {
+        error: Box::new(FetchError::Cancelled),
+        partial: Vec::new(),
+        accept_ranges: false,
+        total_length: None,
+        checksum: None,
+    }
+}
+
+fn header_text(headers: &ureq::http::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
+        .map(|value| String::from(value.trim()))
+}
+
+fn parse_content_range(value: &str) -> Option<(u64, u64)> {
+    let rest = value.trim().strip_prefix("bytes ")?;
+    let (range, total) = rest.split_once('/')?;
+    let (start, _end) = range.split_once('-')?;
+    Some((start.parse().ok()?, total.parse().ok()?))
+}
+
+fn checksum_from_headers(headers: &ureq::http::HeaderMap) -> Result<Option<Checksum>, FetchError> {
+    if let Some(value) = header_text(headers, "x-checksum-sha256") {
+        let digest = decode_hex(&value).ok_or_else(|| FetchError::Integrity {
+            url: String::from("the response"),
+            detail: "X-Checksum-SHA256 is not hexadecimal",
+        })?;
+        return Ok(Some(Checksum { digest }));
+    }
+    if let Some(value) = header_text(headers, "x-amz-checksum-sha256") {
+        let digest = decode_base64(&value).ok_or_else(|| FetchError::Integrity {
+            url: String::from("the response"),
+            detail: "X-Amz-Checksum-SHA256 is not base64",
+        })?;
+        return Ok(Some(Checksum { digest }));
+    }
+    for name in ["content-digest", "repr-digest"] {
+        let Some(value) = header_text(headers, name) else {
+            continue;
+        };
+        for part in value.split(',') {
+            let Some(encoded) = part.trim().strip_prefix("sha-256=") else {
+                continue;
+            };
+            let encoded = encoded.trim().trim_matches(':');
+            let digest = decode_base64(encoded).ok_or_else(|| FetchError::Integrity {
+                url: String::from("the response"),
+                detail: "the SHA-256 digest is not base64",
+            })?;
+            return Ok(Some(Checksum { digest }));
+        }
+    }
+    Ok(None)
+}
+
+fn decode_hex(text: &str) -> Option<Vec<u8>> {
+    let text = text.trim();
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(text.len() / 2);
+    let (pairs, remainder) = text.as_bytes().as_chunks::<2>();
+    if !remainder.is_empty() {
+        return None;
+    }
+    for pair in pairs {
+        let high = hex_digit(pair[0])?;
+        let low = hex_digit(pair[1])?;
+        bytes.push((high << 4) | low);
+    }
+    Some(bytes)
+}
+
+const fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn decode_base64(text: &str) -> Option<Vec<u8>> {
+    let text = text.trim().trim_matches('"');
+    let mut bytes = Vec::with_capacity(text.len().saturating_mul(3) / 4);
+    let mut accumulator = 0_u32;
+    let mut bits = 0_u32;
+    for byte in text.bytes() {
+        if byte == b'=' {
+            break;
+        }
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        accumulator = (accumulator << 6) | u32::from(value);
+        bits = bits.saturating_add(6);
+        if bits >= 8 {
+            bits = bits.saturating_sub(8);
+            bytes.push((accumulator >> bits) as u8);
+        }
+    }
+    Some(bytes)
 }
 
 #[cfg(test)]
@@ -401,17 +878,27 @@ mod tests {
             Ok(())
         });
         let url = format!("http://{address}/slow");
+        let cancel = CancelToken::new();
+        let mut on_read = |_bytes| {};
+        let mut request = TransferRequest {
+            url: &url,
+            accept: "text/plain",
+            etag: None,
+            last_modified: None,
+            offset: 0,
+            cancel: &cancel,
+            on_read: &mut on_read,
+        };
         let body = live_get(
-            &url,
-            "text/plain",
+            &mut request,
             TransferPolicy::for_source(&sources::OPENFREEMAP),
             1024,
         )
-        .map_err(TestError::from);
+        .map_err(|failure| TestError::from(failure.error.to_string()));
         server
             .join()
             .map_err(|_| TestError::from("the slow server thread panicked"))??;
-        assert_eq!(body?, b"slow");
+        assert_eq!(body?.body, b"slow");
         Ok(())
     }
 

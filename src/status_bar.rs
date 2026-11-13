@@ -76,15 +76,30 @@ fn requests_row(
 ) {
     ui.horizontal_wrapped(|ui| {
         let latest = status.latest();
-        let summary = latest
-            .and_then(|status| status.summary.clone())
-            .unwrap_or_else(|| String::from("No requests yet · the engine is idle"));
+        let active = latest
+            .and_then(|status| status.active.as_ref())
+            .map(|transfer| transfer.describe());
+        let summary = active.unwrap_or_else(|| {
+            latest
+                .and_then(|status| status.summary.clone())
+                .unwrap_or_else(|| String::from("No requests yet · the engine is idle"))
+        });
         let requests = latest.map_or(0, |status| status.requests);
+        let transferring = latest
+            .and_then(|status| status.active.as_ref())
+            .is_some();
         ui.label(
             RichText::new(format!("Requests {requests} · {summary}"))
                 .size(theme::TYPE_SMALL)
                 .weak(),
         );
+        if transferring && ui.button("Cancel transfer").clicked() {
+            if acquire.cancel_active() {
+                *notice = Some(String::from("Cancelling the active transfer."));
+            } else {
+                *notice = Some(String::from("No transfer was active to cancel."));
+            }
+        }
         if ui
             .button("Export provenance")
             .on_hover_text(

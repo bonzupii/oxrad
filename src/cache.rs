@@ -33,8 +33,8 @@ use crate::config::CachePolicy;
 use crate::error::PathError;
 use crate::paths;
 
-const SCHEMA_VERSION: u64 = 1;
-const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+const SCHEMA_VERSION: u64 = 2;
+const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// What one prune removed and the budget it enforced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,11 +139,19 @@ impl From<SystemTimeError> for CacheError {
     }
 }
 
+/// The HTTP validators an origin supplied with a body.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Validators {
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+}
+
 /// A verified cached body and its retrieval metadata.
 #[derive(Debug)]
 pub struct Entry {
     pub body: Vec<u8>,
     pub fetched_at_unix_ms: u64,
+    pub validators: Validators,
 }
 
 /// A directory-backed response cache.
@@ -180,12 +188,17 @@ impl Store {
         digest.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
-    fn paths(&self, key: &str) -> (PathBuf, PathBuf) {
-        let stem = Self::digest(key);
-        (
-            self.root.join(format!("{stem}.body")),
-            self.root.join(format!("{stem}.meta.json")),
-        )
+    fn stem(key: &str) -> String {
+        Self::digest(key)
+    }
+
+    fn meta_path(&self, key: &str) -> PathBuf {
+        self.root.join(format!("{}.meta.json", Self::stem(key)))
+    }
+
+    fn body_path(&self, key: &str, body_digest: &str) -> PathBuf {
+        self.root
+            .join(format!("{}.{body_digest}.body", Self::stem(key)))
     }
 
     /// Reads and verifies one cached body. An absent entry is a miss.
@@ -205,7 +218,7 @@ impl Store {
     ///
     /// Returns the same typed errors as [`Self::load`].
     pub fn load_aged(&self, key: &str) -> Result<Option<Entry>, CacheError> {
-        let (body_path, meta_path) = self.paths(key);
+        let meta_path = self.meta_path(key);
         let text = match fs::read_to_string(&meta_path) {
             Ok(text) => text,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
@@ -257,6 +270,15 @@ impl Store {
                 key: String::from(key),
                 detail: "missing body digest",
             })?;
+        if expected_digest.len() != 64
+            || !expected_digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(CacheError::Corrupt {
+                key: String::from(key),
+                detail: "body digest is not SHA-256 hexadecimal",
+            });
+        }
+        let body_path = self.body_path(key, expected_digest);
         let body = fs::read(&body_path).map_err(|source| CacheError::Read {
             path: body_path.display().to_string(),
             source,
@@ -274,9 +296,20 @@ impl Store {
                 detail: "body digest does not match metadata",
             });
         }
+        let validators = Validators {
+            etag: metadata
+                .get("etag")
+                .and_then(Value::as_str)
+                .map(String::from),
+            last_modified: metadata
+                .get("last_modified")
+                .and_then(Value::as_str)
+                .map(String::from),
+        };
         Ok(Some(Entry {
             body,
             fetched_at_unix_ms,
+            validators,
         }))
     }
 
@@ -290,7 +323,26 @@ impl Store {
     /// # Errors
     ///
     /// Returns a typed cache error for oversized bodies or failed writes.
+    #[cfg(test)]
     pub fn store(&self, key: &str, body: &[u8]) -> Result<(), CacheError> {
+        self.store_with(key, body, &Validators::default())
+    }
+
+    /// Stores a body with the validators that can revalidate it later.
+    ///
+    /// The body is written to a digest-named file first. The metadata file is
+    /// the single commit point, so a failure before that rename leaves the
+    /// previous entry, if any, entirely readable.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed cache error for oversized bodies or failed writes.
+    pub fn store_with(
+        &self,
+        key: &str,
+        body: &[u8],
+        validators: &Validators,
+    ) -> Result<(), CacheError> {
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)?
             .as_millis();
@@ -298,10 +350,21 @@ impl Store {
             key: String::from(key),
             detail: "fetch time exceeds the supported range",
         })?;
-        self.store_at(key, body, now)
+        self.store_with_at(key, body, now, validators)
     }
 
+    #[cfg(test)]
     fn store_at(&self, key: &str, body: &[u8], fetched_at_unix_ms: u64) -> Result<(), CacheError> {
+        self.store_with_at(key, body, fetched_at_unix_ms, &Validators::default())
+    }
+
+    fn store_with_at(
+        &self,
+        key: &str,
+        body: &[u8],
+        fetched_at_unix_ms: u64,
+        validators: &Validators,
+    ) -> Result<(), CacheError> {
         if body.len() > MAX_BODY_BYTES {
             return Err(CacheError::TooLarge {
                 key: String::from(key),
@@ -312,20 +375,97 @@ impl Store {
             path: self.root.display().to_string(),
             source,
         })?;
-        let (body_path, meta_path) = self.paths(key);
+        let meta_path = self.meta_path(key);
+        let previous_digest = self.stored_digest(key);
+        let body_digest = Self::digest_body(body);
+        let body_path = self.body_path(key, &body_digest);
         let metadata = json!({
             "schema": SCHEMA_VERSION,
             "key": key,
             "fetched_at_unix_ms": fetched_at_unix_ms,
             "body_len": body.len(),
-            "body_sha256": Self::digest_body(body),
+            "body_sha256": body_digest,
+            "etag": validators.etag,
+            "last_modified": validators.last_modified,
         });
         let encoded = serde_json::to_vec(&metadata).map_err(|source| CacheError::Json {
             path: meta_path.display().to_string(),
             source,
         })?;
         self.write_atomic(&body_path, body)?;
-        self.write_atomic(&meta_path, &encoded)
+        self.write_atomic(&meta_path, &encoded)?;
+        if let Some(previous) = previous_digest
+            && previous != body_digest
+        {
+            let _ = fs::remove_file(self.body_path(key, &previous));
+        }
+        Ok(())
+    }
+
+    fn stored_digest(&self, key: &str) -> Option<String> {
+        let text = fs::read_to_string(self.meta_path(key)).ok()?;
+        let metadata: Value = serde_json::from_str(&text).ok()?;
+        metadata
+            .get("body_sha256")
+            .and_then(Value::as_str)
+            .map(String::from)
+    }
+
+    /// Marks a cached body freshly revalidated without rewriting the body.
+    ///
+    /// Returns `false` when there is no metadata to update. The body digest is
+    /// unchanged, so a repeated 304 keeps the same verified bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed cache error when the metadata cannot be read or written.
+    pub fn revalidated(&self, key: &str, validators: &Validators) -> Result<bool, CacheError> {
+        let meta_path = self.meta_path(key);
+        let text = match fs::read_to_string(&meta_path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(source) => {
+                return Err(CacheError::Read {
+                    path: meta_path.display().to_string(),
+                    source,
+                });
+            }
+        };
+        let mut metadata: Value =
+            serde_json::from_str(&text).map_err(|source| CacheError::Json {
+                path: meta_path.display().to_string(),
+                source,
+            })?;
+        if metadata.get("schema").and_then(Value::as_u64) != Some(SCHEMA_VERSION)
+            || metadata.get("key").and_then(Value::as_str) != Some(key)
+        {
+            return Err(CacheError::Corrupt {
+                key: String::from(key),
+                detail: "metadata cannot be revalidated",
+            });
+        }
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)?
+            .as_millis();
+        let now = u64::try_from(now).map_err(|_| CacheError::Corrupt {
+            key: String::from(key),
+            detail: "fetch time exceeds the supported range",
+        })?;
+        if let Some(object) = metadata.as_object_mut() {
+            object.insert(String::from("fetched_at_unix_ms"), json!(now));
+            if let Some(etag) = &validators.etag {
+                object.insert(String::from("etag"), json!(etag));
+            }
+            if let Some(modified) = &validators.last_modified {
+                object.insert(String::from("last_modified"), json!(modified));
+            }
+        }
+        let encoded = serde_json::to_vec(&metadata).map_err(|source| CacheError::Json {
+            path: meta_path.display().to_string(),
+            source,
+        })?;
+        self.write_atomic(&meta_path, &encoded)?;
+        Ok(true)
     }
 
     fn write_atomic(&self, path: &Path, bytes: &[u8]) -> Result<(), CacheError> {
@@ -373,20 +513,42 @@ impl Store {
     ///
     /// Returns a typed cache error when an existing file cannot be removed.
     pub fn remove(&self, key: &str) -> Result<(), CacheError> {
-        let (body_path, meta_path) = self.paths(key);
-        for path in [body_path, meta_path] {
-            match fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == ErrorKind::NotFound => {}
-                Err(source) => {
-                    return Err(CacheError::Write {
-                        path: path.display().to_string(),
-                        source,
-                    });
+        let stem = Self::stem(key);
+        let prefix = format!("{stem}.");
+        if let Ok(directory) = fs::read_dir(&self.root) {
+            for item in directory {
+                let item = item.map_err(|source| CacheError::Read {
+                    path: self.root.display().to_string(),
+                    source,
+                })?;
+                let path = item.path();
+                let remove = path
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".body"));
+                if remove {
+                    match fs::remove_file(&path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == ErrorKind::NotFound => {}
+                        Err(source) => {
+                            return Err(CacheError::Write {
+                                path: path.display().to_string(),
+                                source,
+                            });
+                        }
+                    }
                 }
             }
         }
-        Ok(())
+        let meta_path = self.meta_path(key);
+        match fs::remove_file(&meta_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(CacheError::Write {
+                path: meta_path.display().to_string(),
+                source,
+            }),
+        }
     }
 
     /// Enforces the configured entry and byte budget.
@@ -457,7 +619,14 @@ impl Store {
                     key: String::from(stem),
                     detail: "missing or invalid body length during pruning",
                 })?;
-            let body = path.with_file_name(format!("{stem}.body"));
+            let body_digest = metadata
+                .get("body_sha256")
+                .and_then(Value::as_str)
+                .ok_or_else(|| CacheError::Corrupt {
+                    key: String::from(stem),
+                    detail: "missing body digest during pruning",
+                })?;
+            let body = path.with_file_name(format!("{stem}.{body_digest}.body"));
             entries.push((fetched, length, body, path));
         }
         entries.sort_by_key(|entry| entry.0);
@@ -530,10 +699,45 @@ mod tests {
         let root = directory("corrupt")?;
         let store = Store::at(root.clone());
         store.store("tile", b"original")?;
-        let (body, _) = store.paths("tile");
+        let metadata = fs::read_to_string(store.meta_path("tile"))
+            .map_err(|error| TestError::from(error.to_string()))?;
+        let metadata: Value =
+            serde_json::from_str(&metadata).map_err(|error| TestError::from(error.to_string()))?;
+        let digest = metadata
+            .get("body_sha256")
+            .and_then(Value::as_str)
+            .ok_or("stored metadata has no digest")?;
+        let body = store.body_path("tile", digest);
         fs::write(body, b"changed").map_err(|source| CacheError::Write {
             path: String::from("test body"),
             source,
+        })?;
+        assert!(matches!(
+            store.load("tile"),
+            Err(CacheError::Corrupt { .. })
+        ));
+        cleanup(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_truncated_body_is_rejected() -> Result<(), TestError> {
+        let root = directory("truncated")?;
+        let store = Store::at(root.clone());
+        store.store("tile", b"original bytes")?;
+        let metadata = fs::read_to_string(store.meta_path("tile"))
+            .map_err(|error| TestError::from(error.to_string()))?;
+        let metadata: Value =
+            serde_json::from_str(&metadata).map_err(|error| TestError::from(error.to_string()))?;
+        let digest = metadata
+            .get("body_sha256")
+            .and_then(Value::as_str)
+            .ok_or("stored metadata has no digest")?;
+        fs::write(store.body_path("tile", digest), b"orig").map_err(|source| {
+            CacheError::Write {
+                path: String::from("test body"),
+                source,
+            }
         })?;
         assert!(matches!(
             store.load("tile"),
@@ -548,7 +752,7 @@ mod tests {
         let root = directory("invalid-length")?;
         let store = Store::at(root.clone());
         store.store_at("broken", b"data", 1)?;
-        let (_, metadata_path) = store.paths("broken");
+        let metadata_path = store.meta_path("broken");
         fs::write(&metadata_path, br#"{"fetched_at_unix_ms":1}"#).map_err(|source| {
             CacheError::Write {
                 path: metadata_path.display().to_string(),

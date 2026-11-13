@@ -100,7 +100,7 @@ impl StationPanel {
         match outcome {
             StationOutcome::Ready(discovery) => {
                 self.refresh_due = due_after(Duration::from_secs(STATION_REFRESH_SECS));
-                self.list = Ok(discovery);
+                self.list = Ok(*discovery);
                 StationReport {
                     notice: None,
                     pending: self.pending.take(),
