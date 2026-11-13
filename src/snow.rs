@@ -28,6 +28,7 @@ use std::time::Instant;
 use serde_json::{Map, Value};
 
 use crate::acquire::Acquire;
+use crate::engine::Served;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
@@ -254,10 +255,14 @@ pub fn parse(document: &Value) -> Result<Snowpack, SnowError> {
     })
 }
 /// Fetches the snow model for one point.
-pub fn fetch(acquire: &Acquire, latitude: f64, longitude: f64) -> Result<Snowpack, SnowError> {
+pub fn fetch(
+    acquire: &Acquire,
+    latitude: f64,
+    longitude: f64,
+) -> Result<Served<Snowpack>, SnowError> {
     let latitude_text = format!("{latitude:.3}");
     let longitude_text = format!("{longitude:.3}");
-    let document = acquire
+    let fetched = acquire
         .fetch_operation(
             &sources::OPEN_METEO_FORECAST,
             "snow",
@@ -268,9 +273,12 @@ pub fn fetch(acquire: &Acquire, latitude: f64, longitude: f64) -> Result<Snowpac
                 ("forecast_days", "3"),
             ],
         )
-        .and_then(|fetched| fetched.json())
         .map_err(|source| SnowError::Provider { source })?;
-    parse(&document)
+    let document = fetched
+        .json()
+        .map_err(|source| SnowError::Provider { source })?;
+    let value = parse(&document)?;
+    Ok(Served::new(value, fetched.provenance, fetched.cache))
 }
 
 /// Requests sent to the worker.
@@ -283,9 +291,19 @@ pub struct SnowRequest {
 
 /// Answers from the worker.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the served value travels whole so its provenance cannot be separated from it"
+)]
 pub enum SnowEvent {
-    Ready { generation: u64, record: Snowpack },
-    Failed { generation: u64, error: SnowError },
+    Ready {
+        generation: u64,
+        record: Served<Snowpack>,
+    },
+    Failed {
+        generation: u64,
+        error: SnowError,
+    },
 }
 
 /// Fetches the snow model off the UI thread.
@@ -357,22 +375,22 @@ impl SnowFeed {
 pub enum SnowState {
     Idle,
     Loading {
-        last: Option<Snowpack>,
+        last: Option<Served<Snowpack>>,
     },
     Ready {
-        record: Snowpack,
+        served: Served<Snowpack>,
     },
     Failed {
         error: SnowError,
-        last: Option<Snowpack>,
+        last: Option<Served<Snowpack>>,
     },
 }
 
 impl SnowState {
     /// The most recent record still worth drawing.
-    pub const fn last(&self) -> Option<&Snowpack> {
+    pub const fn last(&self) -> Option<&Served<Snowpack>> {
         match self {
-            Self::Ready { record } => Some(record),
+            Self::Ready { served } => Some(served),
             Self::Loading { last } | Self::Failed { last, .. } => last.as_ref(),
             Self::Idle => None,
         }
@@ -399,7 +417,11 @@ impl SnowView {
         &self.state
     }
 
-    pub const fn record(&self) -> Option<&Snowpack> {
+    pub fn record(&self) -> Option<&Snowpack> {
+        self.state.last().map(|served| &served.value)
+    }
+
+    pub const fn served(&self) -> Option<&Served<Snowpack>> {
         self.state.last()
     }
 
@@ -425,7 +447,7 @@ impl SnowView {
                     if generation != self.generation {
                         continue;
                     }
-                    self.state = SnowState::Ready { record };
+                    self.state = SnowState::Ready { served: record };
                 }
                 SnowEvent::Failed { generation, error } => {
                     if generation != self.generation {
@@ -441,10 +463,10 @@ impl SnowView {
 }
 
 /// Empties the state and returns the record it was holding.
-fn take_last(state: &mut SnowState) -> Option<Snowpack> {
+fn take_last(state: &mut SnowState) -> Option<Served<Snowpack>> {
     match std::mem::replace(state, SnowState::Idle) {
         SnowState::Loading { last } | SnowState::Failed { last, .. } => last,
-        SnowState::Ready { record } => Some(record),
+        SnowState::Ready { served } => Some(served),
         SnowState::Idle => None,
     }
 }

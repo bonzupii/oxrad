@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align2, FontId, Pos2, Rect, RichText, Stroke};
 
 use crate::acquire::Acquire;
-use crate::canvas::toggle_button;
+use crate::canvas::{provenance, toggle_button};
 use crate::land::{self, Land, LandState, LandView, SoilBand};
 use crate::map::MapView;
 use crate::projection;
@@ -110,6 +110,9 @@ impl LandLayer {
             return;
         }
         self.status(ui);
+        if let Some(served) = self.view.served() {
+            provenance(ui, served);
+        }
         let Some(record) = self.view.record() else {
             return;
         };
@@ -143,9 +146,9 @@ impl LandLayer {
                         .weak(),
                 );
             }
-            LandState::Ready { record } => {
+            LandState::Ready { served } => {
                 ui.label(
-                    RichText::new(describe(record))
+                    RichText::new(describe(served))
                         .size(theme::TYPE_SMALL)
                         .weak(),
                 );

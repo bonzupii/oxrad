@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align2, FontId, Painter, Pos2, Rect, RichText, Stroke};
 
 use crate::acquire::Acquire;
-use crate::canvas::toggle_button;
+use crate::canvas::{provenance, toggle_button};
 use crate::gauge::{self, Gauge, GaugeSet, GaugeState, GaugeView, History, HistoryState};
 use crate::map::{MapTransform, MapView};
 use crate::theme::{self, Palette};
@@ -86,7 +86,7 @@ impl GaugeLayer {
     }
 
     /// The gauges the layer holds, for anything else that reports them.
-    pub const fn gauges(&self) -> Option<&GaugeSet> {
+    pub fn gauges(&self) -> Option<&GaugeSet> {
         self.view.set()
     }
 
@@ -134,6 +134,9 @@ impl GaugeLayer {
             return;
         }
         self.status(ui);
+        if let Some(served) = self.view.served() {
+            provenance(ui, served);
+        }
         let Some(set) = self.view.set().cloned() else {
             return;
         };
@@ -173,8 +176,12 @@ impl GaugeLayer {
                         .weak(),
                 );
             }
-            GaugeState::Ready { set } => {
-                ui.label(RichText::new(describe(set)).size(theme::TYPE_SMALL).weak());
+            GaugeState::Ready { served } => {
+                ui.label(
+                    RichText::new(describe(served))
+                        .size(theme::TYPE_SMALL)
+                        .weak(),
+                );
             }
             GaugeState::Failed { error, last, .. } => {
                 ui.colored_label(
@@ -213,6 +220,9 @@ impl GaugeLayer {
                 );
             }
             HistoryState::Ready { history } => {
+                if let Some(served) = self.view.served_history() {
+                    provenance(ui, served);
+                }
                 let history = history.clone();
                 draw_history(ui, &history, palette);
             }

@@ -171,11 +171,7 @@ pub fn fetch(acquire: &Acquire) -> Result<Served<UkReadings>, UkRiverError> {
             .json()
             .map_err(|source| UkRiverError::Provider { source })?,
     )?;
-    Ok(Served {
-        value,
-        provenance: fetched.provenance,
-        cache: fetched.cache,
-    })
+    Ok(Served::new(value, fetched.provenance, fetched.cache))
 }
 
 /// Where the latest river-level request stands.

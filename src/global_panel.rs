@@ -21,10 +21,12 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align, Color32, Layout, Pos2, Rect, RichText};
 
 use crate::acquire::Acquire;
-use crate::canvas::due_after;
+use crate::canvas::{due_after, provenance};
 use crate::config::Config;
+use crate::engine::Served;
 use crate::global_radar::{
-    self, DecodedTile, GlobalEvent, GlobalRadarError, GlobalRadarFeed, TileBounds, TileImage,
+    self, DecodedTile, GlobalEvent, GlobalRadarError, GlobalRadarFeed, ManifestSnapshot,
+    TileBounds, TileImage,
 };
 use crate::map::{self, MapView};
 use crate::sources;
@@ -69,6 +71,7 @@ pub(crate) struct GlobalPanel {
     request_due: Option<Instant>,
     refresh_due: Option<Instant>,
     state: GlobalState,
+    manifest: Option<Served<ManifestSnapshot>>,
 }
 
 impl GlobalPanel {
@@ -83,6 +86,7 @@ impl GlobalPanel {
             request_due: None,
             refresh_due: None,
             state: GlobalState::Idle,
+            manifest: None,
         }
     }
 
@@ -169,10 +173,11 @@ impl GlobalPanel {
         notice: &mut Option<String>,
     ) {
         match event {
-            GlobalEvent::Manifest { generation } => {
+            GlobalEvent::Manifest { generation, served } => {
                 if generation != self.generation {
                     return;
                 }
+                self.manifest = Some(served);
                 self.frames.clear();
                 self.index = 0;
                 self.playback = GlobalPlayback::Stopped;
@@ -360,12 +365,15 @@ impl GlobalPanel {
                             .monospace(),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.hyperlink_to(
+                        let link = ui.hyperlink_to(
                             RichText::new(global_radar::ATTRIBUTION)
                                 .size(theme::TYPE_SMALL)
                                 .weak(),
                             sources::RAINVIEWER.home,
                         );
+                        if let Some(served) = &self.manifest {
+                            link.on_hover_ui(|ui| provenance(ui, served));
+                        }
                     });
                 });
             });

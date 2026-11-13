@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align2, Color32, FontId, Painter, Pos2, Rect, RichText, Stroke};
 
 use crate::acquire::Acquire;
-use crate::canvas::toggle_button;
+use crate::canvas::{provenance, toggle_button};
 use crate::map::MapTransform;
 use crate::theme::{self, Palette};
 use crate::time;
@@ -82,7 +82,7 @@ impl VolcanoLayer {
     }
 
     /// The report the layer holds, for anything else that reports it.
-    pub const fn report(&self) -> Option<&Report> {
+    pub fn report(&self) -> Option<&Report> {
         self.view.report()
     }
 
@@ -134,6 +134,9 @@ impl VolcanoLayer {
             return;
         }
         self.status(ui);
+        if let Some(served) = self.view.served() {
+            provenance(ui, served);
+        }
         let Some(report) = self.view.report().cloned() else {
             return;
         };
@@ -160,9 +163,9 @@ impl VolcanoLayer {
                         .weak(),
                 );
             }
-            VolcanoState::Ready { report } => {
+            VolcanoState::Ready { served } => {
                 ui.label(
-                    RichText::new(describe(report))
+                    RichText::new(describe(served))
                         .size(theme::TYPE_SMALL)
                         .weak(),
                 );

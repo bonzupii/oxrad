@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align2, Color32, FontId, Painter, Pos2, Rect, RichText, Stroke};
 
 use crate::acquire::Acquire;
-use crate::canvas::toggle_button;
+use crate::canvas::{provenance, toggle_button};
 use crate::cyclone::{self, Alert, Cyclone, CycloneState, CycloneView, StormList};
 use crate::map::MapTransform;
 use crate::theme::{self, Palette};
@@ -83,7 +83,7 @@ impl CycloneLayer {
     }
 
     /// The list the layer holds, for anything else that reports it.
-    pub const fn list(&self) -> Option<&StormList> {
+    pub fn list(&self) -> Option<&StormList> {
         self.view.list()
     }
 
@@ -141,6 +141,9 @@ impl CycloneLayer {
             return;
         }
         self.status(ui);
+        if let Some(served) = self.view.served() {
+            provenance(ui, served);
+        }
         let Some(list) = self.view.list().cloned() else {
             return;
         };
@@ -167,8 +170,12 @@ impl CycloneLayer {
                         .weak(),
                 );
             }
-            CycloneState::Ready { list } => {
-                ui.label(RichText::new(describe(list)).size(theme::TYPE_SMALL).weak());
+            CycloneState::Ready { served } => {
+                ui.label(
+                    RichText::new(describe(served))
+                        .size(theme::TYPE_SMALL)
+                        .weak(),
+                );
             }
             CycloneState::Failed { error, last, .. } => {
                 ui.colored_label(

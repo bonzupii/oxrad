@@ -24,6 +24,7 @@ use std::io::{Cursor, Read};
 use nexrad_decode::messages::MessageContents;
 use nexrad_decode::messages::digital_radar_data::{GenericDataBlock, Message as DigitalRadarData};
 
+use crate::engine::Served;
 use crate::error::{CoordinateError, MessageDefect, MomentError, RadarError, VolumeDefect};
 use crate::product::RadarProduct;
 use crate::projection;
@@ -122,7 +123,7 @@ impl ArchiveOrigin {
 
 #[derive(Debug)]
 pub struct RetrievedVolume {
-    pub volume: RadarVolume,
+    pub volume: Served<RadarVolume>,
     pub origin: ArchiveOrigin,
     pub history_key: Option<String>,
 }

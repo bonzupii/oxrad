@@ -22,6 +22,8 @@ use eframe::egui::{self, RichText};
 use serde_json::Value;
 
 use crate::acquire::Acquire;
+use crate::canvas::provenance;
+use crate::engine::Served;
 use crate::provider::{self, FetchError};
 use crate::sources;
 use crate::theme;
@@ -101,7 +103,11 @@ fn parse(document: &Value, url: &str) -> Result<SunRecord, FetchError> {
     })
 }
 
-fn fetch(acquire: &Acquire, latitude: f64, longitude: f64) -> Result<SunRecord, FetchError> {
+fn fetch(
+    acquire: &Acquire,
+    latitude: f64,
+    longitude: f64,
+) -> Result<Served<SunRecord>, FetchError> {
     let latitude_text = format!("{latitude:.4}");
     let longitude_text = format!("{longitude:.4}");
     let fetched = acquire.fetch_operation(
@@ -113,14 +119,15 @@ fn fetch(acquire: &Acquire, latitude: f64, longitude: f64) -> Result<SunRecord, 
         ],
     )?;
     let document = fetched.json()?;
-    parse(&document, &fetched.provenance.url)
+    let value = parse(&document, &fetched.provenance.url)?;
+    Ok(Served::new(value, fetched.provenance, fetched.cache))
 }
 
 /// User-initiated solar event requests and their last successful result.
 pub struct SunView {
     acquire: Acquire,
-    request: Option<Receiver<Result<SunRecord, FetchError>>>,
-    record: Option<SunRecord>,
+    request: Option<Receiver<Result<Served<SunRecord>, FetchError>>>,
+    record: Option<Served<SunRecord>>,
     error: Option<FetchError>,
 }
 
@@ -194,6 +201,7 @@ impl SunView {
             );
         }
         if let Some(record) = &self.record {
+            provenance(ui, record);
             ui.label("Requested local date and location; refresh manually.");
             if self.request.is_some() || self.error.is_some() {
                 ui.label("Previous result:");

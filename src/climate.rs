@@ -29,6 +29,7 @@ use std::time::{Instant, SystemTimeError};
 use serde_json::Value;
 
 use crate::acquire::Acquire;
+use crate::engine::Served;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
@@ -369,7 +370,7 @@ pub fn fetch(
     acquire: &Acquire,
     latitude: f64,
     longitude: f64,
-) -> Result<ClimateRecord, ClimateError> {
+) -> Result<Served<ClimateRecord>, ClimateError> {
     let now = time::now_unix_ms().map_err(|source| ClimateError::Clock { source })?;
     let today = i64::try_from(now / time::MS_PER_DAY).map_err(|_| ClimateError::Shape {
         detail: "a clock the archive dates can follow",
@@ -380,7 +381,7 @@ pub fn fetch(
     let end_text = date_text(end);
     let latitude_text = format!("{latitude:.3}");
     let longitude_text = format!("{longitude:.3}");
-    let document = acquire
+    let fetched = acquire
         .fetch_operation(
             &sources::OPEN_METEO_ARCHIVE,
             "climate",
@@ -391,9 +392,12 @@ pub fn fetch(
                 ("end_date", end_text.as_str()),
             ],
         )
-        .and_then(|fetched| fetched.json())
         .map_err(|source| ClimateError::Provider { source })?;
-    parse(&document)
+    let document = fetched
+        .json()
+        .map_err(|source| ClimateError::Provider { source })?;
+    let value = parse(&document)?;
+    Ok(Served::new(value, fetched.provenance, fetched.cache))
 }
 
 /// Requests sent to the worker.
@@ -406,10 +410,14 @@ pub struct ClimateRequest {
 
 /// Answers from the worker.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the served value travels whole so its provenance cannot be separated from it"
+)]
 pub enum ClimateEvent {
     Ready {
         generation: u64,
-        record: ClimateRecord,
+        record: Served<ClimateRecord>,
     },
     Failed {
         generation: u64,
@@ -487,22 +495,22 @@ impl ClimateFeed {
 pub enum ClimateState {
     Idle,
     Loading {
-        last: Option<ClimateRecord>,
+        last: Option<Served<ClimateRecord>>,
     },
     Ready {
-        record: ClimateRecord,
+        served: Served<ClimateRecord>,
     },
     Failed {
         error: ClimateError,
-        last: Option<ClimateRecord>,
+        last: Option<Served<ClimateRecord>>,
     },
 }
 
 impl ClimateState {
     /// The most recent record still worth drawing.
-    pub const fn last(&self) -> Option<&ClimateRecord> {
+    pub const fn last(&self) -> Option<&Served<ClimateRecord>> {
         match self {
-            Self::Ready { record } => Some(record),
+            Self::Ready { served } => Some(served),
             Self::Loading { last } | Self::Failed { last, .. } => last.as_ref(),
             Self::Idle => None,
         }
@@ -529,7 +537,11 @@ impl ClimateView {
         &self.state
     }
 
-    pub const fn record(&self) -> Option<&ClimateRecord> {
+    pub fn record(&self) -> Option<&ClimateRecord> {
+        self.state.last().map(|served| &served.value)
+    }
+
+    pub const fn served(&self) -> Option<&Served<ClimateRecord>> {
         self.state.last()
     }
 
@@ -555,7 +567,7 @@ impl ClimateView {
                     if generation != self.generation {
                         continue;
                     }
-                    self.state = ClimateState::Ready { record };
+                    self.state = ClimateState::Ready { served: record };
                 }
                 ClimateEvent::Failed { generation, error } => {
                     if generation != self.generation {
@@ -571,10 +583,10 @@ impl ClimateView {
 }
 
 /// Empties the state and returns the record it was holding.
-fn take_last(state: &mut ClimateState) -> Option<ClimateRecord> {
+fn take_last(state: &mut ClimateState) -> Option<Served<ClimateRecord>> {
     match std::mem::replace(state, ClimateState::Idle) {
         ClimateState::Loading { last } | ClimateState::Failed { last, .. } => last,
-        ClimateState::Ready { record } => Some(record),
+        ClimateState::Ready { served } => Some(served),
         ClimateState::Idle => None,
     }
 }

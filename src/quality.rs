@@ -29,6 +29,7 @@ use std::time::Instant;
 use serde_json::{Map, Value};
 
 use crate::acquire::Acquire;
+use crate::engine::Served;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
@@ -341,10 +342,14 @@ pub fn parse(document: &Value) -> Result<AirQuality, AirError> {
     })
 }
 /// Fetches the record for one point.
-pub fn fetch(acquire: &Acquire, latitude: f64, longitude: f64) -> Result<AirQuality, AirError> {
+pub fn fetch(
+    acquire: &Acquire,
+    latitude: f64,
+    longitude: f64,
+) -> Result<Served<AirQuality>, AirError> {
     let latitude_text = format!("{latitude:.3}");
     let longitude_text = format!("{longitude:.3}");
-    let document = acquire
+    let fetched = acquire
         .fetch_operation(
             &sources::OPEN_METEO_AIR,
             "quality",
@@ -355,9 +360,12 @@ pub fn fetch(acquire: &Acquire, latitude: f64, longitude: f64) -> Result<AirQual
                 ("forecast_days", "2"),
             ],
         )
-        .and_then(|fetched| fetched.json())
         .map_err(|source| AirError::Provider { source })?;
-    parse(&document)
+    let document = fetched
+        .json()
+        .map_err(|source| AirError::Provider { source })?;
+    let value = parse(&document)?;
+    Ok(Served::new(value, fetched.provenance, fetched.cache))
 }
 
 /// Requests sent to the worker.
@@ -370,9 +378,19 @@ pub struct AirRequest {
 
 /// Answers from the worker.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the served value travels whole so its provenance cannot be separated from it"
+)]
 pub enum AirEvent {
-    Ready { generation: u64, record: AirQuality },
-    Failed { generation: u64, error: AirError },
+    Ready {
+        generation: u64,
+        record: Served<AirQuality>,
+    },
+    Failed {
+        generation: u64,
+        error: AirError,
+    },
 }
 
 /// Fetches air quality off the UI thread.
@@ -445,22 +463,22 @@ impl AirFeed {
 pub enum AirState {
     Idle,
     Loading {
-        last: Option<AirQuality>,
+        last: Option<Served<AirQuality>>,
     },
     Ready {
-        record: AirQuality,
+        served: Served<AirQuality>,
     },
     Failed {
         error: AirError,
-        last: Option<AirQuality>,
+        last: Option<Served<AirQuality>>,
     },
 }
 
 impl AirState {
     /// The most recent record still worth drawing.
-    pub const fn last(&self) -> Option<&AirQuality> {
+    pub const fn last(&self) -> Option<&Served<AirQuality>> {
         match self {
-            Self::Ready { record } => Some(record),
+            Self::Ready { served } => Some(served),
             Self::Loading { last } | Self::Failed { last, .. } => last.as_ref(),
             Self::Idle => None,
         }
@@ -487,7 +505,11 @@ impl AirView {
         &self.state
     }
 
-    pub const fn record(&self) -> Option<&AirQuality> {
+    pub fn record(&self) -> Option<&AirQuality> {
+        self.state.last().map(|served| &served.value)
+    }
+
+    pub const fn served(&self) -> Option<&Served<AirQuality>> {
         self.state.last()
     }
 
@@ -513,7 +535,7 @@ impl AirView {
                     if generation != self.generation {
                         continue;
                     }
-                    self.state = AirState::Ready { record };
+                    self.state = AirState::Ready { served: record };
                 }
                 AirEvent::Failed { generation, error } => {
                     if generation != self.generation {
@@ -529,10 +551,10 @@ impl AirView {
 }
 
 /// Empties the state and returns the record it was holding.
-fn take_last(state: &mut AirState) -> Option<AirQuality> {
+fn take_last(state: &mut AirState) -> Option<Served<AirQuality>> {
     match std::mem::replace(state, AirState::Idle) {
         AirState::Loading { last } | AirState::Failed { last, .. } => last,
-        AirState::Ready { record } => Some(record),
+        AirState::Ready { served } => Some(served),
         AirState::Idle => None,
     }
 }

@@ -317,7 +317,7 @@ impl QuakeLayer {
                     },
                 );
                 ui.label(RichText::new(built).size(theme::TYPE_SMALL).weak());
-                provenance(ui, &served.provenance, served.cache);
+                provenance(ui, served);
             }
             QuakeState::Failed { error, last, .. } => {
                 ui.colored_label(

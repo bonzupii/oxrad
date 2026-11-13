@@ -27,6 +27,7 @@ use std::time::{Instant, SystemTimeError};
 use serde_json::Value;
 
 use crate::acquire::Acquire;
+use crate::engine::Served;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
@@ -339,11 +340,11 @@ pub fn fetch(
     latitude: f64,
     longitude: f64,
     ensemble: bool,
-) -> Result<Discharge, HydroError> {
+) -> Result<Served<Discharge>, HydroError> {
     let latitude_text = format!("{latitude:.3}");
     let longitude_text = format!("{longitude:.3}");
     let operation = if ensemble { "hydro-ensemble" } else { "hydro" };
-    let document = acquire
+    let fetched = acquire
         .fetch_operation(
             &sources::OPEN_METEO_FLOOD,
             operation,
@@ -354,10 +355,13 @@ pub fn fetch(
                 ("forecast_days", "7"),
             ],
         )
-        .and_then(|fetched| fetched.json())
+        .map_err(|source| HydroError::Provider { source })?;
+    let document = fetched
+        .json()
         .map_err(|source| HydroError::Provider { source })?;
     let now = time::now_unix_ms().map_err(|source| HydroError::Clock { source })?;
-    parse(&document, now)
+    let value = parse(&document, now)?;
+    Ok(Served::new(value, fetched.provenance, fetched.cache))
 }
 
 /// Requests sent to the worker.
@@ -371,9 +375,19 @@ pub struct HydroRequest {
 
 /// Answers from the worker.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the served value travels whole so its provenance cannot be separated from it"
+)]
 pub enum HydroEvent {
-    Ready { generation: u64, record: Discharge },
-    Failed { generation: u64, error: HydroError },
+    Ready {
+        generation: u64,
+        record: Served<Discharge>,
+    },
+    Failed {
+        generation: u64,
+        error: HydroError,
+    },
 }
 
 /// Fetches discharge off the UI thread.
@@ -451,22 +465,22 @@ impl HydroFeed {
 pub enum HydroState {
     Idle,
     Loading {
-        last: Option<Discharge>,
+        last: Option<Served<Discharge>>,
     },
     Ready {
-        record: Discharge,
+        served: Served<Discharge>,
     },
     Failed {
         error: HydroError,
-        last: Option<Discharge>,
+        last: Option<Served<Discharge>>,
     },
 }
 
 impl HydroState {
     /// The most recent record still worth drawing.
-    pub const fn last(&self) -> Option<&Discharge> {
+    pub const fn last(&self) -> Option<&Served<Discharge>> {
         match self {
-            Self::Ready { record } => Some(record),
+            Self::Ready { served } => Some(served),
             Self::Loading { last } | Self::Failed { last, .. } => last.as_ref(),
             Self::Idle => None,
         }
@@ -493,7 +507,11 @@ impl HydroView {
         &self.state
     }
 
-    pub const fn record(&self) -> Option<&Discharge> {
+    pub fn record(&self) -> Option<&Discharge> {
+        self.state.last().map(|served| &served.value)
+    }
+
+    pub const fn served(&self) -> Option<&Served<Discharge>> {
         self.state.last()
     }
 
@@ -501,7 +519,7 @@ impl HydroView {
         let previous = std::mem::replace(&mut self.state, HydroState::Idle);
         let last = match previous {
             HydroState::Loading { last } | HydroState::Failed { last, .. } => last,
-            HydroState::Ready { record } => Some(record),
+            HydroState::Ready { served } => Some(served),
             HydroState::Idle => None,
         };
         self.state = HydroState::Loading { last };
@@ -526,7 +544,7 @@ impl HydroView {
                     if generation != self.generation {
                         continue;
                     }
-                    self.state = HydroState::Ready { record };
+                    self.state = HydroState::Ready { served: record };
                 }
                 HydroEvent::Failed { generation, error } => {
                     if generation != self.generation {
@@ -534,7 +552,7 @@ impl HydroView {
                     }
                     let last = match std::mem::replace(&mut self.state, HydroState::Idle) {
                         HydroState::Loading { last } | HydroState::Failed { last, .. } => last,
-                        HydroState::Ready { record } => Some(record),
+                        HydroState::Ready { served } => Some(served),
                         HydroState::Idle => None,
                     };
                     self.state = HydroState::Failed { error, last };

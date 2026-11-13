@@ -28,6 +28,7 @@ use std::time::Instant;
 use serde_json::{Map, Value};
 
 use crate::acquire::Acquire;
+use crate::engine::Served;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
@@ -349,10 +350,10 @@ pub fn fetch(
     acquire: &Acquire,
     latitude: f64,
     longitude: f64,
-) -> Result<Environment, EnvironmentError> {
+) -> Result<Served<Environment>, EnvironmentError> {
     let latitude_text = format!("{latitude:.3}");
     let longitude_text = format!("{longitude:.3}");
-    let document = acquire
+    let fetched = acquire
         .fetch_operation(
             &sources::OPEN_METEO_FORECAST,
             "environment",
@@ -362,9 +363,12 @@ pub fn fetch(
                 ("forecast_days", FORECAST_DAYS_STR),
             ],
         )
-        .and_then(|fetched| fetched.json())
         .map_err(|source| EnvironmentError::Provider { source })?;
-    parse(&document)
+    let document = fetched
+        .json()
+        .map_err(|source| EnvironmentError::Provider { source })?;
+    let value = parse(&document)?;
+    Ok(Served::new(value, fetched.provenance, fetched.cache))
 }
 
 /// Requests sent to the worker.
@@ -377,10 +381,14 @@ pub struct EnvironmentRequest {
 
 /// Answers from the worker.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the served value travels whole so its provenance cannot be separated from it"
+)]
 pub enum EnvironmentEvent {
     Ready {
         generation: u64,
-        record: Environment,
+        record: Served<Environment>,
     },
     Failed {
         generation: u64,
@@ -457,22 +465,22 @@ impl EnvironmentFeed {
 pub enum EnvironmentState {
     Idle,
     Loading {
-        last: Option<Environment>,
+        last: Option<Served<Environment>>,
     },
     Ready {
-        record: Environment,
+        served: Served<Environment>,
     },
     Failed {
         error: EnvironmentError,
-        last: Option<Environment>,
+        last: Option<Served<Environment>>,
     },
 }
 
 impl EnvironmentState {
     /// The most recent record still worth drawing.
-    pub const fn last(&self) -> Option<&Environment> {
+    pub const fn last(&self) -> Option<&Served<Environment>> {
         match self {
-            Self::Ready { record } => Some(record),
+            Self::Ready { served } => Some(served),
             Self::Loading { last } | Self::Failed { last, .. } => last.as_ref(),
             Self::Idle => None,
         }
@@ -499,7 +507,11 @@ impl EnvironmentView {
         &self.state
     }
 
-    pub const fn record(&self) -> Option<&Environment> {
+    pub fn record(&self) -> Option<&Environment> {
+        self.state.last().map(|served| &served.value)
+    }
+
+    pub const fn served(&self) -> Option<&Served<Environment>> {
         self.state.last()
     }
 
@@ -525,7 +537,7 @@ impl EnvironmentView {
                     if generation != self.generation {
                         continue;
                     }
-                    self.state = EnvironmentState::Ready { record };
+                    self.state = EnvironmentState::Ready { served: record };
                 }
                 EnvironmentEvent::Failed { generation, error } => {
                     if generation != self.generation {
@@ -541,10 +553,10 @@ impl EnvironmentView {
 }
 
 /// Empties the state and returns the record it was holding.
-fn take_last(state: &mut EnvironmentState) -> Option<Environment> {
+fn take_last(state: &mut EnvironmentState) -> Option<Served<Environment>> {
     match std::mem::replace(state, EnvironmentState::Idle) {
         EnvironmentState::Loading { last } | EnvironmentState::Failed { last, .. } => last,
-        EnvironmentState::Ready { record } => Some(record),
+        EnvironmentState::Ready { served } => Some(served),
         EnvironmentState::Idle => None,
     }
 }

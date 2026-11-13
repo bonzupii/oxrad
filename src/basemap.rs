@@ -11,6 +11,8 @@ use walkers::{Map, MapMemory, Style, TileId, TilePiece, Tiles};
 
 use crate::acquire::Acquire;
 use crate::basemap_tiles::BasemapTiles;
+use crate::canvas::provenance;
+use crate::engine::Served;
 use crate::map::MapView;
 use crate::paths;
 use crate::sources;
@@ -112,10 +114,14 @@ impl Tiles for VisibleTiles<'_> {
     }
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the served value travels whole so its provenance cannot be separated from it"
+)]
 enum StyleResult {
     Refreshed {
         style: MapStyle,
-        document: serde_json::Value,
+        document: Served<serde_json::Value>,
     },
     Failed {
         style: MapStyle,
@@ -124,17 +130,29 @@ enum StyleResult {
 }
 
 fn load_style(style: MapStyle, sender: &mpsc::Sender<StyleResult>, acquire: &Acquire) -> bool {
-    let result = match acquire
-        .fetch_operation(&sources::OPENFREEMAP, "style", &[("style", style.token())])
-        .and_then(|fetched| fetched.json())
-    {
-        Ok(document) if serde_json::from_value::<Style>(document.clone()).is_err() => {
-            StyleResult::Failed {
-                style,
-                error: String::from("Provider returned an unsupported or invalid style document."),
+    let result = match acquire.fetch_operation(
+        &sources::OPENFREEMAP,
+        "style",
+        &[("style", style.token())],
+    ) {
+        Ok(fetched) => match fetched.json() {
+            Ok(document) if serde_json::from_value::<Style>(document.clone()).is_err() => {
+                StyleResult::Failed {
+                    style,
+                    error: String::from(
+                        "Provider returned an unsupported or invalid style document.",
+                    ),
+                }
             }
-        }
-        Ok(document) => StyleResult::Refreshed { style, document },
+            Ok(document) => StyleResult::Refreshed {
+                style,
+                document: Served::new(document, fetched.provenance, fetched.cache),
+            },
+            Err(error) => StyleResult::Failed {
+                style,
+                error: error.to_string(),
+            },
+        },
         Err(error) => StyleResult::Failed {
             style,
             error: error.to_string(),
@@ -147,7 +165,7 @@ pub struct Basemap {
     selected: MapStyle,
     acquire: Acquire,
     active: Option<MapStyle>,
-    active_document: Option<serde_json::Value>,
+    active_document: Option<Served<serde_json::Value>>,
     receiver: Option<Receiver<StyleResult>>,
     tiles: Option<BasemapTiles<OpenFreeMap>>,
     missing_tiles: usize,
@@ -214,6 +232,9 @@ impl Basemap {
             ));
         }
         ui.hyperlink_to(CREDIT, sources::openfreemap_attribution_url());
+        if let Some(document) = &self.active_document {
+            provenance(ui, document);
+        }
         (self.selected != previous).then_some(self.selected)
     }
 
@@ -229,15 +250,18 @@ impl Basemap {
         &mut self,
         context: &egui::Context,
         selected: MapStyle,
-        document: serde_json::Value,
+        document: Served<serde_json::Value>,
     ) {
         if self.tiles.is_some()
             && self.active == Some(selected)
-            && self.active_document.as_ref() == Some(&document)
+            && self
+                .active_document
+                .as_ref()
+                .is_some_and(|active| active.value == document.value)
         {
             return;
         }
-        let style = match serde_json::from_value::<Style>(document.clone()) {
+        let style = match serde_json::from_value::<Style>(document.value.clone()) {
             Ok(style) => style,
             Err(error) => {
                 self.error = Some(format!("Basemap style could not be parsed: {error}"));

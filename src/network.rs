@@ -249,6 +249,8 @@ fn scan_from_key(key: &str) -> Option<u64> {
 #[derive(Debug)]
 pub struct CachedArchive {
     pub bytes: Vec<u8>,
+    pub provenance: crate::engine::Provenance,
+    pub cache: crate::engine::CacheState,
     pub from_cache: bool,
     pub cache_warning: Option<String>,
 }
@@ -279,6 +281,8 @@ pub fn fetch_archive_cached(
     })?;
     Ok(CachedArchive {
         bytes: fetched.body,
+        provenance: fetched.provenance,
+        cache: fetched.cache,
         from_cache: fetched.cache == CacheState::Cached,
         cache_warning: acquire.cache_error(),
     })

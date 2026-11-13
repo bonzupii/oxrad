@@ -459,10 +459,7 @@ mod tests {
     }
 
     fn expression(function: &naga::Function, handle: Handle<Expression>) -> Option<&Expression> {
-        match function.expressions.try_get(handle) {
-            Ok(expression) => Some(expression),
-            Err(_) => None,
-        }
+        function.expressions.try_get(handle).ok()
     }
 
     fn stripped(function: &naga::Function, mut handle: Handle<Expression>) -> Handle<Expression> {

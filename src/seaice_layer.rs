@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align2, FontId, Pos2, Rect, RichText, Stroke};
 
 use crate::acquire::Acquire;
-use crate::canvas::toggle_button;
+use crate::canvas::{provenance, toggle_button};
 use crate::seaice::{self, BASELINE_FROM, BASELINE_TO, SeaIceMonth, SeaIceState, SeaIceView};
 use crate::theme::{self, Palette};
 
@@ -107,6 +107,9 @@ impl SeaIceLayer {
             return;
         }
         self.status(ui);
+        if let Some(served) = self.view.served() {
+            provenance(ui, served);
+        }
         let Some(record) = self.view.record() else {
             return;
         };
@@ -139,12 +142,12 @@ impl SeaIceLayer {
                     .weak(),
                 );
             }
-            SeaIceState::Ready { record } => {
+            SeaIceState::Ready { served } => {
                 ui.label(
                     RichText::new(format!(
                         "{} · {} years on record",
-                        month_name(record.month),
-                        record.north.years.len()
+                        month_name(served.month),
+                        served.north.years.len()
                     ))
                     .size(theme::TYPE_SMALL)
                     .weak(),

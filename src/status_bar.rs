@@ -51,6 +51,7 @@ pub(crate) fn status(
         retry_pipeline = failure_rows(ui, radar);
         requests_row(ui, engine.0, engine.1, notice);
         if let Some(frame) = &radar.display().frame {
+            crate::canvas::provenance(ui, &frame.volume);
             diagnostics(ui, frame, radar.selected_station(stations));
         }
         ui.add_space(6.0);

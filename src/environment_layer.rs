@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Stroke};
 
 use crate::acquire::Acquire;
-use crate::canvas::toggle_button;
+use crate::canvas::{provenance, toggle_button};
 use crate::environment::{
     self, CapeCategory, Environment, EnvironmentHour, EnvironmentState, EnvironmentView,
 };
@@ -119,6 +119,9 @@ impl EnvironmentLayer {
             return;
         }
         self.status(ui);
+        if let Some(served) = self.view.served() {
+            provenance(ui, served);
+        }
         let Some(record) = self.view.record() else {
             return;
         };
@@ -152,9 +155,9 @@ impl EnvironmentLayer {
                         .weak(),
                 );
             }
-            EnvironmentState::Ready { record } => {
+            EnvironmentState::Ready { served } => {
                 ui.label(
-                    RichText::new(describe(record))
+                    RichText::new(describe(served))
                         .size(theme::TYPE_SMALL)
                         .weak(),
                 );

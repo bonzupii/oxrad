@@ -25,6 +25,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
 use crate::acquire::Acquire;
+use crate::engine::Served;
 use crate::error::RadarError;
 use crate::network;
 use crate::radar::{self, RadarVolume};
@@ -64,6 +65,10 @@ impl From<RadarError> for HistoryError {
 }
 
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the served value travels whole so its provenance cannot be separated from it"
+)]
 pub enum HistoryEvent {
     Keys {
         generation: u64,
@@ -72,7 +77,7 @@ pub enum HistoryEvent {
     Volume {
         generation: u64,
         key: String,
-        volume: RadarVolume,
+        volume: Served<RadarVolume>,
         from_cache: bool,
         cache_warning: Option<String>,
     },
@@ -214,7 +219,7 @@ impl HistoryWorker {
                         Ok(volume) => HistoryEvent::Volume {
                             generation,
                             key,
-                            volume,
+                            volume: Served::new(volume, archive.provenance, archive.cache),
                             from_cache: archive.from_cache,
                             cache_warning: archive.cache_warning,
                         },

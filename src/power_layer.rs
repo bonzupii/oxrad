@@ -122,7 +122,7 @@ impl PowerLayer {
                 .size(theme::TYPE_SMALL)
                 .weak(),
         );
-        provenance(ui, &served.provenance, served.cache);
+        provenance(ui, served);
         summary(ui, record, palette);
         table(ui, record, palette);
     }

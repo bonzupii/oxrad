@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, RichText};
 
 use crate::acquire::Acquire;
-use crate::canvas::toggle_button;
+use crate::canvas::{provenance, toggle_button};
 use crate::map;
 use crate::observations::{
     self, FlightCategory, Observation, ObservationSet, ObservationState, ObservationView,
@@ -57,7 +57,7 @@ impl ObservationLayer {
     }
 
     /// The stations the layer is holding, for anything else that reports them.
-    pub const fn stations(&self) -> Option<&crate::observations::ObservationSet> {
+    pub fn stations(&self) -> Option<&crate::observations::ObservationSet> {
         self.view.stations()
     }
 
@@ -154,6 +154,9 @@ impl ObservationLayer {
             return;
         }
         self.status(ui);
+        if let Some(served) = self.view.served() {
+            provenance(ui, served);
+        }
         let Some(set) = self.view.set() else {
             return;
         };

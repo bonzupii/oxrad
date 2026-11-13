@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Stroke, Vec2};
 
 use crate::acquire::Acquire;
-use crate::canvas::toggle_button;
+use crate::canvas::{provenance, toggle_button};
 use crate::map::MapView;
 use crate::projection;
 use crate::sounding::{self, Sounding, SoundingState, SoundingView};
@@ -87,7 +87,7 @@ impl SoundingLayer {
     }
 
     /// The column the layer is holding, for anything else that reports it.
-    pub const fn record(&self) -> Option<&Sounding> {
+    pub fn record(&self) -> Option<&Sounding> {
         self.view.record()
     }
 
@@ -131,6 +131,9 @@ impl SoundingLayer {
             return;
         }
         self.status(ui);
+        if let Some(served) = self.view.served() {
+            provenance(ui, served);
+        }
         let Some(record) = self.view.record() else {
             return;
         };
@@ -158,9 +161,9 @@ impl SoundingLayer {
                         .weak(),
                 );
             }
-            SoundingState::Ready { record } => {
+            SoundingState::Ready { served } => {
                 ui.label(
-                    RichText::new(describe(record))
+                    RichText::new(describe(served))
                         .size(theme::TYPE_SMALL)
                         .weak(),
                 );

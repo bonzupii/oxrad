@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Stroke};
 
 use crate::acquire::Acquire;
-use crate::canvas::toggle_button;
+use crate::canvas::{provenance, toggle_button};
 use crate::hydro::{self, Discharge, HydroState, HydroView};
 use crate::map::MapView;
 use crate::projection;
@@ -144,6 +144,9 @@ impl HydroLayer {
             }
         };
         self.status(ui);
+        if let Some(served) = self.view.served() {
+            provenance(ui, served);
+        }
         if let Some(record) = self.view.record() {
             ui.label(
                 RichText::new(hydro::describe(record))
@@ -182,11 +185,11 @@ impl HydroLayer {
                     );
                 }
             }
-            HydroState::Ready { record } => {
+            HydroState::Ready { served } => {
                 ui.label(
                     RichText::new(format!(
                         "At {:.2}, {:.2} · the map centre",
-                        record.latitude, record.longitude
+                        served.latitude, served.longitude
                     ))
                     .size(theme::TYPE_SMALL)
                     .weak(),
@@ -554,10 +557,7 @@ mod tests {
 
     #[test]
     fn the_plot_headroom_clears_the_highest_value() {
-        let top = match plot_maximum(&series(&[Some(1.0), Some(5.0), None])) {
-            Some(top) => top,
-            None => 0.0,
-        };
+        let top = plot_maximum(&series(&[Some(1.0), Some(5.0), None])).unwrap_or(0.0);
         assert!((top - 5.6).abs() < 1e-9, "{top} clears the highest day");
         assert_eq!(plot_maximum(&series(&[None, None])), None);
         assert_eq!(plot_maximum(&series(&[Some(0.0)])), Some(1.0));

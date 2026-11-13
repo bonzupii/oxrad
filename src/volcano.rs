@@ -32,6 +32,7 @@ use std::time::Instant;
 use serde_json::{Map, Value};
 
 use crate::acquire::Acquire;
+use crate::engine::Served;
 use crate::provider::FetchError;
 use crate::sources;
 /// The provider, in the words the rail uses.
@@ -330,24 +331,31 @@ pub fn plain_text(html: &str) -> String {
     decoded.split_whitespace().collect::<Vec<&str>>().join(" ")
 }
 /// The notice that carries a volcano's latest statement./// Fetches the raised volcanoes and follows each one up for its position.
-pub fn fetch(acquire: &Acquire) -> Result<Report, VolcanoError> {
-    let document = acquire
+pub fn fetch(acquire: &Acquire) -> Result<Served<Report>, VolcanoError> {
+    let list_fetched = acquire
         .fetch_operation(&sources::USGS_VOLCANO, "list", &[])
-        .and_then(|fetched| fetched.json())
+        .map_err(|source| VolcanoError::Provider { source })?;
+    let document = list_fetched
+        .json()
         .map_err(|source| VolcanoError::Provider { source })?;
     let notices = parse_list(&document)?;
     let not_followed = notices.len().saturating_sub(MAX_VOLCANOES);
     let mut volcanoes = Vec::with_capacity(notices.len().min(MAX_VOLCANOES));
+    let mut requests = Vec::new();
     for notice in notices.into_iter().take(MAX_VOLCANOES) {
-        let mut place = match acquire
-            .fetch_operation(
-                &sources::USGS_VOLCANO,
-                "volcano",
-                &[("vnum", notice.vnum.as_str())],
-            )
-            .and_then(|fetched| fetched.json())
-        {
-            Ok(document) => parse_volcano(&document)?,
+        let mut place = match acquire.fetch_operation(
+            &sources::USGS_VOLCANO,
+            "volcano",
+            &[("vnum", notice.vnum.as_str())],
+        ) {
+            Ok(fetched) => {
+                let document = fetched
+                    .json()
+                    .map_err(|source| VolcanoError::Provider { source })?;
+                let place = parse_volcano(&document)?;
+                requests.push((fetched.provenance, fetched.cache));
+                place
+            }
             Err(_) => Place {
                 latitude: None,
                 longitude: None,
@@ -358,22 +366,32 @@ pub fn fetch(acquire: &Acquire) -> Result<Report, VolcanoError> {
             },
         };
         if !notice.identifier.is_empty()
-            && let Ok(document) = acquire
-                .fetch_operation(
-                    &sources::USGS_VOLCANO,
-                    "notice",
-                    &[("notice", notice.identifier.as_str())],
-                )
-                .and_then(|fetched| fetched.json())
+            && let Ok(fetched) = acquire.fetch_operation(
+                &sources::USGS_VOLCANO,
+                "notice",
+                &[("notice", notice.identifier.as_str())],
+            )
         {
+            let document = fetched
+                .json()
+                .map_err(|source| VolcanoError::Provider { source })?;
             place.summary = parse_synopsis(&document);
+            requests.push((fetched.provenance, fetched.cache));
         }
         volcanoes.push(Volcano { notice, place });
     }
-    Ok(Report {
-        volcanoes,
-        not_followed,
-    })
+    let mut served = Served::new(
+        Report {
+            volcanoes,
+            not_followed,
+        },
+        list_fetched.provenance,
+        list_fetched.cache,
+    );
+    for (provenance, cache) in requests {
+        served = served.with_request(provenance, cache);
+    }
+    Ok(served)
 }
 
 /// Requests sent to the worker.
@@ -387,7 +405,7 @@ pub struct VolcanoRequest {
 pub enum VolcanoEvent {
     Ready {
         generation: u64,
-        report: Report,
+        report: Served<Report>,
     },
     Failed {
         generation: u64,
@@ -464,22 +482,22 @@ impl VolcanoFeed {
 pub enum VolcanoState {
     Idle,
     Loading {
-        last: Option<Report>,
+        last: Option<Served<Report>>,
     },
     Ready {
-        report: Report,
+        served: Served<Report>,
     },
     Failed {
         error: VolcanoError,
-        last: Option<Report>,
+        last: Option<Served<Report>>,
     },
 }
 
 impl VolcanoState {
     /// The most recent report still worth drawing.
-    pub const fn last(&self) -> Option<&Report> {
+    pub const fn last(&self) -> Option<&Served<Report>> {
         match self {
-            Self::Ready { report } => Some(report),
+            Self::Ready { served } => Some(served),
             Self::Loading { last } | Self::Failed { last, .. } => last.as_ref(),
             Self::Idle => None,
         }
@@ -506,7 +524,11 @@ impl VolcanoView {
         &self.state
     }
 
-    pub const fn report(&self) -> Option<&Report> {
+    pub fn report(&self) -> Option<&Report> {
+        self.state.last().map(|served| &served.value)
+    }
+
+    pub const fn served(&self) -> Option<&Served<Report>> {
         self.state.last()
     }
 
@@ -530,7 +552,7 @@ impl VolcanoView {
                     if generation != self.generation {
                         continue;
                     }
-                    self.state = VolcanoState::Ready { report };
+                    self.state = VolcanoState::Ready { served: report };
                 }
                 VolcanoEvent::Failed { generation, error } => {
                     if generation != self.generation {
@@ -546,10 +568,10 @@ impl VolcanoView {
 }
 
 /// Empties the state and returns the report it was holding.
-fn take_last(state: &mut VolcanoState) -> Option<Report> {
+fn take_last(state: &mut VolcanoState) -> Option<Served<Report>> {
     match std::mem::replace(state, VolcanoState::Idle) {
         VolcanoState::Loading { last } | VolcanoState::Failed { last, .. } => last,
-        VolcanoState::Ready { report } => Some(report),
+        VolcanoState::Ready { served } => Some(served),
         VolcanoState::Idle => None,
     }
 }

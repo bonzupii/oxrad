@@ -1484,7 +1484,7 @@ mod tests {
         assert!(loaded.units_from_locale);
         let restored = loaded
             .place
-            .ok_or(ConfigError::MissingProfile { path: path.clone() })?;
+            .ok_or_else(|| ConfigError::MissingProfile { path: path.clone() })?;
         assert_eq!(restored.name, "Dublin");
         assert!((restored.lat - 53.3494).abs() < 1e-6);
         fs::remove_dir_all(&directory).map_err(|source| ConfigError::Write {

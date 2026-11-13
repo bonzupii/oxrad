@@ -26,6 +26,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use serde_json::Value;
 
 use crate::acquire::Acquire;
+use crate::engine::Served;
 use crate::provider::FetchError;
 use crate::sources;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -331,17 +332,21 @@ fn parse_collection(document: &Value) -> Result<WarningSet, WarningError> {
 }
 
 /// Retrieves and parses the current active warning collection.
-pub fn fetch(acquire: &Acquire) -> Result<WarningSet, WarningError> {
-    let document = acquire
-        .fetch_operation(&sources::NWS_API, "alerts", &[])
-        .and_then(|fetched| fetched.json())?;
-    parse_collection(&document)
+pub fn fetch(acquire: &Acquire) -> Result<Served<WarningSet>, WarningError> {
+    let fetched = acquire.fetch_operation(&sources::NWS_API, "alerts", &[])?;
+    let document = fetched.json()?;
+    let value = parse_collection(&document)?;
+    Ok(Served::new(value, fetched.provenance, fetched.cache))
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the served value travels whole so its provenance cannot be separated from it"
+)]
 pub enum WarningEvent {
     Ready {
         generation: u64,
-        set: WarningSet,
+        set: Served<WarningSet>,
     },
     Failed {
         generation: u64,
@@ -393,7 +398,7 @@ mod tests {
     use crate::test_support::TestError;
     use serde_json::json;
 
-    fn warning_feature(geometry: Value) -> Value {
+    fn warning_feature(geometry: &Value) -> Value {
         json!({
             "properties": {
                 "id": "urn:test:1",
@@ -407,13 +412,13 @@ mod tests {
                 "sent": "2026-10-31T11:55:00-05:00",
                 "expires": "2026-10-31T12:00:00-05:00"
             },
-            "geometry": geometry
+            "geometry": geometry.clone()
         })
     }
 
     #[test]
     fn parses_polygon_geometry_and_metadata() -> Result<(), TestError> {
-        let feature = warning_feature(json!({
+        let feature = warning_feature(&json!({
             "type": "Polygon",
             "coordinates": [[
                 [-88.0, 37.0],
@@ -444,7 +449,7 @@ mod tests {
 
     #[test]
     fn one_malformed_alert_does_not_discard_the_others() -> Result<(), TestError> {
-        let valid = warning_feature(json!({
+        let valid = warning_feature(&json!({
             "type": "Polygon",
             "coordinates": [[
                 [-88.0, 37.0],
@@ -472,7 +477,7 @@ mod tests {
 
     #[test]
     fn a_warning_without_geometry_is_retained() -> Result<(), TestError> {
-        let feature = warning_feature(Value::Null);
+        let feature = warning_feature(&Value::Null);
         let warning = parse_warning(&feature)?;
         assert!(warning.polygons.is_empty());
         assert_eq!(warning.area, "Test County");
@@ -481,7 +486,7 @@ mod tests {
 
     #[test]
     fn out_of_range_coordinates_are_rejected() {
-        let feature = warning_feature(json!({
+        let feature = warning_feature(&json!({
             "type": "Polygon",
             "coordinates": [[
                 [-88.0, 97.0],
@@ -511,7 +516,7 @@ mod tests {
     #[test]
     fn a_warning_collection_parses_without_a_provider_request() -> Result<(), TestError> {
         let set = parse_collection(&json!({
-            "features": [warning_feature(Value::Null)]
+            "features": [warning_feature(&Value::Null)]
         }))?;
         assert!(
             set.warnings.iter().all(|warning| !warning.event.is_empty()),
@@ -522,7 +527,7 @@ mod tests {
 
     #[test]
     fn multipolygon_rings_are_all_retained() -> Result<(), TestError> {
-        let feature = warning_feature(json!({
+        let feature = warning_feature(&json!({
             "type": "MultiPolygon",
             "coordinates": [
                 [[[-88.0, 37.0], [-87.0, 37.0], [-87.0, 38.0], [-88.0, 37.0]]],

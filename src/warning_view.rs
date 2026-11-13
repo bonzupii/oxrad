@@ -6,8 +6,9 @@
 use std::time::{Duration, Instant};
 
 use crate::acquire::Acquire;
+use crate::engine::Served;
 use crate::overlay_select::retain_warning_selection;
-use crate::warnings::{Warning, WarningError, WarningEvent, WarningFeed};
+use crate::warnings::{Warning, WarningError, WarningEvent, WarningFeed, WarningSet};
 
 /// How long a successful warning set stays current.
 const REFRESH_SECS: u64 = 5 * 60;
@@ -32,9 +33,7 @@ pub enum WarningScope {
 pub struct WarningView {
     feed: WarningFeed,
     generation: u64,
-    pub list: Vec<Warning>,
-    pub without_geometry: usize,
-    pub rejected: usize,
+    served: Option<Served<WarningSet>>,
     pub selected: Option<String>,
     pub scope: WarningScope,
     pub state: WarningState,
@@ -47,9 +46,7 @@ impl WarningView {
         Self {
             feed: WarningFeed::new(acquire),
             generation: 0,
-            list: Vec::new(),
-            without_geometry: 0,
-            rejected: 0,
+            served: None,
             selected: None,
             scope: WarningScope::All,
             state: WarningState::Idle,
@@ -119,18 +116,14 @@ impl WarningView {
     fn apply(&mut self, event: WarningEvent) -> Option<String> {
         match event {
             WarningEvent::Ready { generation, set } if generation == self.generation => {
-                let rejected = set.rejected;
-                self.list = set.warnings;
-                self.without_geometry = set.without_geometry;
-                self.rejected = rejected.len();
-                retain_warning_selection(&mut self.selected, &self.list);
+                let count = set.rejected.len();
+                let first = set.rejected.first().cloned();
+                retain_warning_selection(&mut self.selected, &set.warnings);
+                self.served = Some(set);
                 self.state = WarningState::Ready;
                 self.refresh_due = Some(Instant::now() + Duration::from_secs(REFRESH_SECS));
-                rejected.first().map(|message| {
-                    format!(
-                        "{} active alerts could not be read. First problem: {message}",
-                        rejected.len()
-                    )
+                first.map(|message| {
+                    format!("{count} active alerts could not be read. First problem: {message}")
                 })
             }
             WarningEvent::Failed { generation, error } if generation == self.generation => {
@@ -143,7 +136,29 @@ impl WarningView {
     /// The selected warning, when it is still in the current set.
     pub fn selected_warning(&self) -> Option<&Warning> {
         let id = self.selected.as_deref()?;
-        self.list.iter().find(|warning| warning.id == id)
+        self.list().iter().find(|warning| warning.id == id)
+    }
+
+    /// The warnings in the current set.
+    pub fn list(&self) -> &[Warning] {
+        self.served
+            .as_ref()
+            .map_or(&[], |set| set.warnings.as_slice())
+    }
+
+    /// The current set with its provenance.
+    pub const fn served(&self) -> Option<&Served<WarningSet>> {
+        self.served.as_ref()
+    }
+
+    /// How many warnings carried no polygon.
+    pub fn without_geometry(&self) -> usize {
+        self.served.as_ref().map_or(0, |set| set.without_geometry)
+    }
+
+    /// How many features could not be read.
+    pub fn rejected(&self) -> usize {
+        self.served.as_ref().map_or(0, |set| set.rejected.len())
     }
 }
 
@@ -171,13 +186,13 @@ mod tests {
 
     #[test]
     fn a_selection_that_left_the_set_is_cleared() -> Result<(), TestError> {
-        let mut view = WarningView::new(Acquire::offline());
-        view.list = vec![warning("alert-b", "Updated"), warning("alert-a", "Other")];
-        view.selected = Some(String::from("alert-b"));
-        assert!(view.selected_warning().is_some());
-        view.list = vec![warning("alert-a", "Other")];
-        retain_warning_selection(&mut view.selected, &view.list);
-        assert!(view.selected.is_none());
+        let mut selected = Some(String::from("alert-b"));
+        let first = [warning("alert-b", "Updated"), warning("alert-a", "Other")];
+        retain_warning_selection(&mut selected, &first);
+        assert!(selected.is_some());
+        let second = [warning("alert-a", "Other")];
+        retain_warning_selection(&mut selected, &second);
+        assert!(selected.is_none());
         Ok(())
     }
 }

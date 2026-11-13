@@ -21,6 +21,7 @@ use std::time::Instant;
 use eframe::egui::{self, RichText};
 
 use crate::acquire::Acquire;
+use crate::canvas::provenance;
 use crate::config::Config;
 use crate::forecast::{Forecast, ForecastPeriod, ForecastState, ForecastView};
 use crate::place::Place;
@@ -49,7 +50,7 @@ impl ForecastPanel {
         self.forecast.start(place);
     }
 
-    pub(crate) const fn forecast(&self) -> Option<&Forecast> {
+    pub(crate) fn forecast(&self) -> Option<&Forecast> {
         self.forecast.forecast()
     }
 
@@ -112,11 +113,13 @@ impl ForecastPanel {
                                 "Showing the last forecast received.",
                             );
                             ui.separator();
+                            provenance(ui, forecast);
                             forecast_body(ui, forecast, true, config.units);
                         }
                     }
-                    ForecastState::Ready { forecast } => {
-                        forecast_body(ui, forecast, false, config.units);
+                    ForecastState::Ready { served } => {
+                        provenance(ui, served);
+                        forecast_body(ui, served, false, config.units);
                     }
                 }
                 ui.add_space(theme::SPACE_S);

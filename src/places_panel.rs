@@ -130,7 +130,8 @@ impl PlacesPanel {
                 );
             }
             SearchState::Ready { places } => {
-                chosen = search_results(ui, places, stations.result());
+                crate::canvas::provenance(ui, places);
+                chosen = search_results(ui, &places.value, stations.result());
             }
         }
         ui.add_space(theme::SPACE_XS);
@@ -168,7 +169,7 @@ impl PlacesPanel {
 fn search_results(
     ui: &mut egui::Ui,
     places: &[Place],
-    stations: &Result<Vec<Station>, StationError>,
+    stations: Result<&[Station], &StationError>,
 ) -> Option<Place> {
     if places.is_empty() {
         ui.colored_label(

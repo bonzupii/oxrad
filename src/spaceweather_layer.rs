@@ -20,7 +20,7 @@ use std::time::Instant;
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Stroke};
 
 use crate::acquire::Acquire;
-use crate::canvas::toggle_button;
+use crate::canvas::{provenance, toggle_button};
 use crate::spaceweather::{self, KpStatus, SpaceWeather, SpaceWeatherState, SpaceWeatherView};
 use crate::theme::{self, Palette};
 use crate::time;
@@ -47,7 +47,7 @@ impl SpaceWeatherLayer {
 
     /// The geomagnetic record the layer is holding, for anything else that
     /// reports it.
-    pub const fn record(&self) -> Option<&crate::spaceweather::SpaceWeather> {
+    pub fn record(&self) -> Option<&crate::spaceweather::SpaceWeather> {
         self.view.record()
     }
 
@@ -93,6 +93,9 @@ impl SpaceWeatherLayer {
             return;
         }
         self.status(ui);
+        if let Some(served) = self.view.served() {
+            provenance(ui, served);
+        }
         let Some(record) = self.view.record() else {
             return;
         };

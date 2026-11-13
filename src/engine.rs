@@ -21,6 +21,7 @@
 //! retry, cache or rate state.
 
 use std::collections::BTreeMap;
+use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -123,7 +124,7 @@ impl RequestSpec {
     }
 
     #[cfg(test)]
-    pub(crate) fn without_store(mut self) -> Self {
+    pub(crate) const fn without_store(mut self) -> Self {
         self.store = false;
         self
     }
@@ -199,12 +200,95 @@ pub(crate) struct Fetched {
     pub(crate) cache: CacheState,
 }
 
-/// A parsed value beside the request that produced it.
-#[derive(Debug)]
+/// One request behind a served value.
+#[derive(Debug, Clone)]
+pub(crate) struct SourceRecord {
+    pub(crate) provenance: Provenance,
+    pub(crate) cache: CacheState,
+}
+
+/// A parsed value beside the request or requests that produced it.
+#[derive(Debug, Clone)]
 pub(crate) struct Served<T> {
     pub(crate) value: T,
     pub(crate) provenance: Provenance,
     pub(crate) cache: CacheState,
+    /// Further requests a composite readout needed, such as the solar-wind
+    /// pair beside the Kp index. Empty for a single-request readout.
+    pub(crate) extra: Vec<SourceRecord>,
+}
+
+impl<T> Served<T> {
+    pub(crate) const fn new(value: T, provenance: Provenance, cache: CacheState) -> Self {
+        Self {
+            value,
+            provenance,
+            cache,
+            extra: Vec::new(),
+        }
+    }
+
+    /// Adds one more request behind the same value.
+    pub(crate) fn with_request(mut self, provenance: Provenance, cache: CacheState) -> Self {
+        self.extra.push(SourceRecord { provenance, cache });
+        self
+    }
+
+    /// A served value with stand-in provenance, for deterministic tests.
+    #[cfg(test)]
+    pub(crate) fn test(value: T) -> Self {
+        Self::new(
+            value,
+            Provenance {
+                source: "test",
+                source_name: "Test source",
+                credit: "Test credit",
+                licence: "Test licence",
+                licence_url: "https://example.test/licence",
+                operation: Some("test"),
+                subject: String::new(),
+                station: None,
+                product: None,
+                scan_unix_ms: None,
+                url: String::from("https://example.test/request"),
+                rate_limit_seconds: 0,
+            },
+            CacheState::Network,
+        )
+    }
+
+    /// Adds every request that backed another served value.
+    pub(crate) fn absorb<U>(mut self, other: &Served<U>) -> Self {
+        self.extra.push(SourceRecord {
+            provenance: other.provenance.clone(),
+            cache: other.cache,
+        });
+        self.extra.extend(other.extra.iter().cloned());
+        self
+    }
+
+    /// Every request behind this value, primary first.
+    pub(crate) fn requests(&self) -> impl Iterator<Item = (&Provenance, CacheState)> {
+        std::iter::once((&self.provenance, self.cache)).chain(
+            self.extra
+                .iter()
+                .map(|record| (&record.provenance, record.cache)),
+        )
+    }
+}
+
+impl<T> Deref for Served<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl<T> DerefMut for Served<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.value
+    }
 }
 
 impl Fetched {
@@ -323,7 +407,7 @@ impl EngineState {
     }
 
     #[cfg(test)]
-    pub(crate) fn records(&self) -> &BTreeMap<String, Record> {
+    pub(crate) const fn records(&self) -> &BTreeMap<String, Record> {
         &self.records
     }
 
@@ -694,7 +778,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "oxrad-engine-{name}-{}-{}",
             std::process::id(),
-            now_unix_ms().map_or(0, |now| now)
+            now_unix_ms().unwrap_or(0)
         ));
         Store::at(path)
     }
@@ -705,6 +789,45 @@ mod tests {
             status: code,
             retry_after: None,
         }
+    }
+
+    #[test]
+    fn a_served_value_lists_its_registry_requests_in_order() -> Result<(), FetchError> {
+        let kp = RequestSpec::for_operation(&sources::NOAA_SWPC, "kp", &[])?;
+        let wind = RequestSpec::for_operation(&sources::NOAA_SWPC, "wind", &[])?;
+        let served = Served::new((), kp.provenance(), CacheState::Network)
+            .with_request(wind.provenance(), CacheState::Cached);
+        let requests: Vec<_> = served.requests().collect();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests.first().map(|(entry, _)| entry.url.clone()),
+            Some(kp.url)
+        );
+        assert_eq!(
+            requests.first().map(|(entry, _)| entry.operation),
+            Some(Some("kp"))
+        );
+        assert_eq!(
+            requests.get(1).map(|(entry, _)| entry.url.clone()),
+            Some(wind.url)
+        );
+        assert_eq!(
+            requests.get(1).map(|(_, cache)| *cache),
+            Some(CacheState::Cached)
+        );
+        assert_eq!(
+            requests.first().map(|(entry, _)| entry.licence),
+            Some(
+                sources::NOAA_SWPC
+                    .licence
+                    .map_or("unverified", |licence| licence.name)
+            )
+        );
+        assert_eq!(
+            requests.first().map(|(entry, _)| entry.credit),
+            Some(sources::NOAA_SWPC.credit)
+        );
+        Ok(())
     }
 
     fn spec() -> RequestSpec {
@@ -751,8 +874,7 @@ mod tests {
 
     #[test]
     fn a_fresh_cache_entry_is_served_without_a_second_request() -> Result<(), FetchError> {
-        let store = temporary_store("cache");
-        let mut state = EngineState::test_with_store(store.clone());
+        let mut state = EngineState::test_with_store(temporary_store("cache"));
         let calls = AtomicU32::new(0);
         let fetch = |_url: &str| {
             calls.fetch_add(1, Ordering::SeqCst);

@@ -214,12 +214,12 @@ impl Domains {
     }
 
     /// The storms the alert service is carrying, for the information radio.
-    pub const fn cyclones(&self) -> Option<&StormList> {
+    pub fn cyclones(&self) -> Option<&StormList> {
         self.cyclones.list()
     }
 
     /// What the river gauges are reporting, for the information radio.
-    pub const fn gauges(&self) -> Option<&GaugeSet> {
+    pub fn gauges(&self) -> Option<&GaugeSet> {
         self.gauges.gauges()
     }
 
@@ -229,27 +229,27 @@ impl Domains {
     }
 
     /// What the surface stations are reporting, for the information radio.
-    pub const fn stations(&self) -> Option<&ObservationSet> {
+    pub fn stations(&self) -> Option<&ObservationSet> {
         self.stations_reported.stations()
     }
 
     /// The air-quality record, for the information radio.
-    pub const fn air(&self) -> Option<&AirQuality> {
+    pub fn air(&self) -> Option<&AirQuality> {
         self.air.record()
     }
 
     /// The space-weather record, for the information radio.
-    pub const fn space(&self) -> Option<&SpaceWeather> {
+    pub fn space(&self) -> Option<&SpaceWeather> {
         self.space_weather.record()
     }
 
     /// The volcanic-activity report, for the information radio.
-    pub const fn volcanoes(&self) -> Option<&volcano::Report> {
+    pub fn volcanoes(&self) -> Option<&volcano::Report> {
         self.volcanoes.report()
     }
 
     /// The vertical profile, for the information radio.
-    pub const fn sounding(&self) -> Option<&Sounding> {
+    pub fn sounding(&self) -> Option<&Sounding> {
         self.profile.record()
     }
 }

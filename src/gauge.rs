@@ -36,6 +36,7 @@ use std::time::Instant;
 use serde_json::{Map, Value};
 
 use crate::acquire::Acquire;
+use crate::engine::Served;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
@@ -421,14 +422,20 @@ pub fn bounds(centre_lat: f64, centre_lon: f64, span_km: f64) -> (f64, f64, f64,
 /// service allows.
 pub const MAX_HALF_DEG: f64 = 1.0;
 /// Fetches the gauges in a box.
-pub fn fetch(acquire: &Acquire, bounds: (f64, f64, f64, f64)) -> Result<GaugeSet, GaugeError> {
+pub fn fetch(
+    acquire: &Acquire,
+    bounds: (f64, f64, f64, f64),
+) -> Result<Served<GaugeSet>, GaugeError> {
     let (south, west, north, east) = bounds;
     let bbox = format!("{west:.4},{south:.4},{east:.4},{north:.4}");
-    let document = acquire
+    let fetched = acquire
         .fetch_operation(&sources::USGS_WATER, "box", &[("bbox", bbox.as_str())])
-        .and_then(|fetched| fetched.json())
         .map_err(|source| GaugeError::Provider { source })?;
-    parse(&document)
+    let document = fetched
+        .json()
+        .map_err(|source| GaugeError::Provider { source })?;
+    let value = parse(&document)?;
+    Ok(Served::new(value, fetched.provenance, fetched.cache))
 }
 
 /// Reads a week of one gauge's readings into a hydrograph.
@@ -545,12 +552,15 @@ fn readings_of(entry: &Map<String, Value>) -> Vec<Reading> {
 }
 
 /// Fetches one gauge's week.
-pub fn fetch_history(acquire: &Acquire, site: &str) -> Result<History, GaugeError> {
-    let document = acquire
+pub fn fetch_history(acquire: &Acquire, site: &str) -> Result<Served<History>, GaugeError> {
+    let fetched = acquire
         .fetch_operation(&sources::USGS_WATER, "history", &[("site", site)])
-        .and_then(|fetched| fetched.json())
         .map_err(|source| GaugeError::Provider { source })?;
-    parse_history(&document, site)
+    let document = fetched
+        .json()
+        .map_err(|source| GaugeError::Provider { source })?;
+    let value = parse_history(&document, site)?;
+    Ok(Served::new(value, fetched.provenance, fetched.cache))
 }
 
 /// What the worker is asked for.
@@ -569,9 +579,18 @@ pub enum GaugeRequest {
 /// What the worker answers.
 #[derive(Debug)]
 pub enum GaugeEvent {
-    Ready { generation: u64, set: GaugeSet },
-    HistoryReady { generation: u64, history: History },
-    Failed { generation: u64, error: GaugeError },
+    Ready {
+        generation: u64,
+        set: Served<GaugeSet>,
+    },
+    HistoryReady {
+        generation: u64,
+        history: Served<History>,
+    },
+    Failed {
+        generation: u64,
+        error: GaugeError,
+    },
 }
 
 /// Fetches gauges off the UI thread.
@@ -652,22 +671,22 @@ impl GaugeFeed {
 pub enum GaugeState {
     Idle,
     Loading {
-        last: Option<GaugeSet>,
+        last: Option<Served<GaugeSet>>,
     },
     Ready {
-        set: GaugeSet,
+        served: Served<GaugeSet>,
     },
     Failed {
         error: GaugeError,
-        last: Option<GaugeSet>,
+        last: Option<Served<GaugeSet>>,
     },
 }
 
 impl GaugeState {
     /// The most recent gauge set still worth drawing.
-    pub const fn last(&self) -> Option<&GaugeSet> {
+    pub const fn last(&self) -> Option<&Served<GaugeSet>> {
         match self {
-            Self::Ready { set } => Some(set),
+            Self::Ready { served } => Some(served),
             Self::Loading { last } | Self::Failed { last, .. } => last.as_ref(),
             Self::Idle => None,
         }
@@ -676,10 +695,14 @@ impl GaugeState {
 
 /// Where the hydrograph request stands.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the served value travels whole so its provenance cannot be separated from it"
+)]
 pub enum HistoryState {
     Off,
     Loading { site: String },
-    Ready { history: History },
+    Ready { history: Served<History> },
     Failed { site: String, error: GaugeError },
 }
 
@@ -716,8 +739,19 @@ impl GaugeView {
         &self.history
     }
 
-    pub const fn set(&self) -> Option<&GaugeSet> {
+    pub fn set(&self) -> Option<&GaugeSet> {
+        self.state.last().map(|served| &served.value)
+    }
+
+    pub const fn served(&self) -> Option<&Served<GaugeSet>> {
         self.state.last()
+    }
+
+    pub const fn served_history(&self) -> Option<&Served<History>> {
+        match &self.history {
+            HistoryState::Ready { history } => Some(history),
+            HistoryState::Off | HistoryState::Loading { .. } | HistoryState::Failed { .. } => None,
+        }
     }
 
     pub fn start(&mut self, bounds: (f64, f64, f64, f64)) {
@@ -764,7 +798,7 @@ impl GaugeView {
                     if generation != self.box_generation {
                         continue;
                     }
-                    self.state = GaugeState::Ready { set };
+                    self.state = GaugeState::Ready { served: set };
                 }
                 GaugeEvent::HistoryReady {
                     generation,
@@ -798,10 +832,10 @@ impl GaugeView {
 }
 
 /// Empties the state and returns the set it was holding.
-fn take_last(state: &mut GaugeState) -> Option<GaugeSet> {
+fn take_last(state: &mut GaugeState) -> Option<Served<GaugeSet>> {
     match std::mem::replace(state, GaugeState::Idle) {
         GaugeState::Loading { last } | GaugeState::Failed { last, .. } => last,
-        GaugeState::Ready { set } => Some(set),
+        GaugeState::Ready { served } => Some(served),
         GaugeState::Idle => None,
     }
 }
@@ -986,7 +1020,7 @@ mod tests {
         let top = history.axis_top();
         assert!(floor <= 5.06, "{floor}");
         assert!(floor >= 4.5, "{floor} loses the river's whole range");
-        assert!(top >= 6.21 && top <= 7.0, "{top}");
+        assert!((6.21..=7.0).contains(&top), "{top}");
         assert!(
             top - floor <= 2.5,
             "{floor}..{top} is more than the river moves"

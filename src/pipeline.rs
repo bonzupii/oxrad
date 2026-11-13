@@ -19,6 +19,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use crate::acquire::Acquire;
+use crate::engine::Served;
 use crate::error::RadarError;
 use crate::network;
 use crate::radar::{self, ArchiveOrigin, RadarVolume, RetrievedVolume};
@@ -38,7 +39,7 @@ pub struct FetchFailure {
 
 #[derive(Debug)]
 pub struct FetchUpdate {
-    pub result: Result<Option<RadarVolume>, FetchFailure>,
+    pub result: Result<Option<Served<RadarVolume>>, FetchFailure>,
     pub retry_in: Option<Duration>,
     pub waiting_for_next_volume: bool,
     pub from_cache: bool,
@@ -133,7 +134,7 @@ struct Archive {
 
 struct Fetched {
     key: String,
-    volume: RadarVolume,
+    volume: Served<RadarVolume>,
     from_cache: bool,
     cache_warning: Option<String>,
 }
@@ -365,6 +366,8 @@ fn fetch(
         }
     })?;
     let from_cache = archive.from_cache;
+    let provenance = archive.provenance;
+    let cache = archive.cache;
     let mut cache_warning = archive.cache_warning;
     if events.send(Event::Working(Operation::Decoding)).is_err() {
         return Err(worker_failure(
@@ -383,7 +386,7 @@ fn fetch(
     match results.recv().map_err(|_| decode_failure(site))? {
         Ok(volume) => Ok(Some(Fetched {
             key,
-            volume,
+            volume: Served::new(volume, provenance, cache),
             from_cache,
             cache_warning,
         })),
@@ -552,7 +555,7 @@ mod tests {
         };
         let fetched = pipeline
             .apply(Event::Update(Box::new(FetchUpdate {
-                result: Ok(Some(volume(site))),
+                result: Ok(Some(Served::test(volume(site)))),
                 retry_in: None,
                 waiting_for_next_volume: false,
                 from_cache: true,

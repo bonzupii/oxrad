@@ -512,11 +512,7 @@ pub fn fetch(
             .json()
             .map_err(|source| FireError::Provider { source })?,
     )?;
-    Ok(Served {
-        value,
-        provenance: fetched.provenance,
-        cache: fetched.cache,
-    })
+    Ok(Served::new(value, fetched.provenance, fetched.cache))
 }
 
 /// Where the layer's request stands.

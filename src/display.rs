@@ -22,6 +22,7 @@ use eframe::egui::{Rect, Shape};
 
 use crate::colormap::ColorTable;
 use crate::derived::StormMotion;
+use crate::engine::Served;
 use crate::error::RenderError;
 use crate::gpu::{RadarGpu, RadarMesh};
 use crate::product::RadarProduct;
@@ -29,7 +30,7 @@ use crate::radar::{ArchiveOrigin, RadarVolume, RetrievedVolume};
 use crate::render::{self, RadarGeometry, Sampling};
 
 pub struct Frame {
-    pub volume: RadarVolume,
+    pub volume: Served<RadarVolume>,
     pub origin: ArchiveOrigin,
     pub history_key: Option<String>,
     pub geometry: RadarGeometry,
@@ -241,11 +242,11 @@ impl Display {
 
     pub fn selection_volume(&self) -> Option<&RadarVolume> {
         match &self.state {
-            DisplayState::Failed { volume, .. } => Some(&volume.volume),
+            DisplayState::Failed { volume, .. } => Some(&volume.volume.value),
             DisplayState::Waiting
             | DisplayState::Building
             | DisplayState::Ready
-            | DisplayState::Unavailable(_) => self.frame.as_ref().map(|frame| &frame.volume),
+            | DisplayState::Unavailable(_) => self.frame.as_ref().map(|frame| &frame.volume.value),
         }
     }
 
@@ -426,7 +427,7 @@ mod tests {
 
     fn retrieved(scan: u64) -> Result<RetrievedVolume, TestError> {
         Ok(RetrievedVolume {
-            volume: RadarVolume {
+            volume: Served::test(RadarVolume {
                 site: SiteId::parse("KTWX")?,
                 site_lat: 38.996_94,
                 site_lon: -96.232_49,
@@ -436,7 +437,7 @@ mod tests {
                 skipped_radials: 0,
                 skipped_non_data: 0,
                 moment_error: None,
-            },
+            }),
             origin: ArchiveOrigin::Downloaded,
             history_key: None,
         })

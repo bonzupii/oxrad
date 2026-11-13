@@ -28,6 +28,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::Instant;
 
 use crate::acquire::Acquire;
+use crate::engine::Served;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
@@ -248,28 +249,30 @@ pub struct SeaIce {
     pub south: SeaIceMonth,
 }
 /// Fetches both hemispheres for one calendar month.
-pub fn fetch(acquire: &Acquire, month: u32) -> Result<SeaIce, SeaIceError> {
+pub fn fetch(acquire: &Acquire, month: u32) -> Result<Served<SeaIce>, SeaIceError> {
     let north = fetch_one(acquire, Hemisphere::North, month)?;
     let south = fetch_one(acquire, Hemisphere::South, month)?;
-    Ok(SeaIce {
+    let value = SeaIce {
         month,
-        north,
-        south,
-    })
+        north: north.value,
+        south: south.value,
+    };
+    Ok(Served::new(value, north.provenance, north.cache)
+        .with_request(south.provenance, south.cache))
 }
 
 fn fetch_one(
     acquire: &Acquire,
     hemisphere: Hemisphere,
     month: u32,
-) -> Result<SeaIceMonth, SeaIceError> {
+) -> Result<Served<SeaIceMonth>, SeaIceError> {
     let folder = match hemisphere {
         Hemisphere::North => "north",
         Hemisphere::South => "south",
     };
     let month_text = format!("{month:02}");
     let code = hemisphere.code().to_string();
-    let text = acquire
+    let fetched = acquire
         .fetch_operation(
             &sources::NSIDC_SEA_ICE,
             "month",
@@ -279,9 +282,12 @@ fn fetch_one(
                 ("month", month_text.as_str()),
             ],
         )
-        .and_then(|fetched| fetched.text())
         .map_err(|source| SeaIceError::Provider { source })?;
-    parse(&text, hemisphere)
+    let text = fetched
+        .text()
+        .map_err(|source| SeaIceError::Provider { source })?;
+    let value = parse(&text, hemisphere)?;
+    Ok(Served::new(value, fetched.provenance, fetched.cache))
 }
 
 /// The month the rail asks for: the calendar month it is now.
@@ -305,9 +311,19 @@ pub struct SeaIceRequest {
 
 /// Answers from the worker.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the served value travels whole so its provenance cannot be separated from it"
+)]
 pub enum SeaIceEvent {
-    Ready { generation: u64, record: SeaIce },
-    Failed { generation: u64, error: SeaIceError },
+    Ready {
+        generation: u64,
+        record: Served<SeaIce>,
+    },
+    Failed {
+        generation: u64,
+        error: SeaIceError,
+    },
 }
 
 /// Reads the index off the UI thread.
@@ -379,22 +395,22 @@ impl SeaIceFeed {
 pub enum SeaIceState {
     Idle,
     Loading {
-        last: Option<SeaIce>,
+        last: Option<Served<SeaIce>>,
     },
     Ready {
-        record: SeaIce,
+        served: Served<SeaIce>,
     },
     Failed {
         error: SeaIceError,
-        last: Option<SeaIce>,
+        last: Option<Served<SeaIce>>,
     },
 }
 
 impl SeaIceState {
     /// The most recent index still worth drawing.
-    pub const fn last(&self) -> Option<&SeaIce> {
+    pub const fn last(&self) -> Option<&Served<SeaIce>> {
         match self {
-            Self::Ready { record } => Some(record),
+            Self::Ready { served } => Some(served),
             Self::Loading { last } | Self::Failed { last, .. } => last.as_ref(),
             Self::Idle => None,
         }
@@ -421,7 +437,11 @@ impl SeaIceView {
         &self.state
     }
 
-    pub const fn record(&self) -> Option<&SeaIce> {
+    pub fn record(&self) -> Option<&SeaIce> {
+        self.state.last().map(|served| &served.value)
+    }
+
+    pub const fn served(&self) -> Option<&Served<SeaIce>> {
         self.state.last()
     }
 
@@ -447,7 +467,7 @@ impl SeaIceView {
                     if generation != self.generation {
                         continue;
                     }
-                    self.state = SeaIceState::Ready { record };
+                    self.state = SeaIceState::Ready { served: record };
                 }
                 SeaIceEvent::Failed { generation, error } => {
                     if generation != self.generation {
@@ -463,10 +483,10 @@ impl SeaIceView {
 }
 
 /// Empties the state and returns the record it was holding.
-fn take_last(state: &mut SeaIceState) -> Option<SeaIce> {
+fn take_last(state: &mut SeaIceState) -> Option<Served<SeaIce>> {
     match std::mem::replace(state, SeaIceState::Idle) {
         SeaIceState::Loading { last } | SeaIceState::Failed { last, .. } => last,
-        SeaIceState::Ready { record } => Some(record),
+        SeaIceState::Ready { served } => Some(served),
         SeaIceState::Idle => None,
     }
 }
@@ -486,15 +506,12 @@ mod tests {
 ";
 
     fn record() -> SeaIceMonth {
-        match parse(FILE, Hemisphere::North) {
-            Ok(record) => record,
-            Err(_) => SeaIceMonth {
-                hemisphere: Hemisphere::North,
-                month: 11,
-                years: Vec::new(),
-                unreadable: 0,
-            },
-        }
+        parse(FILE, Hemisphere::North).unwrap_or_else(|_| SeaIceMonth {
+            hemisphere: Hemisphere::North,
+            month: 11,
+            years: Vec::new(),
+            unreadable: 0,
+        })
     }
 
     #[test]

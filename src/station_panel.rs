@@ -21,7 +21,8 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, RichText};
 
 use crate::acquire::Acquire;
-use crate::canvas::due_after;
+use crate::canvas::{due_after, provenance};
+use crate::engine::Served;
 use crate::place::{self, Place};
 use crate::stations::{self, SiteId, Station, StationError, StationFeed, StationOutcome};
 use crate::theme;
@@ -37,7 +38,7 @@ pub(crate) struct StationReport {
 }
 
 pub(crate) struct StationPanel {
-    list: Result<Vec<Station>, StationError>,
+    list: Result<Served<Vec<Station>>, StationError>,
     feed: StationFeed,
     refresh_due: Instant,
     pending: Option<SiteId>,
@@ -47,13 +48,8 @@ pub(crate) struct StationPanel {
 
 impl StationPanel {
     pub(crate) fn new(acquire: &Acquire, restored: Option<&SiteId>) -> Self {
-        let list = match stations::load_cache() {
-            Ok(Some(cached)) => Ok(cached),
-            Ok(None) => Err(StationError::NoStations),
-            Err(error) => Err(error),
-        };
         Self {
-            list,
+            list: Err(StationError::NoStations),
             feed: StationFeed::new(acquire.clone()),
             refresh_due: due_after(Duration::from_secs(STATION_REFRESH_SECS)),
             pending: restored.cloned(),
@@ -62,15 +58,22 @@ impl StationPanel {
         }
     }
 
-    pub(crate) const fn result(&self) -> &Result<Vec<Station>, StationError> {
-        &self.list
+    pub(crate) const fn result(&self) -> Result<&[Station], &StationError> {
+        match &self.list {
+            Ok(served) => Ok(served.value.as_slice()),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn served(&self) -> Option<&Served<Vec<Station>>> {
+        self.list.as_ref().ok()
     }
 
     pub(crate) fn find(&self, id: &SiteId) -> Option<&Station> {
-        let Ok(list) = &self.list else {
+        let Ok(served) = &self.list else {
             return None;
         };
-        stations::find(list, id)
+        stations::find(&served.value, id)
     }
 
     pub(crate) const fn close_picker(&mut self) {
@@ -97,13 +100,9 @@ impl StationPanel {
         match outcome {
             StationOutcome::Ready(discovery) => {
                 self.refresh_due = due_after(Duration::from_secs(STATION_REFRESH_SECS));
-                self.list = Ok(discovery.stations);
+                self.list = Ok(discovery);
                 StationReport {
-                    notice: discovery.cache_warning.map(|warning| {
-                        format!(
-                            "Station metadata is live, but the cache was not updated: {warning}"
-                        )
-                    }),
+                    notice: None,
                     pending: self.pending.take(),
                 }
             }
@@ -147,8 +146,9 @@ impl StationPanel {
                 );
                 if let Some(place) = place
                     && place.in_united_states()
-                    && let Ok(list) = &self.list
-                    && let Ok(Some(nearest)) = place::nearest_station(list, place.lat, place.lon)
+                    && let Ok(served) = &self.list
+                    && let Ok(Some(nearest)) =
+                        place::nearest_station(&served.value, place.lat, place.lon)
                 {
                     ui.label(
                         RichText::new(format!(
@@ -207,6 +207,9 @@ impl StationPanel {
             egui::TextEdit::singleline(&mut query).hint_text("Station name or identifier"),
         );
         let mut chosen: Option<SiteId> = None;
+        if let Some(served) = self.served() {
+            provenance(ui, served);
+        }
         match &self.list {
             Err(error) => {
                 ui.colored_label(
@@ -214,12 +217,13 @@ impl StationPanel {
                     format!("Radar site catalog unavailable: {error}"),
                 );
             }
-            Ok(list) => {
+            Ok(served) => {
                 egui::ScrollArea::vertical()
                     .max_height(STATION_LIST_HEIGHT)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for station in list
+                        for station in served
+                            .value
                             .iter()
                             .filter(|station| stations::matches(station, &query))
                         {

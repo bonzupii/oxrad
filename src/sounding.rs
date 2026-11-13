@@ -30,6 +30,7 @@ use std::time::Instant;
 use serde_json::{Map, Value};
 
 use crate::acquire::Acquire;
+use crate::engine::Served;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
@@ -653,7 +654,11 @@ fn fields() -> String {
     list.join(",")
 }
 /// Fetches the profile for one point.
-pub fn fetch(acquire: &Acquire, latitude: f64, longitude: f64) -> Result<Sounding, SoundingError> {
+pub fn fetch(
+    acquire: &Acquire,
+    latitude: f64,
+    longitude: f64,
+) -> Result<Served<Sounding>, SoundingError> {
     let now_ms = match time::now_unix_ms() {
         Ok(now_ms) => now_ms,
         Err(_) => return Err(shape("a readable system clock to pick the hour")),
@@ -661,7 +666,7 @@ pub fn fetch(acquire: &Acquire, latitude: f64, longitude: f64) -> Result<Soundin
     let latitude_text = format!("{latitude:.3}");
     let longitude_text = format!("{longitude:.3}");
     let hourly = fields();
-    let document = acquire
+    let fetched = acquire
         .fetch_operation(
             &sources::OPEN_METEO_FORECAST,
             "sounding",
@@ -671,9 +676,12 @@ pub fn fetch(acquire: &Acquire, latitude: f64, longitude: f64) -> Result<Soundin
                 ("hourly", hourly.as_str()),
             ],
         )
-        .and_then(|fetched| fetched.json())
         .map_err(|source| SoundingError::Provider { source })?;
-    parse(&document, now_ms)
+    let document = fetched
+        .json()
+        .map_err(|source| SoundingError::Provider { source })?;
+    let value = parse(&document, now_ms)?;
+    Ok(Served::new(value, fetched.provenance, fetched.cache))
 }
 
 /// Requests sent to the worker.
@@ -686,10 +694,14 @@ pub struct SoundingRequest {
 
 /// Answers from the worker.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the served value travels whole so its provenance cannot be separated from it"
+)]
 pub enum SoundingEvent {
     Ready {
         generation: u64,
-        record: Sounding,
+        record: Served<Sounding>,
     },
     Failed {
         generation: u64,
@@ -766,22 +778,22 @@ impl SoundingFeed {
 pub enum SoundingState {
     Idle,
     Loading {
-        last: Option<Sounding>,
+        last: Option<Served<Sounding>>,
     },
     Ready {
-        record: Sounding,
+        served: Served<Sounding>,
     },
     Failed {
         error: SoundingError,
-        last: Option<Sounding>,
+        last: Option<Served<Sounding>>,
     },
 }
 
 impl SoundingState {
     /// The most recent profile still worth drawing.
-    pub const fn last(&self) -> Option<&Sounding> {
+    pub const fn last(&self) -> Option<&Served<Sounding>> {
         match self {
-            Self::Ready { record } => Some(record),
+            Self::Ready { served } => Some(served),
             Self::Loading { last } | Self::Failed { last, .. } => last.as_ref(),
             Self::Idle => None,
         }
@@ -808,7 +820,11 @@ impl SoundingView {
         &self.state
     }
 
-    pub const fn record(&self) -> Option<&Sounding> {
+    pub fn record(&self) -> Option<&Sounding> {
+        self.state.last().map(|served| &served.value)
+    }
+
+    pub const fn served(&self) -> Option<&Served<Sounding>> {
         self.state.last()
     }
 
@@ -834,7 +850,7 @@ impl SoundingView {
                     if generation != self.generation {
                         continue;
                     }
-                    self.state = SoundingState::Ready { record };
+                    self.state = SoundingState::Ready { served: record };
                 }
                 SoundingEvent::Failed { generation, error } => {
                     if generation != self.generation {
@@ -850,10 +866,10 @@ impl SoundingView {
 }
 
 /// Empties the state and returns the record it was holding.
-fn take_last(state: &mut SoundingState) -> Option<Sounding> {
+fn take_last(state: &mut SoundingState) -> Option<Served<Sounding>> {
     match std::mem::replace(state, SoundingState::Idle) {
         SoundingState::Loading { last } | SoundingState::Failed { last, .. } => last,
-        SoundingState::Ready { record } => Some(record),
+        SoundingState::Ready { served } => Some(served),
         SoundingState::Idle => None,
     }
 }

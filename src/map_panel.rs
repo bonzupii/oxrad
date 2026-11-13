@@ -136,7 +136,7 @@ impl MapPanel {
         if !self.layers.visible(LayerId::Warnings) {
             return;
         }
-        for warning in &self.warning_view.list {
+        for warning in self.warning_view.list() {
             if self.warning_view.scope == WarningScope::Viewport
                 && !warning_intersects(warning, transform, rect)
             {
@@ -671,12 +671,13 @@ impl MapPanel {
             WarningState::Idle => String::new(),
             WarningState::Loading => String::from(" · warnings loading"),
             WarningState::Ready => {
-                let mut text = format!(" · {} warnings", self.warning_view.list.len());
-                if (self.warning_view.without_geometry > 0 || self.warning_view.rejected > 0)
+                let mut text = format!(" · {} warnings", self.warning_view.list().len());
+                if (self.warning_view.without_geometry() > 0 || self.warning_view.rejected() > 0)
                     && write!(
                         text,
                         " · {} without polygons · {} unreadable",
-                        self.warning_view.without_geometry, self.warning_view.rejected
+                        self.warning_view.without_geometry(),
+                        self.warning_view.rejected()
                     )
                     .is_err()
                 {
@@ -690,7 +691,7 @@ impl MapPanel {
 
     fn most_severe_warning(&self) -> Option<&Warning> {
         self.warning_view
-            .list
+            .list()
             .iter()
             .max_by_key(|warning| canvas::severity_rank(warning.severity))
     }
@@ -724,7 +725,7 @@ impl MapPanel {
             now_ms: clock.as_ref().copied().unwrap_or(0),
             clock_read: clock.is_ok(),
             place: place.map(|place| place.name.as_str()),
-            warnings: &self.warning_view.list,
+            warnings: self.warning_view.list(),
             quakes: self.quakes.events(),
             stations: self.domains.stations(),
             forecast: forecast.forecast(),
@@ -921,7 +922,7 @@ impl MapPanel {
         actions: &mut MapActions,
         notice: &mut Option<String>,
     ) {
-        if !self.layers.visible(LayerId::Warnings) || self.warning_view.list.is_empty() {
+        if !self.layers.visible(LayerId::Warnings) || self.warning_view.list().is_empty() {
             return;
         }
         ui.add_space(theme::SPACE_M);
@@ -935,6 +936,9 @@ impl MapPanel {
                 .size(theme::TYPE_SMALL)
                 .weak(),
         );
+        if let Some(served) = self.warning_view.served() {
+            canvas::provenance(ui, served);
+        }
         ui.horizontal(|ui| {
             ui.selectable_value(
                 &mut self.warning_view.scope,
@@ -947,10 +951,10 @@ impl MapPanel {
                 "Visible map",
             );
         });
-        let mut order: Vec<usize> = (0..self.warning_view.list.len()).collect();
+        let mut order: Vec<usize> = (0..self.warning_view.list().len()).collect();
         order.sort_by_key(|index| {
             self.warning_view
-                .list
+                .list()
                 .get(*index)
                 .map_or(0, |warning| canvas::severity_rank(warning.severity))
         });
@@ -958,7 +962,7 @@ impl MapPanel {
         if self.warning_view.scope == WarningScope::Viewport {
             order.retain(|index| {
                 self.warning_view
-                    .list
+                    .list()
                     .get(*index)
                     .is_some_and(|warning| self.warning_visible(warning))
             });
@@ -971,7 +975,7 @@ impl MapPanel {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for index in order.into_iter().take(40) {
-                    let Some(warning) = self.warning_view.list.get(index) else {
+                    let Some(warning) = self.warning_view.list().get(index) else {
                         continue;
                     };
                     let selected =
@@ -1001,11 +1005,11 @@ impl MapPanel {
                     .weak(),
             );
         }
-        if self.warning_view.list.len() > 40 {
+        if self.warning_view.list().len() > 40 {
             ui.label(
                 RichText::new(format!(
                     "Showing 40 most severe of {} active alerts.",
-                    self.warning_view.list.len()
+                    self.warning_view.list().len()
                 ))
                 .size(theme::TYPE_SMALL)
                 .weak(),
@@ -1102,11 +1106,19 @@ impl MapPanel {
         actions: &mut MapActions,
         notice: &mut Option<String>,
     ) {
-        let Some(warning) = self.warning_view.list.get(index) else {
+        let Some(id) = self
+            .warning_view
+            .list()
+            .get(index)
+            .map(|warning| warning.id.clone())
+        else {
             *notice = Some(String::from("That warning is no longer available."));
             return;
         };
-        self.warning_view.selected = Some(warning.id.clone());
+        self.warning_view.selected = Some(id);
+        let Some(warning) = self.warning_view.selected_warning() else {
+            return;
+        };
         let Some(ring) = warning.polygons.first() else {
             *notice = Some(format!(
                 "Warning {} has no mapped polygon; its area is {}.",

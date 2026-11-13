@@ -274,7 +274,7 @@ impl FireLayer {
                 );
             }
             FireState::Ready { served } => {
-                provenance(ui, &served.provenance, served.cache);
+                provenance(ui, served);
             }
             FireState::Failed { error, last, .. } => {
                 ui.colored_label(

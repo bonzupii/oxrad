@@ -221,10 +221,18 @@ mod tests {
             text: String::from("Magnitude 5.0 near Somewhere."),
         };
         let second = Bulletin {
+            source: first.source,
+            at_ms: first.at_ms,
+            urgency: first.urgency,
             text: String::from("Magnitude 6.0 near Somewhere."),
-            ..first.clone()
         };
-        assert_ne!(fingerprint(&[first.clone()]), fingerprint(&[second]));
-        assert_eq!(fingerprint(&[first.clone()]), fingerprint(&[first]));
+        assert_ne!(
+            fingerprint(std::slice::from_ref(&first)),
+            fingerprint(&[second])
+        );
+        assert_eq!(
+            fingerprint(std::slice::from_ref(&first)),
+            fingerprint(&[first])
+        );
     }
 }

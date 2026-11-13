@@ -28,6 +28,7 @@ use serde_json::Value;
 
 use crate::acquire::Acquire;
 use crate::engine::RequestSpec;
+use crate::engine::Served;
 use crate::error::RadarError;
 use crate::provider::FetchError;
 use crate::sources;
@@ -96,6 +97,7 @@ pub struct TileImage {
 pub enum GlobalEvent {
     Manifest {
         generation: u64,
+        served: Served<ManifestSnapshot>,
     },
     Frame {
         generation: u64,
@@ -220,7 +222,7 @@ impl From<FetchError> for GlobalRadarError {
 }
 
 #[derive(Debug, Clone)]
-struct ManifestSnapshot {
+pub(crate) struct ManifestSnapshot {
     host: String,
     frames: Vec<GlobalFrame>,
 }
@@ -360,6 +362,7 @@ impl Worker {
             .events
             .send(GlobalEvent::Manifest {
                 generation: request.generation,
+                served: snapshot.clone(),
             })
             .is_err()
         {
@@ -433,7 +436,7 @@ impl Worker {
         }
     }
 
-    fn manifest(&mut self, generation: u64) -> Result<ManifestSnapshot, GlobalRadarError> {
+    fn manifest(&mut self, generation: u64) -> Result<Served<ManifestSnapshot>, GlobalRadarError> {
         let fetched = self
             .acquire
             .fetch_operation(&sources::RAINVIEWER, "manifest", &[])
@@ -444,7 +447,8 @@ impl Worker {
                 message,
             });
         }
-        parse_manifest(&fetched.body)
+        let value = parse_manifest(&fetched.body)?;
+        Ok(Served::new(value, fetched.provenance, fetched.cache))
     }
 }
 

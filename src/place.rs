@@ -18,7 +18,6 @@
 //! A `Place` is the location the user asked about, and it is the only input to
 //! the forecast. The radar station is selected separately from that place.
 
-use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -27,6 +26,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::acquire::Acquire;
+use crate::engine::Served;
 use crate::error::CoordinateError;
 use crate::projection;
 use crate::provider::FetchError;
@@ -287,10 +287,13 @@ fn parse_feature(feature: &Value, url: &str) -> Result<Option<Place>, FetchError
 /// adjacent transposition of the query is retried (for example `cihcago` for
 /// `chicago`). The original answer is kept if the correction does not produce
 /// a closer match, so a failed retry never hides usable results.
-pub fn search(acquire: &Acquire, query: &str) -> Result<Vec<Place>, FetchError> {
+pub fn search(acquire: &Acquire, query: &str) -> Result<Served<Vec<Place>>, FetchError> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
-        return Ok(Vec::new());
+        return Err(FetchError::Shape {
+            url: String::new(),
+            field: "a non-empty place search",
+        });
     }
     let places = fetch_places(acquire, trimmed)?;
     if places.iter().any(|place| match_rank(place, trimmed) <= 2) {
@@ -299,21 +302,22 @@ pub fn search(acquire: &Acquire, query: &str) -> Result<Vec<Place>, FetchError> 
     let Some(corrected) = first_inversion_variant(trimmed) else {
         return Ok(places);
     };
-    let Ok(mut corrected_places) = fetch_places(acquire, &corrected) else {
+    let Ok(corrected_places) = fetch_places(acquire, &corrected) else {
         return Ok(places);
     };
     if corrected_places
         .iter()
         .any(|place| match_rank(place, &corrected) <= 2)
     {
-        rank_places(&mut corrected_places, &corrected);
-        Ok(corrected_places)
+        let mut chosen = corrected_places;
+        rank_places(&mut chosen.value, &corrected);
+        Ok(chosen.with_request(places.provenance, places.cache))
     } else {
         Ok(places)
     }
 }
 
-fn fetch_places(acquire: &Acquire, query: &str) -> Result<Vec<Place>, FetchError> {
+fn fetch_places(acquire: &Acquire, query: &str) -> Result<Served<Vec<Place>>, FetchError> {
     let limit = SEARCH_LIMIT.to_string();
     let fetched = acquire.fetch_operation(
         &sources::PHOTON,
@@ -321,7 +325,8 @@ fn fetch_places(acquire: &Acquire, query: &str) -> Result<Vec<Place>, FetchError
         &[("query", query), ("limit", limit.as_str())],
     )?;
     let document = fetched.json()?;
-    places_from_document(&document, &fetched.provenance.url, query)
+    let value = places_from_document(&document, &fetched.provenance.url, query)?;
+    Ok(Served::new(value, fetched.provenance, fetched.cache))
 }
 
 /// Parses and ranks a Photon feature collection for one query.
@@ -402,7 +407,7 @@ fn merge_place(places: &mut Vec<Place>, place: Place) {
 pub enum SearchState {
     Idle,
     Working { query: String },
-    Ready { places: Vec<Place> },
+    Ready { places: Served<Vec<Place>> },
     Failed { query: String, error: FetchError },
 }
 
@@ -500,7 +505,7 @@ struct SearchMessage {
 /// The answer to one place search.
 #[derive(Debug)]
 pub enum SearchOutcome {
-    Results { places: Vec<Place> },
+    Results { places: Served<Vec<Place>> },
     Failed { query: String, error: FetchError },
 }
 
@@ -523,22 +528,8 @@ impl PlaceSearch {
         let (requests, request_receiver) = mpsc::channel::<SearchRequest>();
         let (result_sender, results) = mpsc::channel::<SearchMessage>();
         std::thread::spawn(move || {
-            let mut cache: HashMap<String, Vec<Place>> = HashMap::new();
             let mut last_request: Option<Instant> = None;
             while let Ok(request) = request_receiver.recv() {
-                let key = request.query.trim().to_lowercase();
-                if let Some(places) = cache.get(&key) {
-                    let message = SearchMessage {
-                        generation: request.generation,
-                        outcome: SearchOutcome::Results {
-                            places: places.clone(),
-                        },
-                    };
-                    if result_sender.send(message).is_err() {
-                        return;
-                    }
-                    continue;
-                }
                 if let Some(last) = last_request {
                     let elapsed = last.elapsed();
                     let policy = Duration::from_secs(1);
@@ -554,9 +545,6 @@ impl PlaceSearch {
                     },
                 };
                 last_request = Some(Instant::now());
-                if let SearchOutcome::Results { places } = &outcome {
-                    cache.insert(key, places.clone());
-                }
                 let message = SearchMessage {
                     generation: request.generation,
                     outcome,
@@ -704,9 +692,9 @@ mod tests {
             .send(SearchMessage {
                 generation: 1,
                 outcome: SearchOutcome::Results {
-                    places: vec![Place::new(
+                    places: Served::test(vec![Place::new(
                         "Chicago", "Illinois", "USA", "us", 41.88, -87.63,
-                    )?],
+                    )?]),
                 },
             })
             .map_err(|error| format!("could not send search result: {error}"))?;

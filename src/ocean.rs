@@ -29,6 +29,7 @@ use std::time::Instant;
 use serde_json::{Map, Value};
 
 use crate::acquire::Acquire;
+use crate::engine::Served;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
@@ -323,10 +324,14 @@ pub fn parse(document: &Value) -> Result<Ocean, OceanError> {
     })
 }
 /// Fetches the marine forecast for one point.
-pub fn fetch(acquire: &Acquire, latitude: f64, longitude: f64) -> Result<Ocean, OceanError> {
+pub fn fetch(
+    acquire: &Acquire,
+    latitude: f64,
+    longitude: f64,
+) -> Result<Served<Ocean>, OceanError> {
     let latitude_text = format!("{latitude:.3}");
     let longitude_text = format!("{longitude:.3}");
-    let document = acquire
+    let fetched = acquire
         .fetch_operation(
             &sources::OPEN_METEO_MARINE,
             "ocean",
@@ -336,9 +341,12 @@ pub fn fetch(acquire: &Acquire, latitude: f64, longitude: f64) -> Result<Ocean, 
                 ("forecast_days", "3"),
             ],
         )
-        .and_then(|fetched| fetched.json())
         .map_err(|source| OceanError::Provider { source })?;
-    parse(&document)
+    let document = fetched
+        .json()
+        .map_err(|source| OceanError::Provider { source })?;
+    let value = parse(&document)?;
+    Ok(Served::new(value, fetched.provenance, fetched.cache))
 }
 
 /// Requests sent to the worker.
@@ -351,9 +359,19 @@ pub struct OceanRequest {
 
 /// Answers from the worker.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the served value travels whole so its provenance cannot be separated from it"
+)]
 pub enum OceanEvent {
-    Ready { generation: u64, record: Ocean },
-    Failed { generation: u64, error: OceanError },
+    Ready {
+        generation: u64,
+        record: Served<Ocean>,
+    },
+    Failed {
+        generation: u64,
+        error: OceanError,
+    },
 }
 
 /// Fetches the sea state off the UI thread.
@@ -425,22 +443,22 @@ impl OceanFeed {
 pub enum OceanState {
     Idle,
     Loading {
-        last: Option<Ocean>,
+        last: Option<Served<Ocean>>,
     },
     Ready {
-        record: Ocean,
+        served: Served<Ocean>,
     },
     Failed {
         error: OceanError,
-        last: Option<Ocean>,
+        last: Option<Served<Ocean>>,
     },
 }
 
 impl OceanState {
     /// The most recent record still worth drawing.
-    pub const fn last(&self) -> Option<&Ocean> {
+    pub const fn last(&self) -> Option<&Served<Ocean>> {
         match self {
-            Self::Ready { record } => Some(record),
+            Self::Ready { served } => Some(served),
             Self::Loading { last } | Self::Failed { last, .. } => last.as_ref(),
             Self::Idle => None,
         }
@@ -467,7 +485,11 @@ impl OceanView {
         &self.state
     }
 
-    pub const fn record(&self) -> Option<&Ocean> {
+    pub fn record(&self) -> Option<&Ocean> {
+        self.state.last().map(|served| &served.value)
+    }
+
+    pub const fn served(&self) -> Option<&Served<Ocean>> {
         self.state.last()
     }
 
@@ -493,7 +515,7 @@ impl OceanView {
                     if generation != self.generation {
                         continue;
                     }
-                    self.state = OceanState::Ready { record };
+                    self.state = OceanState::Ready { served: record };
                 }
                 OceanEvent::Failed { generation, error } => {
                     if generation != self.generation {
@@ -509,10 +531,10 @@ impl OceanView {
 }
 
 /// Empties the state and returns the record it was holding.
-fn take_last(state: &mut OceanState) -> Option<Ocean> {
+fn take_last(state: &mut OceanState) -> Option<Served<Ocean>> {
     match std::mem::replace(state, OceanState::Idle) {
         OceanState::Loading { last } | OceanState::Failed { last, .. } => last,
-        OceanState::Ready { record } => Some(record),
+        OceanState::Ready { served } => Some(served),
         OceanState::Idle => None,
     }
 }

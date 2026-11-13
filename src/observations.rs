@@ -28,6 +28,7 @@ use std::time::Instant;
 use serde_json::Value;
 
 use crate::acquire::Acquire;
+use crate::engine::Served;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
@@ -302,18 +303,21 @@ pub fn bounds(centre_lat: f64, centre_lon: f64, span_km: f64) -> (f64, f64, f64,
 pub fn fetch(
     acquire: &Acquire,
     bounds: (f64, f64, f64, f64),
-) -> Result<ObservationSet, ObservationError> {
+) -> Result<Served<ObservationSet>, ObservationError> {
     let (south, west, north, east) = bounds;
     let bbox = format!("{south:.2},{west:.2},{north:.2},{east:.2}");
-    let document = acquire
+    let fetched = acquire
         .fetch_operation(
             &sources::AVIATION_WEATHER_METAR,
             "box",
             &[("bbox", bbox.as_str()), ("hours", "2")],
         )
-        .and_then(|fetched| fetched.json())
         .map_err(|source| ObservationError::Provider { source })?;
-    parse(&document)
+    let document = fetched
+        .json()
+        .map_err(|source| ObservationError::Provider { source })?;
+    let value = parse(&document)?;
+    Ok(Served::new(value, fetched.provenance, fetched.cache))
 }
 
 /// Requests sent to the worker.
@@ -328,7 +332,7 @@ pub struct ObservationRequest {
 pub enum ObservationEvent {
     Ready {
         generation: u64,
-        set: ObservationSet,
+        set: Served<ObservationSet>,
     },
     Failed {
         generation: u64,
@@ -405,22 +409,22 @@ impl ObservationFeed {
 pub enum ObservationState {
     Idle,
     Loading {
-        last: Option<ObservationSet>,
+        last: Option<Served<ObservationSet>>,
     },
     Ready {
-        set: ObservationSet,
+        served: Served<ObservationSet>,
     },
     Failed {
         error: ObservationError,
-        last: Option<ObservationSet>,
+        last: Option<Served<ObservationSet>>,
     },
 }
 
 impl ObservationState {
     /// The most recent set still worth drawing.
-    pub const fn last(&self) -> Option<&ObservationSet> {
+    pub const fn last(&self) -> Option<&Served<ObservationSet>> {
         match self {
-            Self::Ready { set } => Some(set),
+            Self::Ready { served } => Some(served),
             Self::Loading { last } | Self::Failed { last, .. } => last.as_ref(),
             Self::Idle => None,
         }
@@ -437,8 +441,8 @@ pub struct ObservationView {
 impl ObservationView {
     /// The stations worth drawing: the newest feed, or the last one if a
     /// refresh is under way or failed.
-    pub const fn stations(&self) -> Option<&ObservationSet> {
-        self.state.last()
+    pub fn stations(&self) -> Option<&ObservationSet> {
+        self.state.last().map(|served| &served.value)
     }
 
     pub fn new(acquire: Acquire) -> Self {
@@ -453,7 +457,11 @@ impl ObservationView {
         &self.state
     }
 
-    pub const fn set(&self) -> Option<&ObservationSet> {
+    pub fn set(&self) -> Option<&ObservationSet> {
+        self.state.last().map(|served| &served.value)
+    }
+
+    pub const fn served(&self) -> Option<&Served<ObservationSet>> {
         self.state.last()
     }
 
@@ -478,7 +486,7 @@ impl ObservationView {
                     if generation != self.generation {
                         continue;
                     }
-                    self.state = ObservationState::Ready { set };
+                    self.state = ObservationState::Ready { served: set };
                 }
                 ObservationEvent::Failed { generation, error } => {
                     if generation != self.generation {
@@ -494,10 +502,10 @@ impl ObservationView {
 }
 
 /// Empties the state and returns the set it was holding.
-fn take_last(state: &mut ObservationState) -> Option<ObservationSet> {
+fn take_last(state: &mut ObservationState) -> Option<Served<ObservationSet>> {
     match std::mem::replace(state, ObservationState::Idle) {
         ObservationState::Loading { last } | ObservationState::Failed { last, .. } => last,
-        ObservationState::Ready { set } => Some(set),
+        ObservationState::Ready { served } => Some(served),
         ObservationState::Idle => None,
     }
 }

@@ -13,6 +13,18 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+// Test modules assert their expectations; the production paths keep the
+// panic, unwrap and indexing bans. This exemption does not reach the binary.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        clippy::unwrap_used,
+        clippy::indexing_slicing
+    )
+)]
 mod acquire;
 mod app;
 mod basemap;

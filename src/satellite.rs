@@ -28,8 +28,8 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use eframe::egui::{self, Color32, Pos2, Rect, RichText, TextureHandle};
 
 use crate::acquire::Acquire;
-use crate::canvas::toggle_button;
-use crate::engine::RequestSpec;
+use crate::canvas::{provenance, toggle_button};
+use crate::engine::{RequestSpec, Served};
 use crate::global_radar::{self, TileBounds};
 use crate::map;
 use crate::provider::FetchError;
@@ -329,10 +329,14 @@ pub struct PlanRequest {
 }
 
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the served value travels whole so its provenance cannot be separated from it"
+)]
 pub enum SatelliteEvent {
     Tile {
         generation: u64,
-        tile: TileImage,
+        tile: Served<TileImage>,
     },
     Done {
         generation: u64,
@@ -364,6 +368,10 @@ pub struct SatelliteFeed {
 }
 
 impl SatelliteFeed {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the worker is one ordered loop over the plan's tiles"
+    )]
     pub fn new(acquire: Acquire) -> Self {
         let (requests, request_receiver) = mpsc::channel::<PlanRequest>();
         let (event_sender, events) = mpsc::channel::<SatelliteEvent>();
@@ -405,16 +413,24 @@ impl SatelliteFeed {
                     let decoded = acquire
                         .fetch(&spec)
                         .map_err(|source| SatelliteError::Provider { source })
-                        .and_then(|fetched| decode(&fetched.provenance.url, &fetched.body));
+                        .and_then(|fetched| {
+                            let (width, height, rgba) =
+                                decode(&fetched.provenance.url, &fetched.body)?;
+                            Ok((width, height, rgba, fetched.provenance, fetched.cache))
+                        });
                     match decoded {
-                        Ok((width, height, rgba)) => {
+                        Ok((width, height, rgba, tile_provenance, tile_cache)) => {
                             loaded += 1;
-                            let image = TileImage {
-                                bounds: *tile,
-                                width,
-                                height,
-                                rgba,
-                            };
+                            let image = Served::new(
+                                TileImage {
+                                    bounds: *tile,
+                                    width,
+                                    height,
+                                    rgba,
+                                },
+                                tile_provenance,
+                                tile_cache,
+                            );
                             if event_sender
                                 .send(SatelliteEvent::Tile {
                                     generation: request.generation,
@@ -528,7 +544,7 @@ pub struct SatelliteLayer {
     opacity: u8,
     generation: u64,
     planned: Option<String>,
-    tiles: Vec<PlacedTile>,
+    tiles: Vec<Served<PlacedTile>>,
     status: Status,
 }
 
@@ -645,10 +661,14 @@ impl SatelliteLayer {
                         ),
                         egui::TextureOptions::LINEAR,
                     );
-                    self.tiles.push(PlacedTile {
-                        bounds: tile.bounds,
-                        texture,
-                    });
+                    self.tiles.push(Served::new(
+                        PlacedTile {
+                            bounds: tile.bounds,
+                            texture,
+                        },
+                        tile.provenance.clone(),
+                        tile.cache,
+                    ));
                     if let Status::Loading { of, .. } = self.status {
                         self.status = Status::Loading {
                             loaded: self.tiles.len(),
@@ -742,6 +762,13 @@ impl SatelliteLayer {
                 .size(theme::TYPE_SMALL)
                 .weak(),
         );
+        if let Some(first) = self.tiles.first() {
+            let mut requests = Served::new((), first.provenance.clone(), first.cache);
+            for tile in self.tiles.iter().skip(1) {
+                requests = requests.with_request(tile.provenance.clone(), tile.cache);
+            }
+            provenance(ui, &requests);
+        }
         let label = if self.shown {
             "Satellite: on"
         } else {

@@ -26,6 +26,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use serde_json::Value;
 
 use crate::acquire::Acquire;
+use crate::engine::Served;
 use crate::place::Place;
 use crate::provider::FetchError;
 use crate::sources;
@@ -390,10 +391,10 @@ fn parse_document(place: &Place, document: &Value) -> Result<Forecast, ForecastE
 }
 
 /// Fetches the global forecast for the place, using only its coordinates.
-pub fn fetch(acquire: &Acquire, place: &Place) -> Result<Forecast, ForecastError> {
+pub fn fetch(acquire: &Acquire, place: &Place) -> Result<Served<Forecast>, ForecastError> {
     let latitude_text = format!("{:.4}", place.lat);
     let longitude_text = format!("{:.4}", place.lon);
-    let document = acquire
+    let fetched = acquire
         .fetch_operation(
             &sources::OPEN_METEO_FORECAST,
             "forecast",
@@ -403,24 +404,27 @@ pub fn fetch(acquire: &Acquire, place: &Place) -> Result<Forecast, ForecastError
                 ("forecast_days", "7"),
             ],
         )
-        .and_then(|fetched| fetched.json())
         .map_err(|source| ForecastError::Provider { source })?;
-    parse_document(place, &document)
+    let document = fetched
+        .json()
+        .map_err(|source| ForecastError::Provider { source })?;
+    let value = parse_document(place, &document)?;
+    Ok(Served::new(value, fetched.provenance, fetched.cache))
 }
 
 pub enum ForecastState {
     Empty,
     Loading {
         place: Place,
-        last: Option<Forecast>,
+        last: Option<Served<Forecast>>,
     },
     Ready {
-        forecast: Forecast,
+        served: Served<Forecast>,
     },
     Failed {
         place: Place,
         error: ForecastError,
-        last: Option<Forecast>,
+        last: Option<Served<Forecast>>,
     },
 }
 
@@ -438,11 +442,11 @@ impl ForecastView {
     }
 
     /// The forecast on screen, for anything else that reports it.
-    pub const fn forecast(&self) -> Option<&Forecast> {
+    pub fn forecast(&self) -> Option<&Forecast> {
         match &self.state {
-            ForecastState::Ready { forecast } => Some(forecast),
+            ForecastState::Ready { served } => Some(&served.value),
             ForecastState::Loading { last, .. } | ForecastState::Failed { last, .. } => {
-                last.as_ref()
+                last.as_ref().map(|served| &served.value)
             }
             ForecastState::Empty => None,
         }
@@ -479,7 +483,7 @@ impl ForecastView {
             return;
         };
         let outcome_place = match &outcome {
-            ForecastOutcome::Ready(forecast) => &forecast.place,
+            ForecastOutcome::Ready(served) => &served.place,
             ForecastOutcome::Failed { place, .. } => place,
         };
         if !outcome_place.same_place(place) {
@@ -491,7 +495,7 @@ impl ForecastView {
             return;
         };
         self.state = match outcome {
-            ForecastOutcome::Ready(forecast) => ForecastState::Ready { forecast },
+            ForecastOutcome::Ready(served) => ForecastState::Ready { served },
             ForecastOutcome::Failed { place, error } => {
                 ForecastState::Failed { place, error, last }
             }
@@ -500,13 +504,13 @@ impl ForecastView {
 }
 
 impl ForecastState {
-    fn into_last_for(self, place: &Place) -> Option<Forecast> {
+    fn into_last_for(self, place: &Place) -> Option<Served<Forecast>> {
         let previous = match self {
-            Self::Ready { forecast } => Some(forecast),
+            Self::Ready { served } => Some(served),
             Self::Loading { last, .. } | Self::Failed { last, .. } => last,
             Self::Empty => None,
         };
-        previous.filter(|forecast| forecast.place.same_place(place))
+        previous.filter(|served| served.value.place.same_place(place))
     }
 }
 
@@ -518,13 +522,17 @@ struct ForecastRequest {
 struct ForecastMessage {
     generation: u64,
     place: Place,
-    result: Result<Forecast, ForecastError>,
+    result: Result<Served<Forecast>, ForecastError>,
 }
 
 /// The answer to one forecast request.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the served value travels whole so its provenance cannot be separated from it"
+)]
 pub enum ForecastOutcome {
-    Ready(Forecast),
+    Ready(Served<Forecast>),
     Failed { place: Place, error: ForecastError },
 }
 
@@ -585,7 +593,7 @@ impl ForecastFeed {
                 Ok(message) => {
                     if message.generation == self.generation {
                         return Some(match message.result {
-                            Ok(forecast) => ForecastOutcome::Ready(forecast),
+                            Ok(served) => ForecastOutcome::Ready(served),
                             Err(error) => ForecastOutcome::Failed {
                                 place: message.place,
                                 error,

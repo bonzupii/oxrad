@@ -108,7 +108,7 @@ impl UkRiverLayer {
                 .strong()
                 .color(palette.text),
         );
-        provenance(ui, &served.provenance, served.cache);
+        provenance(ui, served);
         egui::ScrollArea::vertical()
             .max_height(230.0)
             .auto_shrink([false, false])

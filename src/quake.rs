@@ -510,11 +510,7 @@ pub fn fetch(
                 .json()
                 .map_err(|source| QuakeError::Provider { source })?;
             let value = parse(window, &document)?;
-            Ok(Served {
-                value,
-                provenance: fetched.provenance,
-                cache: fetched.cache,
-            })
+            Ok(Served::new(value, fetched.provenance, fetched.cache))
         }
         Provider::Emsc => {
             let now = time::now_unix_ms().map_err(|_| shape("a readable clock"))?;
@@ -536,11 +532,7 @@ pub fn fetch(
                 .json()
                 .map_err(|source| QuakeError::Provider { source })?;
             let value = parse_emsc(window, &document)?;
-            Ok(Served {
-                value,
-                provenance: fetched.provenance,
-                cache: fetched.cache,
-            })
+            Ok(Served::new(value, fetched.provenance, fetched.cache))
         }
     }
 }

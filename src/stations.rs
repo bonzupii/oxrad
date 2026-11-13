@@ -15,22 +15,19 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 //! Runtime radar-station discovery and the source catalog it produces.
 //!
-//! The National Weather Service GeoJSON endpoint is authoritative. A parsed
-//! result is cached as the provider's document so a later network failure
-//! leaves usable station metadata in place.
+//! The National Weather Service GeoJSON endpoint is authoritative. The shared
+//! request engine owns its cache, so a later network failure leaves the last
+//! station document usable through the served value.
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::fs;
-use std::io::ErrorKind;
-use std::path::Path;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::acquire::Acquire;
+use crate::engine::Served;
 use crate::error::SiteIdError;
-use crate::paths;
 use crate::product::RadarProduct;
 use crate::provider::FetchError;
 use crate::sources;
@@ -165,26 +162,9 @@ impl Station {
 /// A failure discovering, parsing, or caching station metadata.
 #[derive(Debug)]
 pub enum StationError {
-    Provider {
-        source: FetchError,
-    },
-    Shape {
-        field: &'static str,
-    },
-    Duplicate {
-        id: String,
-    },
-    CacheRead {
-        path: String,
-        source: std::io::Error,
-    },
-    CacheWrite {
-        path: String,
-        source: std::io::Error,
-    },
-    CachePath {
-        source: crate::error::PathError,
-    },
+    Provider { source: FetchError },
+    Shape { field: &'static str },
+    Duplicate { id: String },
     NoStations,
     NotRadar,
     WorkerStopped,
@@ -200,13 +180,6 @@ impl StationError {
             Self::Duplicate { id } => {
                 format!("The station feed lists {id} more than once.")
             }
-            Self::CacheRead { path, source } => {
-                format!("The cached station feed at {path} could not be read: {source}")
-            }
-            Self::CacheWrite { path, source } => {
-                format!("The station feed could not be cached at {path}: {source}")
-            }
-            Self::CachePath { source } => source.to_string(),
             Self::NoStations => String::from("The station feed listed no radar stations."),
             Self::NotRadar => String::from("The station is not a supported Level II radar."),
             Self::WorkerStopped => {
@@ -226,8 +199,6 @@ impl Error for StationError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Provider { source } => Some(source),
-            Self::CacheRead { source, .. } | Self::CacheWrite { source, .. } => Some(source),
-            Self::CachePath { source } => Some(source),
             Self::Shape { .. }
             | Self::Duplicate { .. }
             | Self::NoStations
@@ -360,93 +331,20 @@ pub fn parse_document(document: &Value) -> Result<Vec<Station>, StationError> {
     Ok(stations)
 }
 
-/// Retrieves the live station document without touching the cache.
-pub fn fetch_document(acquire: &Acquire) -> Result<Value, StationError> {
-    acquire
+/// Retrieves and parses the live station list with its provenance.
+pub fn discover(acquire: &Acquire) -> Result<Served<Vec<Station>>, StationError> {
+    let fetched = acquire
         .fetch_operation(&sources::NWS_API, "stations", &[])
-        .and_then(|fetched| fetched.json())
-        .map_err(|source| StationError::Provider { source })
-}
-
-fn cache_path() -> Result<std::path::PathBuf, StationError> {
-    paths::station_cache_file().map_err(|source| StationError::CachePath { source })
-}
-
-/// Reads the last successfully parsed station document.
-pub fn load_cache() -> Result<Option<Vec<Station>>, StationError> {
-    load_cache_at(&cache_path()?)
-}
-
-fn load_cache_at(path: &Path) -> Result<Option<Vec<Station>>, StationError> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(StationError::CacheRead {
-                path: path.display().to_string(),
-                source,
-            });
-        }
-    };
-    let stored: Value = serde_json::from_str(&text).map_err(|_| StationError::CacheRead {
-        path: path.display().to_string(),
-        source: std::io::Error::new(ErrorKind::InvalidData, "cached station feed is not JSON"),
-    })?;
-    let document = stored
-        .get("document")
-        .ok_or_else(|| shape("cached station document"))?;
-    parse_document(document).map(Some)
-}
-
-fn save_cache(document: &Value) -> Result<(), StationError> {
-    save_cache_at(&cache_path()?, document)
-}
-
-fn save_cache_at(path: &Path, document: &Value) -> Result<(), StationError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| StationError::CacheWrite {
-            path: parent.display().to_string(),
-            source,
-        })?;
-    }
-    let stored = json!({
-        "saved_at_unix_s": crate::time::now_unix_ms().map_or(Value::Null, |ms| json!(ms / 1000)),
-        "document": document,
-    });
-    let body = serde_json::to_string(&stored).map_err(|_| StationError::CacheWrite {
-        path: path.display().to_string(),
-        source: std::io::Error::new(ErrorKind::InvalidData, "station cache could not be encoded"),
-    })?;
-    let temporary = path.with_extension("json.tmp");
-    fs::write(&temporary, body).map_err(|source| StationError::CacheWrite {
-        path: temporary.display().to_string(),
-        source,
-    })?;
-    fs::rename(&temporary, path).map_err(|source| StationError::CacheWrite {
-        path: path.display().to_string(),
-        source,
-    })
-}
-
-/// A live discovery result, with an optional cache-write warning.
-pub struct Discovery {
-    pub stations: Vec<Station>,
-    pub cache_warning: Option<StationError>,
-}
-
-/// Fetches, parses, and caches the live station list.
-pub fn discover(acquire: &Acquire) -> Result<Discovery, StationError> {
-    let document = fetch_document(acquire)?;
-    let stations = parse_document(&document)?;
-    let cache_warning = save_cache(&document).err();
-    Ok(Discovery {
-        stations,
-        cache_warning,
-    })
+        .map_err(|source| StationError::Provider { source })?;
+    let document = fetched
+        .json()
+        .map_err(|source| StationError::Provider { source })?;
+    let value = parse_document(&document)?;
+    Ok(Served::new(value, fetched.provenance, fetched.cache))
 }
 
 pub enum StationOutcome {
-    Ready(Discovery),
+    Ready(Served<Vec<Station>>),
     Failed(StationError),
 }
 
@@ -517,6 +415,7 @@ pub fn find<'a>(stations: &'a [Station], id: &SiteId) -> Option<&'a Station> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn station_document() -> Value {
         json!({
@@ -574,32 +473,6 @@ mod tests {
         ));
         assert!(feed.poll().is_none());
         assert!(feed.is_finished());
-    }
-
-    #[test]
-    fn a_cached_station_document_survives_a_later_unavailable_network() -> Result<(), StationError>
-    {
-        let document = station_document();
-        let directory =
-            std::env::temp_dir().join(format!("oxrad-station-cache-test-{}", std::process::id()));
-        fs::create_dir(&directory).map_err(|source| StationError::CacheWrite {
-            path: directory.display().to_string(),
-            source,
-        })?;
-        let path = directory.join("stations.json");
-        save_cache_at(&path, &document)?;
-        let cached = load_cache_at(&path)?.ok_or(StationError::NoStations)?;
-        let live = parse_document(&document)?;
-        assert_eq!(cached.len(), live.len());
-        assert_eq!(
-            cached.first().map(|station| &station.id),
-            live.first().map(|station| &station.id)
-        );
-        fs::remove_dir_all(&directory).map_err(|source| StationError::CacheWrite {
-            path: directory.display().to_string(),
-            source,
-        })?;
-        Ok(())
     }
 
     #[test]

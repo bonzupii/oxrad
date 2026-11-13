@@ -30,6 +30,7 @@ use std::time::Instant;
 use serde_json::{Map, Value};
 
 use crate::acquire::Acquire;
+use crate::engine::Served;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
@@ -312,10 +313,10 @@ pub fn parse(document: &Value) -> Result<Land, LandError> {
     })
 }
 /// Fetches the land surface for one point.
-pub fn fetch(acquire: &Acquire, latitude: f64, longitude: f64) -> Result<Land, LandError> {
+pub fn fetch(acquire: &Acquire, latitude: f64, longitude: f64) -> Result<Served<Land>, LandError> {
     let latitude_text = format!("{latitude:.3}");
     let longitude_text = format!("{longitude:.3}");
-    let document = acquire
+    let fetched = acquire
         .fetch_operation(
             &sources::OPEN_METEO_FORECAST,
             "land",
@@ -326,9 +327,12 @@ pub fn fetch(acquire: &Acquire, latitude: f64, longitude: f64) -> Result<Land, L
                 ("forecast_days", "2"),
             ],
         )
-        .and_then(|fetched| fetched.json())
         .map_err(|source| LandError::Provider { source })?;
-    parse(&document)
+    let document = fetched
+        .json()
+        .map_err(|source| LandError::Provider { source })?;
+    let value = parse(&document)?;
+    Ok(Served::new(value, fetched.provenance, fetched.cache))
 }
 
 /// Requests sent to the worker.
@@ -341,9 +345,19 @@ pub struct LandRequest {
 
 /// Answers from the worker.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the served value travels whole so its provenance cannot be separated from it"
+)]
 pub enum LandEvent {
-    Ready { generation: u64, record: Land },
-    Failed { generation: u64, error: LandError },
+    Ready {
+        generation: u64,
+        record: Served<Land>,
+    },
+    Failed {
+        generation: u64,
+        error: LandError,
+    },
 }
 
 /// Fetches the land surface off the UI thread.
@@ -415,22 +429,22 @@ impl LandFeed {
 pub enum LandState {
     Idle,
     Loading {
-        last: Option<Land>,
+        last: Option<Served<Land>>,
     },
     Ready {
-        record: Land,
+        served: Served<Land>,
     },
     Failed {
         error: LandError,
-        last: Option<Land>,
+        last: Option<Served<Land>>,
     },
 }
 
 impl LandState {
     /// The most recent record still worth drawing.
-    pub const fn last(&self) -> Option<&Land> {
+    pub const fn last(&self) -> Option<&Served<Land>> {
         match self {
-            Self::Ready { record } => Some(record),
+            Self::Ready { served } => Some(served),
             Self::Loading { last } | Self::Failed { last, .. } => last.as_ref(),
             Self::Idle => None,
         }
@@ -457,7 +471,11 @@ impl LandView {
         &self.state
     }
 
-    pub const fn record(&self) -> Option<&Land> {
+    pub fn record(&self) -> Option<&Land> {
+        self.state.last().map(|served| &served.value)
+    }
+
+    pub const fn served(&self) -> Option<&Served<Land>> {
         self.state.last()
     }
 
@@ -483,7 +501,7 @@ impl LandView {
                     if generation != self.generation {
                         continue;
                     }
-                    self.state = LandState::Ready { record };
+                    self.state = LandState::Ready { served: record };
                 }
                 LandEvent::Failed { generation, error } => {
                     if generation != self.generation {
@@ -499,10 +517,10 @@ impl LandView {
 }
 
 /// Empties the state and returns the record it was holding.
-fn take_last(state: &mut LandState) -> Option<Land> {
+fn take_last(state: &mut LandState) -> Option<Served<Land>> {
     match std::mem::replace(state, LandState::Idle) {
         LandState::Loading { last } | LandState::Failed { last, .. } => last,
-        LandState::Ready { record } => Some(record),
+        LandState::Ready { served } => Some(served),
         LandState::Idle => None,
     }
 }

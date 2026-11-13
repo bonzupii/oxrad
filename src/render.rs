@@ -794,10 +794,10 @@ mod tests {
     fn render_worker_returns_the_origin_with_the_matching_volume() -> Result<(), TestError> {
         let (sender, receiver) = start_build_thread();
         let retrieved = RetrievedVolume {
-            volume: volume(
+            volume: crate::engine::Served::test(volume(
                 vec![radial(89.5, 90.5, 0.0, vec![GateValue::Measured(20.0)])],
                 75.0,
-            )?,
+            )?),
             origin: crate::radar::ArchiveOrigin::Cached,
             history_key: Some(String::from("2026/10/31/KTWX/KTWX20261031_003109_V06")),
         };
@@ -1045,13 +1045,12 @@ mod tests {
                 "column {column}: expected {expected:?}, got {actual:?}"
             );
         }
-        let indices: Result<Vec<u32>, _> = geometry
-            .lattice
-            .indices
-            .chunks_exact(4)
-            .map(|bytes| <[u8; 4]>::try_from(bytes).map(u32::from_le_bytes))
+        let (chunks, remainder) = geometry.lattice.indices.as_chunks::<4>();
+        assert!(remainder.is_empty(), "index bytes came in whole words");
+        let indices: Vec<u32> = chunks
+            .iter()
+            .map(|bytes| u32::from_le_bytes(*bytes))
             .collect();
-        let indices = indices.map_err(|error| format!("invalid index: {error}"))?;
         assert_eq!(indices, vec![0, 1, 3, 0, 3, 2, 4, 5, 7, 4, 7, 6]);
         Ok(())
     }

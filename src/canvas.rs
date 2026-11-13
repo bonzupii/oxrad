@@ -95,35 +95,44 @@ pub(crate) fn toggle_button(
         .stroke(Stroke::new(1.0_f32, palette.border))
 }
 
-/// Draws the source, operation, cache state, request URL, credit and licence
-/// for one served value, so a readout can account for itself.
-pub(crate) fn provenance(
-    ui: &mut egui::Ui,
-    provenance: &crate::engine::Provenance,
-    cache: crate::engine::CacheState,
-) {
-    ui.label(
-        RichText::new(format!(
-            "{} · operation {} · cache {}",
-            provenance.source_name,
-            provenance
-                .operation
-                .map_or("not named", |operation| operation),
-            cache.label()
-        ))
-        .size(theme::TYPE_SMALL)
-        .weak(),
-    );
-    ui.label(
-        RichText::new(&provenance.url)
+/// Draws every request behind a served value: source, operation, cache state,
+/// exact request URL, credit, licence and licence URL. One function is the
+/// whole provenance surface, so no rail can invent its own wording.
+pub(crate) fn provenance<T>(ui: &mut egui::Ui, served: &crate::engine::Served<T>) {
+    for (provenance, cache) in served.requests() {
+        ui.label(
+            RichText::new(format!(
+                "{} · operation {} · cache {}",
+                provenance.source_name,
+                provenance
+                    .operation
+                    .map_or("not named", |operation| operation),
+                cache.label()
+            ))
             .size(theme::TYPE_SMALL)
             .weak(),
-    );
-    ui.label(
-        RichText::new(format!("{} · {}", provenance.credit, provenance.licence))
-            .size(theme::TYPE_SMALL)
-            .weak(),
-    );
+        );
+        ui.label(
+            RichText::new(&provenance.url)
+                .size(theme::TYPE_SMALL)
+                .weak(),
+        );
+        ui.label(
+            RichText::new(format!("{} · {}", provenance.credit, provenance.licence))
+                .size(theme::TYPE_SMALL)
+                .weak(),
+        );
+        if provenance.licence_url.is_empty() {
+            ui.label(
+                RichText::new("licence URL not stated")
+                    .size(theme::TYPE_SMALL)
+                    .weak(),
+            );
+        } else {
+            ui.hyperlink_to(provenance.licence_url, provenance.licence_url)
+                .on_hover_text("Open the licence this source states.");
+        }
+    }
 }
 
 pub(crate) fn action_button(palette: &crate::theme::Palette, label: &str) -> egui::Button<'static> {

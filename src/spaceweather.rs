@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::acquire::Acquire;
+use crate::engine::Served;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
@@ -267,40 +268,62 @@ pub fn parse_wind(speed: &Value, magnetic: &Value) -> Result<SolarWind, SpaceWea
 
 /// Fetches the whole record. The Kp index is required; a missing wind is
 /// reported as a note beside it rather than taking the record down.
-pub fn fetch(acquire: &Acquire) -> Result<SpaceWeather, SpaceWeatherError> {
-    let kp_document = acquire
+pub fn fetch(acquire: &Acquire) -> Result<Served<SpaceWeather>, SpaceWeatherError> {
+    let kp_fetched = acquire
         .fetch_operation(&sources::NOAA_SWPC, "kp", &[])
-        .and_then(|fetched| fetched.json())
+        .map_err(|source| SpaceWeatherError::Provider { source })?;
+    let kp_document = kp_fetched
+        .json()
         .map_err(|source| SpaceWeatherError::Provider { source })?;
     let points = parse_kp(&kp_document)?;
-    let (wind, wind_note) = match fetch_wind(acquire) {
-        Ok(wind) => (Some(wind), None),
-        Err(error) => (None, Some(format!("{error}"))),
+    let (wind, wind_note, wind_served) = match fetch_wind(acquire) {
+        Ok(wind) => (Some(wind.value), None, Some(wind)),
+        Err(error) => (None, Some(format!("{error}")), None),
     };
-    Ok(SpaceWeather {
-        points,
-        wind,
-        wind_note,
-    })
+    let mut served = Served::new(
+        SpaceWeather {
+            points,
+            wind,
+            wind_note,
+        },
+        kp_fetched.provenance,
+        kp_fetched.cache,
+    );
+    if let Some(wind) = wind_served {
+        served = served.absorb(&wind);
+    }
+    Ok(served)
 }
 
-fn fetch_wind(acquire: &Acquire) -> Result<SolarWind, SpaceWeatherError> {
-    let speed = acquire
+fn fetch_wind(acquire: &Acquire) -> Result<Served<SolarWind>, SpaceWeatherError> {
+    let speed_fetched = acquire
         .fetch_operation(&sources::NOAA_SWPC, "wind", &[])
-        .and_then(|fetched| fetched.json())
         .map_err(|source| SpaceWeatherError::Provider { source })?;
-    let magnetic = acquire
+    let speed = speed_fetched
+        .json()
+        .map_err(|source| SpaceWeatherError::Provider { source })?;
+    let magnetic_fetched = acquire
         .fetch_operation(&sources::NOAA_SWPC, "magnetic-field", &[])
-        .and_then(|fetched| fetched.json())
         .map_err(|source| SpaceWeatherError::Provider { source })?;
-    parse_wind(&speed, &magnetic)
+    let magnetic = magnetic_fetched
+        .json()
+        .map_err(|source| SpaceWeatherError::Provider { source })?;
+    let value = parse_wind(&speed, &magnetic)?;
+    Ok(
+        Served::new(value, speed_fetched.provenance, speed_fetched.cache)
+            .with_request(magnetic_fetched.provenance, magnetic_fetched.cache),
+    )
 }
 
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the served value travels whole so its provenance cannot be separated from it"
+)]
 pub enum SpaceWeatherEvent {
     Ready {
         generation: u64,
-        record: SpaceWeather,
+        record: Served<SpaceWeather>,
     },
     Failed {
         generation: u64,
@@ -370,19 +393,19 @@ impl SpaceWeatherFeed {
 pub enum SpaceWeatherState {
     Idle,
     Loading {
-        last: Option<SpaceWeather>,
+        last: Option<Served<SpaceWeather>>,
     },
     Ready {
-        record: SpaceWeather,
+        record: Served<SpaceWeather>,
     },
     Failed {
         error: SpaceWeatherError,
-        last: Option<SpaceWeather>,
+        last: Option<Served<SpaceWeather>>,
     },
 }
 
 impl SpaceWeatherState {
-    pub const fn last(&self) -> Option<&SpaceWeather> {
+    pub const fn last(&self) -> Option<&Served<SpaceWeather>> {
         match self {
             Self::Ready { record } => Some(record),
             Self::Loading { last } | Self::Failed { last, .. } => last.as_ref(),
@@ -413,7 +436,11 @@ impl SpaceWeatherView {
         &self.state
     }
 
-    pub const fn record(&self) -> Option<&SpaceWeather> {
+    pub fn record(&self) -> Option<&SpaceWeather> {
+        self.state.last().map(|served| &served.value)
+    }
+
+    pub const fn served(&self) -> Option<&Served<SpaceWeather>> {
         self.state.last()
     }
 
@@ -467,7 +494,12 @@ impl SpaceWeatherView {
         }
     }
 
-    fn failed(&mut self, error: SpaceWeatherError, last: Option<SpaceWeather>, now: Instant) {
+    fn failed(
+        &mut self,
+        error: SpaceWeatherError,
+        last: Option<Served<SpaceWeather>>,
+        now: Instant,
+    ) {
         self.next_request = now.checked_add(REQUEST_EVERY);
         self.state = SpaceWeatherState::Failed { error, last };
     }

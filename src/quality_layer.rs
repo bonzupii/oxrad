@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Stroke};
 
 use crate::acquire::Acquire;
-use crate::canvas::toggle_button;
+use crate::canvas::{provenance, toggle_button};
 use crate::map::MapView;
 use crate::projection;
 use crate::quality::{self, AirQuality, AirState, AirView, AqiCategory};
@@ -55,7 +55,7 @@ impl AirLayer {
 
     /// The air quality record the layer is holding, for anything else that
     /// reports it.
-    pub const fn record(&self) -> Option<&crate::quality::AirQuality> {
+    pub fn record(&self) -> Option<&crate::quality::AirQuality> {
         self.view.record()
     }
 
@@ -114,6 +114,9 @@ impl AirLayer {
             return;
         }
         self.status(ui);
+        if let Some(served) = self.view.served() {
+            provenance(ui, served);
+        }
         let Some(record) = self.view.record() else {
             return;
         };
@@ -140,9 +143,9 @@ impl AirLayer {
                         .weak(),
                 );
             }
-            AirState::Ready { record } => {
+            AirState::Ready { served } => {
                 ui.label(
-                    RichText::new(describe(record))
+                    RichText::new(describe(served))
                         .size(theme::TYPE_SMALL)
                         .weak(),
                 );

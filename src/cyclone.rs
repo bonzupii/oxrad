@@ -35,6 +35,7 @@ use std::time::Instant;
 use serde_json::Value;
 
 use crate::acquire::Acquire;
+use crate::engine::Served;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
@@ -312,7 +313,7 @@ fn text(object: &serde_json::Map<String, Value>, field: &str) -> Option<String> 
         .map(String::from)
 }
 /// Fetches the storms in the window.
-pub fn fetch(acquire: &Acquire, now_ms: u64) -> Result<StormList, CycloneError> {
+pub fn fetch(acquire: &Acquire, now_ms: u64) -> Result<Served<StormList>, CycloneError> {
     let day = i64::try_from(now_ms / MS_PER_DAY)
         .map_err(|_| shape("a timestamp that falls inside the calendar"))?;
     let from = day - WINDOW_DAYS;
@@ -320,7 +321,7 @@ pub fn fetch(acquire: &Acquire, now_ms: u64) -> Result<StormList, CycloneError> 
     let (to_year, to_month, to_day) = time::civil_from_days(day);
     let from_text = format!("{from_month:02}/{from_day:02}/{from_year:04}");
     let to_text = format!("{to_month:02}/{to_day:02}/{to_year:04}");
-    let document = acquire
+    let fetched = acquire
         .fetch_operation(
             &sources::GDACS,
             "search",
@@ -329,9 +330,12 @@ pub fn fetch(acquire: &Acquire, now_ms: u64) -> Result<StormList, CycloneError> 
                 ("to_date", to_text.as_str()),
             ],
         )
-        .and_then(|fetched| fetched.json())
         .map_err(|source| CycloneError::Provider { source })?;
-    parse(&document)
+    let document = fetched
+        .json()
+        .map_err(|source| CycloneError::Provider { source })?;
+    let value = parse(&document)?;
+    Ok(Served::new(value, fetched.provenance, fetched.cache))
 }
 
 /// Requests sent to the worker.
@@ -346,7 +350,7 @@ pub struct CycloneRequest {
 pub enum CycloneEvent {
     Ready {
         generation: u64,
-        list: StormList,
+        list: Served<StormList>,
     },
     Failed {
         generation: u64,
@@ -423,21 +427,21 @@ impl CycloneFeed {
 pub enum CycloneState {
     Idle,
     Loading {
-        last: Option<StormList>,
+        last: Option<Served<StormList>>,
     },
     Ready {
-        list: StormList,
+        served: Served<StormList>,
     },
     Failed {
         error: CycloneError,
-        last: Option<StormList>,
+        last: Option<Served<StormList>>,
     },
 }
 
 impl CycloneState {
-    pub const fn last(&self) -> Option<&StormList> {
+    pub const fn last(&self) -> Option<&Served<StormList>> {
         match self {
-            Self::Ready { list } => Some(list),
+            Self::Ready { served } => Some(served),
             Self::Loading { last } | Self::Failed { last, .. } => last.as_ref(),
             Self::Idle => None,
         }
@@ -464,7 +468,11 @@ impl CycloneView {
         &self.state
     }
 
-    pub const fn list(&self) -> Option<&StormList> {
+    pub fn list(&self) -> Option<&StormList> {
+        self.state.last().map(|served| &served.value)
+    }
+
+    pub const fn served(&self) -> Option<&Served<StormList>> {
         self.state.last()
     }
 
@@ -489,7 +497,7 @@ impl CycloneView {
                     if generation != self.generation {
                         continue;
                     }
-                    self.state = CycloneState::Ready { list };
+                    self.state = CycloneState::Ready { served: list };
                 }
                 CycloneEvent::Failed { generation, error } => {
                     if generation != self.generation {
@@ -505,10 +513,10 @@ impl CycloneView {
 }
 
 /// Empties the state and returns the list it was holding.
-fn take_last(state: &mut CycloneState) -> Option<StormList> {
+fn take_last(state: &mut CycloneState) -> Option<Served<StormList>> {
     match std::mem::replace(state, CycloneState::Idle) {
         CycloneState::Loading { last } | CycloneState::Failed { last, .. } => last,
-        CycloneState::Ready { list } => Some(list),
+        CycloneState::Ready { served } => Some(served),
         CycloneState::Idle => None,
     }
 }

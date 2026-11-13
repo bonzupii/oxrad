@@ -645,8 +645,7 @@ mod tests {
         });
         let text = said
             .first()
-            .map(|bulletin| bulletin.text.clone())
-            .unwrap_or_default();
+            .map_or_else(String::new, |bulletin| bulletin.text.clone());
         assert!(text.contains("Topeka"), "{text}");
         assert!(text.contains("46 kt"), "{text}");
         assert!(text.contains("south"), "{text}");
@@ -706,7 +705,7 @@ mod tests {
             bulletin.as_ref().map(|found| found.urgency),
             Some(Urgency::Critical)
         );
-        let text = bulletin.map(|found| found.text).unwrap_or_default();
+        let text = bulletin.map_or_else(String::new, |found| found.text);
         assert!(text.contains("Magnitude 6.8"), "{text}");
         assert!(text.contains("tsunami"), "{text}");
     }
