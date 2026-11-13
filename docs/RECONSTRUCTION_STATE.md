@@ -21,7 +21,7 @@ States: not started, in progress, verified, blocked.
 | 11 | GUI and scientific validation | blocked | `scripts/gui.sh` present; `.tools/root` absent, so no display, no window capture | Provision the harness under `.tools`, pinned |
 | 12 | Documentation, including removal of environment-specific workflow | not started | `docs/HEADLESS.md` still carries the Xvfb procedure and an install instruction | Move it to the `headless-gui-testing` skill; make `AGENTS.md` instrument-neutral |
 | 13 | Apply the configured cache budget in the store | verified | Pass 4: `Store::prune` takes the policy from the effective configuration, returns the byte and entry limits it enforced, and the private `MAX_CACHE_*` constants are gone; `oxrad --prune-cache` prints the enforced budget and what it removed | none |
-| 14 | Draw every displayed credit from the enabled registry set | in progress | Pass 4: the basemap credit now comes from `sources::OPENFREEMAP.credit` instead of a literal, and the report derives every credit from the enabled set; no layer yet shows its source credit beside its data, and the basemap credit is not conditioned on the source being enabled | Feed a credit bar from the enabled set |
+| 14 | Draw every displayed credit from the enabled registry set | in progress | Pass 5: the basemap credit is read from `sources::OPENFREEMAP.credit` and is drawn only when the effective set enables `openfreemap`; the report derives every credit from the enabled set; layer credits are still not shown beside their data | Feed a credit bar from the enabled set |
 | 15 | Gate fetches by the enabled provider set | not started | A provider can be disabled in configuration, but no fetcher consults the set yet. Gating at the request path means passing the enabled set into 24 provider modules and the three HTTP boundaries | Thread the enabled set to `provider`, `network` and `basemap_tiles` |
 
 ## Acceptance criteria
@@ -97,6 +97,14 @@ States: not started, in progress, verified, blocked.
 - Observed with 17 synthetic 1 MiB cache bodies under a temporary HOME: `oxrad --set cache_max_mb=8 --prune-cache` printed `budget 8 MiB, 256 entries` and `removed 9`; the same cache under `--set cache_max_mb=4096` printed `budget 4096 MiB, 256 entries` and `removed 0`. The budget printed is the budget used for eviction.
 - Gates: `cargo fmt --all -- --check` exit 0, `cargo clippy -- -D warnings` exit 0, `cargo test --all-targets` 480 passed and 0 failed, `cargo build --release --locked` exit 0.
 - Not done, and the reason is scope rather than uncertainty: acquisition is still not gated by the enabled provider set. The three HTTP boundaries and 24 provider modules do not receive the set, so disabling a provider changes the model and the refusal at parse time but does not yet stop a fetch. Attribution is registry-derived but not yet shown per layer. No window was opened; the environment still has no display or provisioned harness.
+
+### Pass 5
+
+- Decision: the basemap credit is drawn from the registry entry and suppressed when the effective set does not enable `openfreemap`, so enablement reaches the draw path rather than only the report. The check lives in `draw_attribution`, the only place the basemap credit is emitted.
+- Decision: attribution for a set is still computed by walking the registry in order over the enabled identifiers, so two sets differ by exactly the credits of the providers that distinguish them. A test asserts that `rainviewer` and `rainviewer,openfreemap` differ by the OpenFreeMap credit and nothing else.
+- Observed: `oxrad --print-config --set providers=rainviewer` prints one credit, and adding `openfreemap` prints exactly one more. The draw-path suppression is covered by the enablement check and its test; it was not observed in a window.
+- Gates: `cargo fmt --all` clean, `cargo clippy -- -D warnings` exit 0, `cargo test --all-targets` 481 passed and 0 failed, `cargo build --release --locked` exit 0.
+- Not done: acquisition gating at the request boundary. This pass does not meet its own done-when. The remaining work is a single acquisition boundary that owns the transport and the enabled-set check, with all 24 provider modules routed through it; that refactor did not fit this pass and was not started, because a half-converted boundary would be worse than the current state. No window was opened.
 
 ## Known gate gaps
 

@@ -432,8 +432,13 @@ impl Basemap {
     }
 
     /// Draw attribution after overlays so it cannot be covered by map data.
-    pub fn draw_attribution(&self, ui: &egui::Ui, rect: Rect) {
-        if self.tiles.is_none() {
+    pub fn draw_attribution(
+        &self,
+        ui: &egui::Ui,
+        rect: Rect,
+        providers: &crate::config::EnabledProviders,
+    ) {
+        if self.tiles.is_none() || !providers.enables("openfreemap") {
             return;
         }
         let status = if self.error.is_some() && self.active != Some(self.selected) {

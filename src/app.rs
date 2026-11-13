@@ -1569,7 +1569,8 @@ impl OxradApp {
             interaction.clicked(),
         );
         self.map_status(ui, rect);
-        self.basemap.draw_attribution(ui, rect);
+        self.basemap
+            .draw_attribution(ui, rect, &self.config.providers);
         if let Some(id) = clicked_site {
             self.choose_site(id);
         }
@@ -3348,7 +3349,8 @@ impl OxradApp {
             }
         }
         self.map_readout(ui, rect, &transform, radar_visible);
-        self.basemap.draw_attribution(ui, rect);
+        self.basemap
+            .draw_attribution(ui, rect, &self.config.providers);
         if let Some(id) = clicked_site {
             self.choose_site(id);
         }

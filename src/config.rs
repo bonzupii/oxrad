@@ -310,6 +310,11 @@ impl EnabledProviders {
         &self.sources
     }
 
+    /// Whether the effective configuration enables this source.
+    pub fn enables(&self, id: &str) -> bool {
+        self.sources.iter().any(|source| source.id.as_str() == id)
+    }
+
     /// The credit lines the interface must display, in registry order.
     pub fn credits(&self) -> Vec<&'static str> {
         sources::SOURCES
@@ -1409,6 +1414,25 @@ mod tests {
         assert_eq!(
             config.providers.credits(),
             vec!["Weather data by RainViewer"]
+        );
+        assert!(config.providers.enables("rainviewer"));
+        assert!(!config.providers.enables("openfreemap"));
+        Ok(())
+    }
+
+    #[test]
+    fn two_enabled_sets_differ_by_exactly_their_credits() -> Result<(), ConfigError> {
+        let rain = resolved("providers = \"rainviewer\"\n", "")?;
+        let rain_and_basemap = resolved("providers = \"rainviewer,openfreemap\"\n", "")?;
+        let extra: Vec<&str> = rain_and_basemap
+            .providers
+            .credits()
+            .into_iter()
+            .filter(|credit| !rain.providers.credits().contains(credit))
+            .collect();
+        assert_eq!(
+            extra,
+            vec!["OpenFreeMap, OpenMapTiles, OpenStreetMap contributors"]
         );
         Ok(())
     }
