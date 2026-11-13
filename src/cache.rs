@@ -143,6 +143,7 @@ impl From<SystemTimeError> for CacheError {
 #[derive(Debug)]
 pub struct Entry {
     pub body: Vec<u8>,
+    pub fetched_at_unix_ms: u64,
 }
 
 /// A directory-backed response cache.
@@ -164,6 +165,7 @@ impl Store {
     }
 
     /// Uses an explicit cache namespace directory.
+    #[cfg(test)]
     pub const fn at(root: PathBuf) -> Self {
         Self { root }
     }
@@ -192,7 +194,17 @@ impl Store {
     ///
     /// Returns a typed cache error when metadata, the body, or its digest is
     /// invalid. The caller can remove the entry and refetch it.
+    #[cfg(test)]
     pub fn load(&self, key: &str) -> Result<Option<Entry>, CacheError> {
+        self.load_aged(key)
+    }
+
+    /// Reads a cached body together with the instant it was fetched.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed errors as [`Self::load`].
+    pub fn load_aged(&self, key: &str) -> Result<Option<Entry>, CacheError> {
         let (body_path, meta_path) = self.paths(key);
         let text = match fs::read_to_string(&meta_path) {
             Ok(text) => text,
@@ -231,6 +243,13 @@ impl Store {
             key: String::from(key),
             detail: "body length exceeds the platform limit",
         })?;
+        let fetched_at_unix_ms = metadata
+            .get("fetched_at_unix_ms")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| CacheError::Corrupt {
+                key: String::from(key),
+                detail: "missing fetch time",
+            })?;
         let expected_digest = metadata
             .get("body_sha256")
             .and_then(Value::as_str)
@@ -255,7 +274,10 @@ impl Store {
                 detail: "body digest does not match metadata",
             });
         }
-        Ok(Some(Entry { body }))
+        Ok(Some(Entry {
+            body,
+            fetched_at_unix_ms,
+        }))
     }
 
     fn digest_body(body: &[u8]) -> String {

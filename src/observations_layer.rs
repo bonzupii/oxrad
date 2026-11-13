@@ -63,7 +63,7 @@ impl ObservationLayer {
 
     /// Keeps the observations current while the layer is on.
     pub fn update(&mut self, now: Instant, view: &map::MapView) {
-        let retry_due = self.view.update(now);
+        self.view.update(now);
         if !self.shown {
             return;
         }
@@ -82,12 +82,11 @@ impl ObservationLayer {
         let stale = self
             .asked_at
             .is_some_and(|at| now.duration_since(at) >= REFRESH_AFTER);
-        let retry = retry_due && self.view.may_retry();
-        if moved || stale || retry {
+        if moved || stale {
             self.asked = Some((lat, lon, span));
             self.asked_at = Some(Instant::now());
             let box_of_stations = observations::bounds(lat, lon, span);
-            self.view.start(box_of_stations, self.view.attempts());
+            self.view.start(box_of_stations);
         }
     }
 
@@ -197,13 +196,6 @@ impl ObservationLayer {
                 if last.is_some() {
                     ui.label(
                         RichText::new("Still showing the last reports.")
-                            .size(theme::TYPE_SMALL)
-                            .weak(),
-                    );
-                }
-                if self.view.retry_waiting() {
-                    ui.label(
-                        RichText::new("Asking again shortly.")
                             .size(theme::TYPE_SMALL)
                             .weak(),
                     );

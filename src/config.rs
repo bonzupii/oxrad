@@ -1402,7 +1402,11 @@ mod tests {
     #[test]
     fn the_default_provider_set_is_admitted_and_credited() {
         let config = Config::default();
-        assert_eq!(config.providers.sources().len(), 19);
+        let admitted = crate::sources::SOURCES
+            .iter()
+            .filter(|source| source.admits().is_ok())
+            .count();
+        assert_eq!(config.providers.sources().len(), admitted);
         let credits = config.providers.credits();
         assert!(credits.contains(&"Weather data by RainViewer"));
         assert!(credits.contains(&"Sun data by Sunrise-Sunset.org"));

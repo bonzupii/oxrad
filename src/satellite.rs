@@ -21,16 +21,16 @@
 //! acquisition: the interface states the day and the layer, and never pretends
 //! the picture is a single moment.
 
-use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use eframe::egui::{self, Color32, Pos2, Rect, RichText, TextureHandle};
 
 use crate::acquire::Acquire;
 use crate::canvas::toggle_button;
+use crate::engine::RequestSpec;
 use crate::global_radar::{self, TileBounds};
 use crate::map;
 use crate::provider::FetchError;
@@ -38,15 +38,10 @@ use crate::sources;
 use crate::theme::{self, Palette};
 use crate::time;
 
-const GIBS: &str = "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best";
+const GIBS: &str = sources::NASA_GIBS.endpoint;
 const PROVIDER: &str = "NASA EOSDIS GIBS";
-const MAX_TILE_BYTES: u64 = 2 * 1024 * 1024;
 const VIEW_TILE_LIMIT: usize = 9;
 const DAYS_BACK: u8 = 6;
-const CACHED_TILES: usize = 96;
-const RETRY_BASE: Duration = Duration::from_secs(3);
-const RETRY_MAX: Duration = Duration::from_secs(60);
-const RETRY_STEPS: u32 = 5;
 
 /// One published imagery layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -404,32 +399,22 @@ impl SatelliteFeed {
         let (requests, request_receiver) = mpsc::channel::<PlanRequest>();
         let (event_sender, events) = mpsc::channel::<SatelliteEvent>();
         std::thread::spawn(move || {
-            let mut cache: HashMap<String, (u32, u32, Vec<u8>)> = HashMap::new();
             while let Ok(request) = request_receiver.recv() {
                 let mut loaded = 0;
                 let mut failed = 0;
                 let mut first_error = None;
                 for tile in &request.tiles {
                     let url = tile_url(request.imagery, request.day, *tile);
-                    let decoded = match cache.get(&url) {
-                        Some(cached) => Ok(cached.clone()),
-                        None => acquire
-                            .bytes(
-                                &sources::NASA_GIBS,
-                                &url,
-                                request.imagery.content_type(),
-                                MAX_TILE_BYTES,
-                            )
-                            .map_err(|source| SatelliteError::Provider { source })
-                            .and_then(|bytes| {
-                                let decoded = decode(&url, &bytes)?;
-                                if cache.len() >= CACHED_TILES {
-                                    cache.clear();
-                                }
-                                cache.insert(url.clone(), decoded.clone());
-                                Ok(decoded)
-                            }),
-                    };
+                    let spec = RequestSpec::for_source(
+                        &sources::NASA_GIBS,
+                        &url,
+                        request.imagery.content_type(),
+                    )
+                    .ttl(Duration::from_secs(86_400));
+                    let decoded = acquire
+                        .fetch(&spec)
+                        .map_err(|source| SatelliteError::Provider { source })
+                        .and_then(|fetched| decode(&url, &fetched.body));
                     match decoded {
                         Ok((width, height, rgba)) => {
                             loaded += 1;
@@ -542,16 +527,6 @@ enum Status {
     },
 }
 
-/// How long to wait before asking a provider that failed again.
-///
-/// Three seconds, then six, twelve, twenty-four, and a minute from there, so a
-/// provider that is briefly down does not receive a request every frame.
-fn retry_delay(attempt: u32) -> Duration {
-    let steps = attempt.min(RETRY_STEPS);
-    let factor = 1u32 << steps;
-    RETRY_BASE.saturating_mul(factor).min(RETRY_MAX)
-}
-
 /// The satellite imagery layer.
 pub struct SatelliteLayer {
     feed: SatelliteFeed,
@@ -564,8 +539,6 @@ pub struct SatelliteLayer {
     planned: Option<String>,
     tiles: Vec<PlacedTile>,
     status: Status,
-    retry_due: Option<Instant>,
-    failures: u32,
 }
 
 impl SatelliteLayer {
@@ -581,8 +554,6 @@ impl SatelliteLayer {
             planned: None,
             tiles: Vec::new(),
             status: Status::Idle,
-            retry_due: None,
-            failures: 0,
         }
     }
 
@@ -593,12 +564,6 @@ impl SatelliteLayer {
             return;
         }
         self.absorb(context);
-        if let Some(due) = self.retry_due
-            && Instant::now() >= due
-        {
-            self.retry_due = None;
-            self.planned = None;
-        }
         let Ok((lat, lon)) = view.center_latlon() else {
             return;
         };
@@ -652,18 +617,7 @@ impl SatelliteLayer {
     /// Records a failure. A provider that may recover is asked again after a
     /// backoff; a malformed answer or a view this layer cannot serve is not,
     /// because asking again would receive the same answer.
-    fn record_failure(&mut self, message: String, transient: bool) {
-        if transient {
-            self.failures = self.failures.saturating_add(1);
-            self.retry_due = Some(Instant::now() + retry_delay(self.failures));
-            self.status = Status::Failed {
-                message,
-                retrying: true,
-            };
-            return;
-        }
-        self.failures = 0;
-        self.retry_due = None;
+    fn record_failure(&mut self, message: String, _transient: bool) {
         self.status = Status::Failed {
             message,
             retrying: false,
@@ -724,10 +678,6 @@ impl SatelliteLayer {
                         failed,
                         zoom: self.tiles.first().map_or(0, |tile| tile.bounds.zoom),
                     };
-                    if failed == 0 {
-                        self.failures = 0;
-                        self.retry_due = None;
-                    }
                 }
                 SatelliteEvent::Failed { generation, error } => {
                     if generation != self.generation {
@@ -747,8 +697,6 @@ impl SatelliteLayer {
         let newest = self.day_offset.saturating_add(self.lag);
         if error.is_missing() && newest < DAYS_BACK {
             self.lag = self.lag.saturating_add(1);
-            self.failures = 0;
-            self.retry_due = None;
             self.planned = None;
             let asked = day_for(newest).map_or_else(|reason| reason, |day| day.path());
             self.status = Status::Failed {
@@ -757,8 +705,7 @@ impl SatelliteLayer {
             };
             return;
         }
-        let transient = error.is_transient();
-        self.record_failure(format!("{error}"), transient);
+        self.record_failure(format!("{error}"), error.is_transient());
     }
 
     /// Draws the imagery under the vector geography, inside the map canvas.
@@ -917,21 +864,11 @@ impl SatelliteLayer {
                 }
                 ui.label(RichText::new(text).size(theme::TYPE_SMALL).weak());
             }
-            Status::Failed { message, retrying } => {
+            Status::Failed { message, .. } => {
                 ui.colored_label(
                     ui.visuals().error_fg_color,
                     format!("Satellite imagery failed: {message}"),
                 );
-                if *retrying {
-                    ui.label(
-                        RichText::new(format!(
-                            "Asking the provider again in about {} seconds.",
-                            retry_delay(self.failures).as_secs()
-                        ))
-                        .size(theme::TYPE_SMALL)
-                        .weak(),
-                    );
-                }
             }
         }
         if self.shown && !self.tiles.is_empty() {
@@ -1088,16 +1025,6 @@ mod tests {
     }
 
     #[test]
-    fn a_provider_failure_backs_off_to_a_minute() {
-        assert_eq!(retry_delay(1), Duration::from_secs(6));
-        assert_eq!(retry_delay(2), Duration::from_secs(12));
-        assert_eq!(retry_delay(3), Duration::from_secs(24));
-        assert_eq!(retry_delay(4), Duration::from_secs(48));
-        assert_eq!(retry_delay(5), RETRY_MAX);
-        assert_eq!(retry_delay(9), RETRY_MAX);
-    }
-
-    #[test]
     fn an_impossible_view_is_refused() {
         assert!(matches!(
             plan_view(Imagery::TrueColor, 95.0, 0.0, 900.0),
@@ -1106,18 +1033,16 @@ mod tests {
     }
 
     #[test]
-    fn a_shape_failure_is_not_retried_but_a_provider_failure_is() {
+    fn a_failure_is_reported_without_a_panel_retry_timer() {
         let mut layer = SatelliteLayer::new(Acquire::offline());
         layer.shown = true;
-        layer.record_failure(String::from("no tiles"), false);
-        assert!(layer.retry_due.is_none());
-        assert_eq!(layer.failures, 0);
         layer.record_failure(String::from("timed out"), true);
-        assert!(layer.retry_due.is_some());
-        assert_eq!(layer.failures, 1);
         assert!(matches!(
             layer.status,
-            Status::Failed { retrying: true, .. }
+            Status::Failed {
+                retrying: false,
+                ..
+            }
         ));
     }
 
@@ -1139,7 +1064,6 @@ mod tests {
         layer.failed(&status_error(404));
         assert_eq!(layer.lag, 1);
         assert!(layer.planned.is_none(), "the day before is planned again");
-        assert!(layer.retry_due.is_none(), "a missing day is not an outage");
         assert!(matches!(
             layer.status,
             Status::Failed {
@@ -1156,11 +1080,6 @@ mod tests {
         layer.planned = Some(String::from("the same day"));
         layer.failed(&status_error(503));
         assert_eq!(layer.lag, 0, "an outage does not move the archive day");
-        assert!(layer.retry_due.is_some());
-        assert!(matches!(
-            layer.status,
-            Status::Failed { retrying: true, .. }
-        ));
     }
 
     #[test]

@@ -18,18 +18,18 @@
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use std::collections::HashSet;
+use std::time::Duration;
 
 use crate::acquire::Acquire;
-use crate::cache::{CacheError, Store};
+use crate::engine::{CacheState, RequestSpec};
 use crate::error::RadarError;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::stations::SiteId;
-use crate::time::{MS_PER_DAY, civil_from_days, now_unix_ms};
+use crate::time::{MS_PER_DAY, civil_from_days, days_from_civil, now_unix_ms};
 
-const BUCKET_URL: &str = "https://unidata-nexrad-level2.s3.amazonaws.com";
+const BUCKET_URL: &str = sources::NEXRAD_LEVEL_TWO.endpoint;
 const LOOKBACK_DAYS: i64 = 3;
-const MAX_BODY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_LIST_PAGES: usize = 10_000;
 fn encode_query_value(value: &str) -> String {
     let mut encoded = String::new();
@@ -145,7 +145,13 @@ fn list_keys(acquire: &Acquire, prefix: &str) -> Result<Vec<String>, RadarError>
             url.push_str("&continuation-token=");
             url.push_str(&encode_query_value(current));
         }
-        let body = acquire.bytes(&sources::NEXRAD_LEVEL_TWO, &url, "*/*", MAX_BODY_BYTES)?;
+        let fetched = acquire
+            .fetch(
+                &RequestSpec::for_source(&sources::NEXRAD_LEVEL_TWO, &url, "*/*")
+                    .ttl(Duration::from_secs(60)),
+            )
+            .map_err(RadarError::from)?;
+        let body = fetched.body;
         let xml = String::from_utf8(body).map_err(|_| RadarError::ListingBody {
             prefix: String::from(prefix),
         })?;
@@ -232,21 +238,35 @@ pub fn recent_volume_keys(
     Ok(keys.into_iter().skip(start).collect())
 }
 
-/// Retrieves one Archive II volume. A 404 means the listing went stale.
-pub fn fetch_archive(acquire: &Acquire, key: &str) -> Result<Vec<u8>, RadarError> {
-    let url = format!("{BUCKET_URL}/{key}");
-    match acquire.bytes(
-        &sources::NEXRAD_LEVEL_TWO,
-        &url,
-        "application/octet-stream",
-        MAX_BODY_BYTES,
-    ) {
-        Ok(bytes) => Ok(bytes),
-        Err(FetchError::Status { status: 404, .. }) => Err(RadarError::VolumeGone {
-            key: String::from(key),
-        }),
-        Err(other) => Err(other.into()),
+/// The UTC scan instant encoded in an Archive II object key, when it is well formed.
+fn scan_from_key(key: &str) -> Option<u64> {
+    let name = key.rsplit('/').next()?;
+    let stamp = name.get(4..19)?;
+    if stamp.as_bytes().get(8) != Some(&b'_') {
+        return None;
     }
+    let number = |range: std::ops::Range<usize>| -> Option<u32> { stamp.get(range)?.parse().ok() };
+    let year = i32::try_from(number(0..4)?).ok()?;
+    let month = number(4..6)?;
+    let day = number(6..8)?;
+    let hour = number(9..11)?;
+    let minute = number(11..13)?;
+    let second = number(13..15)?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    u64::try_from(days)
+        .ok()?
+        .checked_mul(MS_PER_DAY)?
+        .checked_add(u64::from(hour) * 3_600_000)?
+        .checked_add(u64::from(minute) * 60_000)?
+        .checked_add(u64::from(second) * 1_000)
 }
 
 /// A verified archive body together with the cache outcome.
@@ -254,58 +274,45 @@ pub fn fetch_archive(acquire: &Acquire, key: &str) -> Result<Vec<u8>, RadarError
 pub struct CachedArchive {
     pub bytes: Vec<u8>,
     pub from_cache: bool,
-    pub cache_warning: Option<CacheError>,
+    pub cache_warning: Option<String>,
 }
 
-/// Retrieves a volume through the bounded persistent cache.
+/// Retrieves a volume through the engine's persistent cache.
 ///
-/// A cache miss falls back to the live object and stores it for a later
-/// history view. Cache failures do not replace usable live bytes; they travel
-/// with the response so the interface can report them.
-pub fn fetch_archive_cached(acquire: &Acquire, key: &str) -> Result<CachedArchive, RadarError> {
-    let mut cache_warning = None;
-    let store = match Store::default_location() {
-        Ok(store) => Some(store),
-        Err(error) => {
-            cache_warning = Some(error);
-            None
-        }
-    };
-    if let Some(store) = &store {
-        match store.load(key) {
-            Ok(Some(entry)) => {
-                return Ok(CachedArchive {
-                    bytes: entry.body,
-                    from_cache: true,
-                    cache_warning,
-                });
-            }
-            Ok(None) => {}
-            Err(error) => {
-                cache_warning = Some(error);
-                if let Err(remove_error) = store.remove(key) {
-                    cache_warning = Some(remove_error);
-                }
-            }
-        }
+/// The archive objects are immutable once written, so the engine may serve the
+/// stored copy for a year. A cache failure is reported, never used to replace
+/// bytes the provider did return.
+pub fn fetch_archive_cached(
+    acquire: &Acquire,
+    key: &str,
+    site: &SiteId,
+) -> Result<CachedArchive, RadarError> {
+    let url = format!("{BUCKET_URL}/{key}");
+    let mut request =
+        RequestSpec::for_source(&sources::NEXRAD_LEVEL_TWO, &url, "application/octet-stream")
+            .ttl(Duration::from_secs(365 * 24 * 60 * 60))
+            .station(String::from(site.as_str()))
+            .product("Level II base data");
+    if let Some(scan) = scan_from_key(key) {
+        request = request.scan(scan);
     }
-    let bytes = fetch_archive(acquire, key)?;
-    if let Some(store) = &store
-        && let Err(error) = store.store(key, &bytes)
-    {
-        cache_warning = Some(error);
-    }
+    let fetched = acquire.fetch(&request).map_err(|error| match error {
+        FetchError::Status { status: 404, .. } => RadarError::VolumeGone {
+            key: String::from(key),
+        },
+        other => RadarError::from(other),
+    })?;
     Ok(CachedArchive {
-        bytes,
-        from_cache: false,
-        cache_warning,
+        bytes: fetched.body,
+        from_cache: fetched.cache == CacheState::Cached,
+        cache_warning: acquire.cache_error(),
     })
 }
 
 /// Removes a cached archive after it fails to decode, so the next attempt can
 /// fetch a fresh object instead of replaying corrupt bytes.
-pub fn evict_archive(key: &str) -> Result<(), CacheError> {
-    Store::default_location()?.remove(key)
+pub fn evict_archive(acquire: &Acquire, key: &str) -> Result<(), String> {
+    acquire.evict(key)
 }
 
 #[cfg(test)]

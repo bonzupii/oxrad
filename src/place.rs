@@ -27,13 +27,14 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::acquire::Acquire;
+use crate::engine::RequestSpec;
 use crate::error::CoordinateError;
 use crate::projection;
 use crate::provider::{self, FetchError};
 use crate::sources;
 use crate::stations::Station;
 
-const PHOTON_SEARCH: &str = "https://photon.komoot.io/api/";
+const PHOTON_SEARCH: &str = sources::PHOTON.endpoint;
 const SEARCH_LIMIT: usize = 10;
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(600);
 
@@ -319,7 +320,13 @@ fn fetch_places(acquire: &Acquire, query: &str) -> Result<Vec<Place>, FetchError
         "{PHOTON_SEARCH}?q={}&limit={SEARCH_LIMIT}",
         provider::encode_query(query)
     );
-    let document = acquire.json(&sources::PHOTON, &url, "application/json")?;
+    let document = acquire
+        .fetch(&RequestSpec::for_source(
+            &sources::PHOTON,
+            &url,
+            "application/json",
+        ))
+        .and_then(|fetched| fetched.json())?;
     places_from_document(&document, &url, query)
 }
 

@@ -56,7 +56,7 @@ impl HydroLayer {
     /// Follows the map centre while the layer is on, and takes in the worker's
     /// answers.
     pub fn update(&mut self, now: Instant, view: &MapView) {
-        let retry_due = self.view.update(now);
+        self.view.update(now);
         if !self.shown {
             return;
         }
@@ -73,8 +73,7 @@ impl HydroLayer {
         let stale = self
             .asked_at
             .is_some_and(|at| now.duration_since(at) >= REFRESH_AFTER);
-        let retry = retry_due && self.view.may_retry();
-        if moved || stale || retry {
+        if moved || stale {
             self.request(lat, lon);
         }
     }
@@ -82,8 +81,7 @@ impl HydroLayer {
     fn request(&mut self, latitude: f64, longitude: f64) {
         self.asked = Some((latitude, longitude, self.ensemble));
         self.asked_at = Some(Instant::now());
-        self.view
-            .start(latitude, longitude, self.ensemble, self.view.attempts());
+        self.view.start(latitude, longitude, self.ensemble);
     }
 
     /// The rail section for the layer.
@@ -194,12 +192,7 @@ impl HydroLayer {
                     .weak(),
                 );
             }
-            HydroState::Failed {
-                error,
-                last,
-                attempts,
-                ..
-            } => {
+            HydroState::Failed { error, last, .. } => {
                 ui.colored_label(
                     ui.visuals().error_fg_color,
                     format!("River discharge failed: {error}"),
@@ -207,13 +200,6 @@ impl HydroLayer {
                 if let Some(last) = last {
                     ui.label(
                         RichText::new(format!("Still showing {}", hydro::describe(last)))
-                            .size(theme::TYPE_SMALL)
-                            .weak(),
-                    );
-                }
-                if *attempts > 0 {
-                    ui.label(
-                        RichText::new(format!("Attempt {attempts} of {}", hydro::MAX_ATTEMPTS))
                             .size(theme::TYPE_SMALL)
                             .weak(),
                     );

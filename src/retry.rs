@@ -13,66 +13,15 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
-//! Retry scheduling: exponential backoff, jitter, and `Retry-After`.
+//! Transport-neutral retry helpers shared by the engine and radar decoding.
 
-use std::collections::hash_map::RandomState;
-use std::hash::BuildHasher;
 use std::time::Duration;
 
 use crate::error::RadarError;
-use crate::pipeline::{FetchFailure, FetchUpdate};
 use crate::time::{civil_from_days, now_unix_ms};
 
-pub const BASE_DELAY: Duration = Duration::from_secs(2);
-pub const MAX_DELAY: Duration = Duration::from_secs(60);
-
-pub fn error_update(
-    failure: FetchFailure,
-    failures: u8,
-    delay: Duration,
-    attempt: u32,
-    jitter: &RandomState,
-) -> FetchUpdate {
-    let FetchFailure {
-        operation,
-        error,
-        cache_warning,
-    } = failure;
-    let wait = if is_decode_failure(&error) && failures >= 2 {
-        None
-    } else if let Some(value) = retry_after(&error) {
-        match retry_after_delay(value) {
-            Ok(requested) => Some(requested),
-            Err(invalid) => {
-                return FetchUpdate {
-                    result: Err(FetchFailure {
-                        operation,
-                        error: invalid,
-                        cache_warning: None,
-                    }),
-                    retry_in: Some(jittered(delay, attempt, jitter)),
-                    waiting_for_next_volume: false,
-                    from_cache: false,
-                    cache_warning: cache_warning.map(|error| *error),
-                };
-            }
-        }
-    } else {
-        Some(jittered(delay, attempt, jitter))
-    };
-    FetchUpdate {
-        result: Err(FetchFailure {
-            operation,
-            error,
-            cache_warning: None,
-        }),
-        retry_in: wait,
-        waiting_for_next_volume: wait.is_none(),
-        from_cache: false,
-        cache_warning: cache_warning.map(|error| *error),
-    }
-}
-
+/// Whether a decode failure should wait for a newer volume rather than retry
+/// the same bytes.
 pub const fn is_decode_failure(error: &RadarError) -> bool {
     matches!(
         error,
@@ -90,18 +39,6 @@ pub const fn is_decode_failure(error: &RadarError) -> bool {
             | RadarError::GateRange { .. }
             | RadarError::IncompleteVolume { .. }
     )
-}
-
-/// The `Retry-After` value of a throttled response, if it carries one.
-fn retry_after(error: &RadarError) -> Option<&str> {
-    match error {
-        RadarError::HttpStatus {
-            status: 429 | 503,
-            retry_after: Some(value),
-            ..
-        } => Some(value),
-        _ => None,
-    }
 }
 
 /// The wait a `Retry-After` value asks for, in seconds or as an HTTP date.
@@ -192,56 +129,16 @@ fn parse_decimal(value: &str) -> Option<u32> {
     })
 }
 
-fn jittered(delay: Duration, attempt: u32, state: &RandomState) -> Duration {
-    let millis = state.hash_one(attempt) % 500;
-    (delay + Duration::from_millis(millis)).min(MAX_DELAY)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::VolumeDefect;
-    use crate::pipeline::Operation;
-
-    fn incomplete() -> RadarError {
-        RadarError::IncompleteVolume {
-            site: String::from("KTWX"),
-            defect: VolumeDefect::MissingEnd,
-        }
-    }
-
-    #[test]
-    fn backoff_starts_at_two_seconds_and_caps_at_one_minute() {
-        let random = RandomState::new();
-        assert_eq!(BASE_DELAY, Duration::from_secs(2));
-        for attempt in 0..10 {
-            assert_eq!(jittered(MAX_DELAY, attempt, &random), MAX_DELAY);
-            let short = jittered(BASE_DELAY, attempt, &random);
-            assert!(
-                (BASE_DELAY..Duration::from_millis(2500)).contains(&short),
-                "unexpected jitter {short:?}"
-            );
-        }
-    }
 
     #[test]
     fn retry_after_seconds_is_honored_for_throttling() {
-        let error = RadarError::HttpStatus {
-            url: String::from("https://example.invalid"),
-            status: 429,
-            retry_after: Some(String::from("120")),
-        };
-        assert_eq!(retry_after(&error), Some("120"));
         assert!(matches!(
             retry_after_delay("120"),
             Ok(value) if value == Duration::from_secs(120)
         ));
-        let error = RadarError::HttpStatus {
-            url: String::from("https://example.invalid"),
-            status: 404,
-            retry_after: Some(String::from("120")),
-        };
-        assert_eq!(retry_after(&error), None, "only 429 and 503 ask for a wait");
     }
 
     #[test]
@@ -257,70 +154,5 @@ mod tests {
             None,
             "a date without a zone is rejected"
         );
-    }
-
-    #[test]
-    fn an_invalid_retry_after_falls_back_to_the_backoff_schedule() {
-        let state = RandomState::new();
-        let error = RadarError::HttpStatus {
-            url: String::from("https://example.invalid"),
-            status: 503,
-            retry_after: Some(String::from("invalid")),
-        };
-        let update = error_update(
-            FetchFailure {
-                operation: Operation::Fetching,
-                error,
-                cache_warning: None,
-            },
-            0,
-            BASE_DELAY,
-            0,
-            &state,
-        );
-        assert!(matches!(
-            update.result,
-            Err(FetchFailure {
-                error: RadarError::InvalidRetryAfter { ref value },
-                ..
-            }) if value == "invalid"
-        ));
-        assert!(update.retry_in.is_some(), "the retry still happens");
-        assert!(!update.waiting_for_next_volume);
-    }
-
-    #[test]
-    fn a_decode_failure_waits_for_the_next_volume_after_one_retry() {
-        let state = RandomState::new();
-        let first = error_update(
-            FetchFailure {
-                operation: Operation::Decoding,
-                error: incomplete(),
-                cache_warning: None,
-            },
-            1,
-            BASE_DELAY,
-            0,
-            &state,
-        );
-        assert!(first.retry_in.is_some());
-        assert!(!first.waiting_for_next_volume);
-        let second = error_update(
-            FetchFailure {
-                operation: Operation::Decoding,
-                error: incomplete(),
-                cache_warning: None,
-            },
-            2,
-            Duration::from_secs(4),
-            1,
-            &state,
-        );
-        assert!(second.retry_in.is_none());
-        assert!(second.waiting_for_next_volume);
-        assert!(is_decode_failure(&incomplete()));
-        assert!(!is_decode_failure(&RadarError::VolumeGone {
-            key: String::from("2026/10/31/KTWX/KTWX20261031_003109_V06"),
-        }));
     }
 }

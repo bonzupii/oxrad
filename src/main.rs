@@ -28,6 +28,7 @@ mod cyclone_layer;
 mod derived;
 mod display;
 mod domains;
+mod engine;
 mod environment;
 mod environment_layer;
 mod error;
@@ -109,7 +110,7 @@ use stations::SiteId;
 
 const USAGE: &str = "\
 Usage: oxrad [--site IDENTIFIER] [--profile PATH] [--set key=value]...
-             [--print-config | --prune-cache | --sources]
+             [--print-config | --prune-cache | --sources | --fetch-source ID]
 
 Runs the radar viewer. The last selected site is restored from the
 configuration file; with no saved site the picker opens.
@@ -120,6 +121,8 @@ configuration file; with no saved site the picker opens.
   --print-config      Print the effective configuration and exit
   --prune-cache       Enforce the configured cache budget and exit
   --sources           Print the open-source inventory and exit
+  --fetch-source ID   Fetch one registry endpoint twice through the request
+                      engine and print its provenance and cache state
   -h, --help          Show this message";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -129,6 +132,7 @@ enum Action {
     PrintConfig,
     PruneCache,
     PrintSources,
+    FetchSource,
     Help,
 }
 
@@ -138,12 +142,13 @@ struct Invocation {
     profile: Option<PathBuf>,
     selection: Vec<String>,
     action: Action,
+    fetch_source: Option<String>,
 }
 
 fn choose(action: &mut Action, chosen: Action) -> Result<(), String> {
     if *action != Action::Run {
         return Err(String::from(
-            "only one of --print-config, --prune-cache, --sources and --help may be given.",
+            "only one of --print-config, --prune-cache, --sources, --fetch-source and --help may be given.",
         ));
     }
     *action = chosen;
@@ -178,6 +183,15 @@ fn parse_arguments() -> Result<Invocation, String> {
             "--print-config" => choose(&mut invocation.action, Action::PrintConfig)?,
             "--prune-cache" => choose(&mut invocation.action, Action::PruneCache)?,
             "--sources" => choose(&mut invocation.action, Action::PrintSources)?,
+            "--fetch-source" => {
+                let value = arguments.next().ok_or_else(|| {
+                    String::from(
+                        "--fetch-source needs a registry identifier such as usgs-earthquakes.",
+                    )
+                })?;
+                choose(&mut invocation.action, Action::FetchSource)?;
+                invocation.fetch_source = Some(value);
+            }
             "--help" | "-h" => choose(&mut invocation.action, Action::Help)?,
             unexpected => return Err(format!("Unexpected argument {unexpected}.")),
         }
@@ -211,6 +225,49 @@ fn prune_cache(policy: config::CachePolicy) -> ExitCode {
     }
 }
 
+/// Fetches one registry endpoint twice through the engine and reports what it
+/// served, so cache state and provenance can be observed without a display.
+fn fetch_source(config: &config::Config, id: &str) -> ExitCode {
+    let Some(source) = sources::find(id) else {
+        eprintln!("No registry source is named {id}. Run --sources for the identifiers.");
+        return ExitCode::FAILURE;
+    };
+    let accept = match source.format {
+        sources::Format::Json | sources::Format::GeoJson => "application/json",
+        sources::Format::Xml => "application/xml",
+        sources::Format::Tiles | sources::Format::VectorTiles => "image/png",
+        sources::Format::Binary => "application/octet-stream",
+    };
+    let acquire = acquire::Acquire::new(config.providers.clone());
+    let spec = engine::RequestSpec::for_source(source, source.endpoint, accept);
+    for pass in 1..=2 {
+        match acquire.fetch(&spec) {
+            Ok(fetched) => {
+                println!(
+                    "request {pass}: {} bytes from {} ({})",
+                    fetched.body.len(),
+                    fetched.cache.label(),
+                    source.credit
+                );
+            }
+            Err(error) => {
+                eprintln!("request {pass} failed: {error}");
+                report_provenance(&acquire);
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    report_provenance(&acquire);
+    ExitCode::SUCCESS
+}
+
+fn report_provenance(acquire: &acquire::Acquire) {
+    match serde_json::to_string_pretty(&acquire.provenance()) {
+        Ok(report) => println!("{report}"),
+        Err(error) => eprintln!("The request provenance could not be rendered: {error}"),
+    }
+}
+
 fn print_inventory() -> ExitCode {
     match sources::inventory_markdown() {
         Ok(inventory) => {
@@ -238,7 +295,8 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Action::PrintSources => return print_inventory(),
-        Action::Run | Action::PrintConfig | Action::PruneCache => {}
+
+        Action::Run | Action::PrintConfig | Action::PruneCache | Action::FetchSource => {}
     }
     let selection = match config::selection_text(&invocation.selection) {
         Ok(text) => text,
@@ -271,6 +329,13 @@ fn main() -> ExitCode {
                 }
             },
             Action::PruneCache => return prune_cache(effective.config.cache),
+            Action::FetchSource => {
+                let Some(id) = invocation.fetch_source.as_deref() else {
+                    eprintln!("--fetch-source needs a registry identifier.");
+                    return ExitCode::FAILURE;
+                };
+                return fetch_source(&effective.config, id);
+            }
             Action::Run | Action::PrintSources | Action::Help => {}
         }
         resolved = Some(effective.config);

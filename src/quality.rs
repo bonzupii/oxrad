@@ -24,11 +24,12 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde_json::{Map, Value};
 
 use crate::acquire::Acquire;
+use crate::engine::RequestSpec;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
@@ -36,16 +37,12 @@ use crate::time;
 /// The provider, in the words the rail uses.
 pub const SOURCE: &str = "Open-Meteo, CAMS modelled concentrations";
 
-const BASE: &str = "https://air-quality-api.open-meteo.com/v1/air-quality";
+const BASE: &str = sources::OPEN_METEO_AIR.endpoint;
 const CURRENT_FIELDS: &str =
     "us_aqi,european_aqi,pm2_5,pm10,ozone,nitrogen_dioxide,sulphur_dioxide,carbon_monoxide";
 const HOURLY_FIELDS: &str = "pm2_5,us_aqi";
 const PAST_DAYS: u8 = 1;
 const FORECAST_DAYS: u8 = 2;
-/// How many times a failing request is retried before the layer stops asking.
-pub const MAX_ATTEMPTS: u32 = 4;
-const RETRY_BASE: Duration = Duration::from_secs(4);
-const RETRY_MAX: Duration = Duration::from_secs(60);
 
 /// The United States air-quality index band a concentration falls in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -139,15 +136,7 @@ impl Error for AirError {
     }
 }
 
-impl AirError {
-    /// Whether asking again could succeed.
-    pub const fn is_transient(&self) -> bool {
-        match self {
-            Self::Provider { source } => source.is_transient(),
-            Self::Shape { .. } | Self::WorkerStopped => false,
-        }
-    }
-}
+impl AirError {}
 
 /// The provider's current hour at the requested point.
 #[derive(Debug, Clone, PartialEq)]
@@ -371,7 +360,12 @@ pub fn request_url(latitude: f64, longitude: f64) -> String {
 pub fn fetch(acquire: &Acquire, latitude: f64, longitude: f64) -> Result<AirQuality, AirError> {
     let url = request_url(latitude, longitude);
     let document = acquire
-        .json(&sources::OPEN_METEO_AIR, &url, "application/json")
+        .fetch(&RequestSpec::for_source(
+            &sources::OPEN_METEO_AIR,
+            &url,
+            "application/json",
+        ))
+        .and_then(|fetched| fetched.json())
         .map_err(|source| AirError::Provider { source })?;
     parse(&document)
 }
@@ -469,8 +463,6 @@ pub enum AirState {
     Failed {
         error: AirError,
         last: Option<AirQuality>,
-        attempts: u32,
-        retry_due: Option<Instant>,
     },
 }
 
@@ -485,7 +477,7 @@ impl AirState {
     }
 }
 
-/// The worker and its current state, with retry scheduling.
+/// The worker and the value it last delivered.
 pub struct AirView {
     feed: AirFeed,
     state: AirState,
@@ -509,7 +501,7 @@ impl AirView {
         self.state.last()
     }
 
-    pub fn start(&mut self, latitude: f64, longitude: f64, attempt: u32) {
+    pub fn start(&mut self, latitude: f64, longitude: f64) {
         let last = take_last(&mut self.state);
         self.state = AirState::Loading { last };
         self.generation = self.generation.wrapping_add(1);
@@ -519,17 +511,12 @@ impl AirView {
             longitude,
         };
         if let Err(error) = self.feed.request(request) {
-            self.state = AirState::Failed {
-                error,
-                last: None,
-                attempts: attempt,
-                retry_due: None,
-            };
+            self.state = AirState::Failed { error, last: None };
         }
     }
 
-    /// Takes in the worker's answer and returns whether a retry came due.
-    pub fn update(&mut self, now: Instant) -> bool {
+    /// Takes in the worker's answers. The engine owns retry and cache.
+    pub fn update(&mut self, _now: Instant) -> bool {
         while let Some(event) = self.feed.poll() {
             match event {
                 AirEvent::Ready { generation, record } => {
@@ -543,42 +530,11 @@ impl AirView {
                         continue;
                     }
                     let last = take_last(&mut self.state);
-                    let attempts = self.attempts().saturating_add(1);
-                    let transient = error.is_transient();
-                    self.state = AirState::Failed {
-                        error,
-                        last,
-                        attempts,
-                        retry_due: retry_due(transient, attempts),
-                    };
+                    self.state = AirState::Failed { error, last };
                 }
             }
         }
-        match &self.state {
-            AirState::Failed { retry_due, .. } => retry_due.is_some_and(|due| now >= due),
-            AirState::Idle | AirState::Loading { .. } | AirState::Ready { .. } => false,
-        }
-    }
-
-    /// The attempts already made for the current request.
-    pub const fn attempts(&self) -> u32 {
-        match &self.state {
-            AirState::Failed { attempts, .. } => *attempts,
-            AirState::Idle | AirState::Loading { .. } | AirState::Ready { .. } => 0,
-        }
-    }
-
-    /// Whether another attempt is still allowed.
-    pub const fn may_retry(&self) -> bool {
-        self.attempts() < MAX_ATTEMPTS
-    }
-
-    /// Whether a retry has been scheduled but not yet made.
-    pub const fn retry_waiting(&self) -> bool {
-        match &self.state {
-            AirState::Failed { retry_due, .. } => retry_due.is_some(),
-            AirState::Idle | AirState::Loading { .. } | AirState::Ready { .. } => false,
-        }
+        false
     }
 }
 
@@ -589,16 +545,6 @@ fn take_last(state: &mut AirState) -> Option<AirQuality> {
         AirState::Ready { record } => Some(record),
         AirState::Idle => None,
     }
-}
-
-/// Exponential backoff for a request that may succeed later.
-fn retry_due(transient: bool, attempts: u32) -> Option<Instant> {
-    if !transient || attempts == 0 || attempts >= MAX_ATTEMPTS {
-        return None;
-    }
-    let steps = attempts.min(4);
-    let delay = RETRY_BASE.saturating_mul(1_u32 << steps).min(RETRY_MAX);
-    Instant::now().checked_add(delay)
 }
 
 #[cfg(test)]
@@ -747,12 +693,5 @@ mod tests {
         assert!(url.contains("timezone=UTC"), "{url}");
         assert!(url.contains("past_days=1"), "{url}");
         assert!(url.contains("forecast_days=2"), "{url}");
-    }
-
-    #[test]
-    fn a_failed_request_is_retried_a_bounded_number_of_times() {
-        assert!(retry_due(true, 1).is_some());
-        assert!(retry_due(true, MAX_ATTEMPTS).is_none());
-        assert!(retry_due(false, 1).is_none(), "a shape error is final");
     }
 }

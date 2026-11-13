@@ -22,11 +22,12 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::time::{Duration, Instant, SystemTimeError};
+use std::time::{Instant, SystemTimeError};
 
 use serde_json::Value;
 
 use crate::acquire::Acquire;
+use crate::engine::RequestSpec;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
@@ -34,14 +35,10 @@ use crate::time;
 /// The provider, in the words the rail uses.
 pub const SOURCE: &str = "Open-Meteo flood service, GloFAS modelled discharge";
 
-const BASE: &str = "https://flood-api.open-meteo.com/v1/flood";
+const BASE: &str = sources::OPEN_METEO_FLOOD.endpoint;
 const PAST_DAYS: u8 = 21;
 const FORECAST_DAYS: u8 = 7;
 const MAX_MEMBERS: usize = 51;
-/// How many times a failing request is retried before the layer stops asking.
-pub const MAX_ATTEMPTS: u32 = 4;
-const RETRY_BASE: Duration = Duration::from_secs(4);
-const RETRY_MAX: Duration = Duration::from_secs(60);
 
 /// Why a discharge record could not be read.
 #[derive(Debug)]
@@ -359,7 +356,12 @@ pub fn fetch(
 ) -> Result<Discharge, HydroError> {
     let url = request_url(latitude, longitude, ensemble);
     let document = acquire
-        .json(&sources::OPEN_METEO_FORECAST, &url, "application/json")
+        .fetch(&RequestSpec::for_source(
+            &sources::OPEN_METEO_FORECAST,
+            &url,
+            "application/json",
+        ))
+        .and_then(|fetched| fetched.json())
         .map_err(|source| HydroError::Provider { source })?;
     let now = time::now_unix_ms().map_err(|source| HydroError::Clock { source })?;
     parse(&document, now)
@@ -464,8 +466,6 @@ pub enum HydroState {
     Failed {
         error: HydroError,
         last: Option<Discharge>,
-        attempts: u32,
-        retry_due: Option<Instant>,
     },
 }
 
@@ -480,7 +480,7 @@ impl HydroState {
     }
 }
 
-/// The worker and its current state, with retry scheduling.
+/// The worker and the value it last delivered.
 pub struct HydroView {
     feed: HydroFeed,
     state: HydroState,
@@ -504,7 +504,7 @@ impl HydroView {
         self.state.last()
     }
 
-    pub fn start(&mut self, latitude: f64, longitude: f64, ensemble: bool, attempt: u32) {
+    pub fn start(&mut self, latitude: f64, longitude: f64, ensemble: bool) {
         let previous = std::mem::replace(&mut self.state, HydroState::Idle);
         let last = match previous {
             HydroState::Loading { last } | HydroState::Failed { last, .. } => last,
@@ -520,18 +520,13 @@ impl HydroView {
             ensemble,
         };
         if let Err(error) = self.feed.request(request) {
-            let transient = error.is_transient();
-            self.state = HydroState::Failed {
-                error,
-                last: None,
-                attempts: attempt,
-                retry_due: retry_due(transient, attempt),
-            };
+            let _transient = error.is_transient();
+            self.state = HydroState::Failed { error, last: None };
         }
     }
 
-    /// Takes in the worker's answer and returns whether a retry came due.
-    pub fn update(&mut self, now: Instant) -> bool {
+    /// Takes in the worker's answers. The engine owns retry and cache.
+    pub fn update(&mut self, _now: Instant) -> bool {
         while let Some(event) = self.feed.poll() {
             match event {
                 HydroEvent::Ready { generation, record } => {
@@ -549,45 +544,12 @@ impl HydroView {
                         HydroState::Ready { record } => Some(record),
                         HydroState::Idle => None,
                     };
-                    let attempts = self.attempts().saturating_add(1);
-                    let transient = error.is_transient();
-                    self.state = HydroState::Failed {
-                        error,
-                        last,
-                        attempts,
-                        retry_due: retry_due(transient, attempts),
-                    };
+                    self.state = HydroState::Failed { error, last };
                 }
             }
         }
-        match &self.state {
-            HydroState::Failed { retry_due, .. } => retry_due.is_some_and(|due| now >= due),
-            HydroState::Idle | HydroState::Loading { .. } | HydroState::Ready { .. } => false,
-        }
+        false
     }
-
-    /// The attempts already made for the current request.
-    pub const fn attempts(&self) -> u32 {
-        match &self.state {
-            HydroState::Failed { attempts, .. } => *attempts,
-            HydroState::Idle | HydroState::Loading { .. } | HydroState::Ready { .. } => 0,
-        }
-    }
-
-    /// Whether another attempt is still allowed.
-    pub const fn may_retry(&self) -> bool {
-        self.attempts() < MAX_ATTEMPTS
-    }
-}
-
-/// Exponential backoff for a request that may succeed later.
-fn retry_due(transient: bool, attempts: u32) -> Option<Instant> {
-    if !transient || attempts == 0 || attempts >= MAX_ATTEMPTS {
-        return None;
-    }
-    let steps = attempts.min(4);
-    let delay = RETRY_BASE.saturating_mul(1_u32 << steps).min(RETRY_MAX);
-    Instant::now().checked_add(delay)
 }
 
 #[cfg(test)]
@@ -703,17 +665,6 @@ mod tests {
         assert!(url.contains("forecast_days=7"), "{url}");
         assert!(url.contains("ensemble=true"), "{url}");
         assert!(!request_url(1.0, 2.0, false).contains("ensemble"));
-    }
-
-    #[test]
-    fn a_failed_request_is_retried_a_bounded_number_of_times() {
-        assert!(retry_due(true, 1).is_some());
-        assert!(retry_due(true, MAX_ATTEMPTS).is_none());
-        assert!(
-            retry_due(false, 1).is_none(),
-            "a shape error is not retried"
-        );
-        assert!(retry_due(true, 0).is_none());
     }
 
     #[test]

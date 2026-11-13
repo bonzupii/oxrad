@@ -91,7 +91,7 @@ impl QuakeLayer {
         if !self.shown {
             return;
         }
-        self.view.update(now);
+        self.view.update();
         let due = self.refresh_due.is_some_and(|at| now >= at);
         if due || matches!(self.view.state(), QuakeState::Idle) {
             self.refresh_due = None;
@@ -100,7 +100,7 @@ impl QuakeLayer {
     }
 
     fn refresh(&mut self) {
-        self.view.start(self.window, 0);
+        self.view.start(self.window);
         self.refresh_due = Instant::now().checked_add(Duration::from_secs(quake::REFRESH_SECS));
     }
 

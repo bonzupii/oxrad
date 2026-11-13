@@ -29,13 +29,16 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use serde_json::{Value, json};
 
 use crate::acquire::Acquire;
+use crate::engine::RequestSpec;
 use crate::error::SiteIdError;
 use crate::paths;
 use crate::product::RadarProduct;
 use crate::provider::FetchError;
 use crate::sources;
 
-const STATIONS_URL: &str = "https://api.weather.gov/radar/stations";
+fn stations_url() -> String {
+    format!("{}/radar/stations", sources::NWS_API.endpoint)
+}
 const ACCEPT: &str = "application/geo+json";
 
 /// A four-character radar site identifier such as `KTWX`.
@@ -366,7 +369,12 @@ pub fn parse_document(document: &Value) -> Result<Vec<Station>, StationError> {
 /// Retrieves the live station document without touching the cache.
 pub fn fetch_document(acquire: &Acquire) -> Result<Value, StationError> {
     acquire
-        .json(&sources::NWS_API, STATIONS_URL, ACCEPT)
+        .fetch(&RequestSpec::for_source(
+            &sources::NWS_API,
+            stations_url(),
+            ACCEPT,
+        ))
+        .and_then(|fetched| fetched.json())
         .map_err(|source| StationError::Provider { source })
 }
 

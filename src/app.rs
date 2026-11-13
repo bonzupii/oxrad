@@ -25,6 +25,7 @@ use eframe::egui::{self, RichText};
 
 use crate::acquire::Acquire;
 use crate::config::{self, Config};
+use crate::engine::EngineStatus;
 use crate::forecast_panel::ForecastPanel;
 use crate::global_panel::GlobalPanel;
 use crate::gpu::RadarGpu;
@@ -46,6 +47,7 @@ const RAIL_WIDTH: f32 = 320.0;
 
 pub struct OxradApp {
     acquire: Acquire,
+    engine_status: EngineStatus,
     shell: Shell,
     stations: StationPanel,
     places: PlacesPanel,
@@ -90,9 +92,8 @@ impl OxradApp {
             },
             |config| (config, true, None::<String>),
         );
-        let cache_policy = config.cache;
         let map_style = config.map_style;
-        let acquire = Acquire::new(config.providers.clone());
+        let (acquire, engine_status) = Acquire::new_with_status(config.providers.clone());
         let restored_site = initial.or_else(|| config.site.clone());
         let restored_place = config.place.clone();
         let stations = StationPanel::new(&acquire, restored_site.as_ref());
@@ -100,11 +101,12 @@ impl OxradApp {
         let forecast = ForecastPanel::new(&acquire);
         let radar = RadarPanel::new(gpu, &config);
         let history = HistoryPanel::new(&acquire);
-        let global = GlobalPanel::new(cache_policy, &acquire);
+        let global = GlobalPanel::new(&acquire);
         let map = MapPanel::new(map_style, &acquire);
         let shell = Shell::new(config, config_writable, notice);
         let mut app = Self {
             acquire,
+            engine_status,
             shell,
             stations,
             places,
@@ -490,6 +492,7 @@ impl eframe::App for OxradApp {
                 &mut self.radar,
                 &self.stations,
                 &self.history,
+                (&self.acquire, &self.engine_status),
                 notice,
             );
         }

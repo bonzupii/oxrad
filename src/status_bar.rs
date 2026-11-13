@@ -18,6 +18,7 @@
 
 use eframe::egui::{self, RichText};
 
+use crate::acquire::Acquire;
 use crate::canvas::{ERROR, STALE, STALE_AFTER_MS};
 use crate::config::Config;
 use crate::display::Frame;
@@ -37,6 +38,7 @@ pub(crate) fn status(
     radar: &mut RadarPanel,
     stations: &StationPanel,
     history: &HistoryPanel,
+    engine: (&Acquire, &crate::engine::EngineStatus),
     notice: &mut Option<String>,
 ) {
     let mut retry_pipeline = false;
@@ -47,6 +49,7 @@ pub(crate) fn status(
         ui.add_space(6.0);
         refresh_now = identity_row(ui, radar, stations, history, failed);
         retry_pipeline = failure_rows(ui, radar);
+        requests_row(ui, engine.0, engine.1, notice);
         if let Some(frame) = &radar.display().frame {
             diagnostics(ui, frame, radar.selected_station(stations));
         }
@@ -55,6 +58,51 @@ pub(crate) fn status(
     if retry_pipeline || refresh_now {
         radar.retry_pipeline(notice);
     }
+}
+
+/// The request engine's cache and provenance line, with an export control.
+fn requests_row(
+    ui: &mut egui::Ui,
+    acquire: &Acquire,
+    status: &crate::engine::EngineStatus,
+    notice: &mut Option<String>,
+) {
+    ui.horizontal_wrapped(|ui| {
+        let latest = status.latest();
+        let summary = latest
+            .as_ref()
+            .and_then(|status| status.summary.clone())
+            .unwrap_or_else(|| String::from("No requests yet · the engine is idle"));
+        let requests = latest.as_ref().map_or(0, |status| status.requests);
+        ui.label(
+            RichText::new(format!("Requests {requests} · {summary}"))
+                .size(theme::TYPE_SMALL)
+                .weak(),
+        );
+        if ui
+            .button("Export provenance")
+            .on_hover_text(
+                "Write every request's source, station, product, scan time, URL, cache state and attempt count to a JSON file.",
+            )
+            .clicked()
+        {
+            match acquire.export_provenance() {
+                Ok(path) => {
+                    *notice = Some(format!("Request provenance written to {}.", path.display()));
+                }
+                Err(error) => {
+                    *notice = Some(format!("Request provenance could not be written: {error}"));
+                }
+            }
+        }
+        if let Some(error) = latest.and_then(|status| status.cache_error) {
+            ui.label(
+                RichText::new(format!("Cache unavailable: {error}"))
+                    .size(theme::TYPE_SMALL)
+                    .color(ui.visuals().warn_fg_color),
+            );
+        }
+    });
 }
 
 /// The identity and freshness row: which radar, which moment, how old, and

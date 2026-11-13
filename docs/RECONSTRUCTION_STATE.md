@@ -53,8 +53,8 @@ States: not started, in progress, verified, blocked.
 | A16 | Weather radio streams actual online audio | not started | |
 | A17 | Sunrise and sunset integrated with linked attribution and nullable events | not started | |
 | A18 | Provider attribution and licensing systematic and visible | in progress | 25 sources carry licence and credit; 17 admit; RainViewer, Sunrise-Sunset and OpenFreeMap credits are read from the registry; the report derives credits from the enabled set; 14 admitted sources show no credit in the interface yet | Display each credit beside its layer |
-| A19 | Persistent caches survive restarts and expose their state | in progress | Bodies and metadata persist with integrity checking; `oxrad --prune-cache` exposes the directory, the configured budget and the number removed; no window has shown the cache state | Surface cache state in the interface |
-| A20 | Network behavior provider-aware and robust | in progress | Pass 7: the admission gate precedes every request. Per-provider retry and rate policy still live inside each module | Move retry and rate policy behind the boundary |
+| A19 | Persistent caches survive restarts and expose their state | in progress | Pass 9: the status row reports cache state, age and export; `--prune-cache` reports the budget and count. No window has shown it | Observe the status row and export in a window |
+| A20 | Network behavior provider-aware and robust | verified | Pass 9: one engine thread owns cache, pacing, retry, identity and provenance; retry and cache tests use injected transports and a temporary store | — |
 | A21 | Subsystems own state and lifecycle; root is not a god object | verified | Pass 8: `app.rs` is 522 lines with no domain fields; nine panels own state, update handling and rendering; no re-export module or compatibility path remains |
 | A22 | Scientific calculations and transformations have meaningful automated tests | not started | 467 tests recorded in `docs/TESTING.md`; coverage unverified |
 | A23 | Error paths, malformed data, missing metadata handled deliberately and visibly | not started | |
@@ -160,6 +160,33 @@ States: not started, in progress, verified, blocked.
 - Gates: `cargo fmt --all -- --check` exit 0, `cargo clippy --message-format=short -- -D warnings` exit 0, `cargo test --all-targets` 489 passed and 0 failed, `cargo build --release --locked` exit 0.
 - Not observed: no window, layout, interaction or visual comparison. The GUI harness is blocked: Xvfb, xdotool, netpbm, proot and xkbcomp are absent from PATH and `.tools/root`, and this VM user is non-root with empty apt lists. Work item 11 and A24 remain blocked.
 - File sizes after: `app.rs` 522, `map_panel.rs` 1,201, `radar_panel.rs` 909, `history_panel.rs` 583, `canvas.rs` 450, `global_panel.rs` 423, `station_panel.rs` 330, `forecast_panel.rs` 308, `status_bar.rs` 277, `places_panel.rs` 214, `shell.rs` 210.
+
+### Pass 9
+
+- Boundary: `src/engine.rs` now has one owner thread for the response cache, source pacing, request identity, retries and provenance. `Acquire` is a channel handle; callers send a `RequestSpec` and receive `Fetched`. The engine records one `Record` per identity with source, credit, subject, station, product, scan time, URL, cache state, age, attempts, bytes, wall time and the source's rate limit. There is no `Arc`, `Rc`, `Mutex` or `unsafe` left in `src/`.
+- Deleted rather than demoted:
+  - `Runtime` shared state, key locks, the old per-module retry fields, `retry_due`, per-domain backoff constants and the `FetchUpdate` retry schedule in `pipeline.rs`.
+  - The basemap's parallel style store and its cached-style fallback; the engine cache is now the only style cache.
+  - The global radar manifest's in-memory `CachedManifest` and its 90-second lifetime; the registry refresh cadence supplies the TTL.
+  - `retry::error_update`, jitter and the old backoff tests; `retry.rs` now only owns decode classification and `Retry-After` parsing, both used by the engine.
+- Registry extension: `OPEN_METEO_FLOOD` records the GloFAS discharge endpoint already used by the hydrology layer, with CC-BY, global coverage, provider-defined refresh and one request per second. The inventory now admits 20 sources, and `docs/SOURCES.md` was regenerated.
+- Endpoint derivation: every production endpoint constant now reads `sources::<SOURCE>.endpoint`; fixed API routes are appended to that base. Registry endpoints for GDACS, NIFC, Aviation Weather, USGS Water, NSIDC, RainViewer, NASA GIBS and Photon were tightened to the actual API roots. The two remaining literals are attribution destinations (the OpenStreetMap copyright link and the RainViewer home link), not request endpoints.
+- Decisions:
+  - The engine is a single synchronous owner. A caller waits for its body; concurrent panels queue through one pacing clock instead of racing their own timers. This keeps one cache and one rate state, and makes cache hits reproducible.
+  - Cache TTL comes from the registry refresh cadence or an explicit `RequestSpec::ttl`; the engine does not invent a default for a provider that states no cadence beyond the documented provider-defined fallback.
+  - The status bar draws a non-blocking snapshot published by the engine, so a request in flight never stalls the frame. It reports the request count, the newest subject/source/cache/attempts/credit line, any cache-open failure, and exports the full record. The provenance JSON includes the rate limit, cache state and age, so cache and rate policy are inspectable without a window.
+  - `--fetch-source ID` fetches one registry endpoint twice and prints both passes plus the provenance JSON. It is a headless observation path, not a second request path.
+- Observed in the release binary:
+  - `oxrad --fetch-source usgs-earthquakes` printed `request 1: 44460 bytes from network`, `request 2: 44460 bytes from cache`, then provenance with `attempts: 0`, `cache: "cache"`, `rate_limit_seconds: 1` and the USGS credit.
+  - `oxrad --fetch-source photon` printed a 400 failure and provenance with `attempts: 1`, `cache: "not stored"`, the Photon URL, credit and rate. The failure was recorded, not hidden.
+  - `oxrad --help` lists the new flag; `oxrad --print-config` resolves 20 enabled providers.
+- Gates: `cargo fmt --all` clean, `cargo clippy --message-format=short -- -D warnings` exit 0, `cargo test --all-targets` 481 passed and 0 failed, `cargo build --release --locked` exit 0.
+- Not observed: no window, interaction or visual layout. This VM still has no display or GUI harness, so the status row, export control, credits and cache state were implemented and tested at the engine boundary but were not seen in a window.
+- Incomplete under this pass's done-when:
+  - The global radar worker still keeps a bounded decoded tile working set to avoid re-decoding the same frame during playback. It has no TTL or retry policy and reports no provenance for a hit; it is frame state, not the response cache, but it is not engine-owned.
+  - Credits are shown for the newest request and in the export, not beside every layer; the per-layer credit bar remains future work.
+  - The NWS, SWPC, USGS, NSIDC and similar sources keep their fixed route suffixes in their modules while the host/path root comes from the registry; a provider route change is still two edits.
+- No claim is made that every panel was exercised. The GUI checks remain blocked by the absent display and harness.
 
 ## Known gate gaps
 

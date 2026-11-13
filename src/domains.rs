@@ -16,9 +16,9 @@
 //! The Earth-system layers that follow the map, held in one place so the
 //! application shell does not have to name every one of them.
 //!
-//! Each layer owns its own fetcher, its own retry schedule and its own rail
-//! section. This module only keeps them in the order the rail shows them and
-//! hands them the same map view and clock, so a new domain is one field and
+//! Each layer owns its worker and its rail section; the engine owns request
+//! policy. This module only keeps the layers in the order the rail shows them
+//! and hands them the same map view and clock, so a new domain is one field and
 //! two lines here rather than a handful of inserts in the shell.
 
 use std::time::Instant;
@@ -105,7 +105,7 @@ impl Domains {
         self.sun.update(now);
         self.air.update(now, view);
         self.climate.update(now, view);
-        self.fires.update(now);
+        self.fires.update();
         self.environment.update(now, view);
         self.ocean.update(now, view);
         self.stations_reported.update(now, view);

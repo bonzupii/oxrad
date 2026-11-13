@@ -22,21 +22,19 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
 use crate::acquire::Acquire;
+use crate::engine::RequestSpec;
 use crate::place::Place;
 use crate::provider::FetchError;
 use crate::sources;
 
-const OPEN_METEO: &str = "https://api.open-meteo.com/v1/forecast";
+const OPEN_METEO: &str = sources::OPEN_METEO_FORECAST.endpoint;
 const FORECAST_DAYS: u8 = 7;
 const HOURLY_LIMIT: usize = 24;
 const PROVIDER: &str = "Open-Meteo";
-const RETRY_BASE_SECS: u64 = 2;
-const RETRY_MAX_SECS: u64 = 60;
 
 /// Current conditions at the selected place.
 #[derive(Debug, Clone)]
@@ -88,24 +86,6 @@ pub enum ForecastError {
 }
 
 impl ForecastError {
-    /// Whether trying this forecast again may succeed.
-    pub const fn is_transient(&self) -> bool {
-        match self {
-            Self::Provider { source } => source.is_transient(),
-            Self::NoPeriods | Self::Shape { .. } | Self::Units { .. } | Self::WorkerStopped => {
-                false
-            }
-        }
-    }
-
-    /// The provider's requested wait, when it supplied one.
-    pub const fn retry_after(&self) -> Option<&str> {
-        match self {
-            Self::Provider { source } => source.retry_after(),
-            Self::NoPeriods | Self::Shape { .. } | Self::Units { .. } | Self::WorkerStopped => None,
-        }
-    }
-
     fn message(&self) -> String {
         match self {
             Self::Provider { source } => source.to_string(),
@@ -435,7 +415,12 @@ fn parse_document(place: &Place, document: &Value) -> Result<Forecast, ForecastE
 pub fn fetch(acquire: &Acquire, place: &Place) -> Result<Forecast, ForecastError> {
     let url = request_url(place)?;
     let document = acquire
-        .json(&sources::OPEN_METEO_FORECAST, &url, "application/json")
+        .fetch(&RequestSpec::for_source(
+            &sources::OPEN_METEO_FORECAST,
+            &url,
+            "application/json",
+        ))
+        .and_then(|fetched| fetched.json())
         .map_err(|source| ForecastError::Provider { source })?;
     parse_document(place, &document)
 }
@@ -445,7 +430,6 @@ pub enum ForecastState {
     Loading {
         place: Place,
         last: Option<Forecast>,
-        attempt: u32,
     },
     Ready {
         forecast: Forecast,
@@ -454,8 +438,6 @@ pub enum ForecastState {
         place: Place,
         error: ForecastError,
         last: Option<Forecast>,
-        retry_at: Option<Instant>,
-        attempt: u32,
     },
 }
 
@@ -487,47 +469,29 @@ impl ForecastView {
         &self.state
     }
 
-    pub fn start(&mut self, place: &Place, attempt: u32) {
+    pub fn start(&mut self, place: &Place) {
         let previous = std::mem::replace(&mut self.state, ForecastState::Empty);
         let last = previous.into_last_for(place);
         self.state = match self.feed.start(place) {
             Ok(()) => ForecastState::Loading {
                 place: place.clone(),
                 last,
-                attempt,
             },
             Err(error) => ForecastState::Failed {
                 place: place.clone(),
                 error,
                 last,
-                retry_at: None,
-                attempt,
             },
         };
     }
 
-    pub fn update(&mut self, now: Instant) {
+    pub fn update(&mut self) {
         if let Some(outcome) = self.feed.poll() {
-            self.apply(outcome, now);
-        }
-        let retry = match &self.state {
-            ForecastState::Failed {
-                place,
-                retry_at: Some(due),
-                attempt,
-                ..
-            } if now >= *due => Some((place.clone(), attempt.saturating_add(1))),
-            ForecastState::Failed { .. }
-            | ForecastState::Empty
-            | ForecastState::Loading { .. }
-            | ForecastState::Ready { .. } => None,
-        };
-        if let Some((place, attempt)) = retry {
-            self.start(&place, attempt);
+            self.apply(outcome);
         }
     }
 
-    fn apply(&mut self, outcome: ForecastOutcome, now: Instant) {
+    fn apply(&mut self, outcome: ForecastOutcome) {
         let ForecastState::Loading { place, .. } = &self.state else {
             return;
         };
@@ -539,25 +503,14 @@ impl ForecastView {
             return;
         }
         let previous = std::mem::replace(&mut self.state, ForecastState::Empty);
-        let ForecastState::Loading { last, attempt, .. } = previous else {
+        let ForecastState::Loading { last, .. } = previous else {
             self.state = previous;
             return;
         };
         self.state = match outcome {
             ForecastOutcome::Ready(forecast) => ForecastState::Ready { forecast },
             ForecastOutcome::Failed { place, error } => {
-                let retry_at = if error.is_transient() {
-                    now.checked_add(forecast_retry_delay(&error, attempt))
-                } else {
-                    None
-                };
-                ForecastState::Failed {
-                    place,
-                    error,
-                    last,
-                    retry_at,
-                    attempt,
-                }
+                ForecastState::Failed { place, error, last }
             }
         };
     }
@@ -572,17 +525,6 @@ impl ForecastState {
         };
         previous.filter(|forecast| forecast.place.same_place(place))
     }
-}
-
-fn forecast_retry_delay(error: &ForecastError, attempt: u32) -> Duration {
-    if let Some(value) = error.retry_after()
-        && let Ok(delay) = crate::retry::retry_after_delay(value)
-    {
-        return delay;
-    }
-    let factor = 2_u64.saturating_pow(attempt.min(5));
-    let seconds = RETRY_BASE_SECS.saturating_mul(factor).min(RETRY_MAX_SECS);
-    Duration::from_secs(seconds) + Duration::from_millis(u64::from(attempt).wrapping_mul(137) % 500)
 }
 
 struct ForecastRequest {
@@ -734,29 +676,6 @@ mod tests {
         )?)
     }
 
-    fn throttled(retry_after: Option<&str>) -> ForecastError {
-        ForecastError::Provider {
-            source: FetchError::Status {
-                url: String::from("https://api.open-meteo.com/v1/forecast"),
-                status: 503,
-                retry_after: retry_after.map(String::from),
-            },
-        }
-    }
-
-    #[test]
-    fn forecast_retry_honors_retry_after_and_grows_exponentially() {
-        assert_eq!(
-            forecast_retry_delay(&throttled(Some("17")), 0),
-            Duration::from_secs(17)
-        );
-        let first = forecast_retry_delay(&throttled(None), 0);
-        let second = forecast_retry_delay(&throttled(None), 1);
-        assert_eq!(first, Duration::from_secs(2));
-        assert!(second > first, "{second:?} must exceed {first:?}");
-        assert!(second <= Duration::from_secs(5));
-    }
-
     #[test]
     fn a_failure_for_an_old_place_cannot_replace_the_current_forecast() -> Result<(), TestError> {
         let current = emporia()?;
@@ -765,15 +684,11 @@ mod tests {
         forecast.state = ForecastState::Loading {
             place: current,
             last: None,
-            attempt: 0,
         };
-        forecast.apply(
-            ForecastOutcome::Failed {
-                place: old,
-                error: ForecastError::WorkerStopped,
-            },
-            Instant::now(),
-        );
+        forecast.apply(ForecastOutcome::Failed {
+            place: old,
+            error: ForecastError::WorkerStopped,
+        });
         assert!(matches!(
             forecast.state(),
             ForecastState::Loading { place, .. } if place.name == "Emporia"

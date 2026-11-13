@@ -209,19 +209,17 @@ impl HistoryWorker {
                     generation,
                     site,
                     key,
-                } => match network::fetch_archive_cached(&acquire, &key) {
+                } => match network::fetch_archive_cached(&acquire, &key, &site) {
                     Ok(archive) => match radar::decode_volume(&site, &key, &archive.bytes) {
                         Ok(volume) => HistoryEvent::Volume {
                             generation,
                             key,
                             volume,
                             from_cache: archive.from_cache,
-                            cache_warning: archive.cache_warning.map(|error| error.to_string()),
+                            cache_warning: archive.cache_warning,
                         },
                         Err(error) => {
-                            let cache_warning = network::evict_archive(&key)
-                                .err()
-                                .map(|error| error.to_string());
+                            let cache_warning = network::evict_archive(&acquire, &key).err();
                             HistoryEvent::Failed {
                                 generation,
                                 error: error.into(),

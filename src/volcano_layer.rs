@@ -64,21 +64,20 @@ impl VolcanoLayer {
 
     /// Takes in the worker's answers and asks again when the report is old.
     pub fn update(&mut self, now: Instant) {
-        let retry_due = self.view.update(now);
+        self.view.update(now);
         if !self.shown {
             return;
         }
         let stale = self
             .asked_at
             .is_some_and(|at| now.duration_since(at) >= REFRESH_AFTER);
-        let retry = retry_due && self.view.may_retry();
         // A report already in hand is not asked for again until it is old: the
         // observatories publish a daily update, and a request per frame would
         // spend the reader's connection on nothing.
         let first = matches!(self.view.state(), VolcanoState::Idle);
-        if first || stale || retry {
+        if first || stale {
             self.asked_at = Some(now);
-            self.view.start(self.view.attempts());
+            self.view.start();
         }
     }
 
@@ -121,7 +120,7 @@ impl VolcanoLayer {
             self.shown = !self.shown;
             if self.shown {
                 self.asked_at = Some(Instant::now());
-                self.view.start(0);
+                self.view.start();
             }
         }
         if !self.shown {
@@ -176,13 +175,6 @@ impl VolcanoLayer {
                 if let Some(report) = last {
                     ui.label(
                         RichText::new(format!("Still showing {}", describe(report)))
-                            .size(theme::TYPE_SMALL)
-                            .weak(),
-                    );
-                }
-                if self.view.retry_waiting() {
-                    ui.label(
-                        RichText::new("Asking again shortly.")
                             .size(theme::TYPE_SMALL)
                             .weak(),
                     );

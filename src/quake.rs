@@ -24,18 +24,15 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
 use crate::acquire::Acquire;
+use crate::engine::RequestSpec;
 use crate::provider::FetchError;
 use crate::sources;
 
-const FEEDS: &str = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary";
 const PROVIDER: &str = "USGS";
-const RETRY_BASE_SECS: u64 = 5;
-const RETRY_MAX_SECS: u64 = 300;
 
 /// How often the layer is allowed to ask the provider again.
 pub const REFRESH_SECS: u64 = 120;
@@ -159,22 +156,6 @@ pub enum QuakeError {
     WorkerStopped,
 }
 
-impl QuakeError {
-    pub const fn is_transient(&self) -> bool {
-        match self {
-            Self::Provider { source } => source.is_transient(),
-            Self::Shape { .. } | Self::WorkerStopped => false,
-        }
-    }
-
-    pub const fn retry_after(&self) -> Option<&str> {
-        match self {
-            Self::Provider { source } => source.retry_after(),
-            Self::Shape { .. } | Self::WorkerStopped => None,
-        }
-    }
-}
-
 const fn shape(field: &'static str) -> QuakeError {
     QuakeError::Shape { field }
 }
@@ -199,7 +180,11 @@ impl Error for QuakeError {
 }
 
 pub fn request_url(window: Window) -> String {
-    format!("{FEEDS}/{}.geojson", window.slug())
+    format!(
+        "{}/earthquakes/feed/v1.0/summary/{}.geojson",
+        sources::USGS_EARTHQUAKES.endpoint,
+        window.slug()
+    )
 }
 
 fn number(value: &Value, field: &'static str) -> Result<f64, QuakeError> {
@@ -360,7 +345,12 @@ pub fn parse(window: Window, document: &Value) -> Result<Quakes, QuakeError> {
 pub fn fetch(acquire: &Acquire, window: Window) -> Result<Quakes, QuakeError> {
     let url = request_url(window);
     let document = acquire
-        .json(&sources::USGS_EARTHQUAKES, &url, "application/geo+json")
+        .fetch(&RequestSpec::for_source(
+            &sources::USGS_EARTHQUAKES,
+            &url,
+            "application/geo+json",
+        ))
+        .and_then(|fetched| fetched.json())
         .map_err(|source| QuakeError::Provider { source })?;
     parse(window, &document)
 }
@@ -377,16 +367,6 @@ pub fn describe(quakes: &Quakes) -> String {
         return format!("{text} · {} without usable data", quakes.unreadable);
     }
     text
-}
-
-fn retry_delay(error: &QuakeError, attempt: u32) -> Duration {
-    if let Some(value) = error.retry_after()
-        && let Ok(delay) = crate::retry::retry_after_delay(value)
-    {
-        return delay;
-    }
-    let exponent = attempt.min(6);
-    Duration::from_secs((RETRY_BASE_SECS << exponent).min(RETRY_MAX_SECS))
 }
 
 #[derive(Debug)]
@@ -497,17 +477,13 @@ pub enum QuakeState {
     Loading {
         window: Window,
         last: Option<Quakes>,
-        attempt: u32,
     },
     Ready {
         quakes: Quakes,
     },
     Failed {
-        window: Window,
         error: QuakeError,
         last: Option<Quakes>,
-        retry_at: Option<Instant>,
-        attempt: u32,
     },
 }
 
@@ -546,7 +522,7 @@ impl QuakeView {
         self.state.last()
     }
 
-    pub fn start(&mut self, window: Window, attempt: u32) {
+    pub fn start(&mut self, window: Window) {
         let previous = std::mem::replace(&mut self.state, QuakeState::Idle);
         let last = match previous {
             QuakeState::Loading { last, .. } | QuakeState::Failed { last, .. } => last,
@@ -554,50 +530,20 @@ impl QuakeView {
             QuakeState::Idle => None,
         };
         self.state = match self.feed.start(window) {
-            Ok(()) => QuakeState::Loading {
-                window,
-                last,
-                attempt,
-            },
-            Err(error) => QuakeState::Failed {
-                window,
-                error,
-                last,
-                retry_at: None,
-                attempt,
-            },
+            Ok(()) => QuakeState::Loading { window, last },
+            Err(error) => QuakeState::Failed { error, last },
         };
     }
 
-    pub fn update(&mut self, now: Instant) {
+    pub fn update(&mut self) {
         if let Some(outcome) = self.feed.poll() {
-            self.apply(outcome, now);
-        }
-        let retry = match &self.state {
-            QuakeState::Failed {
-                window,
-                retry_at: Some(due),
-                attempt,
-                ..
-            } if now >= *due => Some((*window, attempt.saturating_add(1))),
-            QuakeState::Failed { .. }
-            | QuakeState::Idle
-            | QuakeState::Loading { .. }
-            | QuakeState::Ready { .. } => None,
-        };
-        if let Some((window, attempt)) = retry {
-            self.start(window, attempt);
+            self.apply(outcome);
         }
     }
 
-    fn apply(&mut self, outcome: QuakeOutcome, now: Instant) {
+    fn apply(&mut self, outcome: QuakeOutcome) {
         let previous = std::mem::replace(&mut self.state, QuakeState::Idle);
-        let QuakeState::Loading {
-            window,
-            last,
-            attempt,
-        } = previous
-        else {
+        let QuakeState::Loading { window, last } = previous else {
             self.state = previous;
             return;
         };
@@ -608,23 +554,9 @@ impl QuakeView {
         if answer_window != window {
             return;
         }
-        let completed = attempt;
         self.state = match outcome {
             QuakeOutcome::Ready(quakes) => QuakeState::Ready { quakes },
-            QuakeOutcome::Failed { window, error } => {
-                let retry_at = if error.is_transient() {
-                    now.checked_add(retry_delay(&error, completed))
-                } else {
-                    None
-                };
-                QuakeState::Failed {
-                    window,
-                    error,
-                    last,
-                    retry_at,
-                    attempt: completed,
-                }
-            }
+            QuakeOutcome::Failed { error, .. } => QuakeState::Failed { error, last },
         };
     }
 }

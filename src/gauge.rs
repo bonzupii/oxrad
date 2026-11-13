@@ -31,18 +31,19 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde_json::{Map, Value};
 
 use crate::acquire::Acquire;
+use crate::engine::RequestSpec;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
 
 /// The provider, in the words the rail uses.
 pub const SOURCE: &str = "USGS National Water Information System";
-const BASE: &str = "https://waterservices.usgs.gov/nwis/iv/";
+const BASE: &str = sources::USGS_WATER.endpoint;
 /// Gage height, in the provider's feet.
 pub const STAGE: &str = "00065";
 /// Discharge, in the provider's cubic feet per second.
@@ -54,11 +55,6 @@ const HISTORY_PERIOD: &str = "P7D";
 /// The water-services host answers a small box in half a minute on a busy day:
 /// the query is server-side and slow independently of how much it returns, so
 /// the shared ten-second budget fails every attempt while the service is up.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(75);
-/// How many times a failing request is retried before the layer stops asking.
-pub const MAX_ATTEMPTS: u32 = 4;
-const RETRY_BASE: Duration = Duration::from_secs(4);
-const RETRY_MAX: Duration = Duration::from_secs(60);
 /// How many gauges the rail lists.
 pub const LIST_LIMIT: usize = 10;
 /// The value the service writes where it has no measurement.
@@ -277,15 +273,7 @@ impl Error for GaugeError {
     }
 }
 
-impl GaugeError {
-    /// Whether asking again could succeed.
-    pub const fn is_transient(&self) -> bool {
-        match self {
-            Self::Provider { source } => source.is_transient(),
-            Self::Shape { .. } | Self::WorkerStopped => false,
-        }
-    }
-}
+impl GaugeError {}
 
 const fn shape(detail: &'static str) -> GaugeError {
     GaugeError::Shape { detail }
@@ -454,12 +442,12 @@ pub fn history_url(site: &str) -> String {
 /// Fetches the gauges in a box.
 pub fn fetch(acquire: &Acquire, bounds: (f64, f64, f64, f64)) -> Result<GaugeSet, GaugeError> {
     let document = acquire
-        .json_within(
+        .fetch(&RequestSpec::for_source(
             &sources::USGS_WATER,
-            &request_url(bounds),
+            request_url(bounds),
             "application/json",
-            REQUEST_TIMEOUT,
-        )
+        ))
+        .and_then(|fetched| fetched.json())
         .map_err(|source| GaugeError::Provider { source })?;
     parse(&document)
 }
@@ -580,12 +568,12 @@ fn readings_of(entry: &Map<String, Value>) -> Vec<Reading> {
 /// Fetches one gauge's week.
 pub fn fetch_history(acquire: &Acquire, site: &str) -> Result<History, GaugeError> {
     let document = acquire
-        .json_within(
+        .fetch(&RequestSpec::for_source(
             &sources::USGS_WATER,
-            &history_url(site),
+            history_url(site),
             "application/json",
-            REQUEST_TIMEOUT,
-        )
+        ))
+        .and_then(|fetched| fetched.json())
         .map_err(|source| GaugeError::Provider { source })?;
     parse_history(&document, site)
 }
@@ -697,8 +685,6 @@ pub enum GaugeState {
     Failed {
         error: GaugeError,
         last: Option<GaugeSet>,
-        attempts: u32,
-        retry_due: Option<Instant>,
     },
 }
 
@@ -759,7 +745,7 @@ impl GaugeView {
         self.state.last()
     }
 
-    pub fn start(&mut self, bounds: (f64, f64, f64, f64), attempt: u32) {
+    pub fn start(&mut self, bounds: (f64, f64, f64, f64)) {
         let last = take_last(&mut self.state);
         self.state = GaugeState::Loading { last };
         self.box_generation = self.box_generation.wrapping_add(1);
@@ -768,12 +754,7 @@ impl GaugeView {
             bounds,
         };
         if let Err(error) = self.feed.request(request) {
-            self.state = GaugeState::Failed {
-                error,
-                last: None,
-                attempts: attempt,
-                retry_due: None,
-            };
+            self.state = GaugeState::Failed { error, last: None };
         }
     }
 
@@ -800,8 +781,8 @@ impl GaugeView {
         self.history = HistoryState::Off;
     }
 
-    /// Takes in the worker's answers and returns whether a retry came due.
-    pub fn update(&mut self, now: Instant) -> bool {
+    /// Takes in the worker's answers. The engine owns retry and cache.
+    pub fn update(&mut self, _now: Instant) -> bool {
         while let Some(event) = self.feed.poll() {
             match event {
                 GaugeEvent::Ready { generation, set } => {
@@ -833,42 +814,11 @@ impl GaugeView {
                         continue;
                     }
                     let last = take_last(&mut self.state);
-                    let attempts = self.attempts().saturating_add(1);
-                    let transient = error.is_transient();
-                    self.state = GaugeState::Failed {
-                        error,
-                        last,
-                        attempts,
-                        retry_due: retry_due(transient, attempts),
-                    };
+                    self.state = GaugeState::Failed { error, last };
                 }
             }
         }
-        match &self.state {
-            GaugeState::Failed { retry_due, .. } => retry_due.is_some_and(|due| now >= due),
-            GaugeState::Idle | GaugeState::Loading { .. } | GaugeState::Ready { .. } => false,
-        }
-    }
-
-    /// The attempts already made for the current request.
-    pub const fn attempts(&self) -> u32 {
-        match &self.state {
-            GaugeState::Failed { attempts, .. } => *attempts,
-            GaugeState::Idle | GaugeState::Loading { .. } | GaugeState::Ready { .. } => 0,
-        }
-    }
-
-    /// Whether another attempt is still allowed.
-    pub const fn may_retry(&self) -> bool {
-        self.attempts() < MAX_ATTEMPTS
-    }
-
-    /// Whether a retry has been scheduled but not yet made.
-    pub const fn retry_waiting(&self) -> bool {
-        match &self.state {
-            GaugeState::Failed { retry_due, .. } => retry_due.is_some(),
-            GaugeState::Idle | GaugeState::Loading { .. } | GaugeState::Ready { .. } => false,
-        }
+        false
     }
 }
 
@@ -879,16 +829,6 @@ fn take_last(state: &mut GaugeState) -> Option<GaugeSet> {
         GaugeState::Ready { set } => Some(set),
         GaugeState::Idle => None,
     }
-}
-
-/// Exponential backoff for a request that may succeed later.
-fn retry_due(transient: bool, attempts: u32) -> Option<Instant> {
-    if !transient || attempts == 0 || attempts >= MAX_ATTEMPTS {
-        return None;
-    }
-    let steps = attempts.min(4);
-    let delay = RETRY_BASE.saturating_mul(1_u32 << steps).min(RETRY_MAX);
-    Instant::now().checked_add(delay)
 }
 
 #[cfg(test)]

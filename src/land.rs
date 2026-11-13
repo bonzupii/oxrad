@@ -25,25 +25,22 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde_json::{Map, Value};
 
 use crate::acquire::Acquire;
+use crate::engine::RequestSpec;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
 
 /// The provider, in the words the rail uses.
 pub const SOURCE: &str = "Open-Meteo land surface";
-const BASE: &str = "https://api.open-meteo.com/v1/forecast";
+const BASE: &str = sources::OPEN_METEO_FORECAST.endpoint;
 const HOURLY: &str = "soil_moisture_0_to_10cm,soil_moisture_10_to_40cm,soil_temperature_6cm,et0_fao_evapotranspiration,vapour_pressure_deficit,shortwave_radiation,direct_normal_irradiance,uv_index";
 const PAST_DAYS: u8 = 1;
 const FORECAST_DAYS: u8 = 2;
-/// How many times a failing request is retried before the layer stops asking.
-pub const MAX_ATTEMPTS: u32 = 4;
-const RETRY_BASE: Duration = Duration::from_secs(4);
-const RETRY_MAX: Duration = Duration::from_secs(60);
 /// The volumetric water content at which a soil is treated as dry, as a rule
 /// of thumb for a loam. It is not a drought index.
 pub const DRY: f64 = 0.18;
@@ -120,15 +117,7 @@ impl Error for LandError {
     }
 }
 
-impl LandError {
-    /// Whether asking again could succeed.
-    pub const fn is_transient(&self) -> bool {
-        match self {
-            Self::Provider { source } => source.is_transient(),
-            Self::Shape { .. } | Self::WorkerStopped => false,
-        }
-    }
-}
+impl LandError {}
 
 /// One hour of the land surface.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -338,11 +327,12 @@ pub fn request_url(latitude: f64, longitude: f64) -> String {
 /// Fetches the land surface for one point.
 pub fn fetch(acquire: &Acquire, latitude: f64, longitude: f64) -> Result<Land, LandError> {
     let document = acquire
-        .json(
+        .fetch(&RequestSpec::for_source(
             &sources::OPEN_METEO_FORECAST,
-            &request_url(latitude, longitude),
+            request_url(latitude, longitude),
             "application/json",
-        )
+        ))
+        .and_then(|fetched| fetched.json())
         .map_err(|source| LandError::Provider { source })?;
     parse(&document)
 }
@@ -439,8 +429,6 @@ pub enum LandState {
     Failed {
         error: LandError,
         last: Option<Land>,
-        attempts: u32,
-        retry_due: Option<Instant>,
     },
 }
 
@@ -455,7 +443,7 @@ impl LandState {
     }
 }
 
-/// The worker and its current state, with retry scheduling.
+/// The worker and the value it last delivered.
 pub struct LandView {
     feed: LandFeed,
     state: LandState,
@@ -479,7 +467,7 @@ impl LandView {
         self.state.last()
     }
 
-    pub fn start(&mut self, latitude: f64, longitude: f64, attempt: u32) {
+    pub fn start(&mut self, latitude: f64, longitude: f64) {
         let last = take_last(&mut self.state);
         self.state = LandState::Loading { last };
         self.generation = self.generation.wrapping_add(1);
@@ -489,17 +477,12 @@ impl LandView {
             longitude,
         };
         if let Err(error) = self.feed.request(request) {
-            self.state = LandState::Failed {
-                error,
-                last: None,
-                attempts: attempt,
-                retry_due: None,
-            };
+            self.state = LandState::Failed { error, last: None };
         }
     }
 
-    /// Takes in the worker's answer and returns whether a retry came due.
-    pub fn update(&mut self, now: Instant) -> bool {
+    /// Takes in the worker's answers. The engine owns retry and cache.
+    pub fn update(&mut self, _now: Instant) -> bool {
         while let Some(event) = self.feed.poll() {
             match event {
                 LandEvent::Ready { generation, record } => {
@@ -513,42 +496,11 @@ impl LandView {
                         continue;
                     }
                     let last = take_last(&mut self.state);
-                    let attempts = self.attempts().saturating_add(1);
-                    let transient = error.is_transient();
-                    self.state = LandState::Failed {
-                        error,
-                        last,
-                        attempts,
-                        retry_due: retry_due(transient, attempts),
-                    };
+                    self.state = LandState::Failed { error, last };
                 }
             }
         }
-        match &self.state {
-            LandState::Failed { retry_due, .. } => retry_due.is_some_and(|due| now >= due),
-            LandState::Idle | LandState::Loading { .. } | LandState::Ready { .. } => false,
-        }
-    }
-
-    /// The attempts already made for the current request.
-    pub const fn attempts(&self) -> u32 {
-        match &self.state {
-            LandState::Failed { attempts, .. } => *attempts,
-            LandState::Idle | LandState::Loading { .. } | LandState::Ready { .. } => 0,
-        }
-    }
-
-    /// Whether another attempt is still allowed.
-    pub const fn may_retry(&self) -> bool {
-        self.attempts() < MAX_ATTEMPTS
-    }
-
-    /// Whether a retry has been scheduled but not yet made.
-    pub const fn retry_waiting(&self) -> bool {
-        match &self.state {
-            LandState::Failed { retry_due, .. } => retry_due.is_some(),
-            LandState::Idle | LandState::Loading { .. } | LandState::Ready { .. } => false,
-        }
+        false
     }
 }
 
@@ -559,16 +511,6 @@ fn take_last(state: &mut LandState) -> Option<Land> {
         LandState::Ready { record } => Some(record),
         LandState::Idle => None,
     }
-}
-
-/// Exponential backoff for a request that may succeed later.
-fn retry_due(transient: bool, attempts: u32) -> Option<Instant> {
-    if !transient || attempts == 0 || attempts >= MAX_ATTEMPTS {
-        return None;
-    }
-    let steps = attempts.min(4);
-    let delay = RETRY_BASE.saturating_mul(1_u32 << steps).min(RETRY_MAX);
-    Instant::now().checked_add(delay)
 }
 
 #[cfg(test)]

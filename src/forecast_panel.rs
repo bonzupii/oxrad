@@ -13,7 +13,7 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
-//! The forecast panel: the forecast for the searched town, its retry state
+//! The forecast panel: the forecast for the searched town, its refresh control
 //! and the point-versus-radar explanation.
 
 use std::time::Instant;
@@ -41,12 +41,12 @@ impl ForecastPanel {
         }
     }
 
-    pub(crate) fn update(&mut self, now: Instant) {
-        self.forecast.update(now);
+    pub(crate) fn update(&mut self, _now: Instant) {
+        self.forecast.update();
     }
 
     pub(crate) fn start(&mut self, place: &Place) {
-        self.forecast.start(place, 0);
+        self.forecast.start(place);
     }
 
     pub(crate) const fn forecast(&self) -> Option<&Forecast> {
@@ -100,28 +100,11 @@ impl ForecastPanel {
                         });
                     }
                     ForecastState::Failed {
-                        place,
-                        error,
-                        last,
-                        retry_at,
-                        ..
+                        place, error, last, ..
                     } => {
                         ui.label(RichText::new(place.label()).size(14.0).strong());
                         ui.colored_label(ui.visuals().error_fg_color, error.to_string());
-                        if let Some(due) = retry_at {
-                            let seconds = due
-                                .saturating_duration_since(Instant::now())
-                                .as_secs()
-                                .saturating_add(1);
-                            ui.label(
-                                RichText::new(format!("Automatic retry in {seconds} s."))
-                                    .size(theme::TYPE_SMALL)
-                                    .color(ui.visuals().warn_fg_color),
-                            );
-                            retry = ui.button("Retry now").clicked();
-                        } else {
-                            retry = ui.button("Retry forecast").clicked();
-                        }
+                        retry = ui.button("Retry forecast").clicked();
                         if let Some(forecast) = last {
                             ui.add_space(theme::SPACE_S);
                             ui.colored_label(

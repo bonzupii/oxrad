@@ -23,17 +23,17 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::Value;
 
 use crate::acquire::Acquire;
-use crate::cache::Store;
+use crate::engine::RequestSpec;
 use crate::error::RadarError;
 use crate::provider::FetchError;
 use crate::sources;
 
-const ENDPOINT: &str = "https://api.rainviewer.com/public/weather-maps.json";
+const ENDPOINT: &str = sources::RAINVIEWER.endpoint;
 const HOST_PREFIX: &str = "https://";
 const TILE_SIZE: u32 = 512;
 const COLOR_SCHEME: u8 = 2;
@@ -41,10 +41,7 @@ const MAX_ZOOM: u8 = 7;
 const MAX_FRAMES: usize = 24;
 const MAX_CACHED_TILES: usize = 120;
 const MAX_VIEW_TILES: usize = 8;
-const MANIFEST_LIFETIME: Duration = Duration::from_secs(90);
 const EARTH_KM_PER_DEGREE: f64 = 111.32;
-const MAX_TILE_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_MANIFEST_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Attribution required by the RainViewer public API terms, from the registry.
 pub const ATTRIBUTION: &str = crate::sources::RAINVIEWER.credit;
@@ -227,11 +224,6 @@ struct ManifestSnapshot {
     frames: Vec<GlobalFrame>,
 }
 
-struct CachedManifest {
-    fetched: Instant,
-    snapshot: ManifestSnapshot,
-}
-
 struct RadarRequest {
     center_lat: f64,
     center_lon: f64,
@@ -248,24 +240,15 @@ pub struct GlobalRadarFeed {
 }
 
 impl GlobalRadarFeed {
-    pub fn new(budget: crate::config::CachePolicy, acquire: Acquire) -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         let (requests, request_receiver) = mpsc::channel::<RadarRequest>();
         let (event_sender, events) = mpsc::channel::<GlobalEvent>();
         std::thread::spawn(move || {
-            let (cache, cache_error) = match Store::default_location() {
-                Ok(store) => (Some(store), None),
-                Err(error) => (None, Some(error.to_string())),
-            };
             Worker {
                 requests: request_receiver,
                 acquire,
                 events: event_sender,
-                cached: None,
                 tiles: HashMap::new(),
-                cache,
-                cache_error,
-                cache_notice_sent: false,
-                budget,
             }
             .run();
         });
@@ -331,12 +314,7 @@ struct Worker {
     requests: Receiver<RadarRequest>,
     acquire: Acquire,
     events: Sender<GlobalEvent>,
-    cached: Option<CachedManifest>,
     tiles: HashMap<String, Vec<u8>>,
-    cache: Option<Store>,
-    cache_error: Option<String>,
-    cache_notice_sent: bool,
-    budget: crate::config::CachePolicy,
 }
 
 impl Worker {
@@ -345,11 +323,6 @@ impl Worker {
             return;
         };
         loop {
-            if let Some(message) = self.cache_error.take()
-                && self.cache_notice(message, request.generation).is_err()
-            {
-                return;
-            }
             match self.refresh(&request) {
                 Ok(Some(next)) => {
                     request = next;
@@ -401,17 +374,16 @@ impl Worker {
                 let key = cache_key(frame, *bounds);
                 let png = match self.tiles.remove(&key) {
                     Some(cached) => cached,
-                    None => match self.cached_body(&url, request.generation)? {
-                        Some(cached) => cached,
-                        None => {
-                            let downloaded = self
-                                .acquire
-                                .bytes(&sources::RAINVIEWER, &url, "image/png", MAX_TILE_BYTES)
-                                .map_err(RadarError::from)?;
-                            self.store_body(&url, &downloaded, request.generation)?;
-                            downloaded
-                        }
-                    },
+                    None => {
+                        let fetched = self
+                            .acquire
+                            .fetch(
+                                &RequestSpec::for_source(&sources::RAINVIEWER, &url, "image/png")
+                                    .ttl(Duration::from_secs(3600)),
+                            )
+                            .map_err(RadarError::from)?;
+                        fetched.body
+                    }
                 };
                 let image = decode_tile(&png, &url)?;
                 if self.tiles.len() >= MAX_CACHED_TILES {
@@ -435,76 +407,8 @@ impl Worker {
                 return Err(GlobalRadarError::WorkerStopped);
             }
         }
-        let prune_error = self
-            .cache
-            .as_ref()
-            .and_then(|cache| cache.prune(self.budget).err());
-        if let Some(error) = prune_error {
-            self.cache_notice(error.to_string(), request.generation)?;
-        }
         self.next_request()
     }
-    fn cached_body(
-        &mut self,
-        key: &str,
-        generation: u64,
-    ) -> Result<Option<Vec<u8>>, GlobalRadarError> {
-        let Some(cache) = self.cache.as_ref() else {
-            return Ok(None);
-        };
-        let outcome = match cache.load(key) {
-            Ok(Some(entry)) => Ok(Some(entry.body)),
-            Ok(None) => Ok(None),
-            Err(error) => {
-                let message = match cache.remove(key) {
-                    Ok(()) => error.to_string(),
-                    Err(remove_error) => {
-                        format!(
-                            "{error} The damaged entry also could not be removed: {remove_error}"
-                        )
-                    }
-                };
-                Err(message)
-            }
-        };
-        match outcome {
-            Ok(body) => Ok(body),
-            Err(message) => {
-                self.cache_notice(message, generation)?;
-                Ok(None)
-            }
-        }
-    }
-
-    fn store_body(
-        &mut self,
-        key: &str,
-        bytes: &[u8],
-        generation: u64,
-    ) -> Result<(), GlobalRadarError> {
-        let outcome = match self.cache.as_ref() {
-            Some(cache) => cache.store(key, bytes),
-            None => return Ok(()),
-        };
-        if let Err(error) = outcome {
-            self.cache_notice(error.to_string(), generation)?;
-        }
-        Ok(())
-    }
-
-    fn cache_notice(&mut self, message: String, generation: u64) -> Result<(), GlobalRadarError> {
-        if self.cache_notice_sent {
-            return Ok(());
-        }
-        self.cache_notice_sent = true;
-        self.events
-            .send(GlobalEvent::Notice {
-                generation,
-                message,
-            })
-            .map_err(|_| GlobalRadarError::WorkerStopped)
-    }
-
     fn next_request(&self) -> Result<Option<RadarRequest>, GlobalRadarError> {
         match self.requests.try_recv() {
             Ok(request) => Ok(Some(request)),
@@ -514,46 +418,21 @@ impl Worker {
     }
 
     fn manifest(&mut self, generation: u64) -> Result<ManifestSnapshot, GlobalRadarError> {
-        if let Some(cached) = &self.cached
-            && cached.fetched.elapsed() < MANIFEST_LIFETIME
-        {
-            return Ok(cached.snapshot.clone());
+        let fetched = self
+            .acquire
+            .fetch(&RequestSpec::for_source(
+                &sources::RAINVIEWER,
+                ENDPOINT,
+                "application/json",
+            ))
+            .map_err(RadarError::from)?;
+        if let Some(message) = self.acquire.cache_error() {
+            let _ = self.events.send(GlobalEvent::Notice {
+                generation,
+                message,
+            });
         }
-        match self.acquire.bytes(
-            &sources::RAINVIEWER,
-            ENDPOINT,
-            "application/json",
-            MAX_MANIFEST_BYTES,
-        ) {
-            Ok(bytes) => {
-                let snapshot = parse_manifest(&bytes)?;
-                self.store_body(ENDPOINT, &bytes, generation)?;
-                let result = snapshot.clone();
-                self.cached = Some(CachedManifest {
-                    fetched: Instant::now(),
-                    snapshot,
-                });
-                Ok(result)
-            }
-            Err(source) => {
-                let Some(bytes) = self.cached_body(ENDPOINT, generation)? else {
-                    return Err(source.into());
-                };
-                let snapshot = parse_manifest(&bytes)?;
-                self.cache_notice(
-                    String::from(
-                        "The live global-radar manifest failed; using the cached manifest.",
-                    ),
-                    generation,
-                )?;
-                let result = snapshot.clone();
-                self.cached = Some(CachedManifest {
-                    fetched: Instant::now(),
-                    snapshot,
-                });
-                Ok(result)
-            }
-        }
+        parse_manifest(&fetched.body)
     }
 }
 

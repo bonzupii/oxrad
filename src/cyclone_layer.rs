@@ -65,21 +65,20 @@ impl CycloneLayer {
 
     /// Takes in the worker's answers and asks again when the list is old.
     pub fn update(&mut self, now: Instant) {
-        let retry_due = self.view.update(now);
+        self.view.update(now);
         if !self.shown {
             return;
         }
         let stale = self
             .asked_at
             .is_some_and(|at| now.duration_since(at) >= REFRESH_AFTER);
-        let retry = retry_due && self.view.may_retry();
         let first = matches!(self.view.state(), CycloneState::Idle);
-        if first || stale || retry {
+        if first || stale {
             let Ok(now_ms) = time::now_unix_ms() else {
                 return;
             };
             self.asked_at = Some(now);
-            self.view.start(now_ms, self.view.attempts());
+            self.view.start(now_ms);
         }
     }
 
@@ -127,7 +126,7 @@ impl CycloneLayer {
             if self.shown {
                 self.asked_at = Some(Instant::now());
                 if let Ok(now_ms) = time::now_unix_ms() {
-                    self.view.start(now_ms, 0);
+                    self.view.start(now_ms);
                 }
             }
         }
@@ -179,13 +178,6 @@ impl CycloneLayer {
                 if let Some(list) = last {
                     ui.label(
                         RichText::new(format!("Still showing {}", describe(list)))
-                            .size(theme::TYPE_SMALL)
-                            .weak(),
-                    );
-                }
-                if self.view.retry_waiting() {
-                    ui.label(
-                        RichText::new("Asking again shortly.")
                             .size(theme::TYPE_SMALL)
                             .weak(),
                     );

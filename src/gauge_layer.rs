@@ -64,7 +64,7 @@ impl GaugeLayer {
 
     /// Follows the map centre while the layer is on.
     pub fn update(&mut self, now: Instant, view: &MapView) {
-        let retry_due = self.view.update(now);
+        self.view.update(now);
         if !self.shown {
             return;
         }
@@ -78,14 +78,10 @@ impl GaugeLayer {
         let stale = self
             .asked_at
             .is_some_and(|at| now.duration_since(at) >= REFRESH_AFTER);
-        let retry = retry_due && self.view.may_retry();
-        if moved || stale || retry {
+        if moved || stale {
             self.asked = Some((lat, lon));
             self.asked_at = Some(now);
-            self.view.start(
-                gauge::bounds(lat, lon, view.span_km()),
-                self.view.attempts(),
-            );
+            self.view.start(gauge::bounds(lat, lon, view.span_km()));
         }
     }
 
@@ -188,13 +184,6 @@ impl GaugeLayer {
                 if let Some(set) = last {
                     ui.label(
                         RichText::new(format!("Still showing {}", describe(set)))
-                            .size(theme::TYPE_SMALL)
-                            .weak(),
-                    );
-                }
-                if self.view.retry_waiting() {
-                    ui.label(
-                        RichText::new("Asking again shortly.")
                             .size(theme::TYPE_SMALL)
                             .weak(),
                     );

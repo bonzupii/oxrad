@@ -8,22 +8,20 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use eframe::egui::{self, Pos2, Rect};
 use walkers::sources::{Attribution, TileSource};
 use walkers::{Style, Tile, TileId, TilePiece, Tiles};
 
 use crate::acquire::Acquire;
-use crate::cache::{CacheError, Store};
+use crate::engine::RequestSpec;
 use crate::provider::FetchError;
 use crate::sources;
 
 /// Concurrent requests allowed by the OpenFreeMap terms for offline downloads.
 const WORKERS: usize = 4;
-const MAX_TILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_MEMORY_TILES: usize = 256;
-const RETRY_DELAY: Duration = Duration::from_secs(10);
 
 /// A tile request or decode that did not produce renderable geometry.
 #[derive(Debug)]
@@ -35,9 +33,6 @@ pub enum TileError {
     },
     Provider {
         source: FetchError,
-    },
-    Cache {
-        source: CacheError,
     },
     Decode {
         url: String,
@@ -59,34 +54,10 @@ impl TileError {
                 |value| format!("{url} returned {code} and asked to retry after {value}."),
             ),
             Self::Provider { source } => format!("The map tile request failed: {source}"),
-            Self::Cache { source } => format!("The map tile cache failed: {source}"),
             Self::Decode { url, zoom, detail } => {
                 format!("The tile from {url} at zoom {zoom} is not renderable: {detail}")
             }
             Self::WorkerStopped => String::from("The tile download worker stopped."),
-        }
-    }
-
-    /// How long to wait before repeating this request, when repeating may help.
-    fn retry_in(&self) -> Option<Duration> {
-        match self {
-            Self::Provider { source } if source.is_transient() => Some(RETRY_DELAY),
-            Self::Provider { .. }
-            | Self::Cache { .. }
-            | Self::Decode { .. }
-            | Self::WorkerStopped => None,
-            Self::Status {
-                code: 429 | 503,
-                retry_after: Some(value),
-                ..
-            } => crate::retry::retry_after_delay(value)
-                .ok()
-                .map(|delay| delay.max(RETRY_DELAY)),
-            Self::Status {
-                code: 429 | 500..=599,
-                ..
-            } => Some(RETRY_DELAY),
-            Self::Status { .. } => None,
         }
     }
 }
@@ -101,7 +72,6 @@ impl Error for TileError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Provider { source } => Some(source),
-            Self::Cache { source } => Some(source),
             Self::Status { .. } | Self::Decode { .. } | Self::WorkerStopped => None,
         }
     }
@@ -124,16 +94,15 @@ struct Worker {
 }
 
 fn start_worker(
-    path: PathBuf,
+    _path: PathBuf,
     events: Sender<Completion>,
     context: egui::Context,
     acquire: Acquire,
 ) -> Worker {
     let (requests, receiver) = mpsc::channel::<Job>();
     std::thread::spawn(move || {
-        let store = Store::at(path);
         while let Ok(job) = receiver.recv() {
-            let (result, warning) = load_tile(&acquire, &store, &job.url);
+            let (result, warning) = load_tile(&acquire, &job.url);
             if events
                 .send(Completion {
                     id: job.id,
@@ -153,40 +122,16 @@ fn start_worker(
     }
 }
 
-/// Reads a tile from the persistent store, or fetches and stores it.
-fn load_tile(
-    acquire: &Acquire,
-    store: &Store,
-    url: &str,
-) -> (Result<Vec<u8>, TileError>, Option<TileError>) {
-    match store.load(url) {
-        Ok(Some(entry)) => (Ok(entry.body), None),
-        Ok(None) => fetch_tile(acquire, store, url),
-        Err(source) => {
-            let (result, warning) = fetch_tile(acquire, store, url);
-            (result, warning.or(Some(TileError::Cache { source })))
-        }
-    }
-}
-
-fn fetch_tile(
-    acquire: &Acquire,
-    store: &Store,
-    url: &str,
-) -> (Result<Vec<u8>, TileError>, Option<TileError>) {
-    match acquire.bytes(
+/// Reads a tile through the engine, which owns its cache and retries.
+fn load_tile(acquire: &Acquire, url: &str) -> (Result<Vec<u8>, TileError>, Option<TileError>) {
+    let spec = RequestSpec::for_source(
         &sources::OPENFREEMAP,
         url,
         "application/vnd.mapbox-vector-tile",
-        MAX_TILE_BYTES,
-    ) {
-        Ok(bytes) => {
-            let warning = store
-                .store(url, &bytes)
-                .err()
-                .map(|source| TileError::Cache { source });
-            (Ok(bytes), warning)
-        }
+    )
+    .ttl(Duration::from_secs(86_400));
+    match acquire.fetch(&spec) {
+        Ok(fetched) => (Ok(fetched.body), None),
         Err(source) => (Err(provider_error(source)), None),
     }
 }
@@ -214,7 +159,6 @@ struct ReadyTile {
 
 struct FailedTile {
     error: TileError,
-    retry_at: Option<Instant>,
 }
 
 /// Owns tile requests, decoded tiles, and their failure state.
@@ -291,7 +235,6 @@ impl<S: TileSource> BasemapTiles<S> {
                                 zoom: id.zoom,
                                 detail,
                             },
-                            retry_at: None,
                         },
                     );
                 }
@@ -300,11 +243,9 @@ impl<S: TileSource> BasemapTiles<S> {
         }
     }
 
-    /// Clears deterministic and backed-off failures so the next draw asks again.
+    /// Clears failures so the next draw asks again through the engine.
     pub fn retry_failed(&mut self) {
-        let now = Instant::now();
-        self.failed
-            .retain(|_, failure| failure.retry_at.is_some_and(|due| due > now));
+        self.failed.clear();
     }
 
     pub fn error(&self, id: TileId) -> Option<&TileError> {
@@ -374,11 +315,7 @@ impl<S: TileSource> BasemapTiles<S> {
                 self.evict();
             }
             Err(error) => {
-                let retry_at = error
-                    .retry_in()
-                    .and_then(|delay| Instant::now().checked_add(delay));
-                self.failed
-                    .insert(completion.id, FailedTile { error, retry_at });
+                self.failed.insert(completion.id, FailedTile { error });
             }
         }
     }
@@ -404,10 +341,10 @@ impl<S: TileSource> BasemapTiles<S> {
         if self.workers.iter().any(|worker| worker.busy == Some(id)) {
             return true;
         }
-        let Some(failure) = self.failed.get(&id) else {
+        let Some(_failure) = self.failed.get(&id) else {
             return false;
         };
-        failure.retry_at.is_none_or(|at| Instant::now() < at)
+        true
     }
 
     fn schedule(&mut self, id: TileId) {
@@ -429,7 +366,6 @@ impl<S: TileSource> BasemapTiles<S> {
                     id,
                     FailedTile {
                         error: TileError::WorkerStopped,
-                        retry_at: None,
                     },
                 );
             }
@@ -554,37 +490,6 @@ mod tests {
         );
         std::fs::remove_dir_all(root).map_err(|error| error.to_string())?;
         Ok(())
-    }
-
-    #[test]
-    fn a_status_error_names_the_provider_and_its_retry() {
-        let error = TileError::Status {
-            url: String::from("https://example.test/4/3/7.pbf"),
-            code: 503,
-            retry_after: Some(String::from("30")),
-        };
-        assert_eq!(
-            error.to_string(),
-            "https://example.test/4/3/7.pbf returned 503 and asked to retry after 30."
-        );
-        assert_eq!(error.retry_in(), Some(Duration::from_secs(30)));
-        assert!(error.source().is_none());
-    }
-
-    #[test]
-    fn a_missing_tile_is_not_retried_and_a_server_fault_is() {
-        let missing = TileError::Status {
-            url: String::from("https://example.test/4/3/7.pbf"),
-            code: 404,
-            retry_after: None,
-        };
-        assert!(missing.retry_in().is_none());
-        let fault = TileError::Status {
-            url: String::from("https://example.test/4/3/7.pbf"),
-            code: 502,
-            retry_after: None,
-        };
-        assert_eq!(fault.retry_in(), Some(RETRY_DELAY));
     }
 
     #[test]

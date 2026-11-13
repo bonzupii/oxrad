@@ -22,7 +22,7 @@ use eframe::egui::{self, Align, Color32, Layout, Pos2, Rect, RichText};
 
 use crate::acquire::Acquire;
 use crate::canvas::due_after;
-use crate::config::{CachePolicy, Config};
+use crate::config::Config;
 use crate::global_radar::{
     self, DecodedTile, GlobalEvent, GlobalRadarError, GlobalRadarFeed, TileBounds, TileImage,
 };
@@ -71,9 +71,9 @@ pub(crate) struct GlobalPanel {
 }
 
 impl GlobalPanel {
-    pub(crate) fn new(cache_policy: CachePolicy, acquire: &Acquire) -> Self {
+    pub(crate) fn new(acquire: &Acquire) -> Self {
         Self {
-            feed: GlobalRadarFeed::new(cache_policy, acquire.clone()),
+            feed: GlobalRadarFeed::new(acquire.clone()),
             generation: 0,
             frames: Vec::new(),
             index: 0,

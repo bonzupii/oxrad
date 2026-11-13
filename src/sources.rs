@@ -26,7 +26,7 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter, Write as _};
 
 /// The stable identifier a source is recorded under.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SourceId(&'static str);
 
 impl SourceId {
@@ -223,6 +223,9 @@ pub struct Source {
     /// The credit line the interface must show verbatim.
     pub credit: &'static str,
     pub refresh: Refresh,
+    /// The smallest humane interval between two requests to this source, in
+    /// seconds. The request engine enforces it for every caller.
+    pub rate_limit_seconds: u32,
     pub cache: CachePermission,
     pub level: Level,
 }
@@ -381,6 +384,7 @@ pub const OPENFREEMAP: Source = Source {
     licence: Some(OSM_COPYRIGHT),
     credit: "OpenFreeMap, OpenMapTiles, OpenStreetMap contributors",
     refresh: Refresh::ProviderDefined,
+    rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Admitted,
 };
@@ -397,6 +401,7 @@ pub const OPEN_METEO_FORECAST: Source = Source {
     licence: Some(CC_BY),
     credit: "Weather data by Open-Meteo.com",
     refresh: Refresh::ProviderDefined,
+    rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
 };
@@ -413,6 +418,7 @@ pub const OPEN_METEO_ARCHIVE: Source = Source {
     licence: Some(CC_BY),
     credit: "Weather data by Open-Meteo.com, ERA5 from ECMWF",
     refresh: Refresh::ProviderDefined,
+    rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
 };
@@ -429,6 +435,7 @@ pub const OPEN_METEO_AIR: Source = Source {
     licence: Some(CC_BY),
     credit: "Air quality data by Open-Meteo.com, CAMS",
     refresh: Refresh::ProviderDefined,
+    rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
 };
@@ -445,6 +452,24 @@ pub const OPEN_METEO_MARINE: Source = Source {
     licence: Some(CC_BY),
     credit: "Marine data by Open-Meteo.com",
     refresh: Refresh::ProviderDefined,
+    rate_limit_seconds: 1,
+    cache: CachePermission::Permitted,
+    level: Level::Parsed,
+};
+
+/// Open-Meteo GloFAS river discharge.
+pub const OPEN_METEO_FLOOD: Source = Source {
+    id: SourceId::new("open-meteo-flood"),
+    name: "Open-Meteo river discharge, GloFAS",
+    domain: Domain::Hydrology,
+    coverage: Coverage::Global,
+    home: "https://open-meteo.com/en/docs/flood-api",
+    endpoint: "https://flood-api.open-meteo.com/v1/flood",
+    format: Format::Json,
+    licence: Some(CC_BY),
+    credit: "River discharge by Open-Meteo.com, GloFAS",
+    refresh: Refresh::ProviderDefined,
+    rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
 };
@@ -456,7 +481,7 @@ pub const RAINVIEWER: Source = Source {
     domain: Domain::Radar,
     coverage: Coverage::Global,
     home: "https://www.rainviewer.com",
-    endpoint: "https://api.rainviewer.com",
+    endpoint: "https://api.rainviewer.com/public/weather-maps.json",
     format: Format::Tiles,
     licence: Some(Licence {
         name: "RainViewer free terms, attribution required",
@@ -464,6 +489,7 @@ pub const RAINVIEWER: Source = Source {
     }),
     credit: "Weather data by RainViewer",
     refresh: Refresh::Seconds(600),
+    rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Admitted,
 };
@@ -480,6 +506,7 @@ pub const NEXRAD_LEVEL_TWO: Source = Source {
     licence: Some(US_GOVERNMENT),
     credit: "NOAA NEXRAD, distributed by Unidata",
     refresh: Refresh::Seconds(300),
+    rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
 };
@@ -496,6 +523,7 @@ pub const NWS_API: Source = Source {
     licence: Some(US_GOVERNMENT),
     credit: "National Weather Service",
     refresh: Refresh::Seconds(60),
+    rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
 };
@@ -512,6 +540,7 @@ pub const USGS_EARTHQUAKES: Source = Source {
     licence: Some(US_GOVERNMENT),
     credit: "USGS Earthquake Hazards Program",
     refresh: Refresh::Seconds(60),
+    rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
 };
@@ -523,11 +552,12 @@ pub const USGS_WATER: Source = Source {
     domain: Domain::Hydrology,
     coverage: Coverage::Countries(&["US"]),
     home: "https://waterdata.usgs.gov",
-    endpoint: "https://waterservices.usgs.gov",
+    endpoint: "https://waterservices.usgs.gov/nwis/iv/",
     format: Format::Json,
     licence: Some(US_GOVERNMENT),
     credit: "USGS National Water Information System",
     refresh: Refresh::Seconds(900),
+    rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
 };
@@ -539,7 +569,7 @@ pub const NASA_GIBS: Source = Source {
     domain: Domain::Satellite,
     coverage: Coverage::Global,
     home: "https://www.earthdata.nasa.gov",
-    endpoint: "https://gibs.earthdata.nasa.gov",
+    endpoint: "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best",
     format: Format::Tiles,
     licence: Some(Licence {
         name: "NASA open data, no key required",
@@ -547,6 +577,7 @@ pub const NASA_GIBS: Source = Source {
     }),
     credit: "NASA EOSDIS GIBS",
     refresh: Refresh::ProviderDefined,
+    rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
 };
@@ -563,6 +594,7 @@ pub const NOAA_SWPC: Source = Source {
     licence: Some(US_GOVERNMENT),
     credit: "NOAA Space Weather Prediction Center",
     refresh: Refresh::Seconds(600),
+    rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
 };
@@ -582,6 +614,7 @@ pub const SUNRISE_SUNSET: Source = Source {
     }),
     credit: "Sun data by Sunrise-Sunset.org",
     refresh: Refresh::ProviderDefined,
+    rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
 };
@@ -593,7 +626,7 @@ pub const PHOTON: Source = Source {
     domain: Domain::Geocoding,
     coverage: Coverage::Global,
     home: "https://photon.komoot.io",
-    endpoint: "https://photon.komoot.io",
+    endpoint: "https://photon.komoot.io/api/",
     format: Format::GeoJson,
     licence: Some(Licence {
         name: "OpenStreetMap data, ODbL 1.0, fair use",
@@ -601,6 +634,7 @@ pub const PHOTON: Source = Source {
     }),
     credit: "Place search by Photon, data from OpenStreetMap contributors",
     refresh: Refresh::ProviderDefined,
+    rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
 };
@@ -612,7 +646,7 @@ pub const GDACS: Source = Source {
     domain: Domain::Cyclone,
     coverage: Coverage::Global,
     home: "https://www.gdacs.org",
-    endpoint: "https://www.gdacs.org",
+    endpoint: "https://www.gdacs.org/gdacsapi/api/events/geteventlist/SEARCH",
     format: Format::GeoJson,
     licence: Some(Licence {
         name: "Free and open, attribution requested",
@@ -620,6 +654,7 @@ pub const GDACS: Source = Source {
     }),
     credit: "GDACS, European Commission Joint Research Centre",
     refresh: Refresh::ProviderDefined,
+    rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
 };
@@ -631,11 +666,12 @@ pub const AVIATION_WEATHER_METAR: Source = Source {
     domain: Domain::Observation,
     coverage: Coverage::Extent("Worldwide where METAR is reported"),
     home: "https://aviationweather.gov",
-    endpoint: "https://aviationweather.gov",
+    endpoint: "https://aviationweather.gov/api/data/metar",
     format: Format::Json,
     licence: Some(US_GOVERNMENT),
     credit: "Aviation Weather Center METAR",
     refresh: Refresh::Seconds(600),
+    rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
 };
@@ -647,11 +683,12 @@ pub const NIFC_WFIGS: Source = Source {
     domain: Domain::Fire,
     coverage: Coverage::Countries(&["US"]),
     home: "https://www.nifc.gov",
-    endpoint: "https://services3.arcgis.com",
+    endpoint: "https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/WFIGS_Interagency_Perimeters_Current/FeatureServer/0/query",
     format: Format::GeoJson,
     licence: Some(US_GOVERNMENT),
     credit: "NIFC WFIGS interagency perimeters",
     refresh: Refresh::Seconds(1800),
+    rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
 };
@@ -663,11 +700,12 @@ pub const NSIDC_SEA_ICE: Source = Source {
     domain: Domain::Ocean,
     coverage: Coverage::Global,
     home: "https://nsidc.org/data/g02135",
-    endpoint: "https://noaadata.apps.nsidc.org",
+    endpoint: "https://noaadata.apps.nsidc.org/NOAA/G02135",
     format: Format::Binary,
     licence: Some(US_GOVERNMENT),
     credit: "NSIDC Sea Ice Index, National Snow and Ice Data Center",
     refresh: Refresh::ProviderDefined,
+    rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
 };
@@ -684,6 +722,7 @@ pub const USGS_VOLCANO: Source = Source {
     licence: Some(US_GOVERNMENT),
     credit: "USGS Volcano Hazards Program",
     refresh: Refresh::ProviderDefined,
+    rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
 };
@@ -704,6 +743,7 @@ pub const DWD_OPEN_DATA: Source = Source {
     licence: None,
     credit: "Deutscher Wetterdienst",
     refresh: Refresh::ProviderDefined,
+    rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Documented,
 };
@@ -720,6 +760,7 @@ pub const ECCC_GEOMET: Source = Source {
     licence: None,
     credit: "Environment and Climate Change Canada",
     refresh: Refresh::ProviderDefined,
+    rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     // Probed 2026-11-13: the collections listing answered 200 application/json.
     level: Level::Probed,
@@ -737,6 +778,7 @@ pub const BOM_RADAR: Source = Source {
     licence: None,
     credit: "Australian Bureau of Meteorology",
     refresh: Refresh::ProviderDefined,
+    rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Documented,
 };
@@ -753,6 +795,7 @@ pub const METEOALARM: Source = Source {
     licence: None,
     credit: "MeteoAlarm, EUMETNET",
     refresh: Refresh::ProviderDefined,
+    rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Documented,
 };
@@ -769,6 +812,7 @@ pub const EMSC: Source = Source {
     licence: None,
     credit: "European-Mediterranean Seismological Centre",
     refresh: Refresh::ProviderDefined,
+    rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Documented,
 };
@@ -785,6 +829,7 @@ pub const MET_NORWAY: Source = Source {
     licence: None,
     credit: "Norwegian Meteorological Institute",
     refresh: Refresh::ProviderDefined,
+    rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     // Probed 2026-11-13: the compact forecast answered 200 application/json.
     level: Level::Probed,
@@ -802,6 +847,7 @@ pub const COPERNICUS_DEM: Source = Source {
     licence: None,
     credit: "Copernicus DEM, European Space Agency",
     refresh: Refresh::ProviderDefined,
+    rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Documented,
 };
@@ -818,6 +864,7 @@ pub const SMITHSONIAN_GVP: Source = Source {
     licence: None,
     credit: "Smithsonian Global Volcanism Program",
     refresh: Refresh::ProviderDefined,
+    rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Documented,
 };
@@ -829,6 +876,7 @@ pub const SOURCES: &[Source] = &[
     OPEN_METEO_ARCHIVE,
     OPEN_METEO_AIR,
     OPEN_METEO_MARINE,
+    OPEN_METEO_FLOOD,
     RAINVIEWER,
     NEXRAD_LEVEL_TWO,
     NWS_API,
@@ -874,13 +922,13 @@ pub fn inventory_markdown() -> Result<String, fmt::Error> {
          (parsed, licensed, credited and displayed).\n\n",
     );
     out.push_str(
-        "| id | name | domain | coverage | format | endpoint | licence | credit | refresh | cache | level | admission |\n",
+        "| id | name | domain | coverage | format | endpoint | licence | credit | refresh | rate | cache | level | admission |\n",
     );
-    out.push_str("|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+    out.push_str("|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
     for source in SOURCES {
         writeln!(
             &mut out,
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             source.id.as_str(),
             source.name,
             source.domain.label(),
@@ -890,6 +938,7 @@ pub fn inventory_markdown() -> Result<String, fmt::Error> {
             source.licence.map_or("unverified", |licence| licence.name),
             source.credit,
             source.refresh.label(),
+            source.rate_limit_seconds,
             source.cache.label(),
             source.level.label(),
             source.admission_label(),

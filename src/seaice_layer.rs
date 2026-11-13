@@ -51,7 +51,7 @@ impl SeaIceLayer {
 
     /// Takes in the worker's answers and keeps the request current.
     pub fn update(&mut self, now: Instant) {
-        let retry_due = self.view.update(now);
+        self.view.update(now);
         if !self.shown {
             return;
         }
@@ -63,11 +63,10 @@ impl SeaIceLayer {
             .asked_at
             .is_some_and(|at| now.duration_since(at) >= REFRESH_AFTER);
         let changed = self.asked_month != Some(month);
-        let retry = retry_due && self.view.may_retry();
-        if changed || stale || retry || matches!(self.view.state(), SeaIceState::Idle) {
+        if changed || stale || matches!(self.view.state(), SeaIceState::Idle) {
             self.asked_at = Some(Instant::now());
             self.asked_month = Some(month);
-            self.view.start(month, self.view.attempts());
+            self.view.start(month);
         }
     }
 
@@ -159,13 +158,6 @@ impl SeaIceLayer {
                 if last.is_some() {
                     ui.label(
                         RichText::new("Still showing the last index that arrived.")
-                            .size(theme::TYPE_SMALL)
-                            .weak(),
-                    );
-                }
-                if self.view.retry_waiting() {
-                    ui.label(
-                        RichText::new("Asking again shortly.")
                             .size(theme::TYPE_SMALL)
                             .weak(),
                     );

@@ -18,12 +18,19 @@
 //! A caller names the registry source it is asking. The gate refuses a source
 //! the effective configuration does not enable before a socket is opened, so a
 //! disabled provider cannot fetch even when a caller still asks for it.
+//!
+//! The gate is a handle to one engine thread, which owns the cache, pacing
+//! clock and request records. Callers send a spec and wait for the body.
 
+#[cfg(test)]
+use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Sender, channel};
 use std::time::Duration;
 
 use serde_json::Value;
 
 use crate::config::EnabledProviders;
+use crate::engine::{self, Command, EngineStatus, Fetched, RequestSpec, Status};
 use crate::provider::FetchError;
 use crate::sources::Source;
 
@@ -39,91 +46,135 @@ pub(crate) const USER_AGENT: &str = concat!(
     " (https://github.com/bonzupii/oxrad)"
 );
 
-/// The enabled source set and the transport that carries admitted requests.
+/// A handle to the engine thread and the sources this configuration enables.
 #[derive(Clone)]
 pub struct Acquire {
-    enabled: EnabledProviders,
-    transport: Transport,
+    commands: Sender<Command>,
 }
 
 impl Acquire {
     /// Builds a gate for the providers a configuration enables.
-    pub const fn new(enabled: EnabledProviders) -> Self {
-        Self {
-            enabled,
-            transport: Transport::Live,
+    pub fn new(enabled: EnabledProviders) -> Self {
+        Self::start(enabled, Transport::Live, true, None)
+    }
+
+    /// Builds a gate and the non-blocking status reader for its engine.
+    pub fn new_with_status(enabled: EnabledProviders) -> (Self, EngineStatus) {
+        let (updates, receiver) = channel();
+        let acquire = Self::start(enabled, Transport::Live, true, Some(updates));
+        (acquire, EngineStatus::new(receiver))
+    }
+
+    fn start(
+        enabled: EnabledProviders,
+        transport: Transport,
+        open_store: bool,
+        updates: Option<Sender<Status>>,
+    ) -> Self {
+        let (commands, receiver) = channel();
+        std::thread::spawn(move || {
+            engine::serve(
+                &receiver,
+                &enabled,
+                &transport,
+                open_store,
+                updates.as_ref(),
+            );
+        });
+        Self { commands }
+    }
+
+    /// Runs one request through the engine: cache, pacing, retry and record.
+    pub fn fetch(&self, spec: &RequestSpec) -> Result<Fetched, FetchError> {
+        let (reply, receiver) = channel();
+        self.commands
+            .send(Command::Fetch {
+                spec: spec.clone(),
+                reply,
+            })
+            .map_err(|_| FetchError::WorkerStopped)?;
+        receiver.recv().map_err(|_| FetchError::WorkerStopped)?
+    }
+
+    /// The engine's request records, newest state per identity.
+    pub fn provenance(&self) -> Value {
+        let (reply, receiver) = channel();
+        if self.commands.send(Command::Report(reply)).is_err() {
+            return serde_json::json!({"error": "the request engine stopped"});
         }
+        receiver
+            .recv()
+            .unwrap_or_else(|_| serde_json::json!({"error": "the request engine stopped"}))
     }
 
-    /// Fetches a JSON document from a registry source.
-    pub fn json(
+    /// Writes the engine's request records to a JSON file and returns its path.
+    pub fn export_provenance(&self) -> Result<std::path::PathBuf, String> {
+        let (reply, receiver) = channel();
+        self.commands
+            .send(Command::Export(reply))
+            .map_err(|_| String::from("the request engine stopped"))?;
+        receiver
+            .recv()
+            .map_err(|_| String::from("the request engine stopped"))?
+    }
+
+    /// Why the response cache could not be opened, when it could not.
+    pub fn cache_error(&self) -> Option<String> {
+        let (reply, receiver) = channel();
+        if self.commands.send(Command::CacheError(reply)).is_err() {
+            return Some(String::from("the request engine stopped"));
+        }
+        receiver
+            .recv()
+            .unwrap_or_else(|_| Some(String::from("the request engine stopped")))
+    }
+
+    /// Removes one stored body so a corrupt decode is not replayed.
+    pub fn evict(&self, key: &str) -> Result<(), String> {
+        let (reply, receiver) = channel();
+        self.commands
+            .send(Command::Evict {
+                key: String::from(key),
+                reply,
+            })
+            .map_err(|_| String::from("the request engine stopped"))?;
+        receiver
+            .recv()
+            .map_err(|_| String::from("the request engine stopped"))?
+    }
+}
+
+/// The live HTTPS transport, and test transports that count a request without
+/// a socket.
+pub(crate) enum Transport {
+    Live,
+    #[cfg(test)]
+    Offline,
+    #[cfg(test)]
+    Scripted {
+        body: &'static [u8],
+        observed: Sender<Observed>,
+    },
+}
+
+impl Transport {
+    /// Carries one admitted request. The engine has already paced it.
+    pub(crate) fn get(
         &self,
+        enabled: &EnabledProviders,
         source: &'static Source,
         url: &str,
         accept: &str,
-    ) -> Result<Value, FetchError> {
-        let body = self.bytes_within(source, url, accept, REQUEST_TIMEOUT, MAX_DOCUMENT_BYTES)?;
-        serde_json::from_slice(&body).map_err(|source| FetchError::Json {
-            url: String::from(url),
-            source,
-        })
-    }
-
-    /// Fetches a JSON document within a stated time, for a heavy query.
-    pub fn json_within(
-        &self,
-        source: &'static Source,
-        url: &str,
-        accept: &str,
-        timeout: Duration,
-    ) -> Result<Value, FetchError> {
-        let body = self.bytes_within(source, url, accept, timeout, MAX_DOCUMENT_BYTES)?;
-        serde_json::from_slice(&body).map_err(|source| FetchError::Json {
-            url: String::from(url),
-            source,
-        })
-    }
-
-    /// Fetches a document written as text, such as a comma-separated index.
-    pub fn text(
-        &self,
-        source: &'static Source,
-        url: &str,
-        accept: &str,
-    ) -> Result<String, FetchError> {
-        let body = self.bytes_within(source, url, accept, REQUEST_TIMEOUT, MAX_DOCUMENT_BYTES)?;
-        String::from_utf8(body).map_err(|_| FetchError::Shape {
-            url: String::from(url),
-            field: "a body written as text",
-        })
-    }
-
-    /// Fetches a binary document, such as an imagery tile.
-    pub fn bytes(
-        &self,
-        source: &'static Source,
-        url: &str,
-        accept: &str,
-        limit: u64,
     ) -> Result<Vec<u8>, FetchError> {
-        self.bytes_within(source, url, accept, REQUEST_TIMEOUT, limit)
-    }
-
-    fn bytes_within(
-        &self,
-        source: &'static Source,
-        url: &str,
-        accept: &str,
-        timeout: Duration,
-        limit: u64,
-    ) -> Result<Vec<u8>, FetchError> {
-        self.admit(source)?;
-        match &self.transport {
-            Transport::Live => live_get(url, accept, timeout, limit),
+        if !enabled.enables(source.id.as_str()) {
+            return Err(FetchError::Disabled { id: source.id });
+        }
+        match self {
+            Self::Live => live_get(url, accept, REQUEST_TIMEOUT, MAX_DOCUMENT_BYTES),
             #[cfg(test)]
-            Transport::Offline => Err(FetchError::WorkerStopped),
+            Self::Offline => Err(FetchError::WorkerStopped),
             #[cfg(test)]
-            Transport::Scripted { body, observed } => {
+            Self::Scripted { body, observed } => {
                 observed
                     .send(Observed {
                         source: source.id,
@@ -134,27 +185,6 @@ impl Acquire {
             }
         }
     }
-
-    fn admit(&self, source: &'static Source) -> Result<(), FetchError> {
-        if self.enabled.enables(source.id.as_str()) {
-            return Ok(());
-        }
-        Err(FetchError::Disabled { id: source.id })
-    }
-}
-
-/// The live HTTPS transport, and a scripted one that lets a test count a
-/// request without a socket.
-#[derive(Clone)]
-enum Transport {
-    Live,
-    #[cfg(test)]
-    Offline,
-    #[cfg(test)]
-    Scripted {
-        body: &'static [u8],
-        observed: std::sync::mpsc::Sender<Observed>,
-    },
 }
 
 /// One request a scripted transport was asked to carry.
@@ -169,24 +199,20 @@ pub struct Observed {
 impl Acquire {
     /// A gate that enables every admitted source and carries no request.
     pub fn offline() -> Self {
-        Self {
-            enabled: EnabledProviders::all_admitted(),
-            transport: Transport::Offline,
-        }
+        Self::start(
+            EnabledProviders::all_admitted(),
+            Transport::Offline,
+            false,
+            None,
+        )
     }
 
     /// A gate for the enabled set whose transport returns `body` and reports
     /// every request it is asked to carry.
-    pub fn scripted(
-        enabled: EnabledProviders,
-        body: &'static [u8],
-    ) -> (Self, std::sync::mpsc::Receiver<Observed>) {
-        let (observed, receiver) = std::sync::mpsc::channel();
+    pub fn scripted(enabled: EnabledProviders, body: &'static [u8]) -> (Self, Receiver<Observed>) {
+        let (observed, receiver) = channel();
         (
-            Self {
-                enabled,
-                transport: Transport::Scripted { body, observed },
-            },
+            Self::start(enabled, Transport::Scripted { body, observed }, false, None),
             receiver,
         )
     }
@@ -243,11 +269,13 @@ mod tests {
     #[test]
     fn a_disabled_source_is_refused_without_a_request() -> Result<(), TestError> {
         let (acquire, observed) = Acquire::scripted(enabled(), br#"{"features":[]}"#);
-        let result = acquire.json(
-            &sources::DWD_OPEN_DATA,
-            "https://example.test/fire",
-            "application/json",
-        );
+        let result = acquire
+            .fetch(&RequestSpec::for_source(
+                &sources::DWD_OPEN_DATA,
+                "https://example.test/fire",
+                "application/json",
+            ))
+            .and_then(|fetched| fetched.json());
         assert!(matches!(
             result,
             Err(FetchError::Disabled { id }) if id.as_str() == "dwd-open-data"
@@ -259,11 +287,13 @@ mod tests {
     #[test]
     fn an_enabled_source_is_requested_once_and_parsed() -> Result<(), TestError> {
         let (acquire, observed) = Acquire::scripted(enabled(), br#"{"features":[]}"#);
-        let document = acquire.json(
-            &sources::NIFC_WFIGS,
-            "https://example.test/fire",
-            "application/json",
-        )?;
+        let document = acquire
+            .fetch(&RequestSpec::for_source(
+                &sources::NIFC_WFIGS,
+                "https://example.test/fire",
+                "application/json",
+            ))
+            .and_then(|fetched| fetched.json())?;
         assert_eq!(document["features"].as_array().map(Vec::len), Some(0));
         let request = observed.try_recv();
         assert!(matches!(
@@ -278,11 +308,13 @@ mod tests {
     #[test]
     fn a_text_document_keeps_its_bytes() -> Result<(), TestError> {
         let (acquire, _observed) = Acquire::scripted(enabled(), b"a,b\n1,2\n");
-        let text = acquire.text(
-            &sources::USGS_WATER,
-            "https://example.test/series",
-            "text/csv",
-        )?;
+        let text = acquire
+            .fetch(&RequestSpec::for_source(
+                &sources::USGS_WATER,
+                "https://example.test/series",
+                "text/csv",
+            ))
+            .and_then(|fetched| fetched.text())?;
         assert_eq!(text, "a,b\n1,2\n");
         Ok(())
     }
@@ -290,11 +322,13 @@ mod tests {
     #[test]
     fn a_body_that_is_not_utf8_is_a_shape_failure() -> Result<(), TestError> {
         let (acquire, _observed) = Acquire::scripted(enabled(), &[0xff, 0xfe]);
-        let result = acquire.text(
-            &sources::USGS_WATER,
-            "https://example.test/series",
-            "text/csv",
-        );
+        let result = acquire
+            .fetch(&RequestSpec::for_source(
+                &sources::USGS_WATER,
+                "https://example.test/series",
+                "text/csv",
+            ))
+            .and_then(|fetched| fetched.text());
         assert!(matches!(result, Err(FetchError::Shape { .. })));
         Ok(())
     }

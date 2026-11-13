@@ -16,14 +16,14 @@
 //! Sunrise and sunset for a requested map centre.
 
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use eframe::egui::{self, RichText};
 use serde_json::Value;
 
 use crate::acquire::Acquire;
+use crate::engine::RequestSpec;
 use crate::provider::{self, FetchError};
-use crate::retry;
 use crate::sources;
 use crate::theme;
 use crate::time;
@@ -102,7 +102,13 @@ fn parse(document: &Value) -> Result<SunRecord, FetchError> {
 
 fn fetch(acquire: &Acquire, latitude: f64, longitude: f64) -> Result<SunRecord, FetchError> {
     let url = format!("{BASE}?lat={latitude:.4}&lng={longitude:.4}");
-    let document = acquire.json(&sources::SUNRISE_SUNSET, &url, "application/json")?;
+    let document = acquire
+        .fetch(&RequestSpec::for_source(
+            &sources::SUNRISE_SUNSET,
+            &url,
+            "application/json",
+        ))
+        .and_then(|fetched| fetched.json())?;
     parse(&document)
 }
 
@@ -112,7 +118,6 @@ pub struct SunView {
     request: Option<Receiver<Result<SunRecord, FetchError>>>,
     record: Option<SunRecord>,
     error: Option<FetchError>,
-    retry_at: Option<Instant>,
 }
 
 impl SunView {
@@ -122,11 +127,10 @@ impl SunView {
             request: None,
             record: None,
             error: None,
-            retry_at: None,
         }
     }
 
-    pub fn update(&mut self, now: Instant) {
+    pub fn update(&mut self, _now: Instant) {
         let Some(receiver) = &self.request else {
             return;
         };
@@ -140,14 +144,8 @@ impl SunView {
             Ok(record) => {
                 self.record = Some(record);
                 self.error = None;
-                self.retry_at = None;
             }
             Err(error) => {
-                if let Some(value) = error.retry_after() {
-                    let delay =
-                        retry::retry_after_delay(value).unwrap_or_else(|_| Duration::from_secs(60));
-                    self.retry_at = now.checked_add(delay);
-                }
                 self.error = Some(error);
             }
         }
@@ -172,10 +170,9 @@ impl SunView {
             crate::sources::SUNRISE_SUNSET.credit,
             crate::sources::SUNRISE_SUNSET.home,
         );
-        let waiting = self.retry_at.is_some_and(|at| Instant::now() < at);
         if ui
             .add_enabled(
-                centre.is_some() && self.request.is_none() && !waiting,
+                centre.is_some() && self.request.is_none(),
                 egui::Button::new("Get sun times for map centre"),
             )
             .clicked()
@@ -185,9 +182,6 @@ impl SunView {
         }
         if self.request.is_some() {
             ui.label("Loading sun times…");
-        }
-        if waiting {
-            ui.label("The provider requested a wait before retrying.");
         }
         if let Some(error) = &self.error {
             ui.colored_label(

@@ -138,13 +138,6 @@ impl SpaceWeatherLayer {
                             .weak(),
                     );
                 }
-                if self.view.retry_waiting() {
-                    ui.label(
-                        RichText::new("Asking again shortly.")
-                            .size(theme::TYPE_SMALL)
-                            .weak(),
-                    );
-                }
             }
         }
     }

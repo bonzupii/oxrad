@@ -16,8 +16,6 @@
 //! The wildfire layer: its rail section, the nearest fires, and the perimeters
 //! drawn over the map.
 
-use std::time::{Duration, Instant};
-
 use eframe::egui::{self, Color32, Pos2, Rect, RichText, Shape, Stroke};
 
 use crate::acquire::Acquire;
@@ -28,8 +26,6 @@ use crate::projection;
 use crate::theme::{self, Palette};
 use crate::time;
 
-/// The perimeters change as crews map them, but not minute by minute.
-const REFRESH_AFTER: Duration = Duration::from_secs(1800);
 /// How many of the nearest fires the rail lists.
 const LISTED: usize = 6;
 /// A perimeter whose ring reaches past this many map widths is refused by the
@@ -44,31 +40,21 @@ const MARKER_RADIUS: f32 = 2.5;
 pub struct FireLayer {
     view: FireView,
     shown: bool,
-    asked_at: Option<Instant>,
 }
 
 impl FireLayer {
-    pub fn new(acquire: Acquire) -> Self {
+    pub const fn new(acquire: Acquire) -> Self {
         Self {
             view: FireView::new(acquire),
             shown: false,
-            asked_at: None,
         }
     }
 
-    /// Keeps the perimeters up to date while the layer is on.
-    pub fn update(&mut self, now: Instant) {
-        let retry_due = self.view.update(now);
-        if !self.shown {
-            return;
-        }
-        let stale = self
-            .asked_at
-            .is_some_and(|at| now.duration_since(at) >= REFRESH_AFTER);
-        let retry = retry_due && self.view.may_retry();
-        if self.asked_at.is_none() || stale || retry {
-            self.asked_at = Some(Instant::now());
-            self.view.start(self.view.attempts());
+    /// Takes in the engine's answer and starts one read while the layer is on.
+    pub fn update(&mut self) {
+        self.view.update();
+        if self.shown && !self.view.started() {
+            self.view.start();
         }
     }
 
@@ -142,9 +128,6 @@ impl FireLayer {
             .clicked()
         {
             self.shown = !self.shown;
-            if !self.shown {
-                self.asked_at = None;
-            }
         }
         if !self.shown {
             ui.label(
@@ -200,13 +183,6 @@ impl FireLayer {
                 if last.is_some() {
                     ui.label(
                         RichText::new("Still showing the last perimeters.")
-                            .size(theme::TYPE_SMALL)
-                            .weak(),
-                    );
-                }
-                if self.view.retry_waiting() {
-                    ui.label(
-                        RichText::new("Asking again shortly.")
                             .size(theme::TYPE_SMALL)
                             .weak(),
                     );

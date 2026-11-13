@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::acquire::Acquire;
+use crate::engine::RequestSpec;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
@@ -36,9 +37,26 @@ use crate::time;
 /// The provider, in the words the rail uses.
 pub const SOURCE: &str = "NOAA Space Weather Prediction Center";
 
-const KP_URL: &str = "https://services.swpc.noaa.gov/products/noaa-planetary-k-index-forecast.json";
-const WIND_URL: &str = "https://services.swpc.noaa.gov/products/summary/solar-wind-speed.json";
-const MAG_URL: &str = "https://services.swpc.noaa.gov/products/summary/solar-wind-mag-field.json";
+fn kp_url() -> String {
+    format!(
+        "{}/products/noaa-planetary-k-index-forecast.json",
+        sources::NOAA_SWPC.endpoint
+    )
+}
+
+fn wind_url() -> String {
+    format!(
+        "{}/products/summary/solar-wind-speed.json",
+        sources::NOAA_SWPC.endpoint
+    )
+}
+
+fn mag_url() -> String {
+    format!(
+        "{}/products/summary/solar-wind-mag-field.json",
+        sources::NOAA_SWPC.endpoint
+    )
+}
 const REQUEST_EVERY: Duration = Duration::from_secs(600);
 
 /// Why the space-weather record could not be read.
@@ -72,15 +90,6 @@ impl Error for SpaceWeatherError {
         match self {
             Self::Provider { source } => Some(source),
             Self::Shape { .. } | Self::WorkerStopped => None,
-        }
-    }
-}
-
-impl SpaceWeatherError {
-    pub const fn is_transient(&self) -> bool {
-        match self {
-            Self::Provider { source } => source.is_transient(),
-            Self::Shape { .. } | Self::WorkerStopped => false,
         }
     }
 }
@@ -281,7 +290,12 @@ pub fn parse_wind(speed: &Value, magnetic: &Value) -> Result<SolarWind, SpaceWea
 /// reported as a note beside it rather than taking the record down.
 pub fn fetch(acquire: &Acquire) -> Result<SpaceWeather, SpaceWeatherError> {
     let kp_document = acquire
-        .json(&sources::NOAA_SWPC, KP_URL, "application/json")
+        .fetch(&RequestSpec::for_source(
+            &sources::NOAA_SWPC,
+            kp_url(),
+            "application/json",
+        ))
+        .and_then(|fetched| fetched.json())
         .map_err(|source| SpaceWeatherError::Provider { source })?;
     let points = parse_kp(&kp_document)?;
     let (wind, wind_note) = match fetch_wind(acquire) {
@@ -297,10 +311,20 @@ pub fn fetch(acquire: &Acquire) -> Result<SpaceWeather, SpaceWeatherError> {
 
 fn fetch_wind(acquire: &Acquire) -> Result<SolarWind, SpaceWeatherError> {
     let speed = acquire
-        .json(&sources::NOAA_SWPC, WIND_URL, "application/json")
+        .fetch(&RequestSpec::for_source(
+            &sources::NOAA_SWPC,
+            wind_url(),
+            "application/json",
+        ))
+        .and_then(|fetched| fetched.json())
         .map_err(|source| SpaceWeatherError::Provider { source })?;
     let magnetic = acquire
-        .json(&sources::NOAA_SWPC, MAG_URL, "application/json")
+        .fetch(&RequestSpec::for_source(
+            &sources::NOAA_SWPC,
+            mag_url(),
+            "application/json",
+        ))
+        .and_then(|fetched| fetched.json())
         .map_err(|source| SpaceWeatherError::Provider { source })?;
     parse_wind(&speed, &magnetic)
 }
@@ -387,7 +411,6 @@ pub enum SpaceWeatherState {
     Failed {
         error: SpaceWeatherError,
         last: Option<SpaceWeather>,
-        retry_due: Option<Instant>,
     },
 }
 
@@ -407,7 +430,6 @@ pub struct SpaceWeatherView {
     state: SpaceWeatherState,
     generation: u64,
     next_request: Option<Instant>,
-    failures: u32,
 }
 
 impl SpaceWeatherView {
@@ -417,7 +439,6 @@ impl SpaceWeatherView {
             state: SpaceWeatherState::Idle,
             generation: 0,
             next_request: None,
-            failures: 0,
         }
     }
 
@@ -456,7 +477,6 @@ impl SpaceWeatherView {
                     if generation != self.generation {
                         continue;
                     }
-                    self.failures = 0;
                     self.state = SpaceWeatherState::Ready { record };
                 }
                 SpaceWeatherEvent::Failed { generation, error } => {
@@ -481,27 +501,8 @@ impl SpaceWeatherView {
     }
 
     fn failed(&mut self, error: SpaceWeatherError, last: Option<SpaceWeather>, now: Instant) {
-        let transient = error.is_transient();
-        self.failures = self.failures.saturating_add(1);
-        let retry_due = if transient && self.failures <= 4 {
-            now.checked_add(Duration::from_secs(u64::from(self.failures) * 20))
-        } else {
-            None
-        };
-        self.next_request = retry_due.or_else(|| now.checked_add(REQUEST_EVERY));
-        self.state = SpaceWeatherState::Failed {
-            error,
-            last,
-            retry_due,
-        };
-    }
-
-    /// Whether a retry is waiting.
-    pub const fn retry_waiting(&self) -> bool {
-        match &self.state {
-            SpaceWeatherState::Failed { retry_due, .. } => retry_due.is_some(),
-            _ => false,
-        }
+        self.next_request = now.checked_add(REQUEST_EVERY);
+        self.state = SpaceWeatherState::Failed { error, last };
     }
 }
 

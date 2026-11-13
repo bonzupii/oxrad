@@ -22,12 +22,12 @@
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::time::{Duration, Instant};
+use std::sync::mpsc::Receiver;
 
 use serde_json::Value;
 
 use crate::acquire::Acquire;
+use crate::engine::RequestSpec;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
@@ -35,7 +35,7 @@ use crate::time;
 /// The provider, in the words the rail uses.
 pub const SOURCE: &str = "NIFC WFIGS interagency perimeters";
 
-const BASE: &str = "https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/WFIGS_Interagency_Perimeters_Current/FeatureServer/0/query";
+const BASE: &str = sources::NIFC_WFIGS.endpoint;
 /// The fields the layer reads, so the service does not ship every attribute it
 /// keeps for an incident.
 const FIELDS: &str = "poly_IncidentName,poly_GISAcres,attr_PercentContained,attr_IncidentTypeCategory,attr_POOState,poly_PolygonDateTime";
@@ -44,10 +44,6 @@ const FIELDS: &str = "poly_IncidentName,poly_GISAcres,attr_PercentContained,attr
 const SIMPLIFY_DEGREES: f64 = 0.01;
 /// The shortest ring worth drawing.
 const MIN_RING_POINTS: usize = 4;
-/// How many times a failing request is retried before the layer stops asking.
-pub const MAX_ATTEMPTS: u32 = 3;
-const RETRY_BASE: Duration = Duration::from_secs(5);
-const RETRY_MAX: Duration = Duration::from_secs(60);
 
 /// Why a perimeter record could not be read.
 #[derive(Debug)]
@@ -86,15 +82,7 @@ impl Error for FireError {
     }
 }
 
-impl FireError {
-    /// Whether asking again could succeed.
-    pub const fn is_transient(&self) -> bool {
-        match self {
-            Self::Provider { source } => source.is_transient(),
-            Self::Shape { .. } | Self::WorkerStopped => false,
-        }
-    }
-}
+impl FireError {}
 
 /// What kind of burn the perimeter belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,89 +324,22 @@ pub fn request_url() -> String {
     )
 }
 
-/// Fetches every current perimeter.
+/// Fetches every current perimeter through the request engine.
 pub fn fetch(acquire: &Acquire) -> Result<FireSet, FireError> {
-    let document = acquire
-        .json(&sources::NIFC_WFIGS, &request_url(), "application/json")
+    let spec = RequestSpec::new(
+        &sources::NIFC_WFIGS,
+        request_url(),
+        "application/json",
+        "fire:current-perimeters",
+        "current wildfire perimeters",
+    );
+    let fetched = acquire
+        .fetch(&spec)
+        .map_err(|source| FireError::Provider { source })?;
+    let document = fetched
+        .json()
         .map_err(|source| FireError::Provider { source })?;
     parse(&document)
-}
-
-/// Requests sent to the worker.
-#[derive(Debug)]
-pub struct FireRequest {
-    pub generation: u64,
-}
-
-/// Answers from the worker.
-#[derive(Debug)]
-pub enum FireEvent {
-    Ready { generation: u64, set: FireSet },
-    Failed { generation: u64, error: FireError },
-}
-
-/// Fetches perimeters off the UI thread.
-pub struct FireFeed {
-    requests: Sender<FireRequest>,
-    events: Receiver<FireEvent>,
-    generation: u64,
-    stopped: bool,
-}
-
-impl FireFeed {
-    pub fn new(acquire: Acquire) -> Self {
-        let (requests, request_receiver) = mpsc::channel::<FireRequest>();
-        let (event_sender, events) = mpsc::channel::<FireEvent>();
-        std::thread::spawn(move || {
-            while let Ok(request) = request_receiver.recv() {
-                let event = match fetch(&acquire) {
-                    Ok(set) => FireEvent::Ready {
-                        generation: request.generation,
-                        set,
-                    },
-                    Err(error) => FireEvent::Failed {
-                        generation: request.generation,
-                        error,
-                    },
-                };
-                if event_sender.send(event).is_err() {
-                    return;
-                }
-            }
-        });
-        Self {
-            requests,
-            events,
-            generation: 0,
-            stopped: false,
-        }
-    }
-
-    pub fn request(&mut self, request: FireRequest) -> Result<(), FireError> {
-        self.generation = request.generation;
-        if self.requests.send(request).is_err() {
-            self.stopped = true;
-            return Err(FireError::WorkerStopped);
-        }
-        Ok(())
-    }
-
-    pub fn poll(&mut self) -> Option<FireEvent> {
-        match self.events.try_recv() {
-            Ok(event) => Some(event),
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => {
-                if self.stopped {
-                    return None;
-                }
-                self.stopped = true;
-                Some(FireEvent::Failed {
-                    generation: self.generation,
-                    error: FireError::WorkerStopped,
-                })
-            }
-        }
-    }
 }
 
 /// Where the layer's request stands.
@@ -434,8 +355,6 @@ pub enum FireState {
     Failed {
         error: FireError,
         last: Option<FireSet>,
-        attempts: u32,
-        retry_due: Option<Instant>,
     },
 }
 
@@ -450,19 +369,20 @@ impl FireState {
     }
 }
 
-/// The worker and its current state, with retry scheduling.
+/// The engine read and its current state. The engine owns retry and cache;
+/// this view only holds what the layer draws.
 pub struct FireView {
-    feed: FireFeed,
+    acquire: Acquire,
+    pending: Option<Receiver<Result<FireSet, FireError>>>,
     state: FireState,
-    generation: u64,
 }
 
 impl FireView {
-    pub fn new(acquire: Acquire) -> Self {
+    pub const fn new(acquire: Acquire) -> Self {
         Self {
-            feed: FireFeed::new(acquire),
+            acquire,
+            pending: None,
             state: FireState::Idle,
-            generation: 0,
         }
     }
 
@@ -474,73 +394,43 @@ impl FireView {
         self.state.last()
     }
 
-    pub fn start(&mut self, attempt: u32) {
+    /// Whether a read is already in flight.
+    pub const fn started(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Starts one engine read, keeping the last set on screen meanwhile.
+    pub fn start(&mut self) {
         let last = take_last(&mut self.state);
         self.state = FireState::Loading { last };
-        self.generation = self.generation.wrapping_add(1);
-        let request = FireRequest {
-            generation: self.generation,
+        let acquire = self.acquire.clone();
+        self.pending = Some(crate::engine::task(move || fetch(&acquire)));
+    }
+
+    /// Takes in the read's single answer.
+    pub fn update(&mut self) {
+        let Some(receiver) = &self.pending else {
+            return;
         };
-        if let Err(error) = self.feed.request(request) {
-            self.state = FireState::Failed {
-                error,
-                last: None,
-                attempts: attempt,
-                retry_due: None,
-            };
-        }
-    }
-
-    /// Takes in the worker's answer and returns whether a retry came due.
-    pub fn update(&mut self, now: Instant) -> bool {
-        while let Some(event) = self.feed.poll() {
-            match event {
-                FireEvent::Ready { generation, set } => {
-                    if generation != self.generation {
-                        continue;
-                    }
-                    self.state = FireState::Ready { set };
-                }
-                FireEvent::Failed { generation, error } => {
-                    if generation != self.generation {
-                        continue;
-                    }
-                    let last = take_last(&mut self.state);
-                    let attempts = self.attempts().saturating_add(1);
-                    let transient = error.is_transient();
-                    self.state = FireState::Failed {
-                        error,
-                        last,
-                        attempts,
-                        retry_due: retry_due(transient, attempts),
-                    };
-                }
+        match receiver.try_recv() {
+            Ok(Ok(set)) => {
+                self.state = FireState::Ready { set };
+                self.pending = None;
             }
-        }
-        match &self.state {
-            FireState::Failed { retry_due, .. } => retry_due.is_some_and(|due| now >= due),
-            FireState::Idle | FireState::Loading { .. } | FireState::Ready { .. } => false,
-        }
-    }
-
-    /// The attempts already made for the current request.
-    pub const fn attempts(&self) -> u32 {
-        match &self.state {
-            FireState::Failed { attempts, .. } => *attempts,
-            FireState::Idle | FireState::Loading { .. } | FireState::Ready { .. } => 0,
-        }
-    }
-
-    /// Whether another attempt is still allowed.
-    pub const fn may_retry(&self) -> bool {
-        self.attempts() < MAX_ATTEMPTS
-    }
-
-    /// Whether a retry has been scheduled but not yet made.
-    pub const fn retry_waiting(&self) -> bool {
-        match &self.state {
-            FireState::Failed { retry_due, .. } => retry_due.is_some(),
-            FireState::Idle | FireState::Loading { .. } | FireState::Ready { .. } => false,
+            Ok(Err(error)) => {
+                let last = take_last(&mut self.state);
+                self.state = FireState::Failed { error, last };
+                self.pending = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                let last = take_last(&mut self.state);
+                self.state = FireState::Failed {
+                    error: FireError::WorkerStopped,
+                    last,
+                };
+                self.pending = None;
+            }
         }
     }
 }
@@ -552,16 +442,6 @@ fn take_last(state: &mut FireState) -> Option<FireSet> {
         FireState::Ready { set } => Some(set),
         FireState::Idle => None,
     }
-}
-
-/// Exponential backoff for a request that may succeed later.
-fn retry_due(transient: bool, attempts: u32) -> Option<Instant> {
-    if !transient || attempts == 0 || attempts >= MAX_ATTEMPTS {
-        return None;
-    }
-    let steps = attempts.min(4);
-    let delay = RETRY_BASE.saturating_mul(1_u32 << steps).min(RETRY_MAX);
-    Instant::now().checked_add(delay)
 }
 
 /// How long ago a perimeter was mapped, in the words the rail uses.
@@ -726,12 +606,5 @@ mod tests {
         // the cosine of the latitude, which puts the diagonal near 28 km.
         assert!((span - 28.1).abs() < 1.0, "the diagonal was {span} km");
         Ok(())
-    }
-
-    #[test]
-    fn a_failed_request_is_retried_a_bounded_number_of_times() {
-        assert!(retry_due(true, 1).is_some());
-        assert!(retry_due(true, MAX_ATTEMPTS).is_none());
-        assert!(retry_due(false, 1).is_none());
     }
 }

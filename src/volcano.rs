@@ -27,25 +27,33 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde_json::{Map, Value};
 
 use crate::acquire::Acquire;
+use crate::engine::RequestSpec;
 use crate::provider::FetchError;
 use crate::sources;
 
 /// The provider, in the words the rail uses.
 pub const SOURCE: &str = "USGS Volcano Hazards Program";
-const LIST_URL: &str = "https://volcanoes.usgs.gov/hans-public/api/volcano/getElevatedVolcanoes";
-const VOLCANO_URL: &str = "https://volcanoes.usgs.gov/hans-public/api/volcano/getVolcano/";
+fn elevated_url() -> String {
+    format!(
+        "{}/hans-public/api/volcano/getElevatedVolcanoes",
+        sources::USGS_VOLCANO.endpoint
+    )
+}
+
+fn record_url(vnum: &str) -> String {
+    format!(
+        "{}/hans-public/api/volcano/getVolcano/{vnum}",
+        sources::USGS_VOLCANO.endpoint
+    )
+}
 /// How many raised volcanoes are followed up for a position, so one busy day
 /// cannot turn into an unbounded burst of requests.
 pub const MAX_VOLCANOES: usize = 12;
-/// How many times a failing request is retried before the layer stops asking.
-pub const MAX_ATTEMPTS: u32 = 4;
-const RETRY_BASE: Duration = Duration::from_secs(4);
-const RETRY_MAX: Duration = Duration::from_secs(60);
 
 /// The aviation colour code, lowest first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -218,15 +226,7 @@ impl Error for VolcanoError {
     }
 }
 
-impl VolcanoError {
-    /// Whether asking again could succeed.
-    pub const fn is_transient(&self) -> bool {
-        match self {
-            Self::Provider { source } => source.is_transient(),
-            Self::Shape { .. } | Self::WorkerStopped => false,
-        }
-    }
-}
+impl VolcanoError {}
 
 const fn shape(detail: &'static str) -> VolcanoError {
     VolcanoError::Shape { detail }
@@ -345,34 +345,45 @@ pub fn plain_text(html: &str) -> String {
 }
 
 /// The summary request.
-pub const fn list_url() -> &'static str {
-    LIST_URL
+pub fn list_url() -> String {
+    elevated_url()
 }
 
 /// The request for one volcano's own record.
 pub fn volcano_url(vnum: &str) -> String {
-    format!("{VOLCANO_URL}{vnum}")
+    record_url(vnum)
 }
 
 /// The notice that carries a volcano's latest statement.
 pub fn notice_url(notice_id: &str) -> String {
-    format!("https://volcanoes.usgs.gov/hans-public/api/notice/getNotice/{notice_id}")
+    format!(
+        "{}/hans-public/api/notice/getNotice/{notice_id}",
+        sources::USGS_VOLCANO.endpoint
+    )
 }
 
 /// Fetches the raised volcanoes and follows each one up for its position.
 pub fn fetch(acquire: &Acquire) -> Result<Report, VolcanoError> {
     let document = acquire
-        .json(&sources::USGS_VOLCANO, list_url(), "application/json")
+        .fetch(&RequestSpec::for_source(
+            &sources::USGS_VOLCANO,
+            list_url(),
+            "application/json",
+        ))
+        .and_then(|fetched| fetched.json())
         .map_err(|source| VolcanoError::Provider { source })?;
     let notices = parse_list(&document)?;
     let not_followed = notices.len().saturating_sub(MAX_VOLCANOES);
     let mut volcanoes = Vec::with_capacity(notices.len().min(MAX_VOLCANOES));
     for notice in notices.into_iter().take(MAX_VOLCANOES) {
-        let mut place = match acquire.json(
-            &sources::USGS_VOLCANO,
-            &volcano_url(&notice.vnum),
-            "application/json",
-        ) {
+        let mut place = match acquire
+            .fetch(&RequestSpec::for_source(
+                &sources::USGS_VOLCANO,
+                volcano_url(&notice.vnum),
+                "application/json",
+            ))
+            .and_then(|fetched| fetched.json())
+        {
             Ok(document) => parse_volcano(&document)?,
             Err(_) => Place {
                 latitude: None,
@@ -384,11 +395,13 @@ pub fn fetch(acquire: &Acquire) -> Result<Report, VolcanoError> {
             },
         };
         if !notice.identifier.is_empty()
-            && let Ok(document) = acquire.json(
-                &sources::USGS_VOLCANO,
-                &notice_url(&notice.identifier),
-                "application/json",
-            )
+            && let Ok(document) = acquire
+                .fetch(&RequestSpec::for_source(
+                    &sources::USGS_VOLCANO,
+                    notice_url(&notice.identifier),
+                    "application/json",
+                ))
+                .and_then(|fetched| fetched.json())
         {
             place.summary = parse_synopsis(&document);
         }
@@ -496,8 +509,6 @@ pub enum VolcanoState {
     Failed {
         error: VolcanoError,
         last: Option<Report>,
-        attempts: u32,
-        retry_due: Option<Instant>,
     },
 }
 
@@ -512,7 +523,7 @@ impl VolcanoState {
     }
 }
 
-/// The worker and its current state, with retry scheduling.
+/// The worker and the value it last delivered.
 pub struct VolcanoView {
     feed: VolcanoFeed,
     state: VolcanoState,
@@ -536,7 +547,7 @@ impl VolcanoView {
         self.state.last()
     }
 
-    pub fn start(&mut self, attempt: u32) {
+    pub fn start(&mut self) {
         let last = take_last(&mut self.state);
         self.state = VolcanoState::Loading { last };
         self.generation = self.generation.wrapping_add(1);
@@ -544,17 +555,12 @@ impl VolcanoView {
             generation: self.generation,
         };
         if let Err(error) = self.feed.request(request) {
-            self.state = VolcanoState::Failed {
-                error,
-                last: None,
-                attempts: attempt,
-                retry_due: None,
-            };
+            self.state = VolcanoState::Failed { error, last: None };
         }
     }
 
-    /// Takes in the worker's answer and returns whether a retry came due.
-    pub fn update(&mut self, now: Instant) -> bool {
+    /// Takes in the worker's answers. The engine owns retry and cache.
+    pub fn update(&mut self, _now: Instant) -> bool {
         while let Some(event) = self.feed.poll() {
             match event {
                 VolcanoEvent::Ready { generation, report } => {
@@ -568,42 +574,11 @@ impl VolcanoView {
                         continue;
                     }
                     let last = take_last(&mut self.state);
-                    let attempts = self.attempts().saturating_add(1);
-                    let transient = error.is_transient();
-                    self.state = VolcanoState::Failed {
-                        error,
-                        last,
-                        attempts,
-                        retry_due: retry_due(transient, attempts),
-                    };
+                    self.state = VolcanoState::Failed { error, last };
                 }
             }
         }
-        match &self.state {
-            VolcanoState::Failed { retry_due, .. } => retry_due.is_some_and(|due| now >= due),
-            VolcanoState::Idle | VolcanoState::Loading { .. } | VolcanoState::Ready { .. } => false,
-        }
-    }
-
-    /// The attempts already made for the current request.
-    pub const fn attempts(&self) -> u32 {
-        match &self.state {
-            VolcanoState::Failed { attempts, .. } => *attempts,
-            VolcanoState::Idle | VolcanoState::Loading { .. } | VolcanoState::Ready { .. } => 0,
-        }
-    }
-
-    /// Whether another attempt is still allowed.
-    pub const fn may_retry(&self) -> bool {
-        self.attempts() < MAX_ATTEMPTS
-    }
-
-    /// Whether a retry has been scheduled but not yet made.
-    pub const fn retry_waiting(&self) -> bool {
-        match &self.state {
-            VolcanoState::Failed { retry_due, .. } => retry_due.is_some(),
-            VolcanoState::Idle | VolcanoState::Loading { .. } | VolcanoState::Ready { .. } => false,
-        }
+        false
     }
 }
 
@@ -614,16 +589,6 @@ fn take_last(state: &mut VolcanoState) -> Option<Report> {
         VolcanoState::Ready { report } => Some(report),
         VolcanoState::Idle => None,
     }
-}
-
-/// Exponential backoff for a request that may succeed later.
-fn retry_due(transient: bool, attempts: u32) -> Option<Instant> {
-    if !transient || attempts == 0 || attempts >= MAX_ATTEMPTS {
-        return None;
-    }
-    let steps = attempts.min(4);
-    let delay = RETRY_BASE.saturating_mul(1_u32 << steps).min(RETRY_MAX);
-    Instant::now().checked_add(delay)
 }
 
 #[cfg(test)]

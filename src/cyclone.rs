@@ -30,24 +30,21 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde_json::Value;
 
 use crate::acquire::Acquire;
+use crate::engine::RequestSpec;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
 
 /// The provider, in the words the rail uses.
 pub const SOURCE: &str = "GDACS global disaster alerts";
-const BASE: &str = "https://www.gdacs.org/gdacsapi/api/events/geteventlist/SEARCH";
+const BASE: &str = sources::GDACS.endpoint;
 /// How far back the list reaches, in days.
 pub const WINDOW_DAYS: i64 = 30;
-/// How many times a failing request is retried before the layer stops asking.
-pub const MAX_ATTEMPTS: u32 = 4;
-const RETRY_BASE: Duration = Duration::from_secs(4);
-const RETRY_MAX: Duration = Duration::from_secs(60);
 const MS_PER_DAY: u64 = 86_400_000;
 
 /// The service's alert level, lowest first. It measures expected humanitarian
@@ -217,15 +214,6 @@ impl Error for CycloneError {
     }
 }
 
-impl CycloneError {
-    pub const fn is_transient(&self) -> bool {
-        match self {
-            Self::Provider { source } => source.is_transient(),
-            Self::Shape { .. } | Self::WorkerStopped => false,
-        }
-    }
-}
-
 const fn shape(detail: &'static str) -> CycloneError {
     CycloneError::Shape { detail }
 }
@@ -341,7 +329,12 @@ pub fn request_url(now_ms: u64) -> Result<String, CycloneError> {
 /// Fetches the storms in the window.
 pub fn fetch(acquire: &Acquire, now_ms: u64) -> Result<StormList, CycloneError> {
     let document = acquire
-        .json(&sources::GDACS, &request_url(now_ms)?, "application/json")
+        .fetch(&RequestSpec::for_source(
+            &sources::GDACS,
+            &request_url(now_ms)?,
+            "application/json",
+        ))
+        .and_then(|fetched| fetched.json())
         .map_err(|source| CycloneError::Provider { source })?;
     parse(&document)
 }
@@ -443,8 +436,6 @@ pub enum CycloneState {
     Failed {
         error: CycloneError,
         last: Option<StormList>,
-        attempts: u32,
-        retry_due: Option<Instant>,
     },
 }
 
@@ -482,7 +473,7 @@ impl CycloneView {
         self.state.last()
     }
 
-    pub fn start(&mut self, now_ms: u64, attempt: u32) {
+    pub fn start(&mut self, now_ms: u64) {
         let last = take_last(&mut self.state);
         self.state = CycloneState::Loading { last };
         self.generation = self.generation.wrapping_add(1);
@@ -491,17 +482,12 @@ impl CycloneView {
             now_ms,
         };
         if let Err(error) = self.feed.request(request) {
-            self.state = CycloneState::Failed {
-                error,
-                last: None,
-                attempts: attempt,
-                retry_due: None,
-            };
+            self.state = CycloneState::Failed { error, last: None };
         }
     }
 
-    /// Takes in the worker's answer and returns whether a retry came due.
-    pub fn update(&mut self, now: Instant) -> bool {
+    /// Takes in the worker's answers. The engine owns retry and cache.
+    pub fn update(&mut self, _now: Instant) -> bool {
         while let Some(event) = self.feed.poll() {
             match event {
                 CycloneEvent::Ready { generation, list } => {
@@ -515,39 +501,11 @@ impl CycloneView {
                         continue;
                     }
                     let last = take_last(&mut self.state);
-                    let attempts = self.attempts().saturating_add(1);
-                    let transient = error.is_transient();
-                    self.state = CycloneState::Failed {
-                        error,
-                        last,
-                        attempts,
-                        retry_due: retry_due(transient, attempts),
-                    };
+                    self.state = CycloneState::Failed { error, last };
                 }
             }
         }
-        match &self.state {
-            CycloneState::Failed { retry_due, .. } => retry_due.is_some_and(|due| now >= due),
-            CycloneState::Idle | CycloneState::Loading { .. } | CycloneState::Ready { .. } => false,
-        }
-    }
-
-    pub const fn attempts(&self) -> u32 {
-        match &self.state {
-            CycloneState::Failed { attempts, .. } => *attempts,
-            CycloneState::Idle | CycloneState::Loading { .. } | CycloneState::Ready { .. } => 0,
-        }
-    }
-
-    pub const fn may_retry(&self) -> bool {
-        self.attempts() < MAX_ATTEMPTS
-    }
-
-    pub const fn retry_waiting(&self) -> bool {
-        match &self.state {
-            CycloneState::Failed { retry_due, .. } => retry_due.is_some(),
-            CycloneState::Idle | CycloneState::Loading { .. } | CycloneState::Ready { .. } => false,
-        }
+        false
     }
 }
 
@@ -558,16 +516,6 @@ fn take_last(state: &mut CycloneState) -> Option<StormList> {
         CycloneState::Ready { list } => Some(list),
         CycloneState::Idle => None,
     }
-}
-
-/// Exponential backoff for a request that may succeed later.
-fn retry_due(transient: bool, attempts: u32) -> Option<Instant> {
-    if !transient || attempts == 0 || attempts >= MAX_ATTEMPTS {
-        return None;
-    }
-    let steps = attempts.min(4);
-    let delay = RETRY_BASE.saturating_mul(1_u32 << steps).min(RETRY_MAX);
-    Instant::now().checked_add(delay)
 }
 
 #[cfg(test)]

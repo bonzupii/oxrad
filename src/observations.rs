@@ -23,11 +23,12 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde_json::Value;
 
 use crate::acquire::Acquire;
+use crate::engine::RequestSpec;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
@@ -35,16 +36,12 @@ use crate::time;
 /// The provider, in the words the rail uses.
 pub const SOURCE: &str = "Aviation Weather Center METAR";
 
-const BASE: &str = "https://aviationweather.gov/api/data/metar";
+const BASE: &str = sources::AVIATION_WEATHER_METAR.endpoint;
 /// How far back the request looks, which bounds how stale a report can be.
 const HOURS: u8 = 2;
 /// The largest box the layer asks for, so a wide view does not request a
 /// hemisphere of stations on every move.
 const MAX_SPAN_DEG: f64 = 12.0;
-/// How many times a failing request is retried before the layer stops asking.
-pub const MAX_ATTEMPTS: u32 = 4;
-const RETRY_BASE: Duration = Duration::from_secs(4);
-const RETRY_MAX: Duration = Duration::from_secs(60);
 
 /// Why an observation set could not be read.
 #[derive(Debug)]
@@ -86,15 +83,7 @@ impl Error for ObservationError {
     }
 }
 
-impl ObservationError {
-    /// Whether asking again could succeed.
-    pub const fn is_transient(&self) -> bool {
-        match self {
-            Self::Provider { source } => source.is_transient(),
-            Self::Shape { .. } | Self::WorkerStopped => false,
-        }
-    }
-}
+impl ObservationError {}
 
 /// The flight category a station reports, which is the aviation reading of
 /// ceiling and visibility.
@@ -325,11 +314,12 @@ pub fn fetch(
     bounds: (f64, f64, f64, f64),
 ) -> Result<ObservationSet, ObservationError> {
     let document = acquire
-        .json(
+        .fetch(&RequestSpec::for_source(
             &sources::AVIATION_WEATHER_METAR,
-            &request_url(bounds),
+            request_url(bounds),
             "application/json",
-        )
+        ))
+        .and_then(|fetched| fetched.json())
         .map_err(|source| ObservationError::Provider { source })?;
     parse(&document)
 }
@@ -431,8 +421,6 @@ pub enum ObservationState {
     Failed {
         error: ObservationError,
         last: Option<ObservationSet>,
-        attempts: u32,
-        retry_due: Option<Instant>,
     },
 }
 
@@ -447,7 +435,7 @@ impl ObservationState {
     }
 }
 
-/// The worker and its current state, with retry scheduling.
+/// The worker and the value it last delivered.
 pub struct ObservationView {
     feed: ObservationFeed,
     state: ObservationState,
@@ -477,7 +465,7 @@ impl ObservationView {
         self.state.last()
     }
 
-    pub fn start(&mut self, bounds: (f64, f64, f64, f64), attempt: u32) {
+    pub fn start(&mut self, bounds: (f64, f64, f64, f64)) {
         let last = take_last(&mut self.state);
         self.state = ObservationState::Loading { last };
         self.generation = self.generation.wrapping_add(1);
@@ -486,17 +474,12 @@ impl ObservationView {
             bounds,
         };
         if let Err(error) = self.feed.request(request) {
-            self.state = ObservationState::Failed {
-                error,
-                last: None,
-                attempts: attempt,
-                retry_due: None,
-            };
+            self.state = ObservationState::Failed { error, last: None };
         }
     }
 
-    /// Takes in the worker's answer and returns whether a retry came due.
-    pub fn update(&mut self, now: Instant) -> bool {
+    /// Takes in the worker's answers. The engine owns retry and cache.
+    pub fn update(&mut self, _now: Instant) -> bool {
         while let Some(event) = self.feed.poll() {
             match event {
                 ObservationEvent::Ready { generation, set } => {
@@ -510,48 +493,11 @@ impl ObservationView {
                         continue;
                     }
                     let last = take_last(&mut self.state);
-                    let attempts = self.attempts().saturating_add(1);
-                    let transient = error.is_transient();
-                    self.state = ObservationState::Failed {
-                        error,
-                        last,
-                        attempts,
-                        retry_due: retry_due(transient, attempts),
-                    };
+                    self.state = ObservationState::Failed { error, last };
                 }
             }
         }
-        match &self.state {
-            ObservationState::Failed { retry_due, .. } => retry_due.is_some_and(|due| now >= due),
-            ObservationState::Idle
-            | ObservationState::Loading { .. }
-            | ObservationState::Ready { .. } => false,
-        }
-    }
-
-    /// The attempts already made for the current request.
-    pub const fn attempts(&self) -> u32 {
-        match &self.state {
-            ObservationState::Failed { attempts, .. } => *attempts,
-            ObservationState::Idle
-            | ObservationState::Loading { .. }
-            | ObservationState::Ready { .. } => 0,
-        }
-    }
-
-    /// Whether another attempt is still allowed.
-    pub const fn may_retry(&self) -> bool {
-        self.attempts() < MAX_ATTEMPTS
-    }
-
-    /// Whether a retry has been scheduled but not yet made.
-    pub const fn retry_waiting(&self) -> bool {
-        match &self.state {
-            ObservationState::Failed { retry_due, .. } => retry_due.is_some(),
-            ObservationState::Idle
-            | ObservationState::Loading { .. }
-            | ObservationState::Ready { .. } => false,
-        }
+        false
     }
 }
 
@@ -562,16 +508,6 @@ fn take_last(state: &mut ObservationState) -> Option<ObservationSet> {
         ObservationState::Ready { set } => Some(set),
         ObservationState::Idle => None,
     }
-}
-
-/// Exponential backoff for a request that may succeed later.
-fn retry_due(transient: bool, attempts: u32) -> Option<Instant> {
-    if !transient || attempts == 0 || attempts >= MAX_ATTEMPTS {
-        return None;
-    }
-    let steps = attempts.min(4);
-    let delay = RETRY_BASE.saturating_mul(1_u32 << steps).min(RETRY_MAX);
-    Instant::now().checked_add(delay)
 }
 
 /// How old a report is, in the words the rail uses.

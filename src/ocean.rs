@@ -24,11 +24,12 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde_json::{Map, Value};
 
 use crate::acquire::Acquire;
+use crate::engine::RequestSpec;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
@@ -36,13 +37,9 @@ use crate::time;
 /// The provider, in the words the rail uses.
 pub const SOURCE: &str = "Open-Meteo marine, MeteoFrance and ECMWF waves";
 
-const BASE: &str = "https://marine-api.open-meteo.com/v1/marine";
+const BASE: &str = sources::OPEN_METEO_MARINE.endpoint;
 const HOURLY: &str = "wave_height,wave_direction,wave_period,swell_wave_height,sea_surface_temperature,ocean_current_velocity,ocean_current_direction";
 const FORECAST_DAYS: u8 = 3;
-/// How many times a failing request is retried before the layer stops asking.
-pub const MAX_ATTEMPTS: u32 = 4;
-const RETRY_BASE: Duration = Duration::from_secs(4);
-const RETRY_MAX: Duration = Duration::from_secs(60);
 /// The wave height at which the sea becomes rough under the Douglas scale.
 pub const ROUGH: f64 = 2.5;
 /// The wave height at which it becomes moderate.
@@ -153,15 +150,7 @@ impl Error for OceanError {
     }
 }
 
-impl OceanError {
-    /// Whether asking again could succeed.
-    pub const fn is_transient(&self) -> bool {
-        match self {
-            Self::Provider { source } => source.is_transient(),
-            Self::Shape { .. } | Self::WorkerStopped => false,
-        }
-    }
-}
+impl OceanError {}
 
 /// One hour of the marine forecast.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -348,11 +337,12 @@ pub fn request_url(latitude: f64, longitude: f64) -> String {
 /// Fetches the marine forecast for one point.
 pub fn fetch(acquire: &Acquire, latitude: f64, longitude: f64) -> Result<Ocean, OceanError> {
     let document = acquire
-        .json(
+        .fetch(&RequestSpec::for_source(
             &sources::OPEN_METEO_MARINE,
-            &request_url(latitude, longitude),
+            request_url(latitude, longitude),
             "application/json",
-        )
+        ))
+        .and_then(|fetched| fetched.json())
         .map_err(|source| OceanError::Provider { source })?;
     parse(&document)
 }
@@ -449,8 +439,6 @@ pub enum OceanState {
     Failed {
         error: OceanError,
         last: Option<Ocean>,
-        attempts: u32,
-        retry_due: Option<Instant>,
     },
 }
 
@@ -465,7 +453,7 @@ impl OceanState {
     }
 }
 
-/// The worker and its current state, with retry scheduling.
+/// The worker and the value it last delivered.
 pub struct OceanView {
     feed: OceanFeed,
     state: OceanState,
@@ -489,7 +477,7 @@ impl OceanView {
         self.state.last()
     }
 
-    pub fn start(&mut self, latitude: f64, longitude: f64, attempt: u32) {
+    pub fn start(&mut self, latitude: f64, longitude: f64) {
         let last = take_last(&mut self.state);
         self.state = OceanState::Loading { last };
         self.generation = self.generation.wrapping_add(1);
@@ -499,17 +487,12 @@ impl OceanView {
             longitude,
         };
         if let Err(error) = self.feed.request(request) {
-            self.state = OceanState::Failed {
-                error,
-                last: None,
-                attempts: attempt,
-                retry_due: None,
-            };
+            self.state = OceanState::Failed { error, last: None };
         }
     }
 
-    /// Takes in the worker's answer and returns whether a retry came due.
-    pub fn update(&mut self, now: Instant) -> bool {
+    /// Takes in the worker's answers. The engine owns retry and cache.
+    pub fn update(&mut self, _now: Instant) -> bool {
         while let Some(event) = self.feed.poll() {
             match event {
                 OceanEvent::Ready { generation, record } => {
@@ -523,42 +506,11 @@ impl OceanView {
                         continue;
                     }
                     let last = take_last(&mut self.state);
-                    let attempts = self.attempts().saturating_add(1);
-                    let transient = error.is_transient();
-                    self.state = OceanState::Failed {
-                        error,
-                        last,
-                        attempts,
-                        retry_due: retry_due(transient, attempts),
-                    };
+                    self.state = OceanState::Failed { error, last };
                 }
             }
         }
-        match &self.state {
-            OceanState::Failed { retry_due, .. } => retry_due.is_some_and(|due| now >= due),
-            OceanState::Idle | OceanState::Loading { .. } | OceanState::Ready { .. } => false,
-        }
-    }
-
-    /// The attempts already made for the current request.
-    pub const fn attempts(&self) -> u32 {
-        match &self.state {
-            OceanState::Failed { attempts, .. } => *attempts,
-            OceanState::Idle | OceanState::Loading { .. } | OceanState::Ready { .. } => 0,
-        }
-    }
-
-    /// Whether another attempt is still allowed.
-    pub const fn may_retry(&self) -> bool {
-        self.attempts() < MAX_ATTEMPTS
-    }
-
-    /// Whether a retry has been scheduled but not yet made.
-    pub const fn retry_waiting(&self) -> bool {
-        match &self.state {
-            OceanState::Failed { retry_due, .. } => retry_due.is_some(),
-            OceanState::Idle | OceanState::Loading { .. } | OceanState::Ready { .. } => false,
-        }
+        false
     }
 }
 
@@ -569,16 +521,6 @@ fn take_last(state: &mut OceanState) -> Option<Ocean> {
         OceanState::Ready { record } => Some(record),
         OceanState::Idle => None,
     }
-}
-
-/// Exponential backoff for a request that may succeed later.
-fn retry_due(transient: bool, attempts: u32) -> Option<Instant> {
-    if !transient || attempts == 0 || attempts >= MAX_ATTEMPTS {
-        return None;
-    }
-    let steps = attempts.min(4);
-    let delay = RETRY_BASE.saturating_mul(1_u32 << steps).min(RETRY_MAX);
-    Instant::now().checked_add(delay)
 }
 
 #[cfg(test)]

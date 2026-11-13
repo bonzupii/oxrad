@@ -15,16 +15,14 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 //! The fetch and decode workers for one site, and the state they report.
 
-use std::collections::hash_map::RandomState;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use crate::acquire::Acquire;
-use crate::cache::CacheError;
 use crate::error::RadarError;
 use crate::network;
 use crate::radar::{self, ArchiveOrigin, RadarVolume, RetrievedVolume};
-use crate::retry::{self, BASE_DELAY, MAX_DELAY, error_update};
+use crate::retry::is_decode_failure;
 use crate::stations::SiteId;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -35,7 +33,7 @@ const SHUTDOWN_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 pub struct FetchFailure {
     pub operation: Operation,
     pub error: RadarError,
-    pub cache_warning: Option<Box<CacheError>>,
+    pub cache_warning: Option<String>,
 }
 
 #[derive(Debug)]
@@ -44,7 +42,7 @@ pub struct FetchUpdate {
     pub retry_in: Option<Duration>,
     pub waiting_for_next_volume: bool,
     pub from_cache: bool,
-    pub cache_warning: Option<CacheError>,
+    pub cache_warning: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,7 +135,7 @@ struct Fetched {
     key: String,
     volume: RadarVolume,
     from_cache: bool,
-    cache_warning: Option<CacheError>,
+    cache_warning: Option<String>,
 }
 
 pub struct Pipeline {
@@ -224,7 +222,7 @@ impl Pipeline {
                     cache_warning,
                 } = *update;
                 if let Some(warning) = cache_warning {
-                    self.cache_warning = Some(warning.to_string());
+                    self.cache_warning = Some(warning);
                 }
                 match result {
                     Ok(Some(volume)) => {
@@ -290,28 +288,20 @@ struct FetchState {
     last_key: Option<String>,
     failed_key: Option<String>,
     decode_failures: u8,
-    delay: Duration,
-    attempt: u32,
-    jitter: RandomState,
 }
 
 impl FetchState {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             last_key: None,
             failed_key: None,
             decode_failures: 0,
-            delay: BASE_DELAY,
-            attempt: 0,
-            jitter: RandomState::new(),
         }
     }
 
     fn reset_retry(&mut self) {
         self.failed_key = None;
         self.decode_failures = 0;
-        self.delay = BASE_DELAY;
-        self.attempt = 0;
     }
 }
 
@@ -338,6 +328,10 @@ fn decode_failure(site: &SiteId) -> FetchFailure {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "the failure carries the operation, typed error and cache context"
+)]
 fn fetch(
     state: &mut FetchState,
     acquire: &Acquire,
@@ -360,7 +354,7 @@ fn fetch(
         state.failed_key = None;
         state.decode_failures = 0;
     }
-    let archive = network::fetch_archive_cached(acquire, &key).map_err(|error| {
+    let archive = network::fetch_archive_cached(acquire, &key, site).map_err(|error| {
         if matches!(error, RadarError::VolumeGone { .. }) {
             state.last_key = None;
         }
@@ -394,17 +388,17 @@ fn fetch(
             cache_warning,
         })),
         Err(error) => {
-            if retry::is_decode_failure(&error) {
+            if is_decode_failure(&error) {
                 state.failed_key = Some(key.clone());
                 state.decode_failures = state.decode_failures.saturating_add(1);
             }
-            if let Err(remove_error) = network::evict_archive(&key) {
+            if let Err(remove_error) = network::evict_archive(acquire, &key) {
                 cache_warning = Some(remove_error);
             }
             Err(FetchFailure {
                 operation: Operation::Decoding,
                 error,
-                cache_warning: cache_warning.map(Box::new),
+                cache_warning,
             })
         }
     }
@@ -470,36 +464,45 @@ impl Fetcher {
                         cache_warning: fetched.cache_warning,
                     }
                 }
-                Ok(None) => {
-                    state.delay = BASE_DELAY;
-                    state.attempt = 0;
+                Ok(None) => FetchUpdate {
+                    result: Ok(None),
+                    retry_in: None,
+                    waiting_for_next_volume: false,
+                    from_cache: false,
+                    cache_warning: None,
+                },
+                Err(failure) => {
+                    let FetchFailure {
+                        operation,
+                        error,
+                        cache_warning,
+                    } = failure;
+                    let waiting_for_next_volume = matches!(
+                        error,
+                        RadarError::VolumeGone { .. }
+                            | RadarError::HttpStatus {
+                                status: 400 | 404,
+                                ..
+                            }
+                    );
                     FetchUpdate {
-                        result: Ok(None),
+                        result: Err(FetchFailure {
+                            operation,
+                            error,
+                            cache_warning: None,
+                        }),
                         retry_in: None,
-                        waiting_for_next_volume: false,
+                        waiting_for_next_volume,
                         from_cache: false,
-                        cache_warning: None,
+                        cache_warning,
                     }
                 }
-                Err(failure) => error_update(
-                    failure,
-                    state.decode_failures,
-                    state.delay,
-                    state.attempt,
-                    &state.jitter,
-                ),
             };
-            let wait = update.retry_in;
             if events.send(Event::Update(Box::new(update))).is_err() {
                 return;
             }
-            let timeout = wait.unwrap_or(POLL_INTERVAL);
-            match wait_for_retry(retries, timeout) {
+            match wait_for_retry(retries, POLL_INTERVAL) {
                 WaitOutcome::Retry => state.reset_retry(),
-                WaitOutcome::Elapsed if wait.is_some() => {
-                    state.delay = state.delay.saturating_mul(2).min(MAX_DELAY);
-                    state.attempt = state.attempt.saturating_add(1);
-                }
                 WaitOutcome::Elapsed => {}
                 WaitOutcome::Stopped => return,
             }
