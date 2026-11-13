@@ -29,7 +29,6 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::acquire::Acquire;
-use crate::engine::RequestSpec;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
@@ -37,26 +36,6 @@ use crate::time;
 /// The provider, in the words the rail uses.
 pub const SOURCE: &str = "NOAA Space Weather Prediction Center";
 
-fn kp_url() -> String {
-    format!(
-        "{}/products/noaa-planetary-k-index-forecast.json",
-        sources::NOAA_SWPC.endpoint
-    )
-}
-
-fn wind_url() -> String {
-    format!(
-        "{}/products/summary/solar-wind-speed.json",
-        sources::NOAA_SWPC.endpoint
-    )
-}
-
-fn mag_url() -> String {
-    format!(
-        "{}/products/summary/solar-wind-mag-field.json",
-        sources::NOAA_SWPC.endpoint
-    )
-}
 const REQUEST_EVERY: Duration = Duration::from_secs(600);
 
 /// Why the space-weather record could not be read.
@@ -290,11 +269,7 @@ pub fn parse_wind(speed: &Value, magnetic: &Value) -> Result<SolarWind, SpaceWea
 /// reported as a note beside it rather than taking the record down.
 pub fn fetch(acquire: &Acquire) -> Result<SpaceWeather, SpaceWeatherError> {
     let kp_document = acquire
-        .fetch(&RequestSpec::for_source(
-            &sources::NOAA_SWPC,
-            kp_url(),
-            "application/json",
-        ))
+        .fetch_operation(&sources::NOAA_SWPC, "kp", &[])
         .and_then(|fetched| fetched.json())
         .map_err(|source| SpaceWeatherError::Provider { source })?;
     let points = parse_kp(&kp_document)?;
@@ -311,19 +286,11 @@ pub fn fetch(acquire: &Acquire) -> Result<SpaceWeather, SpaceWeatherError> {
 
 fn fetch_wind(acquire: &Acquire) -> Result<SolarWind, SpaceWeatherError> {
     let speed = acquire
-        .fetch(&RequestSpec::for_source(
-            &sources::NOAA_SWPC,
-            wind_url(),
-            "application/json",
-        ))
+        .fetch_operation(&sources::NOAA_SWPC, "wind", &[])
         .and_then(|fetched| fetched.json())
         .map_err(|source| SpaceWeatherError::Provider { source })?;
     let magnetic = acquire
-        .fetch(&RequestSpec::for_source(
-            &sources::NOAA_SWPC,
-            mag_url(),
-            "application/json",
-        ))
+        .fetch_operation(&sources::NOAA_SWPC, "magnetic-field", &[])
         .and_then(|fetched| fetched.json())
         .map_err(|source| SpaceWeatherError::Provider { source })?;
     parse_wind(&speed, &magnetic)

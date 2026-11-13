@@ -28,7 +28,6 @@ use std::time::Instant;
 use serde_json::Value;
 
 use crate::acquire::Acquire;
-use crate::engine::RequestSpec;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
@@ -36,9 +35,7 @@ use crate::time;
 /// The provider, in the words the rail uses.
 pub const SOURCE: &str = "Aviation Weather Center METAR";
 
-const BASE: &str = sources::AVIATION_WEATHER_METAR.endpoint;
 /// How far back the request looks, which bounds how stale a report can be.
-const HOURS: u8 = 2;
 /// The largest box the layer asks for, so a wide view does not request a
 /// hemisphere of stations on every move.
 const MAX_SPAN_DEG: f64 = 12.0;
@@ -301,24 +298,19 @@ pub fn bounds(centre_lat: f64, centre_lon: f64, span_km: f64) -> (f64, f64, f64,
     let east = (centre_lon + half_lon).clamp(-180.0, 180.0);
     (south, west, north, east)
 }
-
-/// The request for one box.
-pub fn request_url(bounds: (f64, f64, f64, f64)) -> String {
-    let (south, west, north, east) = bounds;
-    format!("{BASE}?bbox={south:.2},{west:.2},{north:.2},{east:.2}&format=json&hours={HOURS}")
-}
-
 /// Fetches the stations in a box.
 pub fn fetch(
     acquire: &Acquire,
     bounds: (f64, f64, f64, f64),
 ) -> Result<ObservationSet, ObservationError> {
+    let (south, west, north, east) = bounds;
+    let bbox = format!("{south:.2},{west:.2},{north:.2},{east:.2}");
     let document = acquire
-        .fetch(&RequestSpec::for_source(
+        .fetch_operation(
             &sources::AVIATION_WEATHER_METAR,
-            request_url(bounds),
-            "application/json",
-        ))
+            "box",
+            &[("bbox", bbox.as_str()), ("hours", "2")],
+        )
         .and_then(|fetched| fetched.json())
         .map_err(|source| ObservationError::Provider { source })?;
     parse(&document)
@@ -641,14 +633,6 @@ mod tests {
         assert!((north - south - 2.0 * MAX_SPAN_DEG).abs() < 0.001);
         let (south, _, north, _) = bounds(89.5, 0.0, 500.0);
         assert!(south >= -89.0 && north <= 89.0);
-    }
-
-    #[test]
-    fn the_request_names_the_box_and_the_hours() {
-        let url = request_url(bounds(39.0, -96.0, 200.0));
-        assert!(url.contains("bbox="), "{url}");
-        assert!(url.contains("format=json"), "{url}");
-        assert!(url.contains("hours=2"), "{url}");
     }
 
     #[test]

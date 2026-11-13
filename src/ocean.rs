@@ -29,7 +29,6 @@ use std::time::Instant;
 use serde_json::{Map, Value};
 
 use crate::acquire::Acquire;
-use crate::engine::RequestSpec;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
@@ -37,9 +36,6 @@ use crate::time;
 /// The provider, in the words the rail uses.
 pub const SOURCE: &str = "Open-Meteo marine, MeteoFrance and ECMWF waves";
 
-const BASE: &str = sources::OPEN_METEO_MARINE.endpoint;
-const HOURLY: &str = "wave_height,wave_direction,wave_period,swell_wave_height,sea_surface_temperature,ocean_current_velocity,ocean_current_direction";
-const FORECAST_DAYS: u8 = 3;
 /// The wave height at which the sea becomes rough under the Douglas scale.
 pub const ROUGH: f64 = 2.5;
 /// The wave height at which it becomes moderate.
@@ -326,22 +322,20 @@ pub fn parse(document: &Value) -> Result<Ocean, OceanError> {
         hours,
     })
 }
-
-/// The request for one point.
-pub fn request_url(latitude: f64, longitude: f64) -> String {
-    format!(
-        "{BASE}?latitude={latitude:.3}&longitude={longitude:.3}&hourly={HOURLY}&forecast_days={FORECAST_DAYS}&timezone=UTC&cell_selection=sea"
-    )
-}
-
 /// Fetches the marine forecast for one point.
 pub fn fetch(acquire: &Acquire, latitude: f64, longitude: f64) -> Result<Ocean, OceanError> {
+    let latitude_text = format!("{latitude:.3}");
+    let longitude_text = format!("{longitude:.3}");
     let document = acquire
-        .fetch(&RequestSpec::for_source(
+        .fetch_operation(
             &sources::OPEN_METEO_MARINE,
-            request_url(latitude, longitude),
-            "application/json",
-        ))
+            "ocean",
+            &[
+                ("latitude", latitude_text.as_str()),
+                ("longitude", longitude_text.as_str()),
+                ("forecast_days", "3"),
+            ],
+        )
         .and_then(|fetched| fetched.json())
         .map_err(|source| OceanError::Provider { source })?;
     parse(&document)
@@ -636,15 +630,5 @@ mod tests {
             return;
         };
         assert_eq!(record.hours[0].wave_from_deg, None);
-    }
-
-    #[test]
-    fn the_request_names_the_point_and_asks_for_sea_cells() {
-        let url = request_url(25.0, -80.0);
-        assert!(url.contains("latitude=25.000"), "{url}");
-        assert!(url.contains("wave_height"), "{url}");
-        assert!(url.contains("ocean_current_direction"), "{url}");
-        assert!(url.contains("cell_selection=sea"), "{url}");
-        assert!(url.contains("timezone=UTC"), "{url}");
     }
 }

@@ -29,7 +29,6 @@ use std::time::{Instant, SystemTimeError};
 use serde_json::Value;
 
 use crate::acquire::Acquire;
-use crate::engine::RequestSpec;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
@@ -37,7 +36,6 @@ use crate::time;
 /// The provider, in the words the rail uses.
 pub const SOURCE: &str = "Open-Meteo archive, ERA5 reanalysis";
 
-const BASE: &str = sources::OPEN_METEO_ARCHIVE.endpoint;
 /// The first year of the baseline the layer computes its own normals from.
 pub const BASELINE_START: i32 = 1991;
 /// The last year of that baseline.
@@ -366,19 +364,6 @@ fn date_text(day: i64) -> String {
     let (year, month, day) = time::civil_from_days(day);
     format!("{year:04}-{month:02}-{day:02}")
 }
-
-/// The request for one point: every day since the baseline began, up to the
-/// last day the archive is expected to hold.
-pub fn request_url(latitude: f64, longitude: f64, today: i64) -> String {
-    let start = time::days_from_civil(BASELINE_START, 1, 1);
-    let end = today - LAG_DAYS;
-    format!(
-        "{BASE}?latitude={latitude:.3}&longitude={longitude:.3}&start_date={}&end_date={}&daily=temperature_2m_mean,precipitation_sum&timezone=UTC",
-        date_text(start),
-        date_text(end)
-    )
-}
-
 /// Fetches the record for one point.
 pub fn fetch(
     acquire: &Acquire,
@@ -389,13 +374,23 @@ pub fn fetch(
     let today = i64::try_from(now / time::MS_PER_DAY).map_err(|_| ClimateError::Shape {
         detail: "a clock the archive dates can follow",
     })?;
-    let url = request_url(latitude, longitude, today);
+    let start = time::days_from_civil(BASELINE_START, 1, 1);
+    let end = today - LAG_DAYS;
+    let start_text = date_text(start);
+    let end_text = date_text(end);
+    let latitude_text = format!("{latitude:.3}");
+    let longitude_text = format!("{longitude:.3}");
     let document = acquire
-        .fetch(&RequestSpec::for_source(
+        .fetch_operation(
             &sources::OPEN_METEO_ARCHIVE,
-            &url,
-            "application/json",
-        ))
+            "climate",
+            &[
+                ("latitude", latitude_text.as_str()),
+                ("longitude", longitude_text.as_str()),
+                ("start_date", start_text.as_str()),
+                ("end_date", end_text.as_str()),
+            ],
+        )
         .and_then(|fetched| fetched.json())
         .map_err(|source| ClimateError::Provider { source })?;
     parse(&document)

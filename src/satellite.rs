@@ -24,7 +24,6 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::time::Duration;
 
 use eframe::egui::{self, Color32, Pos2, Rect, RichText, TextureHandle};
 
@@ -38,7 +37,6 @@ use crate::sources;
 use crate::theme::{self, Palette};
 use crate::time;
 
-const GIBS: &str = sources::NASA_GIBS.endpoint;
 const PROVIDER: &str = "NASA EOSDIS GIBS";
 const VIEW_TILE_LIMIT: usize = 9;
 const DAYS_BACK: u8 = 6;
@@ -154,13 +152,6 @@ impl Imagery {
         match self {
             Self::TrueColor => "image%2Fjpeg",
             _ => "image%2Fpng",
-        }
-    }
-
-    pub const fn content_type(self) -> &'static str {
-        match self {
-            Self::TrueColor => "image/jpeg",
-            _ => "image/png",
         }
     }
 
@@ -320,28 +311,6 @@ pub fn plan_view(
         tiles: grid.tiles,
     })
 }
-
-pub fn tile_url(imagery: Imagery, day: CalendarDay, tile: TileBounds) -> String {
-    // The provider's RESTful path answers a zeroed placeholder for these
-    // layers, so the request uses the same interface the capabilities document
-    // advertises for real tiles: KVP.
-    format!(
-        concat!(
-            "{}/wmts.cgi?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0",
-            "&LAYER={}&STYLE=default&TILEMATRIXSET=GoogleMapsCompatible_Level{}",
-            "&TILEMATRIX={}&TILEROW={}&TILECOL={}&FORMAT={}&TIME={}",
-        ),
-        GIBS,
-        imagery.layer(),
-        imagery.level(),
-        tile.zoom,
-        tile.y,
-        tile.x,
-        imagery.format(),
-        day.path()
-    )
-}
-
 /// A decoded tile with the geographic bounds it covers.
 #[derive(Debug)]
 pub struct TileImage {
@@ -404,17 +373,39 @@ impl SatelliteFeed {
                 let mut failed = 0;
                 let mut first_error = None;
                 for tile in &request.tiles {
-                    let url = tile_url(request.imagery, request.day, *tile);
-                    let spec = RequestSpec::for_source(
+                    let layer = String::from(request.imagery.layer());
+                    let level = request.imagery.level().to_string();
+                    let format = String::from(request.imagery.format());
+                    let day = request.day.path();
+                    let zoom = tile.zoom.to_string();
+                    let x = tile.x.to_string();
+                    let y = tile.y.to_string();
+                    let spec = match RequestSpec::for_operation(
                         &sources::NASA_GIBS,
-                        &url,
-                        request.imagery.content_type(),
-                    )
-                    .ttl(Duration::from_secs(86_400));
+                        "tile",
+                        &[
+                            ("layer", layer.as_str()),
+                            ("level", level.as_str()),
+                            ("format", format.as_str()),
+                            ("time", day.as_str()),
+                            ("zoom", zoom.as_str()),
+                            ("x", x.as_str()),
+                            ("y", y.as_str()),
+                        ],
+                    ) {
+                        Ok(spec) => spec,
+                        Err(source) => {
+                            failed += 1;
+                            if first_error.is_none() {
+                                first_error = Some(SatelliteError::Provider { source });
+                            }
+                            continue;
+                        }
+                    };
                     let decoded = acquire
                         .fetch(&spec)
                         .map_err(|source| SatelliteError::Provider { source })
-                        .and_then(|fetched| decode(&url, &fetched.body));
+                        .and_then(|fetched| decode(&fetched.provenance.url, &fetched.body));
                     match decoded {
                         Ok((width, height, rgba)) => {
                             loaded += 1;
@@ -894,18 +885,6 @@ fn key_for(bounds: &TileBounds) -> String {
 mod tests {
     use super::*;
 
-    fn tile(x: u32, y: u32) -> TileBounds {
-        TileBounds {
-            zoom: 6,
-            x,
-            y,
-            west: -180.0,
-            south: -80.0,
-            east: -170.0,
-            north: -70.0,
-        }
-    }
-
     #[test]
     fn each_product_names_its_layer_tile_set_and_format() {
         assert_eq!(
@@ -973,34 +952,6 @@ mod tests {
         assert_eq!(Imagery::LandSurfaceTemp.level(), 7);
         assert_eq!(Imagery::CloudTopHeight.level(), 6);
         assert_eq!(Imagery::Precipitation.level(), 6);
-    }
-
-    #[test]
-    fn a_tile_url_carries_the_layer_day_level_and_tile() {
-        let day = CalendarDay {
-            year: 2026,
-            month: 11,
-            day: 1,
-        };
-        let url = tile_url(Imagery::TrueColor, day, tile(3, 6));
-        assert!(url.starts_with(
-            "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/wmts.cgi?SERVICE=WMTS&REQUEST=GetTile"
-        ));
-        assert!(
-            url.contains("LAYER=MODIS_Terra_CorrectedReflectance_TrueColor"),
-            "{url}"
-        );
-        assert!(url.contains("STYLE=default"), "{url}");
-        assert!(
-            url.contains("TILEMATRIXSET=GoogleMapsCompatible_Level9"),
-            "{url}"
-        );
-        assert!(url.contains("TILEMATRIX=6&TILEROW=6&TILECOL=3"), "{url}");
-        assert!(url.contains("FORMAT=image%2Fjpeg"), "{url}");
-        assert!(url.contains("TIME=2026-11-01"), "{url}");
-        let ir = tile_url(Imagery::CloudTopTemp, day, tile(3, 6));
-        assert!(ir.contains("GoogleMapsCompatible_Level6"), "{ir}");
-        assert!(ir.contains("FORMAT=image%2Fpng"), "{ir}");
     }
 
     #[test]

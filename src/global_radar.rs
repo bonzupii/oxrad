@@ -23,7 +23,6 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::time::Duration;
 
 use serde_json::Value;
 
@@ -33,12 +32,14 @@ use crate::error::RadarError;
 use crate::provider::FetchError;
 use crate::sources;
 
-const ENDPOINT: &str = sources::RAINVIEWER.endpoint;
-const HOST_PREFIX: &str = "https://";
 const TILE_SIZE: u32 = 512;
 const COLOR_SCHEME: u8 = 2;
 const MAX_ZOOM: u8 = 7;
 const MAX_FRAMES: usize = 24;
+/// Decoded PNGs kept per worker so playback does not re-fetch or re-decode a
+/// frame tile it has already shown. This is playback frame state: it carries no
+/// TTL, retry or provenance and is cleared wholesale at the bound. The engine's
+/// response cache remains the owner of the hour-long request TTL.
 const MAX_CACHED_TILES: usize = 120;
 const MAX_VIEW_TILES: usize = 8;
 const EARTH_KM_PER_DEGREE: f64 = 111.32;
@@ -370,22 +371,37 @@ impl Worker {
                 if let Some(next) = self.next_request()? {
                     return Ok(Some(next));
                 }
-                let url = tile_url(&snapshot.host, frame, *bounds)?;
                 let key = cache_key(frame, *bounds);
                 let png = match self.tiles.remove(&key) {
                     Some(cached) => cached,
                     None => {
-                        let fetched = self
-                            .acquire
-                            .fetch(
-                                &RequestSpec::for_source(&sources::RAINVIEWER, &url, "image/png")
-                                    .ttl(Duration::from_secs(3600)),
-                            )
-                            .map_err(RadarError::from)?;
-                        fetched.body
+                        if !valid_host(&snapshot.host) || !valid_path(&frame.path) {
+                            return Err(GlobalRadarError::Shape {
+                                detail: "a valid tile host and frame path",
+                            });
+                        }
+                        let size = TILE_SIZE.to_string();
+                        let zoom = bounds.zoom.to_string();
+                        let x = bounds.x.to_string();
+                        let y = bounds.y.to_string();
+                        let spec = RequestSpec::for_operation(
+                            &sources::RAINVIEWER,
+                            "tile",
+                            &[
+                                ("host", snapshot.host.as_str()),
+                                ("path", frame.path.as_str()),
+                                ("size", size.as_str()),
+                                ("zoom", zoom.as_str()),
+                                ("x", x.as_str()),
+                                ("y", y.as_str()),
+                                ("scheme", &COLOR_SCHEME.to_string()),
+                            ],
+                        )
+                        .map_err(RadarError::from)?;
+                        self.acquire.fetch(&spec).map_err(RadarError::from)?.body
                     }
                 };
-                let image = decode_tile(&png, &url)?;
+                let image = decode_tile(&png, &frame.path)?;
                 if self.tiles.len() >= MAX_CACHED_TILES {
                     self.tiles.clear();
                 }
@@ -420,11 +436,7 @@ impl Worker {
     fn manifest(&mut self, generation: u64) -> Result<ManifestSnapshot, GlobalRadarError> {
         let fetched = self
             .acquire
-            .fetch(&RequestSpec::for_source(
-                &sources::RAINVIEWER,
-                ENDPOINT,
-                "application/json",
-            ))
+            .fetch_operation(&sources::RAINVIEWER, "manifest", &[])
             .map_err(RadarError::from)?;
         if let Some(message) = self.acquire.cache_error() {
             let _ = self.events.send(GlobalEvent::Notice {
@@ -449,7 +461,7 @@ fn parse_time(value: &Value, field: &'static str) -> Result<u64, GlobalRadarErro
 }
 
 fn valid_host(host: &str) -> bool {
-    let Some(name) = host.strip_prefix(HOST_PREFIX) else {
+    let Some(name) = host.strip_prefix(sources::HTTPS_SCHEME) else {
         return false;
     };
     !name.is_empty()
@@ -649,23 +661,6 @@ fn grid_at_zoom(
     }
     Ok(TileGrid { zoom, tiles })
 }
-
-fn tile_url(
-    host: &str,
-    frame: &GlobalFrame,
-    bounds: TileBounds,
-) -> Result<String, GlobalRadarError> {
-    if !valid_host(host) || !valid_path(&frame.path) {
-        return Err(GlobalRadarError::Shape {
-            detail: "a valid tile host and frame path",
-        });
-    }
-    Ok(format!(
-        "{host}{}/{TILE_SIZE}/{}/{}/{}/{COLOR_SCHEME}/1_1.png",
-        frame.path, bounds.zoom, bounds.x, bounds.y
-    ))
-}
-
 fn cache_key(frame: &GlobalFrame, bounds: TileBounds) -> String {
     format!(
         "{}:{}:{}:{}",

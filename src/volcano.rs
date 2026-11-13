@@ -32,25 +32,11 @@ use std::time::Instant;
 use serde_json::{Map, Value};
 
 use crate::acquire::Acquire;
-use crate::engine::RequestSpec;
 use crate::provider::FetchError;
 use crate::sources;
-
 /// The provider, in the words the rail uses.
 pub const SOURCE: &str = "USGS Volcano Hazards Program";
-fn elevated_url() -> String {
-    format!(
-        "{}/hans-public/api/volcano/getElevatedVolcanoes",
-        sources::USGS_VOLCANO.endpoint
-    )
-}
 
-fn record_url(vnum: &str) -> String {
-    format!(
-        "{}/hans-public/api/volcano/getVolcano/{vnum}",
-        sources::USGS_VOLCANO.endpoint
-    )
-}
 /// How many raised volcanoes are followed up for a position, so one busy day
 /// cannot turn into an unbounded burst of requests.
 pub const MAX_VOLCANOES: usize = 12;
@@ -343,33 +329,10 @@ pub fn plain_text(html: &str) -> String {
         .replace("&amp;", "&");
     decoded.split_whitespace().collect::<Vec<&str>>().join(" ")
 }
-
-/// The summary request.
-pub fn list_url() -> String {
-    elevated_url()
-}
-
-/// The request for one volcano's own record.
-pub fn volcano_url(vnum: &str) -> String {
-    record_url(vnum)
-}
-
-/// The notice that carries a volcano's latest statement.
-pub fn notice_url(notice_id: &str) -> String {
-    format!(
-        "{}/hans-public/api/notice/getNotice/{notice_id}",
-        sources::USGS_VOLCANO.endpoint
-    )
-}
-
-/// Fetches the raised volcanoes and follows each one up for its position.
+/// The notice that carries a volcano's latest statement./// Fetches the raised volcanoes and follows each one up for its position.
 pub fn fetch(acquire: &Acquire) -> Result<Report, VolcanoError> {
     let document = acquire
-        .fetch(&RequestSpec::for_source(
-            &sources::USGS_VOLCANO,
-            list_url(),
-            "application/json",
-        ))
+        .fetch_operation(&sources::USGS_VOLCANO, "list", &[])
         .and_then(|fetched| fetched.json())
         .map_err(|source| VolcanoError::Provider { source })?;
     let notices = parse_list(&document)?;
@@ -377,11 +340,11 @@ pub fn fetch(acquire: &Acquire) -> Result<Report, VolcanoError> {
     let mut volcanoes = Vec::with_capacity(notices.len().min(MAX_VOLCANOES));
     for notice in notices.into_iter().take(MAX_VOLCANOES) {
         let mut place = match acquire
-            .fetch(&RequestSpec::for_source(
+            .fetch_operation(
                 &sources::USGS_VOLCANO,
-                volcano_url(&notice.vnum),
-                "application/json",
-            ))
+                "volcano",
+                &[("vnum", notice.vnum.as_str())],
+            )
             .and_then(|fetched| fetched.json())
         {
             Ok(document) => parse_volcano(&document)?,
@@ -396,11 +359,11 @@ pub fn fetch(acquire: &Acquire) -> Result<Report, VolcanoError> {
         };
         if !notice.identifier.is_empty()
             && let Ok(document) = acquire
-                .fetch(&RequestSpec::for_source(
+                .fetch_operation(
                     &sources::USGS_VOLCANO,
-                    notice_url(&notice.identifier),
-                    "application/json",
-                ))
+                    "notice",
+                    &[("notice", notice.identifier.as_str())],
+                )
                 .and_then(|fetched| fetched.json())
         {
             place.summary = parse_synopsis(&document);
@@ -756,14 +719,5 @@ mod tests {
             vec![(Colour::Orange, 1), (Colour::Yellow, 1)]
         );
         assert_eq!(report.located().count(), 0);
-    }
-
-    #[test]
-    fn the_requests_name_the_volcano_and_its_notice() {
-        assert_eq!(
-            volcano_url("311120"),
-            "https://volcanoes.usgs.gov/hans-public/api/volcano/getVolcano/311120"
-        );
-        assert!(notice_url("DOI-USGS-AVO-1").ends_with("/DOI-USGS-AVO-1"));
     }
 }

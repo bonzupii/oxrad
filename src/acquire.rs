@@ -40,12 +40,6 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long one address may take to answer, so a dual-stack host with a dead
 /// IPv6 route does not hold up a request the working address answers at once.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-pub(crate) const USER_AGENT: &str = concat!(
-    "oxrad/",
-    env!("CARGO_PKG_VERSION"),
-    " (https://github.com/bonzupii/oxrad)"
-);
-
 /// A handle to the engine thread and the sources this configuration enables.
 #[derive(Clone)]
 pub struct Acquire {
@@ -94,6 +88,17 @@ impl Acquire {
             })
             .map_err(|_| FetchError::WorkerStopped)?;
         receiver.recv().map_err(|_| FetchError::WorkerStopped)?
+    }
+
+    /// Requests one named registry operation and returns its served body.
+    pub fn fetch_operation(
+        &self,
+        source: &'static Source,
+        operation: &'static str,
+        values: &[(&str, &str)],
+    ) -> Result<Fetched, FetchError> {
+        let spec = RequestSpec::for_operation(source, operation, values)?;
+        self.fetch(&spec)
     }
 
     /// The engine's request records, newest state per identity.
@@ -220,7 +225,7 @@ impl Acquire {
 
 fn live_get(url: &str, accept: &str, timeout: Duration, limit: u64) -> Result<Vec<u8>, FetchError> {
     let mut response = ureq::get(url)
-        .header("User-Agent", USER_AGENT)
+        .header("User-Agent", crate::sources::USER_AGENT)
         .header("Accept", accept)
         .config()
         .timeout_global(Some(timeout))

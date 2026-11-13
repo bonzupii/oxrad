@@ -27,6 +27,7 @@ use crate::global_radar::{
     self, DecodedTile, GlobalEvent, GlobalRadarError, GlobalRadarFeed, TileBounds, TileImage,
 };
 use crate::map::{self, MapView};
+use crate::sources;
 use crate::theme;
 use crate::time;
 
@@ -363,7 +364,7 @@ impl GlobalPanel {
                             RichText::new(global_radar::ATTRIBUTION)
                                 .size(theme::TYPE_SMALL)
                                 .weak(),
-                            "https://www.rainviewer.com/",
+                            sources::RAINVIEWER.home,
                         );
                     });
                 });

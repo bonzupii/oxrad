@@ -8,7 +8,6 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Duration;
 
 use eframe::egui::{self, Pos2, Rect};
 use walkers::sources::{Attribution, TileSource};
@@ -79,7 +78,6 @@ impl Error for TileError {
 
 struct Job {
     id: TileId,
-    url: String,
 }
 
 struct Completion {
@@ -102,7 +100,7 @@ fn start_worker(
     let (requests, receiver) = mpsc::channel::<Job>();
     std::thread::spawn(move || {
         while let Ok(job) = receiver.recv() {
-            let (result, warning) = load_tile(&acquire, &job.url);
+            let (result, warning) = load_tile(&acquire, job.id);
             if events
                 .send(Completion {
                     id: job.id,
@@ -122,14 +120,23 @@ fn start_worker(
     }
 }
 
-/// Reads a tile through the engine, which owns its cache and retries.
-fn load_tile(acquire: &Acquire, url: &str) -> (Result<Vec<u8>, TileError>, Option<TileError>) {
-    let spec = RequestSpec::for_source(
+/// Reads a tile through the engine, which owns the URL, cache and retries.
+fn load_tile(acquire: &Acquire, id: TileId) -> (Result<Vec<u8>, TileError>, Option<TileError>) {
+    let zoom = id.zoom.to_string();
+    let x = id.x.to_string();
+    let y = id.y.to_string();
+    let spec = match RequestSpec::for_operation(
         &sources::OPENFREEMAP,
-        url,
-        "application/vnd.mapbox-vector-tile",
-    )
-    .ttl(Duration::from_secs(86_400));
+        "tile",
+        &[
+            ("zoom", zoom.as_str()),
+            ("x", x.as_str()),
+            ("y", y.as_str()),
+        ],
+    ) {
+        Ok(spec) => spec,
+        Err(source) => return (Err(provider_error(source)), None),
+    };
     match acquire.fetch(&spec) {
         Ok(fetched) => (Ok(fetched.body), None),
         Err(source) => (Err(provider_error(source)), None),
@@ -355,10 +362,7 @@ impl<S: TileSource> BasemapTiles<S> {
         let Some(worker) = self.workers.iter_mut().find(|worker| worker.busy.is_none()) else {
             return;
         };
-        let job = Job {
-            id,
-            url: self.source.tile_url(id),
-        };
+        let job = Job { id };
         match worker.requests.send(job) {
             Ok(()) => worker.busy = Some(id),
             Err(_) => {

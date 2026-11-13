@@ -35,14 +35,12 @@ use std::time::Instant;
 use serde_json::Value;
 
 use crate::acquire::Acquire;
-use crate::engine::RequestSpec;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
 
 /// The provider, in the words the rail uses.
 pub const SOURCE: &str = "GDACS global disaster alerts";
-const BASE: &str = sources::GDACS.endpoint;
 /// How far back the list reaches, in days.
 pub const WINDOW_DAYS: i64 = 30;
 const MS_PER_DAY: u64 = 86_400_000;
@@ -313,27 +311,24 @@ fn text(object: &serde_json::Map<String, Value>, field: &str) -> Option<String> 
         .filter(|value| !value.is_empty())
         .map(String::from)
 }
-
-/// The request for the last `WINDOW_DAYS` days, as the service writes dates.
-pub fn request_url(now_ms: u64) -> Result<String, CycloneError> {
+/// Fetches the storms in the window.
+pub fn fetch(acquire: &Acquire, now_ms: u64) -> Result<StormList, CycloneError> {
     let day = i64::try_from(now_ms / MS_PER_DAY)
         .map_err(|_| shape("a timestamp that falls inside the calendar"))?;
     let from = day - WINDOW_DAYS;
     let (from_year, from_month, from_day) = time::civil_from_days(from);
     let (to_year, to_month, to_day) = time::civil_from_days(day);
-    Ok(format!(
-        "{BASE}?eventlist=TC&fromdate={from_month:02}/{from_day:02}/{from_year:04}&todate={to_month:02}/{to_day:02}/{to_year:04}"
-    ))
-}
-
-/// Fetches the storms in the window.
-pub fn fetch(acquire: &Acquire, now_ms: u64) -> Result<StormList, CycloneError> {
+    let from_text = format!("{from_month:02}/{from_day:02}/{from_year:04}");
+    let to_text = format!("{to_month:02}/{to_day:02}/{to_year:04}");
     let document = acquire
-        .fetch(&RequestSpec::for_source(
+        .fetch_operation(
             &sources::GDACS,
-            &request_url(now_ms)?,
-            "application/json",
-        ))
+            "search",
+            &[
+                ("from_date", from_text.as_str()),
+                ("to_date", to_text.as_str()),
+            ],
+        )
         .and_then(|fetched| fetched.json())
         .map_err(|source| CycloneError::Provider { source })?;
     parse(&document)
@@ -620,16 +615,6 @@ mod tests {
             wind.is_some_and(|wind| (wind - 108.0).abs() < 1e-9),
             "{wind:?}"
         );
-    }
-
-    #[test]
-    fn the_request_names_the_window_the_service_understands() -> Result<(), CycloneError> {
-        // 2026-11-02T00:00Z is day 20759, so the window opens on 2026-10-03.
-        let url = request_url(20_759 * MS_PER_DAY)?;
-        assert!(url.contains("fromdate=10/03/2026"), "{url}");
-        assert!(url.contains("todate=11/02/2026"), "{url}");
-        assert!(url.contains("eventlist=TC"), "{url}");
-        Ok(())
     }
 
     #[test]

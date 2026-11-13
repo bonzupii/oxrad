@@ -28,7 +28,6 @@ use std::time::Instant;
 use serde_json::{Map, Value};
 
 use crate::acquire::Acquire;
-use crate::engine::RequestSpec;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
@@ -36,10 +35,6 @@ use crate::time;
 /// The provider, in the words the rail uses.
 pub const SOURCE: &str = "Open-Meteo snow model";
 
-const BASE: &str = sources::OPEN_METEO_FORECAST.endpoint;
-const HOURLY: &str = "snow_depth,snowfall";
-const PAST_DAYS: u8 = 1;
-const FORECAST_DAYS: u8 = 3;
 /// The depth at which a snowpack is worth calling a snowpack.
 pub const DEEP_CM: f64 = 30.0;
 
@@ -258,22 +253,21 @@ pub fn parse(document: &Value) -> Result<Snowpack, SnowError> {
         hours,
     })
 }
-
-/// The request for one point.
-pub fn request_url(latitude: f64, longitude: f64) -> String {
-    format!(
-        "{BASE}?latitude={latitude:.3}&longitude={longitude:.3}&hourly={HOURLY}&past_days={PAST_DAYS}&forecast_days={FORECAST_DAYS}&timezone=UTC"
-    )
-}
-
 /// Fetches the snow model for one point.
 pub fn fetch(acquire: &Acquire, latitude: f64, longitude: f64) -> Result<Snowpack, SnowError> {
+    let latitude_text = format!("{latitude:.3}");
+    let longitude_text = format!("{longitude:.3}");
     let document = acquire
-        .fetch(&RequestSpec::for_source(
+        .fetch_operation(
             &sources::OPEN_METEO_FORECAST,
-            request_url(latitude, longitude),
-            "application/json",
-        ))
+            "snow",
+            &[
+                ("latitude", latitude_text.as_str()),
+                ("longitude", longitude_text.as_str()),
+                ("past_days", "1"),
+                ("forecast_days", "3"),
+            ],
+        )
         .and_then(|fetched| fetched.json())
         .map_err(|source| SnowError::Provider { source })?;
     parse(&document)
@@ -562,15 +556,5 @@ mod tests {
             return;
         };
         assert!(parse(&value).is_err());
-    }
-
-    #[test]
-    fn the_request_names_the_point_and_the_window() {
-        let url = request_url(46.5, 10.0);
-        assert!(url.contains("latitude=46.500"), "{url}");
-        assert!(url.contains("longitude=10.000"), "{url}");
-        assert!(url.contains("snow_depth"), "{url}");
-        assert!(url.contains("past_days=1"), "{url}");
-        assert!(url.contains("forecast_days=3"), "{url}");
     }
 }

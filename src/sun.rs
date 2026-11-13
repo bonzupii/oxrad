@@ -22,13 +22,10 @@ use eframe::egui::{self, RichText};
 use serde_json::Value;
 
 use crate::acquire::Acquire;
-use crate::engine::RequestSpec;
 use crate::provider::{self, FetchError};
 use crate::sources;
 use crate::theme;
 use crate::time;
-
-const BASE: &str = crate::sources::SUNRISE_SUNSET.endpoint;
 
 #[derive(Debug)]
 struct SunRecord {
@@ -42,35 +39,39 @@ struct SunRecord {
     solar_noon: Option<String>,
 }
 
-fn required_text<'a>(document: &'a Value, key: &'static str) -> Result<&'a str, FetchError> {
+fn required_text<'a>(
+    document: &'a Value,
+    key: &'static str,
+    url: &str,
+) -> Result<&'a str, FetchError> {
     document
         .get(key)
         .and_then(Value::as_str)
         .filter(|text| !text.is_empty())
         .ok_or_else(|| FetchError::Shape {
-            url: String::from(BASE),
+            url: String::from(url),
             field: key,
         })
 }
 
-fn event(document: &Value, key: &'static str) -> Result<Option<String>, FetchError> {
+fn event(document: &Value, key: &'static str, url: &str) -> Result<Option<String>, FetchError> {
     match document.get(key) {
         Some(Value::Null) => Ok(None),
         Some(Value::String(text)) if time::parse_iso_utc(text).is_some() => Ok(Some(text.clone())),
         Some(_) | None => Err(FetchError::Shape {
-            url: String::from(BASE),
+            url: String::from(url),
             field: key,
         }),
     }
 }
 
-fn parse(document: &Value) -> Result<SunRecord, FetchError> {
+fn parse(document: &Value, url: &str) -> Result<SunRecord, FetchError> {
     let latitude = document
         .get("lat")
         .and_then(Value::as_f64)
         .filter(|value| (-90.0..=90.0).contains(value))
         .ok_or_else(|| FetchError::Shape {
-            url: String::from(BASE),
+            url: String::from(url),
             field: "latitude",
         })?;
     let longitude = document
@@ -78,38 +79,41 @@ fn parse(document: &Value) -> Result<SunRecord, FetchError> {
         .and_then(Value::as_f64)
         .filter(|value| (-180.0..=180.0).contains(value))
         .ok_or_else(|| FetchError::Shape {
-            url: String::from(BASE),
+            url: String::from(url),
             field: "longitude",
         })?;
-    let status = required_text(document, "sun_status")?;
+    let status = required_text(document, "sun_status", url)?;
     if !matches!(status, "normal" | "midnight_sun" | "polar_night") {
         return Err(FetchError::Shape {
-            url: String::from(BASE),
+            url: String::from(url),
             field: "sun_status",
         });
     }
     Ok(SunRecord {
         latitude,
         longitude,
-        date: String::from(required_text(document, "date")?),
-        timezone: String::from(required_text(document, "tzid")?),
+        date: String::from(required_text(document, "date", url)?),
+        timezone: String::from(required_text(document, "tzid", url)?),
         status: String::from(status),
-        sunrise: event(document, "sunrise")?,
-        sunset: event(document, "sunset")?,
-        solar_noon: event(document, "solar_noon")?,
+        sunrise: event(document, "sunrise", url)?,
+        sunset: event(document, "sunset", url)?,
+        solar_noon: event(document, "solar_noon", url)?,
     })
 }
 
 fn fetch(acquire: &Acquire, latitude: f64, longitude: f64) -> Result<SunRecord, FetchError> {
-    let url = format!("{BASE}?lat={latitude:.4}&lng={longitude:.4}");
-    let document = acquire
-        .fetch(&RequestSpec::for_source(
-            &sources::SUNRISE_SUNSET,
-            &url,
-            "application/json",
-        ))
-        .and_then(|fetched| fetched.json())?;
-    parse(&document)
+    let latitude_text = format!("{latitude:.4}");
+    let longitude_text = format!("{longitude:.4}");
+    let fetched = acquire.fetch_operation(
+        &sources::SUNRISE_SUNSET,
+        "day",
+        &[
+            ("latitude", latitude_text.as_str()),
+            ("longitude", longitude_text.as_str()),
+        ],
+    )?;
+    let document = fetched.json()?;
+    parse(&document, &fetched.provenance.url)
 }
 
 /// User-initiated solar event requests and their last successful result.
@@ -239,7 +243,7 @@ mod tests {
 
     #[test]
     fn events_are_independently_nullable() -> Result<(), FetchError> {
-        let record = parse(&document())?;
+        let record = parse(&document(), sources::SUNRISE_SUNSET.endpoints[0].template)?;
         assert_eq!(record.sunrise.as_deref(), Some("2026-06-20T01:00:00+02:00"));
         assert_eq!(record.sunset, None);
         assert_eq!(record.timezone, "Europe/Oslo");
@@ -251,7 +255,7 @@ mod tests {
         let mut value = document();
         value["sunrise"] = serde_json::json!("not a timestamp");
         assert!(matches!(
-            parse(&value),
+            parse(&value, sources::SUNRISE_SUNSET.endpoints[0].template),
             Err(FetchError::Shape {
                 field: "sunrise",
                 ..
@@ -264,7 +268,7 @@ mod tests {
         let mut value = document();
         value["sun_status"] = serde_json::json!("unknown");
         assert!(matches!(
-            parse(&value),
+            parse(&value, sources::SUNRISE_SUNSET.endpoints[0].template),
             Err(FetchError::Shape {
                 field: "sun_status",
                 ..

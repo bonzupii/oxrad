@@ -11,7 +11,6 @@ use walkers::{Map, MapMemory, Style, TileId, TilePiece, Tiles};
 
 use crate::acquire::Acquire;
 use crate::basemap_tiles::BasemapTiles;
-use crate::engine::RequestSpec;
 use crate::map::MapView;
 use crate::paths;
 use crate::sources;
@@ -66,16 +65,13 @@ struct OpenFreeMap;
 
 impl TileSource for OpenFreeMap {
     fn tile_url(&self, tile: TileId) -> String {
-        format!(
-            "https://tiles.openfreemap.org/planet/latest/{}/{}/{}.pbf",
-            tile.zoom, tile.x, tile.y
-        )
+        sources::basemap_tile_url(tile.zoom, tile.x, tile.y)
     }
 
     fn attribution(&self) -> Attribution {
         Attribution {
             text: CREDIT,
-            url: "https://www.openstreetmap.org/copyright",
+            url: sources::openfreemap_attribution_url(),
             logo_light: None,
             logo_dark: None,
         }
@@ -128,13 +124,8 @@ enum StyleResult {
 }
 
 fn load_style(style: MapStyle, sender: &mpsc::Sender<StyleResult>, acquire: &Acquire) -> bool {
-    let url = format!("{}/styles/{}", sources::OPENFREEMAP.endpoint, style.token());
     let result = match acquire
-        .fetch(&RequestSpec::for_source(
-            &sources::OPENFREEMAP,
-            &url,
-            "application/json",
-        ))
+        .fetch_operation(&sources::OPENFREEMAP, "style", &[("style", style.token())])
         .and_then(|fetched| fetched.json())
     {
         Ok(document) if serde_json::from_value::<Style>(document.clone()).is_err() => {
@@ -222,7 +213,7 @@ impl Basemap {
                 self.missing_tiles
             ));
         }
-        ui.hyperlink_to(CREDIT, "https://www.openstreetmap.org/copyright");
+        ui.hyperlink_to(CREDIT, sources::openfreemap_attribution_url());
         (self.selected != previous).then_some(self.selected)
     }
 

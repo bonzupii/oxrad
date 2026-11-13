@@ -36,20 +36,17 @@ use std::time::Instant;
 use serde_json::{Map, Value};
 
 use crate::acquire::Acquire;
-use crate::engine::RequestSpec;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
 
 /// The provider, in the words the rail uses.
 pub const SOURCE: &str = "USGS National Water Information System";
-const BASE: &str = sources::USGS_WATER.endpoint;
 /// Gage height, in the provider's feet.
 pub const STAGE: &str = "00065";
 /// Discharge, in the provider's cubic feet per second.
 pub const DISCHARGE: &str = "00060";
 /// How much history the hydrograph asks for.
-const HISTORY_PERIOD: &str = "P7D";
 /// How long a gauge query may take.
 ///
 /// The water-services host answers a small box in half a minute on a busy day:
@@ -423,30 +420,12 @@ pub fn bounds(centre_lat: f64, centre_lon: f64, span_km: f64) -> (f64, f64, f64,
 /// square is sixteen square degrees, comfortably under the twenty-five the
 /// service allows.
 pub const MAX_HALF_DEG: f64 = 1.0;
-
-/// The request for the gauges in a box.
-pub fn request_url(bounds: (f64, f64, f64, f64)) -> String {
-    let (south, west, north, east) = bounds;
-    format!(
-        "{BASE}?format=json&bBox={west:.4},{south:.4},{east:.4},{north:.4}&parameterCd={STAGE},{DISCHARGE}&siteStatus=all"
-    )
-}
-
-/// The request for one gauge's week.
-pub fn history_url(site: &str) -> String {
-    format!(
-        "{BASE}?format=json&sites={site}&parameterCd={STAGE},{DISCHARGE}&period={HISTORY_PERIOD}"
-    )
-}
-
 /// Fetches the gauges in a box.
 pub fn fetch(acquire: &Acquire, bounds: (f64, f64, f64, f64)) -> Result<GaugeSet, GaugeError> {
+    let (south, west, north, east) = bounds;
+    let bbox = format!("{west:.4},{south:.4},{east:.4},{north:.4}");
     let document = acquire
-        .fetch(&RequestSpec::for_source(
-            &sources::USGS_WATER,
-            request_url(bounds),
-            "application/json",
-        ))
+        .fetch_operation(&sources::USGS_WATER, "box", &[("bbox", bbox.as_str())])
         .and_then(|fetched| fetched.json())
         .map_err(|source| GaugeError::Provider { source })?;
     parse(&document)
@@ -568,11 +547,7 @@ fn readings_of(entry: &Map<String, Value>) -> Vec<Reading> {
 /// Fetches one gauge's week.
 pub fn fetch_history(acquire: &Acquire, site: &str) -> Result<History, GaugeError> {
     let document = acquire
-        .fetch(&RequestSpec::for_source(
-            &sources::USGS_WATER,
-            history_url(site),
-            "application/json",
-        ))
+        .fetch_operation(&sources::USGS_WATER, "history", &[("site", site)])
         .and_then(|fetched| fetched.json())
         .map_err(|source| GaugeError::Provider { source })?;
     parse_history(&document, site)
@@ -1066,17 +1041,6 @@ mod tests {
         let (south, west, north, east) = bounds(60.0, 20.0, 900.0);
         let area = (north - south) * (east - west);
         assert!(area <= 25.0, "{area} square degrees at high latitude");
-    }
-
-    #[test]
-    fn the_requests_name_the_box_and_the_parameters() {
-        let url = request_url((37.0, -98.0, 38.0, -97.0));
-        assert!(
-            url.contains("bBox=-98.0000,37.0000,-97.0000,38.0000"),
-            "{url}"
-        );
-        assert!(url.contains("parameterCd=00065,00060"), "{url}");
-        assert!(history_url("07144570").contains("sites=07144570"));
     }
 
     #[test]

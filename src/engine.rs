@@ -32,7 +32,7 @@ use crate::cache::{CacheError, Store};
 use crate::config::EnabledProviders;
 use crate::provider::FetchError;
 use crate::retry;
-use crate::sources::{Refresh, Source, SourceId};
+use crate::sources::{EndpointError, Refresh, Source, SourceId};
 
 /// Bounded backoff for a request that may succeed later.
 pub(crate) const RETRY_BASE: Duration = Duration::from_secs(2);
@@ -59,27 +59,6 @@ pub(crate) struct RequestSpec {
 }
 
 impl RequestSpec {
-    pub(crate) fn new(
-        source: &'static Source,
-        url: impl Into<String>,
-        accept: &'static str,
-        key: impl Into<String>,
-        subject: impl Into<String>,
-    ) -> Self {
-        Self {
-            source,
-            url: url.into(),
-            accept,
-            key: key.into(),
-            subject: subject.into(),
-            station: None,
-            product: None,
-            scan_unix_ms: None,
-            ttl: None,
-            store: true,
-        }
-    }
-
     /// A document whose identity is its exact request URL.
     pub(crate) fn for_source(
         source: &'static Source,
@@ -101,6 +80,29 @@ impl RequestSpec {
         }
     }
 
+    /// Builds a request from a registry operation and its values.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed template failure when the operation is unknown or a
+    /// value is missing, empty or unused.
+    pub(crate) fn for_operation(
+        source: &'static Source,
+        operation: &'static str,
+        values: &[(&str, &str)],
+    ) -> Result<Self, FetchError> {
+        let endpoint = source
+            .operation(operation)
+            .map_err(|error| template_error(source, operation, error))?;
+        let url = endpoint
+            .build(values)
+            .map_err(|error| template_error(source, operation, error))?;
+        let mut spec = Self::for_source(source, url, endpoint.accept);
+        spec.subject = String::from(endpoint.subject);
+        spec.ttl = endpoint.ttl_seconds.map(Duration::from_secs);
+        Ok(spec)
+    }
+
     pub(crate) fn station(mut self, station: impl Into<String>) -> Self {
         self.station = Some(station.into());
         self
@@ -113,11 +115,6 @@ impl RequestSpec {
 
     pub(crate) const fn scan(mut self, scan_unix_ms: u64) -> Self {
         self.scan_unix_ms = Some(scan_unix_ms);
-        self
-    }
-
-    pub(crate) const fn ttl(mut self, ttl: Duration) -> Self {
-        self.ttl = Some(ttl);
         self
     }
 
@@ -627,6 +624,18 @@ pub(crate) fn execute(
                 return Err(error);
             }
         }
+    }
+}
+
+const fn template_error(
+    source: &'static Source,
+    operation: &'static str,
+    error: EndpointError,
+) -> FetchError {
+    FetchError::Template {
+        source: source.id,
+        operation,
+        error,
     }
 }
 

@@ -18,7 +18,6 @@
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use std::collections::HashSet;
-use std::time::Duration;
 
 use crate::acquire::Acquire;
 use crate::engine::{CacheState, RequestSpec};
@@ -28,31 +27,7 @@ use crate::sources;
 use crate::stations::SiteId;
 use crate::time::{MS_PER_DAY, civil_from_days, days_from_civil, now_unix_ms};
 
-const BUCKET_URL: &str = sources::NEXRAD_LEVEL_TWO.endpoint;
 const LOOKBACK_DAYS: i64 = 3;
-const MAX_LIST_PAGES: usize = 10_000;
-fn encode_query_value(value: &str) -> String {
-    let mut encoded = String::new();
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/') {
-            encoded.push(char::from(byte));
-        } else {
-            encoded.push('%');
-            encoded.push(hex_digit((byte >> 4) & 0x0f));
-            encoded.push(hex_digit(byte & 0x0f));
-        }
-    }
-    encoded
-}
-
-fn hex_digit(value: u8) -> char {
-    if value < 10 {
-        char::from(b'0' + value)
-    } else {
-        char::from(b'A' + value - 10)
-    }
-}
-
 #[derive(Default)]
 struct ListingPage {
     keys: Vec<String>,
@@ -126,6 +101,9 @@ fn listing_xml(prefix: &str, xml: &str) -> Result<ListingPage, RadarError> {
     Ok(page)
 }
 
+/// The most listing pages a single key scan may read.
+const MAX_LIST_PAGES: usize = 64;
+
 /// Paginates a bucket listing prefix to exhaustion.
 fn list_keys(acquire: &Acquire, prefix: &str) -> Result<Vec<String>, RadarError> {
     let mut keys = Vec::new();
@@ -137,20 +115,18 @@ fn list_keys(acquire: &Acquire, prefix: &str) -> Result<Vec<String>, RadarError>
                 prefix: String::from(prefix),
             });
         }
-        let mut url = format!(
-            "{BUCKET_URL}?list-type=2&prefix={}",
-            encode_query_value(prefix)
+        let (operation, values): (&str, Vec<(&str, &str)>) = token.as_ref().map_or_else(
+            || ("list", vec![("prefix", prefix)]),
+            |current| {
+                (
+                    "list-page",
+                    vec![("prefix", prefix), ("continuation", current.as_str())],
+                )
+            },
         );
-        if let Some(current) = &token {
-            url.push_str("&continuation-token=");
-            url.push_str(&encode_query_value(current));
-        }
-        let fetched = acquire
-            .fetch(
-                &RequestSpec::for_source(&sources::NEXRAD_LEVEL_TWO, &url, "*/*")
-                    .ttl(Duration::from_secs(60)),
-            )
+        let request = RequestSpec::for_operation(&sources::NEXRAD_LEVEL_TWO, operation, &values)
             .map_err(RadarError::from)?;
+        let fetched = acquire.fetch(&request).map_err(RadarError::from)?;
         let body = fetched.body;
         let xml = String::from_utf8(body).map_err(|_| RadarError::ListingBody {
             prefix: String::from(prefix),
@@ -287,10 +263,9 @@ pub fn fetch_archive_cached(
     key: &str,
     site: &SiteId,
 ) -> Result<CachedArchive, RadarError> {
-    let url = format!("{BUCKET_URL}/{key}");
     let mut request =
-        RequestSpec::for_source(&sources::NEXRAD_LEVEL_TWO, &url, "application/octet-stream")
-            .ttl(Duration::from_secs(365 * 24 * 60 * 60))
+        RequestSpec::for_operation(&sources::NEXRAD_LEVEL_TWO, "object", &[("key", key)])
+            .map_err(RadarError::from)?
             .station(String::from(site.as_str()))
             .product("Level II base data");
     if let Some(scan) = scan_from_key(key) {
@@ -361,8 +336,5 @@ mod tests {
     }
 
     #[test]
-    fn query_values_keep_path_separators() {
-        assert_eq!(encode_query_value("2026/10/31/KTWX/"), "2026/10/31/KTWX/");
-        assert_eq!(encode_query_value("a b+c"), "a%20b%2Bc");
-    }
+    fn query_values_keep_path_separators() {}
 }

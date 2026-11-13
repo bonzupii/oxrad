@@ -29,20 +29,12 @@ use std::time::Instant;
 use serde_json::{Map, Value};
 
 use crate::acquire::Acquire;
-use crate::engine::RequestSpec;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
 
 /// The provider, in the words the rail uses.
 pub const SOURCE: &str = "Open-Meteo, CAMS modelled concentrations";
-
-const BASE: &str = sources::OPEN_METEO_AIR.endpoint;
-const CURRENT_FIELDS: &str =
-    "us_aqi,european_aqi,pm2_5,pm10,ozone,nitrogen_dioxide,sulphur_dioxide,carbon_monoxide";
-const HOURLY_FIELDS: &str = "pm2_5,us_aqi";
-const PAST_DAYS: u8 = 1;
-const FORECAST_DAYS: u8 = 2;
 
 /// The United States air-quality index band a concentration falls in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -348,23 +340,21 @@ pub fn parse(document: &Value) -> Result<AirQuality, AirError> {
         hours,
     })
 }
-
-/// The request for one point.
-pub fn request_url(latitude: f64, longitude: f64) -> String {
-    format!(
-        "{BASE}?latitude={latitude:.3}&longitude={longitude:.3}&current={CURRENT_FIELDS}&hourly={HOURLY_FIELDS}&timezone=UTC&past_days={PAST_DAYS}&forecast_days={FORECAST_DAYS}"
-    )
-}
-
 /// Fetches the record for one point.
 pub fn fetch(acquire: &Acquire, latitude: f64, longitude: f64) -> Result<AirQuality, AirError> {
-    let url = request_url(latitude, longitude);
+    let latitude_text = format!("{latitude:.3}");
+    let longitude_text = format!("{longitude:.3}");
     let document = acquire
-        .fetch(&RequestSpec::for_source(
+        .fetch_operation(
             &sources::OPEN_METEO_AIR,
-            &url,
-            "application/json",
-        ))
+            "quality",
+            &[
+                ("latitude", latitude_text.as_str()),
+                ("longitude", longitude_text.as_str()),
+                ("past_days", "1"),
+                ("forecast_days", "2"),
+            ],
+        )
         .and_then(|fetched| fetched.json())
         .map_err(|source| AirError::Provider { source })?;
     parse(&document)
@@ -682,16 +672,5 @@ mod tests {
         assert_eq!(record.current.time_ms % 3_600_000, 0);
         assert_eq!(record.hours[0].time_ms + 3_600_000, record.hours[1].time_ms);
         Ok(())
-    }
-
-    #[test]
-    fn the_request_names_the_point_and_the_hours_it_wants() {
-        let url = request_url(39.0, -96.2345);
-        assert!(url.contains("latitude=39.000"), "{url}");
-        assert!(url.contains("longitude=-96.234"), "{url}");
-        assert!(url.contains("us_aqi"), "{url}");
-        assert!(url.contains("timezone=UTC"), "{url}");
-        assert!(url.contains("past_days=1"), "{url}");
-        assert!(url.contains("forecast_days=2"), "{url}");
     }
 }

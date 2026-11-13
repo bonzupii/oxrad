@@ -26,12 +26,10 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use serde_json::Value;
 
 use crate::acquire::Acquire;
-use crate::engine::RequestSpec;
 use crate::place::Place;
 use crate::provider::FetchError;
 use crate::sources;
 
-const OPEN_METEO: &str = sources::OPEN_METEO_FORECAST.endpoint;
 const FORECAST_DAYS: u8 = 7;
 const HOURLY_LIMIT: usize = 24;
 const PROVIDER: &str = "Open-Meteo";
@@ -119,26 +117,6 @@ impl Error for ForecastError {
 const fn shape(field: &'static str) -> ForecastError {
     ForecastError::Shape { field }
 }
-
-/// The forecast request for the place's own coordinates.
-pub fn request_url(place: &Place) -> Result<String, ForecastError> {
-    if !place.lat.is_finite() || !(-90.0..=90.0).contains(&place.lat) {
-        return Err(shape("place latitude"));
-    }
-    if !place.lon.is_finite() || !(-180.0..=180.0).contains(&place.lon) {
-        return Err(shape("place longitude"));
-    }
-    Ok(format!(
-        "{OPEN_METEO}?latitude={:.4}&longitude={:.4}\
-         &current=temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,weather_code,wind_speed_10m,wind_direction_10m\
-         &hourly=temperature_2m,precipitation_probability,weather_code,wind_speed_10m\
-         &daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max\
-         &temperature_unit=celsius&wind_speed_unit=kmh&precipitation_unit=mm\
-         &timezone=auto&forecast_days={FORECAST_DAYS}",
-        place.lat, place.lon
-    ))
-}
-
 fn object<'a>(value: &'a Value, field: &'static str) -> Result<&'a Value, ForecastError> {
     value
         .get(field)
@@ -413,13 +391,18 @@ fn parse_document(place: &Place, document: &Value) -> Result<Forecast, ForecastE
 
 /// Fetches the global forecast for the place, using only its coordinates.
 pub fn fetch(acquire: &Acquire, place: &Place) -> Result<Forecast, ForecastError> {
-    let url = request_url(place)?;
+    let latitude_text = format!("{:.4}", place.lat);
+    let longitude_text = format!("{:.4}", place.lon);
     let document = acquire
-        .fetch(&RequestSpec::for_source(
+        .fetch_operation(
             &sources::OPEN_METEO_FORECAST,
-            &url,
-            "application/json",
-        ))
+            "forecast",
+            &[
+                ("latitude", latitude_text.as_str()),
+                ("longitude", longitude_text.as_str()),
+                ("forecast_days", "7"),
+            ],
+        )
         .and_then(|fetched| fetched.json())
         .map_err(|source| ForecastError::Provider { source })?;
     parse_document(place, &document)
@@ -693,23 +676,6 @@ mod tests {
             forecast.state(),
             ForecastState::Loading { place, .. } if place.name == "Emporia"
         ));
-        Ok(())
-    }
-
-    #[test]
-    fn the_forecast_request_uses_the_town_coordinates() -> Result<(), TestError> {
-        let place = emporia()?;
-        let url = request_url(&place)?;
-        assert!(url.contains("38.4039"), "request URL {url}");
-        assert!(url.contains("-96.1817"), "request URL {url}");
-        assert!(
-            !url.contains("38.9969"),
-            "the request must not use the KTWX station latitude"
-        );
-        assert!(
-            !url.contains("-96.2325"),
-            "the request must not use the KTWX station longitude"
-        );
         Ok(())
     }
 

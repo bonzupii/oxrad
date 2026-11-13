@@ -30,17 +30,12 @@ use std::time::Instant;
 use serde_json::{Map, Value};
 
 use crate::acquire::Acquire;
-use crate::engine::RequestSpec;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
 
 /// The provider, in the words the rail uses.
 pub const SOURCE: &str = "Open-Meteo land surface";
-const BASE: &str = sources::OPEN_METEO_FORECAST.endpoint;
-const HOURLY: &str = "soil_moisture_0_to_10cm,soil_moisture_10_to_40cm,soil_temperature_6cm,et0_fao_evapotranspiration,vapour_pressure_deficit,shortwave_radiation,direct_normal_irradiance,uv_index";
-const PAST_DAYS: u8 = 1;
-const FORECAST_DAYS: u8 = 2;
 /// The volumetric water content at which a soil is treated as dry, as a rule
 /// of thumb for a loam. It is not a drought index.
 pub const DRY: f64 = 0.18;
@@ -316,22 +311,21 @@ pub fn parse(document: &Value) -> Result<Land, LandError> {
         hours,
     })
 }
-
-/// The request for one point.
-pub fn request_url(latitude: f64, longitude: f64) -> String {
-    format!(
-        "{BASE}?latitude={latitude:.3}&longitude={longitude:.3}&hourly={HOURLY}&past_days={PAST_DAYS}&forecast_days={FORECAST_DAYS}&timezone=UTC"
-    )
-}
-
 /// Fetches the land surface for one point.
 pub fn fetch(acquire: &Acquire, latitude: f64, longitude: f64) -> Result<Land, LandError> {
+    let latitude_text = format!("{latitude:.3}");
+    let longitude_text = format!("{longitude:.3}");
     let document = acquire
-        .fetch(&RequestSpec::for_source(
+        .fetch_operation(
             &sources::OPEN_METEO_FORECAST,
-            request_url(latitude, longitude),
-            "application/json",
-        ))
+            "land",
+            &[
+                ("latitude", latitude_text.as_str()),
+                ("longitude", longitude_text.as_str()),
+                ("past_days", "1"),
+                ("forecast_days", "2"),
+            ],
+        )
         .and_then(|fetched| fetched.json())
         .map_err(|source| LandError::Provider { source })?;
     parse(&document)
@@ -619,15 +613,5 @@ mod tests {
             record.hours.first().and_then(|hour| hour.moisture_top),
             None
         );
-    }
-
-    #[test]
-    fn the_request_asks_for_the_soil_and_the_sun() {
-        let url = request_url(37.2, -97.5);
-        assert!(url.contains("soil_moisture_0_to_10cm"), "{url}");
-        assert!(url.contains("soil_moisture_10_to_40cm"), "{url}");
-        assert!(url.contains("et0_fao_evapotranspiration"), "{url}");
-        assert!(url.contains("uv_index"), "{url}");
-        assert!(url.contains("past_days=1"), "{url}");
     }
 }

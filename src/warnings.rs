@@ -26,17 +26,8 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use serde_json::Value;
 
 use crate::acquire::Acquire;
-use crate::engine::RequestSpec;
 use crate::provider::FetchError;
 use crate::sources;
-
-fn alerts_url() -> String {
-    format!(
-        "{}/alerts/active?status=actual&message_type=alert",
-        sources::NWS_API.endpoint
-    )
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
     Extreme,
@@ -342,11 +333,7 @@ fn parse_collection(document: &Value) -> Result<WarningSet, WarningError> {
 /// Retrieves and parses the current active warning collection.
 pub fn fetch(acquire: &Acquire) -> Result<WarningSet, WarningError> {
     let document = acquire
-        .fetch(&RequestSpec::for_source(
-            &sources::NWS_API,
-            alerts_url(),
-            "application/geo+json",
-        ))
+        .fetch_operation(&sources::NWS_API, "alerts", &[])
         .and_then(|fetched| fetched.json())?;
     parse_collection(&document)
 }

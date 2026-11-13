@@ -30,7 +30,6 @@ use std::time::Instant;
 use serde_json::{Map, Value};
 
 use crate::acquire::Acquire;
-use crate::engine::RequestSpec;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
@@ -38,7 +37,6 @@ use crate::time;
 /// The provider, in the words the rail uses.
 pub const SOURCE: &str = "Open-Meteo forecast, pressure levels";
 
-const BASE: &str = sources::OPEN_METEO_FORECAST.endpoint;
 /// The pressure levels the profile asks for, in hectopascals.
 pub const LEVELS: [u16; 12] = [1000, 975, 925, 850, 800, 700, 600, 500, 400, 300, 250, 200];
 /// Gravity, for the precipitable-water integral.
@@ -654,27 +652,25 @@ fn fields() -> String {
     }
     list.join(",")
 }
-
-/// The request for one point.
-pub fn request_url(latitude: f64, longitude: f64) -> String {
-    format!(
-        "{BASE}?latitude={latitude:.3}&longitude={longitude:.3}&hourly={}&wind_speed_unit=ms&forecast_days=1&timezone=UTC",
-        fields()
-    )
-}
-
 /// Fetches the profile for one point.
 pub fn fetch(acquire: &Acquire, latitude: f64, longitude: f64) -> Result<Sounding, SoundingError> {
     let now_ms = match time::now_unix_ms() {
         Ok(now_ms) => now_ms,
         Err(_) => return Err(shape("a readable system clock to pick the hour")),
     };
+    let latitude_text = format!("{latitude:.3}");
+    let longitude_text = format!("{longitude:.3}");
+    let hourly = fields();
     let document = acquire
-        .fetch(&RequestSpec::for_source(
+        .fetch_operation(
             &sources::OPEN_METEO_FORECAST,
-            request_url(latitude, longitude),
-            "application/json",
-        ))
+            "sounding",
+            &[
+                ("latitude", latitude_text.as_str()),
+                ("longitude", longitude_text.as_str()),
+                ("hourly", hourly.as_str()),
+            ],
+        )
         .and_then(|fetched| fetched.json())
         .map_err(|source| SoundingError::Provider { source })?;
     parse(&document, now_ms)
@@ -1091,20 +1087,6 @@ mod tests {
         // 3.5 °C at 3105 m down to -13.5 °C at 5705 m is 17 K over 2.6 km.
         assert!((6.0..=7.0).contains(&rate), "{rate}");
         Ok(())
-    }
-
-    #[test]
-    fn the_request_names_every_level_it_needs() {
-        let url = request_url(37.2, -97.5);
-        for level in LEVELS {
-            assert!(url.contains(&format!("temperature_{level}hPa")), "{level}");
-            assert!(
-                url.contains(&format!("wind_direction_{level}hPa")),
-                "{level}"
-            );
-        }
-        assert!(url.contains("wind_speed_unit=ms"), "{url}");
-        assert!(url.contains("surface_pressure"), "{url}");
     }
 
     #[test]

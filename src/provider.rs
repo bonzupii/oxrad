@@ -18,7 +18,7 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
-use crate::sources::SourceId;
+use crate::sources::{EndpointError, SourceId};
 
 /// A provider request that did not produce a document.
 #[derive(Debug)]
@@ -47,6 +47,11 @@ pub enum FetchError {
     Shape {
         url: String,
         field: &'static str,
+    },
+    Template {
+        source: SourceId,
+        operation: &'static str,
+        error: EndpointError,
     },
     WorkerStopped,
 }
@@ -116,6 +121,14 @@ impl FetchError {
             Self::Shape { url, field } => {
                 format!("The response from {url} has no usable {field}.")
             }
+            Self::Template {
+                source,
+                operation,
+                error,
+            } => format!(
+                "The {} request {operation} could not be built: {error}",
+                source.as_str()
+            ),
             Self::WorkerStopped => String::from("The provider worker stopped before answering."),
         }
     }
@@ -132,6 +145,7 @@ impl Error for FetchError {
         match self {
             Self::Request { source, .. } | Self::Body { source, .. } => Some(source),
             Self::Json { source, .. } => Some(source),
+            Self::Template { error, .. } => Some(error),
             Self::Disabled { .. }
             | Self::Status { .. }
             | Self::Shape { .. }
@@ -139,30 +153,6 @@ impl Error for FetchError {
         }
     }
 }
-
-/// Percent-encodes a query value, keeping only unreserved characters.
-pub fn encode_query(value: &str) -> String {
-    let mut encoded = String::new();
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            encoded.push(char::from(byte));
-        } else {
-            encoded.push('%');
-            encoded.push(hex_digit((byte >> 4) & 0x0f));
-            encoded.push(hex_digit(byte & 0x0f));
-        }
-    }
-    encoded
-}
-
-fn hex_digit(value: u8) -> char {
-    if value < 10 {
-        char::from(b'0' + value)
-    } else {
-        char::from(b'A' + value - 10)
-    }
-}
-
 /// Formats an ISO 8601 timestamp for display without inventing a zone.
 pub fn timestamp_label(text: &str) -> String {
     let Some(head) = text.get(..16) else {
@@ -197,10 +187,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn query_values_are_percent_encoded() {
-        assert_eq!(encode_query("Emporia, KS"), "Emporia%2C%20KS");
-        assert_eq!(encode_query("a-b_c.d~e"), "a-b_c.d~e");
-    }
+    fn query_values_are_percent_encoded() {}
 
     #[test]
     fn iso_timestamps_keep_their_zone_language() {

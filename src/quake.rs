@@ -28,7 +28,6 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use serde_json::Value;
 
 use crate::acquire::Acquire;
-use crate::engine::RequestSpec;
 use crate::provider::FetchError;
 use crate::sources;
 
@@ -178,15 +177,6 @@ impl Error for QuakeError {
         }
     }
 }
-
-pub fn request_url(window: Window) -> String {
-    format!(
-        "{}/earthquakes/feed/v1.0/summary/{}.geojson",
-        sources::USGS_EARTHQUAKES.endpoint,
-        window.slug()
-    )
-}
-
 fn number(value: &Value, field: &'static str) -> Result<f64, QuakeError> {
     value
         .get(field)
@@ -343,13 +333,12 @@ pub fn parse(window: Window, document: &Value) -> Result<Quakes, QuakeError> {
 }
 
 pub fn fetch(acquire: &Acquire, window: Window) -> Result<Quakes, QuakeError> {
-    let url = request_url(window);
     let document = acquire
-        .fetch(&RequestSpec::for_source(
+        .fetch_operation(
             &sources::USGS_EARTHQUAKES,
-            &url,
-            "application/geo+json",
-        ))
+            "feed",
+            &[("window", window.slug())],
+        )
         .and_then(|fetched| fetched.json())
         .map_err(|source| QuakeError::Provider { source })?;
     parse(window, &document)
@@ -674,14 +663,6 @@ mod tests {
         assert!(quakes.events.is_empty());
         assert_eq!(quakes.unreadable, 1);
         Ok(())
-    }
-
-    #[test]
-    fn each_window_requests_its_own_feed() {
-        assert!(request_url(Window::Hour).ends_with("/all_hour.geojson"));
-        assert!(request_url(Window::Day).ends_with("/2.5_day.geojson"));
-        assert!(request_url(Window::Week).ends_with("/4.5_week.geojson"));
-        assert!(request_url(Window::Day).starts_with("https://earthquake.usgs.gov/"));
     }
 
     #[test]

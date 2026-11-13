@@ -28,14 +28,12 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::Instant;
 
 use crate::acquire::Acquire;
-use crate::engine::RequestSpec;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
 
 /// The provider, in the words the rail uses.
 pub const SOURCE: &str = "NSIDC Sea Ice Index v4";
-const BASE: &str = sources::NSIDC_SEA_ICE.endpoint;
 /// The baseline the anomaly is taken against.
 pub const BASELINE_FROM: i32 = 1981;
 pub const BASELINE_TO: i32 = 2010;
@@ -249,19 +247,6 @@ pub struct SeaIce {
     pub north: SeaIceMonth,
     pub south: SeaIceMonth,
 }
-
-/// The request for one month of one hemisphere.
-pub fn request_url(hemisphere: Hemisphere, month: u32) -> String {
-    let folder = match hemisphere {
-        Hemisphere::North => "north",
-        Hemisphere::South => "south",
-    };
-    format!(
-        "{BASE}/{folder}/monthly/data/{}_{month:02}_extent_v4.0.csv",
-        hemisphere.code()
-    )
-}
-
 /// Fetches both hemispheres for one calendar month.
 pub fn fetch(acquire: &Acquire, month: u32) -> Result<SeaIce, SeaIceError> {
     let north = fetch_one(acquire, Hemisphere::North, month)?;
@@ -278,12 +263,22 @@ fn fetch_one(
     hemisphere: Hemisphere,
     month: u32,
 ) -> Result<SeaIceMonth, SeaIceError> {
+    let folder = match hemisphere {
+        Hemisphere::North => "north",
+        Hemisphere::South => "south",
+    };
+    let month_text = format!("{month:02}");
+    let code = hemisphere.code().to_string();
     let text = acquire
-        .fetch(&RequestSpec::for_source(
+        .fetch_operation(
             &sources::NSIDC_SEA_ICE,
-            request_url(hemisphere, month),
-            "text/csv",
-        ))
+            "month",
+            &[
+                ("hemisphere", folder),
+                ("code", code.as_str()),
+                ("month", month_text.as_str()),
+            ],
+        )
         .and_then(|fetched| fetched.text())
         .map_err(|source| SeaIceError::Provider { source })?;
     parse(&text, hemisphere)
@@ -540,17 +535,6 @@ mod tests {
         // 8.77 is the smallest of the six years, so it is the first.
         assert_eq!(record.rank_from_lowest(), Some(1));
         assert_eq!(record.smallest().map(|year| year.year), Some(2025));
-    }
-
-    #[test]
-    fn the_request_names_the_month_and_hemisphere() {
-        assert!(
-            request_url(Hemisphere::North, 11)
-                .ends_with("/north/monthly/data/N_11_extent_v4.0.csv")
-        );
-        assert!(
-            request_url(Hemisphere::South, 3).ends_with("/south/monthly/data/S_03_extent_v4.0.csv")
-        );
     }
 
     #[test]

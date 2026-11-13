@@ -27,7 +27,6 @@ use std::sync::mpsc::Receiver;
 use serde_json::Value;
 
 use crate::acquire::Acquire;
-use crate::engine::RequestSpec;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
@@ -35,13 +34,10 @@ use crate::time;
 /// The provider, in the words the rail uses.
 pub const SOURCE: &str = "NIFC WFIGS interagency perimeters";
 
-const BASE: &str = sources::NIFC_WFIGS.endpoint;
 /// The fields the layer reads, so the service does not ship every attribute it
 /// keeps for an incident.
-const FIELDS: &str = "poly_IncidentName,poly_GISAcres,attr_PercentContained,attr_IncidentTypeCategory,attr_POOState,poly_PolygonDateTime";
 /// A perimeter is simplified to this many degrees before it is sent, which
 /// keeps a national answer to a few hundred kilobytes without moving a fire.
-const SIMPLIFY_DEGREES: f64 = 0.01;
 /// The shortest ring worth drawing.
 const MIN_RING_POINTS: usize = 4;
 
@@ -316,25 +312,10 @@ pub fn parse(document: &Value) -> Result<FireSet, FireError> {
         rejected,
     })
 }
-
-/// The request for every current perimeter.
-pub fn request_url() -> String {
-    format!(
-        "{BASE}?where=1%3D1&outFields={FIELDS}&outSR=4326&geometryPrecision=4&maxAllowableOffset={SIMPLIFY_DEGREES}&f=geojson"
-    )
-}
-
 /// Fetches every current perimeter through the request engine.
 pub fn fetch(acquire: &Acquire) -> Result<FireSet, FireError> {
-    let spec = RequestSpec::new(
-        &sources::NIFC_WFIGS,
-        request_url(),
-        "application/json",
-        "fire:current-perimeters",
-        "current wildfire perimeters",
-    );
     let fetched = acquire
-        .fetch(&spec)
+        .fetch_operation(&sources::NIFC_WFIGS, "perimeters", &[])
         .map_err(|source| FireError::Provider { source })?;
     let document = fetched
         .json()
@@ -583,19 +564,6 @@ mod tests {
             return;
         };
         assert!(parse(&value).is_err());
-    }
-
-    #[test]
-    fn the_request_asks_for_the_fields_and_a_simplification() {
-        let url = request_url();
-        assert!(
-            url.contains("WFIGS_Interagency_Perimeters_Current"),
-            "{url}"
-        );
-        assert!(url.contains("f=geojson"), "{url}");
-        assert!(url.contains("outSR=4326"), "{url}");
-        assert!(url.contains("poly_IncidentName"), "{url}");
-        assert!(url.contains("maxAllowableOffset=0.01"), "{url}");
     }
 
     #[test]

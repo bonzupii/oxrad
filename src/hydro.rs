@@ -27,7 +27,6 @@ use std::time::{Instant, SystemTimeError};
 use serde_json::Value;
 
 use crate::acquire::Acquire;
-use crate::engine::RequestSpec;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
@@ -35,9 +34,6 @@ use crate::time;
 /// The provider, in the words the rail uses.
 pub const SOURCE: &str = "Open-Meteo flood service, GloFAS modelled discharge";
 
-const BASE: &str = sources::OPEN_METEO_FLOOD.endpoint;
-const PAST_DAYS: u8 = 21;
-const FORECAST_DAYS: u8 = 7;
 const MAX_MEMBERS: usize = 51;
 
 /// Why a discharge record could not be read.
@@ -213,16 +209,6 @@ pub fn describe(record: &Discharge) -> String {
     );
     format!("{} days · {start} to {end} · {peak}", record.days.len())
 }
-
-/// The request for one point.
-pub fn request_url(latitude: f64, longitude: f64, ensemble: bool) -> String {
-    let ensemble = if ensemble { "&ensemble=true" } else { "" };
-    format!(
-        "{BASE}?latitude={latitude:.3}&longitude={longitude:.3}\
-         &daily=river_discharge&past_days={PAST_DAYS}&forecast_days={FORECAST_DAYS}{ensemble}"
-    )
-}
-
 const fn shape(detail: &'static str) -> HydroError {
     HydroError::Shape { detail }
 }
@@ -354,13 +340,20 @@ pub fn fetch(
     longitude: f64,
     ensemble: bool,
 ) -> Result<Discharge, HydroError> {
-    let url = request_url(latitude, longitude, ensemble);
+    let latitude_text = format!("{latitude:.3}");
+    let longitude_text = format!("{longitude:.3}");
+    let operation = if ensemble { "hydro-ensemble" } else { "hydro" };
     let document = acquire
-        .fetch(&RequestSpec::for_source(
-            &sources::OPEN_METEO_FORECAST,
-            &url,
-            "application/json",
-        ))
+        .fetch_operation(
+            &sources::OPEN_METEO_FLOOD,
+            operation,
+            &[
+                ("latitude", latitude_text.as_str()),
+                ("longitude", longitude_text.as_str()),
+                ("past_days", "21"),
+                ("forecast_days", "7"),
+            ],
+        )
         .and_then(|fetched| fetched.json())
         .map_err(|source| HydroError::Provider { source })?;
     let now = time::now_unix_ms().map_err(|source| HydroError::Clock { source })?;
@@ -653,18 +646,6 @@ mod tests {
         assert!(day_from_text("2026-13-01").is_err());
         assert!(day_from_text("2026-11").is_err());
         Ok(())
-    }
-
-    #[test]
-    fn the_request_names_the_point_and_the_ensemble_switch() {
-        let url = request_url(39.025, -96.225, true);
-        assert!(url.contains("latitude=39.025"), "{url}");
-        assert!(url.contains("longitude=-96.225"), "{url}");
-        assert!(url.contains("daily=river_discharge"), "{url}");
-        assert!(url.contains("past_days=21"), "{url}");
-        assert!(url.contains("forecast_days=7"), "{url}");
-        assert!(url.contains("ensemble=true"), "{url}");
-        assert!(!request_url(1.0, 2.0, false).contains("ensemble"));
     }
 
     #[test]

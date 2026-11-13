@@ -93,6 +93,7 @@ mod status_bar;
 mod sun;
 #[cfg(test)]
 mod test_support;
+mod text;
 mod theme;
 mod time;
 mod units;
@@ -232,14 +233,21 @@ fn fetch_source(config: &config::Config, id: &str) -> ExitCode {
         eprintln!("No registry source is named {id}. Run --sources for the identifiers.");
         return ExitCode::FAILURE;
     };
-    let accept = match source.format {
-        sources::Format::Json | sources::Format::GeoJson => "application/json",
-        sources::Format::Xml => "application/xml",
-        sources::Format::Tiles | sources::Format::VectorTiles => "image/png",
-        sources::Format::Binary => "application/octet-stream",
-    };
     let acquire = acquire::Acquire::new(config.providers.clone());
-    let spec = engine::RequestSpec::for_source(source, source.endpoint, accept);
+    let Some(operation) = source.static_operation() else {
+        eprintln!(
+            "{} has no operation that can be fetched without values; use it from the workstation.",
+            source.id.as_str()
+        );
+        return ExitCode::FAILURE;
+    };
+    let spec = match engine::RequestSpec::for_operation(source, operation.operation, &[]) {
+        Ok(spec) => spec,
+        Err(error) => {
+            eprintln!("The request could not be built: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     for pass in 1..=2 {
         match acquire.fetch(&spec) {
             Ok(fetched) => {
