@@ -7,7 +7,7 @@ This document describes the network paths in the current implementation. It does
 | Host | Purpose | Current use |
 |---|---|---|
 | `api.weather.gov` | Radar-station discovery and active warnings | `GET /radar/stations` and `GET /alerts/active?status=actual&message_type=alert`, both with `Accept: application/geo+json` |
-| `photon.komoot.io` | Place search | `GET /api/` with `q`, `limit`, and a user agent |
+| `geocoding-api.open-meteo.com` | Place search | `GET /v1/search` with `name`, `count`, and a user agent |
 | `api.open-meteo.com` | Global forecast | `GET /v1/forecast` for current, hourly, and daily data |
 | `unidata-nexrad-level2.s3.amazonaws.com` | NEXRAD Level II archive | S3 list and object GET |
 | `api.rainviewer.com` | Global radar manifest | `GET /public/weather-maps.json` |
@@ -76,4 +76,4 @@ The forecast, place, global-radar, and active-warning workers use generation num
 
 ## Privacy
 
-Place queries are sent to Photon (OpenStreetMap data). Forecast coordinates are sent to Open-Meteo. Global radar requests send the map-centre tile coordinates to RainViewer. NEXRAD requests send only the site and time prefix. Active-warning requests send no coordinates or user identity and receive the national United States collection. No account, API key, or device identifier is sent.
+Place queries are sent to Open-Meteo geocoding (GeoNames data). Forecast coordinates are sent to Open-Meteo. Global radar requests send the map-centre tile coordinates to RainViewer. NEXRAD requests send only the site and time prefix. Active-warning requests send no coordinates or user identity and receive the national United States collection. No account, API key, or device identifier is sent.

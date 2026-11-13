@@ -218,52 +218,24 @@ fn text_field(value: &Value, key: &str) -> Option<String> {
         .map(String::from)
 }
 
-fn address_field(address: &Value, keys: &[&str]) -> Option<String> {
-    for key in keys {
-        if let Some(text) = text_field(address, key) {
-            return Some(text);
-        }
-    }
-    None
-}
-
-fn parse_feature(feature: &Value, url: &str) -> Result<Option<Place>, FetchError> {
-    let Some(properties) = feature.get("properties") else {
+fn parse_result(result: &Value, url: &str) -> Result<Option<Place>, FetchError> {
+    let Some(name) = text_field(result, "name") else {
         return Ok(None);
     };
-    let Some(coordinates) = feature
-        .get("geometry")
-        .and_then(|geometry| geometry.get("coordinates"))
-        .and_then(Value::as_array)
-    else {
-        return Ok(None);
-    };
-    let (Some(lon), Some(lat)) = (
-        coordinates.first().and_then(Value::as_f64),
-        coordinates.get(1).and_then(Value::as_f64),
+    let (Some(lat), Some(lon)) = (
+        result.get("latitude").and_then(Value::as_f64),
+        result.get("longitude").and_then(Value::as_f64),
     ) else {
         return Ok(None);
     };
-    let name = text_field(properties, "name").or_else(|| {
-        address_field(
-            properties,
-            &[
-                "city", "town", "village", "hamlet", "locality", "district", "county",
-            ],
-        )
-    });
-    let Some(name) = name else {
-        return Ok(None);
-    };
-    let mut region = String::new();
-    if let Some(administrative_region) = address_field(properties, &["state", "county"]) {
-        region = administrative_region;
-    }
-    let country = text_field(properties, "country").ok_or_else(|| FetchError::Shape {
+    let region = text_field(result, "admin1")
+        .or_else(|| text_field(result, "admin2"))
+        .unwrap_or_default();
+    let country = text_field(result, "country").ok_or_else(|| FetchError::Shape {
         url: String::from(url),
         field: "place country",
     })?;
-    let country_code = text_field(properties, "countrycode").ok_or_else(|| FetchError::Shape {
+    let country_code = text_field(result, "country_code").ok_or_else(|| FetchError::Shape {
         url: String::from(url),
         field: "place country code",
     })?;
@@ -320,7 +292,7 @@ pub fn search(acquire: &Acquire, query: &str) -> Result<Served<Vec<Place>>, Fetc
 fn fetch_places(acquire: &Acquire, query: &str) -> Result<Served<Vec<Place>>, FetchError> {
     let limit = SEARCH_LIMIT.to_string();
     let fetched = acquire.fetch_operation(
-        &sources::PHOTON,
+        &sources::OPEN_METEO_GEOCODING,
         "search",
         &[("query", query), ("limit", limit.as_str())],
     )?;
@@ -329,22 +301,22 @@ fn fetch_places(acquire: &Acquire, query: &str) -> Result<Served<Vec<Place>>, Fe
     Ok(Served::new(value, fetched.provenance, fetched.cache))
 }
 
-/// Parses and ranks a Photon feature collection for one query.
+/// Parses and ranks an Open-Meteo geocoding result array for one query.
 pub(crate) fn places_from_document(
     document: &Value,
     url: &str,
     query: &str,
 ) -> Result<Vec<Place>, FetchError> {
-    let features = document
-        .get("features")
+    let results = document
+        .get("results")
         .and_then(Value::as_array)
         .ok_or_else(|| FetchError::Shape {
             url: String::from(url),
             field: "place results",
         })?;
     let mut places: Vec<Place> = Vec::new();
-    for feature in features {
-        if let Some(place) = parse_feature(feature, url)? {
+    for result in results {
+        if let Some(place) = parse_result(result, url)? {
             merge_place(&mut places, place);
         }
     }
@@ -784,29 +756,47 @@ mod tests {
     }
 
     #[test]
-    fn features_without_usable_coordinates_are_skipped() {
-        let feature = serde_json::json!({
-            "properties": {"name": "Nowhere", "country": "United States"},
-            "geometry": {"type": "Point", "coordinates": ["not-a-number"]}
+    fn results_without_usable_coordinates_are_skipped() {
+        let result = serde_json::json!({
+            "name": "Nowhere", "country": "United States", "country_code": "US",
+            "latitude": "not-a-number", "longitude": -96.0
         });
         assert!(matches!(
-            parse_feature(&feature, "https://example.invalid"),
+            parse_result(&result, "https://example.invalid"),
             Ok(None)
         ));
     }
 
     #[test]
-    fn photon_features_carry_identity_and_region() -> Result<(), TestError> {
-        let feature = serde_json::json!({
-            "properties": {
-                "name": "Emporia",
-                "state": "Kansas",
-                "country": "United States",
-                "countrycode": "US"
-            },
-            "geometry": {"type": "Point", "coordinates": [-96.1817, 38.4039]}
+    fn an_empty_result_array_is_no_places() -> Result<(), TestError> {
+        let document = serde_json::json!({"results": []});
+        assert!(places_from_document(&document, "https://example.invalid", "Berlin")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_malformed_geocoding_document_is_rejected() {
+        let document = serde_json::json!({"generationtime_ms": 0.1});
+        assert!(matches!(
+            places_from_document(&document, "https://example.invalid", "Berlin"),
+            Err(FetchError::Shape {
+                field: "place results",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn geocoding_results_carry_identity_and_region() -> Result<(), TestError> {
+        let result = serde_json::json!({
+            "name": "Emporia",
+            "admin1": "Kansas",
+            "country": "United States",
+            "country_code": "US",
+            "latitude": 38.4039,
+            "longitude": -96.1817
         });
-        let place = parse_feature(&feature, "https://example.invalid")?.ok_or("no place")?;
+        let place = parse_result(&result, "https://example.invalid")?.ok_or("no place")?;
         assert_eq!(place.name, "Emporia");
         assert_eq!(place.region, "Kansas");
         assert!(place.in_united_states());
@@ -815,12 +805,12 @@ mod tests {
 
     #[test]
     fn missing_country_code_cannot_be_treated_as_a_non_us_place() {
-        let feature = serde_json::json!({
-            "properties": {"name": "Emporia", "country": "United States"},
-            "geometry": {"type": "Point", "coordinates": [-96.1817, 38.4039]}
+        let result = serde_json::json!({
+            "name": "Emporia", "country": "United States",
+            "latitude": 38.4039, "longitude": -96.1817
         });
         assert!(matches!(
-            parse_feature(&feature, "https://example.invalid"),
+            parse_result(&result, "https://example.invalid"),
             Err(FetchError::Shape {
                 field: "place country code",
                 ..
@@ -830,11 +820,11 @@ mod tests {
 
     #[test]
     fn region_is_optional_when_the_country_is_identified() -> Result<(), TestError> {
-        let feature = serde_json::json!({
-            "properties": {"name": "Dublin", "country": "Ireland", "countrycode": "IE"},
-            "geometry": {"type": "Point", "coordinates": [-6.26, 53.35]}
+        let result = serde_json::json!({
+            "name": "Dublin", "country": "Ireland", "country_code": "IE",
+            "latitude": 53.35, "longitude": -6.26
         });
-        let place = parse_feature(&feature, "https://example.invalid")?.ok_or("no place")?;
+        let place = parse_result(&result, "https://example.invalid")?.ok_or("no place")?;
         assert_eq!(place.label(), "Dublin, Ireland");
         assert!(!place.in_united_states());
         Ok(())
@@ -900,31 +890,29 @@ mod tests {
         ));
     }
 
-    const PHOTON_URL: &str = "https://example.invalid/search";
+    const GEOCODING_URL: &str = "https://example.invalid/search";
 
     fn fixture_places(query: &str) -> Result<Vec<Place>, TestError> {
-        let feature = |name: &str, region: &str, lat: f64, lon: f64| {
+        let result = |name: &str, region: &str, lat: f64, lon: f64| {
             serde_json::json!({
-                "properties": {
-                    "name": name,
-                    "state": region,
-                    "country": "United States",
-                    "countrycode": "US"
-                },
-                "geometry": {"type": "Point", "coordinates": [lon, lat]}
+                "name": name,
+                "admin1": region,
+                "country": "United States",
+                "country_code": "US",
+                "latitude": lat,
+                "longitude": lon
             })
         };
         let document = serde_json::json!({
-            "type": "FeatureCollection",
-            "features": [
-                feature("Emporia", "Kansas", EMPORIA_LAT, EMPORIA_LON),
-                feature("Emporia", "Virginia", 36.7, -77.5),
-                feature("Springfield", "Missouri", 37.2, -93.3),
-                feature("Springfield", "Illinois", 39.8, -89.6),
-                feature("Unrelated", "Kansas", 38.0, -96.0)
+            "results": [
+                result("Emporia", "Kansas", EMPORIA_LAT, EMPORIA_LON),
+                result("Emporia", "Virginia", 36.7, -77.5),
+                result("Springfield", "Missouri", 37.2, -93.3),
+                result("Springfield", "Illinois", 39.8, -89.6),
+                result("Unrelated", "Kansas", 38.0, -96.0)
             ]
         });
-        Ok(places_from_document(&document, PHOTON_URL, query)?)
+        Ok(places_from_document(&document, GEOCODING_URL, query)?)
     }
 
     /// Tests parsing, ranking, and station selection with a generated response.

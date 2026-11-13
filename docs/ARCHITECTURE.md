@@ -76,7 +76,7 @@ These are defects against `STYLE.md`, not preferences.
 |---|---|---|
 | `app.rs` is a god module | 4681 lines; `OxradApp` holds unrelated workspace, feed, and presentation state | Features share application state and responsibilities are difficult to test independently |
 | No layer abstraction | Warnings, global radar, and viewport radars each carry their own visibility, state, and draw path | A fourth data type needs a fourth parallel implementation |
-| No provider abstraction | NEXRAD, RainViewer, NWS alerts, Open-Meteo, and Photon each reach the UI through separate ad-hoc state | No international source can be added without new UI branches |
+| No provider abstraction | NEXRAD, RainViewer, NWS alerts, Open-Meteo forecast, and Open-Meteo geocoding each reach the UI through separate ad-hoc state | No international source can be added without new UI branches |
 | Partial unit model | `units.rs` converts distance and temperature; other forecast values retain provider units | The persisted unit preference does not cover all displayed quantities |
 | Partial design tokens | `theme.rs` defines palettes and text sizes; `app.rs` also uses constants and literals | Theme and sizing remain inconsistent |
 | No time model | Each subsystem tracks its own timestamps | Layers cannot be aligned to one observation time |

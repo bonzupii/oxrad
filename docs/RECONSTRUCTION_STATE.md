@@ -334,3 +334,56 @@ States: not started, in progress, verified, blocked.
   - A NEXRAD volume opened from a cached key without a fresh listing has no listing record because no listing request occurred in that flow.
   - Tiles held in the RainViewer playback set but not asked for by the selected frame are not in that frame's report. Their engine records remain in the engine export.
 - Gates after this pass: `cargo fmt --all -- --check` exit 0, `cargo clippy --all-targets --message-format=short -- -D warnings` exit 0, `cargo test --all-targets` 491 passed and 0 failed, `cargo build --release --locked` exit 0. `docs/SOURCES.md` is regenerated from the release binary and byte-identical.
+
+### Pass 15
+
+- Registry coverage audit: before this pass `docs/SOURCES.md` recorded 31 candidates, 24 admitted and 7 rejected. The only mission domain with no admitted provider was Terrain; GIS was represented by OpenFreeMap and Photon but not labelled as GIS. The other named sciences already had admitted providers. The audit found no field recording when a provider was last observed live.
+- Registry schema: `Source` now carries `last_verified: Option<&'static str>`. `admits` rejects any source at `Level::Parsed` or `Level::Admitted` whose date is `None` (`AdmissionError::Unverified`). This makes a live observation part of admission rather than a comment. Every one of the 25 admitted sources carries `2026-11-13`; the six rejected candidates carry a date only when they were actually probed (ECCC GeoMet and MET Norway `2026-11-13`, the rest `None`).
+- Generated inventory: `inventory_markdown` now renders the licence as its name and URL, each operation with its dataset `subject`, and a `last live` column. It also appends a registry-owned `## Coverage gaps` section. `docs/SOURCES.md` is regenerated from `target/release/oxrad --sources`; the release output is byte-identical (`cmp` exit 0).
+- Terrain provider: `open-meteo-elevation` (Open-Meteo Elevation API, Copernicus DEM 2021 GLO-90, 90 m) with `https://api.open-meteo.com/v1/elevation?latitude={latitude}&longitude={longitude}`, JSON, CC BY 4.0 (`https://creativecommons.org/licenses/by/4.0/`), credit `Elevation data by Open-Meteo.com from Copernicus DEM GLO-90 (European Union, ESA)`, provider-defined cadence, one request per second, persistent cache permitted, `Level::Parsed`, last live `2026-11-13`. It replaces the unlicensed `copernicus-dem` S3 candidate, which never had a verified licence.
+- Terrain parser: `src/terrain.rs` decodes the provider's single-value `elevation` array, validates finite values and request coordinates, keeps negative heights rather than clamping, keeps full precision, exposes metres and names the dataset. A multi-value array is rejected rather than truncated. It does not invent a vertical datum or observation time; the probe prints `vertical datum: not stated by provider` and `reference 2021 DEM release; no observation time`.
+- Terrain tests: nine deterministic tests cover a normal point, a negative height, empty array, malformed JSON, empty body, missing key, non-numeric value, multi-value array and invalid request coordinates. No fixture file is committed.
+- Geocoding repair: Photon (`photon.komoot.io`) returned a TCP connect timeout on repeated attempts, including direct curl and the release binary. It was replaced, not left as an admitted feed, by `open-meteo-geocoding` (Open-Meteo Geocoding API over GeoNames), endpoint `https://geocoding-api.open-meteo.com/v1/search?name={query}&count={limit}&language=en&format=json`, JSON, CC BY 4.0, credit `Place search by Open-Meteo.com, data from GeoNames`, provider-defined cadence, one request per second, persistent cache permitted, `Level::Parsed`, last live `2026-11-13`. There is no fallback or parallel geocoder path: `place.rs` now parses the provider's flat `results` array only. The place panel's credit is taken from the registry instead of a literal.
+- Geocoding tests: the existing identity, ranking, station-selection and de-duplication tests were rewritten to the flat result shape. New tests assert an empty `results` array is no places and a missing `results` key is a typed shape failure.
+- Domain labels: `Basemap` now reads `GIS basemap` and `Geocoding` reads `GIS geocoding`, so the generated inventory names the mission's GIS coverage explicitly. A registry test requires an admitted provider for every mission domain: radar, forecast, satellite, GIS basemap, GIS geocoding, hydrology, seismicity, climate, ocean, air quality/composition, fire, space weather and terrain.
+- Coverage statements: the generated inventory now states the admitted limits rather than implying global coverage: wildfire perimeters only in the US and Canada; warnings only in the US; national radar archives only NEXRAD in the US; volcano notices only US volcanoes; real-time river gauges only the US and England (GloFAS is a global model, not a gauge); terrain is land GLO-90 with no stated vertical datum and no whole-ocean-floor product.
+- Live verification on 2026-11-13 with the release binary and a fresh `HOME=/tmp/oxrad-home-final`: all 25 admitted providers exited 0. Each single-request provider printed one network response and one cache response; OpenFreeMap printed 5 requests (style plus four vector tiles), RainViewer 9 (manifest plus eight tiles) and NEXRAD 2 (listing plus object). A script parsed every exported request report and found no missing `url`, `operation`, `cache`, `credit`, `licence`, `licence_url`, `subject`, `source`, `source_name` or `rate_limit_seconds`.
+- Observed values from that run:
+  - `open-meteo-elevation` at Berlin: 38 m, dataset `Copernicus DEM 2021 release GLO-90`, vertical datum explicitly unknown.
+  - `open-meteo-forecast` at 39.025, -96.225: -5.5 °C, apparent -9.5 °C, 7 km/h from 215°, fog, 24 hourly and 2 daily periods, timezone America/Chicago; observation `2026-11-13T06:30 (America/Chicago)`.
+  - `open-meteo-archive` at Berlin: 7 days, first 5 °C, latest precipitation 1.9 mm, latest day 2025-01-07 UTC.
+  - `open-meteo-air-quality` at Berlin: US AQI 51, PM2.5 4 μg/m³, PM10 9.7 μg/m³, 72 hours, 2026-11-13 12:00 UTC.
+  - `open-meteo-marine` at 54.0417, -10.0417: 0.9 m wave height, 11.5 °C sea-surface temperature, 48 hours.
+  - `open-meteo-flood` at 51.525, -0.125: peak 39.55 m³/s, 3 days, 2026-11-13 00:00 UTC.
+  - `open-meteo-geocoding` query Berlin: 8 places, first Berlin, State of Berlin at 52.5244, 13.4105.
+  - `openfreemap` style `positron`: 55 style layers, four z2 tiles, 4,100 vector features, 5,633,689 tile bytes; five requests.
+  - `rainviewer`: 13 frames, latest 2026-11-13 12:40 UTC, path `/v2/radar/64ec3c7b5527`, 512 × 512 tiles, 8,388,608 RGBA bytes; nine requests.
+  - `nexrad-level-2` prefix `2026/11/13/KTWX/`: KTWX, 2026-11-13 12:30:23 UTC, one discovery page, 14 sweeps, 720 radials, 0.52°, 459.3 km, 2,688,844-byte object; two requests.
+  - `nws-api`: 159 stations, first KLNX North Platte at 41.9579, -100.5762, observation 2026-11-13 12:40:59 UTC.
+  - `usgs-earthquakes`: 30 events, 2 unreadable, strongest M5.8 mww 148 km NW of Kavieng, Papua New Guinea, 2026-11-12 22:04:06 UTC.
+  - `usgs-water` box `-98,37,-97,38`: 29 gauges, 2 unreadable, first 07143330 Arkansas River near Hutchinson, Kansas, newest 1.88 ft provisional at 2026-11-13 11:30 UTC.
+  - `nasa-gibs`: MODIS Terra true colour, z3 x1 y2 for 2026-11-12, 256 × 256 px, 262,144 RGBA bytes.
+  - `noaa-swpc`: 81 Kp points, latest 1.67 estimated at 2026-11-13 21:00 UTC.
+  - `sunrise-sunset` at Berlin: normal, sunrise 07:24:23 +01:00, sunset 16:16:11 +01:00, solar noon 11:50:35 +01:00.
+  - `gdacs`: one episode, MURASU-26, red, maximum wind 157 km/h, observed 2026-11-03 06:00 UTC.
+  - `aviationweather-metar`: 7 stations, first KEGT Wellington, Kansas, raw report at 2026-11-13 12:35 UTC.
+  - `nifc-wfigs`: 43 perimeters, first RX Buck Creek, 325.93381626009597 ha, mapped 2026-03-18 23:34:15 UTC.
+  - `nsidc-sea-ice`: 48 years, latest 2025-11 at 8.77 million km².
+  - `usgs-volcano`: 3 elevated notices, first Great Sitkin orange at 2026-11-09 21:09:11 UTC.
+  - `emsc`: 8 events, 0 unreadable, strongest M4.8 mb at Tonga, 2026-11-13 11:18:05 UTC.
+  - `uk-ea-flood`: 8 readings, newest 0.276 m at A6 Bridge, qualifier Stage, 2026-11-13 12:08:11 UTC.
+  - `nasa-power` at Berlin: 12 months, annual 9.68 °C and 1.65 mm/day, period 25-year climatology January 2001 to December 2025.
+  - `cwfis`: the chosen box returned 0 perimeters; reported as 0 with `observed: not reported`, not filled from another source.
+- Defects found and resolved by the live run:
+  - The previous pass observed `open-meteo-forecast` timing out at connect. This pass answered on every attempt; the old failure was not reproduced and no code change was needed.
+  - The first USGS water probe printed HTTP 400. The cause was the probe invocation passing latitude/longitude order (`37,-98,38,-97`); USGS expects west,south,east,north (`-98,37,-97,38`). The production `gauge::fetch` already formats west,south,east,north. Rerunning with the correct box exited 0 with 29 gauges. This is recorded as a probe-input error, not a code defect.
+  - Photon timed out at TCP connect on every attempt. Replacing it with the working Open-Meteo geocoder closed the only admitted provider that could not complete live.
+  - The forecast probe printed a bare local timestamp while also printing a timezone. It now prints `2026-11-13T06:30 (America/Chicago)` so the reference time is unambiguous.
+- GUI: not observed. `scripts/gui.sh radar /tmp/gui-coverage` exited 1 with `gui: Xvfb is required and was not found`. No rail, map, terrain readout, place search or attribution row was seen rendered. The claims above are about registry structure, parsers, deterministic tests and headless request reports only.
+- Remaining limitations:
+  - Terrain has no observation time because the DEM is static; its vertical datum is not stated by the provider.
+  - Wildfire perimeters, warnings, national radar archives and volcano notices remain country-limited or US-only as recorded in `docs/SOURCES.md`; no global source is invented for them.
+  - Real-time river gauges are admitted only for the US and England; the global hydrology provider is a model.
+  - Non-composite providers are exercised through their first registry operation. Their other operations have separate parser tests and rail paths, but this pass did not fetch every secondary operation live.
+  - No GUI pixels were observed, so visual layout, interaction, palette and export controls remain unverified in this environment.
+- Gates after the final edits: `cargo fmt --all -- --check` exit 0, `cargo clippy --all-targets --message-format=short -- -D warnings` exit 0, `cargo test --all-targets` 508 passed and 0 failed, `cargo build --release --locked` exit 0, and `target/release/oxrad --sources` is byte-identical to `docs/SOURCES.md`.

@@ -135,10 +135,11 @@ impl PlacesPanel {
             }
         }
         ui.add_space(theme::SPACE_XS);
-        ui.label(
-            RichText::new("Place search © OpenStreetMap contributors, via Photon.")
+        ui.hyperlink_to(
+            RichText::new(crate::sources::OPEN_METEO_GEOCODING.credit)
                 .size(theme::TYPE_SMALL)
                 .weak(),
+            crate::sources::OPEN_METEO_GEOCODING.home,
         );
         chosen
     }

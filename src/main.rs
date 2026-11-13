@@ -107,6 +107,7 @@ mod station_panel;
 mod stations;
 mod status_bar;
 mod sun;
+mod terrain;
 #[cfg(test)]
 mod test_support;
 mod text;

@@ -65,7 +65,7 @@ pub enum Domain {
 impl Domain {
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Basemap => "Basemap",
+            Self::Basemap => "GIS basemap",
             Self::Forecast => "Forecast",
             Self::Observation => "Observation",
             Self::Warnings => "Warnings",
@@ -81,7 +81,7 @@ impl Domain {
             Self::Volcano => "Volcano",
             Self::Cyclone => "Cyclone",
             Self::Terrain => "Terrain",
-            Self::Geocoding => "Geocoding",
+            Self::Geocoding => "GIS geocoding",
             Self::Solar => "Solar",
         }
     }
@@ -410,6 +410,10 @@ pub struct Source {
     pub rate_limit_seconds: u32,
     pub cache: CachePermission,
     pub level: Level,
+    /// The date this source was last observed answering a live request, in
+    /// `YYYY-MM-DD` form. A publishable source must carry one; a documented
+    /// candidate that has never been fetched carries `None` and cannot ship.
+    pub last_verified: Option<&'static str>,
 }
 
 impl Source {
@@ -466,6 +470,9 @@ impl Source {
         }
         if self.cache == CachePermission::Unstated {
             return Err(AdmissionError::CacheUnstated { id: self.id });
+        }
+        if self.level.is_publishable() && self.last_verified.is_none() {
+            return Err(AdmissionError::Unverified { id: self.id });
         }
         Ok(())
     }
@@ -536,6 +543,9 @@ pub enum AdmissionError {
     CacheUnstated {
         id: SourceId,
     },
+    Unverified {
+        id: SourceId,
+    },
 }
 
 impl Display for AdmissionError {
@@ -571,6 +581,11 @@ impl Display for AdmissionError {
             Self::CacheUnstated { id } => write!(
                 formatter,
                 "{} does not permit a persistent cache",
+                id.as_str()
+            ),
+            Self::Unverified { id } => write!(
+                formatter,
+                "{} has never been observed live, so its parser is unverified",
                 id.as_str()
             ),
         }
@@ -656,6 +671,7 @@ pub const OPENFREEMAP: Source = Source {
     rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Admitted,
+    last_verified: Some("2026-11-13"),
 };
 
 /// Open-Meteo numerical forecast.
@@ -704,6 +720,7 @@ pub const OPEN_METEO_FORECAST: Source = Source {
     rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
+    last_verified: Some("2026-11-13"),
 };
 
 /// Open-Meteo ERA5 archive.
@@ -726,6 +743,7 @@ pub const OPEN_METEO_ARCHIVE: Source = Source {
     rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
+    last_verified: Some("2026-11-13"),
 };
 
 /// Open-Meteo CAMS air quality.
@@ -748,6 +766,7 @@ pub const OPEN_METEO_AIR: Source = Source {
     rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
+    last_verified: Some("2026-11-13"),
 };
 
 /// Open-Meteo marine wave and current fields.
@@ -770,6 +789,7 @@ pub const OPEN_METEO_MARINE: Source = Source {
     rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
+    last_verified: Some("2026-11-13"),
 };
 
 /// Open-Meteo GloFAS river discharge.
@@ -800,6 +820,30 @@ pub const OPEN_METEO_FLOOD: Source = Source {
     rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
+    last_verified: Some("2026-11-13"),
+};
+
+/// Global terrain elevation from Copernicus DEM GLO-90.
+pub const OPEN_METEO_ELEVATION: Source = Source {
+    id: SourceId::new("open-meteo-elevation"),
+    name: "Open-Meteo elevation, Copernicus DEM GLO-90",
+    domain: Domain::Terrain,
+    coverage: Coverage::Global,
+    home: "https://open-meteo.com/en/docs/elevation-api",
+    endpoints: &[Endpoint::new(
+        "elevation",
+        "terrain elevation at a point",
+        "https://api.open-meteo.com/v1/elevation?latitude={latitude}&longitude={longitude}",
+        "application/json",
+    )],
+    format: Format::Json,
+    licence: Some(CC_BY),
+    credit: "Elevation data by Open-Meteo.com from Copernicus DEM GLO-90 (European Union, ESA)",
+    refresh: Refresh::ProviderDefined,
+    rate_limit_seconds: 1,
+    cache: CachePermission::Permitted,
+    level: Level::Parsed,
+    last_verified: Some("2026-11-13"),
 };
 
 /// The global reflectivity composite.
@@ -834,6 +878,7 @@ pub const RAINVIEWER: Source = Source {
     rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Admitted,
+    last_verified: Some("2026-11-13"),
 };
 
 /// The United States NEXRAD Level II archive.
@@ -873,6 +918,7 @@ pub const NEXRAD_LEVEL_TWO: Source = Source {
     rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
+    last_verified: Some("2026-11-13"),
 };
 
 /// United States station metadata and active alerts.
@@ -903,6 +949,7 @@ pub const NWS_API: Source = Source {
     rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
+    last_verified: Some("2026-11-13"),
 };
 
 /// Global earthquakes.
@@ -925,6 +972,7 @@ pub const USGS_EARTHQUAKES: Source = Source {
     rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
+    last_verified: Some("2026-11-13"),
 };
 
 /// United States river gauges.
@@ -955,6 +1003,7 @@ pub const USGS_WATER: Source = Source {
     rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
+    last_verified: Some("2026-11-13"),
 };
 
 /// NASA Global Imagery Browse Services.
@@ -981,6 +1030,7 @@ pub const NASA_GIBS: Source = Source {
     rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
+    last_verified: Some("2026-11-13"),
 };
 
 /// NOAA space weather products.
@@ -1017,6 +1067,7 @@ pub const NOAA_SWPC: Source = Source {
     rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
+    last_verified: Some("2026-11-13"),
 };
 
 /// Sunrise, sunset and solar noon.
@@ -1042,31 +1093,30 @@ pub const SUNRISE_SUNSET: Source = Source {
     rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
+    last_verified: Some("2026-11-13"),
 };
 
-/// OpenStreetMap place search.
-pub const PHOTON: Source = Source {
-    id: SourceId::new("photon"),
-    name: "Photon place search",
+/// Global place search over GeoNames.
+pub const OPEN_METEO_GEOCODING: Source = Source {
+    id: SourceId::new("open-meteo-geocoding"),
+    name: "Open-Meteo geocoding, GeoNames",
     domain: Domain::Geocoding,
     coverage: Coverage::Global,
-    home: "https://photon.komoot.io",
+    home: "https://open-meteo.com/en/docs/geocoding-api",
     endpoints: &[Endpoint::new(
         "search",
         "place search",
-        "https://photon.komoot.io/api/?q={query}&limit={limit}",
+        "https://geocoding-api.open-meteo.com/v1/search?name={query}&count={limit}&language=en&format=json",
         "application/json",
     )],
-    format: Format::GeoJson,
-    licence: Some(Licence {
-        name: "OpenStreetMap data, ODbL 1.0, fair use",
-        url: "https://www.openstreetmap.org/copyright",
-    }),
-    credit: "Place search by Photon, data from OpenStreetMap contributors",
+    format: Format::Json,
+    licence: Some(CC_BY),
+    credit: "Place search by Open-Meteo.com, data from GeoNames",
     refresh: Refresh::ProviderDefined,
     rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
+    last_verified: Some("2026-11-13"),
 };
 
 /// Global disaster alerts, including tropical cyclones.
@@ -1092,6 +1142,7 @@ pub const GDACS: Source = Source {
     rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
+    last_verified: Some("2026-11-13"),
 };
 
 /// Worldwide aviation surface reports.
@@ -1114,6 +1165,7 @@ pub const AVIATION_WEATHER_METAR: Source = Source {
     rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
+    last_verified: Some("2026-11-13"),
 };
 
 /// United States wildfire perimeters.
@@ -1136,6 +1188,7 @@ pub const NIFC_WFIGS: Source = Source {
     rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
+    last_verified: Some("2026-11-13"),
 };
 
 /// Arctic and Antarctic sea-ice extent.
@@ -1158,6 +1211,7 @@ pub const NSIDC_SEA_ICE: Source = Source {
     rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
+    last_verified: Some("2026-11-13"),
 };
 
 /// United States volcano activity notices.
@@ -1194,6 +1248,7 @@ pub const USGS_VOLCANO: Source = Source {
     rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Parsed,
+    last_verified: Some("2026-11-13"),
 };
 
 // Candidates below have not had their terms verified against the provider.
@@ -1220,6 +1275,7 @@ pub const DWD_OPEN_DATA: Source = Source {
     rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Documented,
+    last_verified: None,
 };
 
 /// Canadian radar and weather layers.
@@ -1243,6 +1299,7 @@ pub const ECCC_GEOMET: Source = Source {
     cache: CachePermission::Permitted,
     // Probed 2026-11-13: the collections listing answered 200 application/json.
     level: Level::Probed,
+    last_verified: Some("2026-11-13"),
 };
 
 /// Australian national radar.
@@ -1265,6 +1322,7 @@ pub const BOM_RADAR: Source = Source {
     rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Documented,
+    last_verified: None,
 };
 
 /// European warning aggregation.
@@ -1287,6 +1345,7 @@ pub const METEOALARM: Source = Source {
     rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Documented,
+    last_verified: None,
 };
 
 /// European-Mediterranean earthquakes, including the global EMSC catalogue.
@@ -1310,6 +1369,7 @@ pub const EMSC: Source = Source {
     rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Admitted,
+    last_verified: Some("2026-11-13"),
 };
 
 /// England's real-time river levels and flows.
@@ -1333,6 +1393,7 @@ pub const UK_EA_FLOOD: Source = Source {
     rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Admitted,
+    last_verified: Some("2026-11-13"),
 };
 
 /// NASA POWER's MERRA-2 monthly climatology.
@@ -1356,6 +1417,7 @@ pub const NASA_POWER: Source = Source {
     rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Admitted,
+    last_verified: Some("2026-11-13"),
 };
 
 /// Natural Resources Canada's current fire-perimeter estimates.
@@ -1379,6 +1441,7 @@ pub const CWFIS: Source = Source {
     rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Admitted,
+    last_verified: Some("2026-11-13"),
 };
 
 /// Norwegian global forecast.
@@ -1402,28 +1465,7 @@ pub const MET_NORWAY: Source = Source {
     cache: CachePermission::Permitted,
     // Probed 2026-11-13: the compact forecast answered 200 application/json.
     level: Level::Probed,
-};
-
-/// Global elevation.
-pub const COPERNICUS_DEM: Source = Source {
-    id: SourceId::new("copernicus-dem"),
-    name: "Copernicus DEM",
-    domain: Domain::Terrain,
-    coverage: Coverage::Global,
-    home: "https://dataspace.copernicus.eu",
-    endpoints: &[Endpoint::new(
-        "site",
-        "Copernicus DEM candidate site",
-        "https://copernicus-dem-30m.s3.amazonaws.com",
-        "*/*",
-    )],
-    format: Format::Binary,
-    licence: None,
-    credit: "Copernicus DEM, European Space Agency",
-    refresh: Refresh::ProviderDefined,
-    rate_limit_seconds: 1,
-    cache: CachePermission::Permitted,
-    level: Level::Documented,
+    last_verified: Some("2026-11-13"),
 };
 
 /// Global volcano activity.
@@ -1446,6 +1488,7 @@ pub const SMITHSONIAN_GVP: Source = Source {
     rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
     level: Level::Documented,
+    last_verified: None,
 };
 
 /// Every recorded source, admitted or not.
@@ -1456,6 +1499,7 @@ pub const SOURCES: &[Source] = &[
     OPEN_METEO_AIR,
     OPEN_METEO_MARINE,
     OPEN_METEO_FLOOD,
+    OPEN_METEO_ELEVATION,
     RAINVIEWER,
     NEXRAD_LEVEL_TWO,
     NWS_API,
@@ -1464,7 +1508,7 @@ pub const SOURCES: &[Source] = &[
     NASA_GIBS,
     NOAA_SWPC,
     SUNRISE_SUNSET,
-    PHOTON,
+    OPEN_METEO_GEOCODING,
     GDACS,
     AVIATION_WEATHER_METAR,
     NIFC_WFIGS,
@@ -1479,7 +1523,6 @@ pub const SOURCES: &[Source] = &[
     NASA_POWER,
     CWFIS,
     MET_NORWAY,
-    COPERNICUS_DEM,
     SMITHSONIAN_GVP,
 ];
 
@@ -1501,11 +1544,16 @@ fn endpoint_list(source: &Source) -> String {
         .iter()
         .map(|endpoint| {
             endpoint.ttl_seconds.map_or_else(
-                || format!("{}: {}", endpoint.operation, endpoint.template),
+                || {
+                    format!(
+                        "{} ({}): {}",
+                        endpoint.operation, endpoint.subject, endpoint.template
+                    )
+                },
                 |seconds| {
                     format!(
-                        "{}: {} ({} s)",
-                        endpoint.operation, endpoint.template, seconds
+                        "{} ({}): {} ({} s)",
+                        endpoint.operation, endpoint.subject, endpoint.template, seconds
                     )
                 },
             )
@@ -1513,6 +1561,30 @@ fn endpoint_list(source: &Source) -> String {
         .collect::<Vec<String>>()
         .join("<br>")
 }
+
+/// The documented limits of admitted coverage. These are registry facts, not
+/// missing values, and they are rendered into the inventory beside the table.
+const COVERAGE_GAPS: &[&str] = &[
+    "Wildfire perimeters: the admitted providers cover the United States (NIFC WFIGS) \
+     and Canada (CWFIS) only. No admitted provider covers another country's current \
+     perimeters.",
+    "Warnings: the admitted provider covers the United States and its territories \
+     (National Weather Service). MeteoAlarm is not admitted because its licence has not \
+     been verified, so no European warning feed is recorded.",
+    "National radar archives: the admitted archive is NEXRAD for the United States. \
+     RainViewer is a global composite, not a national archive. DWD, ECCC GeoMet and the \
+     Australian Bureau of Meteorology are not admitted because their licences have not \
+     been verified.",
+    "Volcano notices: the admitted provider covers United States volcanoes and \
+     territories (USGS). The Smithsonian Global Volcanism Program is not admitted \
+     because its licence has not been verified, so no global volcano feed is recorded.",
+    "River gauges: real-time gauge observations are admitted for the United States \
+     (USGS) and England (Environment Agency). GloFAS is a global model discharge, not a \
+     gauge observation; no other national gauge network is recorded.",
+    "Terrain: the admitted provider gives a Copernicus DEM GLO-90 height for land \
+     points. It does not state a vertical datum, and no admitted provider supplies \
+     terrain for the whole ocean floor.",
+];
 
 /// Renders the source inventory from the registry.
 ///
@@ -1530,27 +1602,40 @@ pub fn inventory_markdown() -> Result<String, fmt::Error> {
          (parsed, licensed, credited and displayed).\n\n",
     );
     out.push_str(
-        "| id | name | domain | coverage | format | operations | licence | credit | refresh | rate | cache | level | admission |\n",
+        "| id | name | domain | coverage | format | operations | licence | credit | refresh | rate | cache | level | last live | admission |\n",
     );
-    out.push_str("|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+    out.push_str("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
     for source in SOURCES {
+        let licence = source.licence.map_or_else(
+            || String::from("unverified"),
+            |licence| format!("[{}]({})", licence.name, licence.url),
+        );
         writeln!(
             &mut out,
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             source.id.as_str(),
             source.name,
             source.domain.label(),
             source.coverage.label(),
             source.format.label(),
             endpoint_list(source),
-            source.licence.map_or("unverified", |licence| licence.name),
+            licence,
             source.credit,
             source.refresh.label(),
             source.rate_limit_seconds,
             source.cache.label(),
             source.level.label(),
+            source.last_verified.unwrap_or("never"),
             source.admission_label(),
         )?;
+    }
+    out.push_str("\n## Coverage gaps\n\n");
+    out.push_str(
+        "These are limits of the admitted registry, not missing scientific values. \
+         A country or science absent here is not silently filled from another source.\n\n",
+    );
+    for gap in COVERAGE_GAPS {
+        writeln!(&mut out, "- {gap}")?;
     }
     Ok(out)
 }
@@ -1659,6 +1744,94 @@ mod tests {
             insecure.admits(),
             Err(AdmissionError::Insecure { .. })
         ));
+    }
+
+    fn valid_live_date(date: &str) -> bool {
+        let bytes = date.as_bytes();
+        bytes.len() == 10
+            && bytes[4] == b'-'
+            && bytes[7] == b'-'
+            && bytes
+                .iter()
+                .enumerate()
+                .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
+            && date.starts_with("20")
+            && date
+                .get(5..7)
+                .and_then(|month| month.parse::<u8>().ok())
+                .is_some_and(|month| (1..=12).contains(&month))
+            && date
+                .get(8..10)
+                .and_then(|day| day.parse::<u8>().ok())
+                .is_some_and(|day| (1..=31).contains(&day))
+    }
+
+    #[test]
+    fn every_mission_science_has_an_admitted_provider() {
+        let mission = [
+            Domain::Radar,
+            Domain::Forecast,
+            Domain::Satellite,
+            Domain::Basemap,
+            Domain::Geocoding,
+            Domain::Hydrology,
+            Domain::Seismicity,
+            Domain::Climate,
+            Domain::Ocean,
+            Domain::AirQuality,
+            Domain::Fire,
+            Domain::SpaceWeather,
+            Domain::Terrain,
+        ];
+        for domain in mission {
+            assert!(
+                SOURCES
+                    .iter()
+                    .any(|source| source.domain == domain && source.admits().is_ok()),
+                "no admitted provider covers {}",
+                domain.label()
+            );
+        }
+    }
+
+    #[test]
+    fn every_publishable_source_records_a_valid_last_live_date() {
+        for source in SOURCES {
+            if source.level.is_publishable() {
+                let date = source.last_verified.unwrap_or("");
+                assert!(
+                    valid_live_date(date),
+                    "{} is {} but its last live date is {date:?}",
+                    source.id.as_str(),
+                    source.level.label()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_parsed_source_without_a_live_date_is_rejected() {
+        let unverified = Source {
+            level: Level::Parsed,
+            last_verified: None,
+            ..OPEN_METEO_FORECAST
+        };
+        assert!(matches!(
+            unverified.admits(),
+            Err(AdmissionError::Unverified { .. })
+        ));
+    }
+
+    #[test]
+    fn the_inventory_carries_the_licence_url_and_live_date() -> Result<(), fmt::Error> {
+        let inventory = inventory_markdown()?;
+        assert!(inventory.contains("https://creativecommons.org/licenses/by/4.0/"));
+        assert!(inventory.contains("| last live |"));
+        assert!(inventory.contains("2026-11-13"));
+        assert!(inventory.contains("terrain elevation at a point"));
+        assert!(inventory.contains("## Coverage gaps"));
+        assert!(inventory.contains("Wildfire perimeters"));
+        Ok(())
     }
 
     #[test]

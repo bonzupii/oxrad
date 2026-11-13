@@ -17,7 +17,7 @@ This is a pre-release build. The radar display works. The product around it does
 | OpenFreeMap vector basemap | Partial: runtime tiles and selectable styles; offline reuse and full style fidelity remain unverified |
 | Global radar composite | Working: RainViewer, two-hour loop |
 | Forecast | Working: Open-Meteo, global |
-| Place search | Working: live partial and transposed names via Photon; proximity ranking absent |
+| Place search | Working: live partial and transposed names via Open-Meteo geocoding; proximity ranking absent |
 | Warnings | United States only |
 | Earthquakes | Working: USGS global feeds by hour, day, and week, with depth and magnitude-scaled symbols, list, and provider event pages |
 | River discharge | Working: Open-Meteo flood service (GloFAS) at the map centre, three weeks behind and one week ahead, drawn as a hydrograph with the forecast and the ensemble range |
@@ -99,7 +99,7 @@ The response cache holds up to 256 entries and 128 MiB, and verifies bodies agai
 | National Weather Service station directory | Station discovery | United States and territories | Public domain |
 | National Weather Service active alerts | Warnings | United States and territories | Public domain |
 | Open-Meteo | Forecast | Global | CC BY 4.0 |
-| OpenStreetMap contributors, Photon | Place search | Global | ODbL |
+| Open-Meteo, GeoNames | Place search | Global | CC BY 4.0 |
 | OpenFreeMap / OpenMapTiles / OpenStreetMap contributors | Vector basemap | Global | ODbL and provider attribution requirements |
 | [Sunrise-Sunset.org](https://sunrise-sunset.org) | Sunrise, sunset, and solar noon | Global | Free API with attribution; no data license specified |
 | USGS Earthquake Hazards Program | Earthquakes | Global | Public domain |

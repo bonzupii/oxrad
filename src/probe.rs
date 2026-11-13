@@ -36,6 +36,7 @@ use crate::sources;
 use crate::spaceweather;
 use crate::stations::{self, SiteId};
 use crate::sun;
+use crate::terrain;
 use crate::time;
 use crate::uk_rivers;
 use crate::volcano;
@@ -536,7 +537,7 @@ pub(crate) fn parse(
             Ok(ProbeReport::new(source, operation)
                 .station(format!("probe point at {:.4}, {:.4}", place.lat, place.lon))
                 .product("point forecast")
-                .observed(record.current.observed.clone())
+                .observed(format!("{} ({})", record.current.observed, record.timezone))
                 .field(
                     "current temperature",
                     format!("{} {}", record.current.temperature, record.current.unit),
@@ -640,6 +641,19 @@ pub(crate) fn parse(
                     ),
                 )
                 .field("hours", record.hours.len().to_string()))
+        }
+        ("open-meteo-elevation", "elevation") => {
+            let latitude = number(values, "latitude")?;
+            let longitude = number(values, "longitude")?;
+            let record = terrain::parse_body(body, latitude, longitude, request_url)
+                .map_err(|error| rejected("Open-Meteo elevation", error))?;
+            Ok(ProbeReport::new(source, operation)
+                .station(format!("{:.4}, {:.4}", record.latitude, record.longitude))
+                .product("terrain elevation")
+                .observed("reference 2021 DEM release; no observation time")
+                .field("elevation", format!("{} m", record.elevation_m))
+                .field("dataset", record.dataset())
+                .field("vertical datum", "not stated by provider"))
         }
         ("open-meteo-flood", "hydro") => {
             let now = time::now_unix_ms().map_err(|error| rejected("Open-Meteo flood", error))?;
@@ -845,11 +859,11 @@ pub(crate) fn parse(
                         .unwrap_or_else(|| String::from("not reported")),
                 ))
         }
-        ("photon", "search") => {
-            let document = json_body(body, "Photon search")?;
+        ("open-meteo-geocoding", "search") => {
+            let document = json_body(body, "Open-Meteo geocoding")?;
             let query = value(values, "query")?;
             let places = place::places_from_document(&document, request_url, query)
-                .map_err(|error| rejected("Photon search", error))?;
+                .map_err(|error| rejected("Open-Meteo geocoding", error))?;
             let first = places.first();
             Ok(ProbeReport::new(source, operation)
                 .product("place search")
@@ -1146,6 +1160,51 @@ mod tests {
                 .fields
                 .iter()
                 .any(|field| field.value == "4.33 (observed)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_geocoding_probe_reports_a_place_and_its_provenance() -> Result<(), ProbeError> {
+        let body = br#"{"results":[{"name":"Berlin","admin1":"State of Berlin","country":"Germany","country_code":"DE","latitude":52.52437,"longitude":13.41053}]}"#;
+        let report = parse(
+            &sources::OPEN_METEO_GEOCODING,
+            "search",
+            body,
+            &[("query", "Berlin"), ("limit", "8")],
+            "https://geocoding-api.open-meteo.com/v1/search?name=Berlin&count=8&language=en&format=json",
+        )?;
+        assert_eq!(report.source, "open-meteo-geocoding");
+        assert_eq!(report.station.as_deref(), Some("Berlin, State of Berlin"));
+        assert!(
+            report
+                .fields
+                .iter()
+                .any(|field| field.label == "places" && field.value == "1")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_elevation_probe_reports_metres_and_its_dataset() -> Result<(), ProbeError> {
+        let report = parse(
+            &sources::OPEN_METEO_ELEVATION,
+            "elevation",
+            br#"{"elevation":[38.0]}"#,
+            &[("latitude", "52.52"), ("longitude", "13.41")],
+            "https://api.open-meteo.com/v1/elevation?latitude=52.52&longitude=13.41",
+        )?;
+        assert_eq!(report.source, "open-meteo-elevation");
+        assert_eq!(report.product.as_deref(), Some("terrain elevation"));
+        assert!(
+            report
+                .fields
+                .iter()
+                .any(|field| field.label == "elevation" && field.value == "38 m")
+        );
+        assert!(
+            report.fields.iter().any(|field| field.label == "dataset"
+                && field.value == "Copernicus DEM 2021 release GLO-90")
         );
         Ok(())
     }

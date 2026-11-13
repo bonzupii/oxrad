@@ -23,7 +23,7 @@ A source is never listed as available because an organisation publishes somethin
 | Radar station directory | National Weather Service | United States and territories | Station identity, coordinates, type, capability text | `api.weather.gov/radar/stations`, GeoJSON | Continuous | United States Government work, public domain | Verified |
 | Active alerts | National Weather Service | United States and territories | Warning polygons, event, severity, urgency, area, headline, description, instruction, expiry | `api.weather.gov/alerts/active`, GeoJSON | Continuous | United States Government work, public domain | Verified |
 | Global forecast | Open-Meteo | Global | Current, hourly, daily | `api.open-meteo.com/v1/forecast` | Hourly model updates | CC BY 4.0, attribution required | Verified |
-| Place search | OpenStreetMap contributors, Photon | Global | Place name, region, country, coordinates | `photon.komoot.io/api/`, GeoJSON | Live, fair use | ODbL 1.0 for data, attribution required | Verified |
+| Place search | Open-Meteo geocoding, GeoNames | Global | Place name, region, country, coordinates | `geocoding-api.open-meteo.com/v1/search`, JSON | Live, one request per second | CC BY 4.0, attribution required | Verified |
 | Sunrise and sunset | Sunrise-Sunset.org | Global | Sunrise, sunset, solar noon and polar status for one local date | `api.sunrise-sunset.org/v2`, JSON | User-initiated | Free API for reasonable volumes; linked attribution required | Implemented, unverified in running GUI |
 | Global radar composite | RainViewer | 1,200 or more radars in 150 or more countries | Reflectivity composite tiles, two hours of ten-minute frames | `api.rainviewer.com` manifest, `tilecache.rainviewer.com` tiles | 10 minutes | Free personal and community terms, visible attribution required | Verified |
 | Basemap | OpenFreeMap / OpenMapTiles / OpenStreetMap contributors | Global | OpenMapTiles vector tiles and OpenFreeMap style documents | `tiles.openfreemap.org`, HTTPS | Versioned planet updates | ODbL; visible attribution required | Map frame inspected; style fidelity and offline cache reuse remain unverified |
@@ -48,7 +48,7 @@ A source is never listed as available because an organisation publishes somethin
 
 RainViewer is a processed composite. It is not Level II and cannot supply moment-level products. Attribution is displayed in map view.
 
-Photon is used for live type-ahead place search. It supports partial and many misspelled queries; a single adjacent transposition is retried locally when the first answer has no close match. Its public instance is offered under fair use without an availability guarantee, so search errors are surfaced rather than hidden.
+Open-Meteo geocoding is used for live type-ahead place search over GeoNames. It supports partial and many misspelled queries; a single adjacent transposition is retried locally when the first answer has no close match. Search errors are surfaced rather than hidden.
 
 ## Researched, not implemented
 
@@ -132,7 +132,7 @@ A source is admitted in this order. Skipping a step leaves it listed as research
 |---|---|
 | RainViewer | Weather data by RainViewer |
 | OpenStreetMap | Data copyright OpenStreetMap contributors |
-| Open-Meteo | Weather data by Open-Meteo, CC BY 4.0 |
+| Open-Meteo | Weather data by Open-Meteo, CC BY 4.0; place search data from GeoNames |
 | DWD, when integrated | Deutscher Wetterdienst, CC BY 4.0, with a statement of modification |
 | National Weather Service | NOAA National Weather Service |
 
