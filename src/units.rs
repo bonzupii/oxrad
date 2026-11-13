@@ -45,6 +45,24 @@ impl UnitSystem {
         }
     }
 
+    /// The convention for a locale region.
+    ///
+    /// Metric is the international default; imperial is returned only for the
+    /// three countries whose everyday practice is imperial, so a reader is
+    /// never given one country's units by accident.
+    pub const fn for_region(region: Option<&str>) -> Self {
+        match region {
+            Some(code)
+                if code.eq_ignore_ascii_case("US")
+                    || code.eq_ignore_ascii_case("LR")
+                    || code.eq_ignore_ascii_case("MM") =>
+            {
+                Self::Imperial
+            }
+            _ => Self::Metric,
+        }
+    }
+
     /// Parses a configuration token.
     pub fn parse(text: &str) -> Option<Self> {
         match text {

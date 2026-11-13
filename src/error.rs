@@ -20,6 +20,7 @@ use std::fmt::{self, Display, Formatter};
 use std::io;
 use std::path::PathBuf;
 
+use crate::config::{CachePolicyError, LocaleError, ProviderError};
 use crate::place::PlaceError;
 use crate::product::RadarProduct;
 
@@ -257,6 +258,35 @@ pub enum ConfigError {
         line: usize,
         source: PlaceError,
     },
+    Locale {
+        path: PathBuf,
+        line: usize,
+        source: LocaleError,
+    },
+    Number {
+        path: PathBuf,
+        line: usize,
+        field: &'static str,
+        value: String,
+    },
+    CachePolicy {
+        path: PathBuf,
+        line: usize,
+        field: &'static str,
+        source: CachePolicyError,
+    },
+    Provider {
+        path: PathBuf,
+        line: usize,
+        source: ProviderError,
+    },
+    MissingProfile {
+        path: PathBuf,
+    },
+    Selection {
+        field: String,
+        reason: &'static str,
+    },
     Path {
         source: PathError,
     },
@@ -330,9 +360,62 @@ impl ConfigError {
                 "{} line {line} has an invalid saved place: {source}",
                 path.display()
             ),
+            Self::Locale { path, line, source } => locale_message(path, *line, source),
+            Self::Number {
+                path,
+                line,
+                field,
+                value,
+            } => number_message(path, *line, field, value),
+            Self::CachePolicy {
+                path,
+                line,
+                field,
+                source,
+            } => cache_message(path, *line, field, source),
+            Self::Provider { path, line, source } => provider_message(path, *line, source),
+            Self::MissingProfile { path } => {
+                format!("The profile {} does not exist.", path.display())
+            }
+            Self::Selection { field, reason } => {
+                format!("The selection {field} is invalid: {reason}.")
+            }
             Self::Path { source } => source.to_string(),
         }
     }
+}
+
+fn locale_message(path: &std::path::Path, line: usize, source: &LocaleError) -> String {
+    format!(
+        "{} line {line} has an invalid locale: {source}",
+        path.display()
+    )
+}
+
+fn number_message(path: &std::path::Path, line: usize, field: &'static str, value: &str) -> String {
+    format!(
+        "{} line {line} has an invalid {field}: {value:?}",
+        path.display()
+    )
+}
+
+fn cache_message(
+    path: &std::path::Path,
+    line: usize,
+    field: &'static str,
+    source: &CachePolicyError,
+) -> String {
+    format!(
+        "{} line {line} sets {field} to an invalid budget: {source}",
+        path.display()
+    )
+}
+
+fn provider_message(path: &std::path::Path, line: usize, source: &ProviderError) -> String {
+    format!(
+        "{} line {line} sets invalid providers: {source}",
+        path.display()
+    )
 }
 
 impl Display for ConfigError {
@@ -347,6 +430,9 @@ impl Error for ConfigError {
             Self::Read { source, .. } | Self::Write { source, .. } => Some(source),
             Self::Site { source, .. } => Some(source),
             Self::PlaceEntry { source, .. } => Some(source),
+            Self::Locale { source, .. } => Some(source),
+            Self::CachePolicy { source, .. } => Some(source),
+            Self::Provider { source, .. } => Some(source),
             Self::Path { source } => Some(source),
             Self::Syntax { .. }
             | Self::InvalidUnit { .. }
@@ -357,7 +443,10 @@ impl Error for ConfigError {
             | Self::StormMotion { .. }
             | Self::UnknownKey { .. }
             | Self::IncompletePlaceEntry { .. }
-            | Self::PlaceNumber { .. } => None,
+            | Self::PlaceNumber { .. }
+            | Self::Number { .. }
+            | Self::MissingProfile { .. }
+            | Self::Selection { .. } => None,
         }
     }
 }

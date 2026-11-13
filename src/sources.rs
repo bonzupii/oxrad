@@ -229,7 +229,7 @@ pub struct Source {
 
 impl Source {
     /// Whether this source may be used at all.
-    fn admits(&self) -> Result<(), AdmissionError> {
+    pub fn admits(&self) -> Result<(), AdmissionError> {
         if self.endpoint.is_empty() {
             return Err(AdmissionError::NoEndpoint { id: self.id });
         }
@@ -818,6 +818,11 @@ pub const SOURCES: &[Source] = &[
     COPERNICUS_DEM,
     SMITHSONIAN_GVP,
 ];
+
+/// Looks up a source by its registry identifier.
+pub fn find(id: &str) -> Option<&'static Source> {
+    SOURCES.iter().find(|source| source.id.as_str() == id)
+}
 
 /// Renders the source inventory from the registry.
 ///

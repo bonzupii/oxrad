@@ -90,58 +90,129 @@ mod warning_view;
 mod warnings;
 mod workspaces;
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use app::OxradApp;
 use stations::SiteId;
 
 const USAGE: &str = "\
-Usage: oxrad [--site IDENTIFIER] [--sources]
+Usage: oxrad [--site IDENTIFIER] [--profile PATH] [--set key=value]...
+             [--print-config] [--sources]
 
 Runs the radar viewer. The last selected site is restored from the
 configuration file; with no saved site the picker opens.
 
   --site IDENTIFIER   Start with this site instead of the saved one
+  --profile PATH      Read this profile instead of ~/.oxrad/config.toml
+  --set key=value     Override one setting for this run; repeatable
+  --print-config      Print the effective configuration and exit
   --sources           Print the open-source inventory and exit
   -h, --help          Show this message";
 
-fn main() -> ExitCode {
-    let mut initial = None;
+#[derive(Default)]
+struct Invocation {
+    initial: Option<SiteId>,
+    profile: Option<PathBuf>,
+    selection: Vec<String>,
+    print_config: bool,
+    print_sources: bool,
+    help: bool,
+}
+
+fn parse_arguments() -> Result<Invocation, String> {
+    let mut invocation = Invocation::default();
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
-            "--site" => match arguments.next() {
-                Some(value) => match SiteId::parse(&value) {
-                    Ok(site) => initial = Some(site),
-                    Err(error) => {
-                        eprintln!("{error}");
-                        return ExitCode::FAILURE;
-                    }
-                },
-                None => {
-                    eprintln!("--site needs an identifier such as KTWX.\n\n{USAGE}");
-                    return ExitCode::FAILURE;
-                }
-            },
-            "--sources" => match sources::inventory_markdown() {
-                Ok(inventory) => {
-                    print!("{inventory}");
+            "--site" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| String::from("--site needs an identifier such as KTWX."))?;
+                let site = SiteId::parse(&value).map_err(|error| error.to_string())?;
+                invocation.selection.push(format!("site={}", site.as_str()));
+                invocation.initial = Some(site);
+            }
+            "--profile" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| String::from("--profile needs a path."))?;
+                invocation.profile = Some(PathBuf::from(value));
+            }
+            "--set" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| String::from("--set needs a setting such as units=imperial."))?;
+                invocation.selection.push(value);
+            }
+            "--print-config" => invocation.print_config = true,
+            "--sources" => invocation.print_sources = true,
+            "--help" | "-h" => invocation.help = true,
+            unexpected => return Err(format!("Unexpected argument {unexpected}.")),
+        }
+    }
+    Ok(invocation)
+}
+
+fn print_inventory() -> ExitCode {
+    match sources::inventory_markdown() {
+        Ok(inventory) => {
+            print!("{inventory}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("The source inventory could not be rendered: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn main() -> ExitCode {
+    let invocation = match parse_arguments() {
+        Ok(invocation) => invocation,
+        Err(message) => {
+            eprintln!("{message}\n\n{USAGE}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if invocation.help {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
+    if invocation.print_sources {
+        return print_inventory();
+    }
+    let selection = match config::selection_text(&invocation.selection) {
+        Ok(text) => text,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let layered =
+        invocation.print_config || invocation.profile.is_some() || !invocation.selection.is_empty();
+    let mut resolved = None;
+    if layered {
+        let effective = match config::load_effective(invocation.profile.as_deref(), &selection) {
+            Ok(effective) => effective,
+            Err(error) => {
+                eprintln!("{error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if invocation.print_config {
+            match effective.render() {
+                Ok(report) => {
+                    print!("{report}");
                     return ExitCode::SUCCESS;
                 }
                 Err(error) => {
-                    eprintln!("The source inventory could not be rendered: {error}");
+                    eprintln!("The configuration report could not be rendered: {error}");
                     return ExitCode::FAILURE;
                 }
-            },
-            "--help" | "-h" => {
-                println!("{USAGE}");
-                return ExitCode::SUCCESS;
-            }
-            unexpected => {
-                eprintln!("Unexpected argument {unexpected}.\n\n{USAGE}");
-                return ExitCode::FAILURE;
             }
         }
+        resolved = Some(effective.config);
     }
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
@@ -155,7 +226,7 @@ fn main() -> ExitCode {
         options,
         Box::new(move |creation| {
             let gpu = creation.wgpu_render_state.as_ref().map(gpu::RadarGpu::new);
-            Ok(Box::new(OxradApp::new(gpu, initial)))
+            Ok(Box::new(OxradApp::new(gpu, invocation.initial, resolved)))
         }),
     ) {
         Ok(()) => ExitCode::SUCCESS,

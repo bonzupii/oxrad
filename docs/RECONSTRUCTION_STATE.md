@@ -9,7 +9,7 @@ States: not started, in progress, verified, blocked.
 | # | Work item | State | Evidence | Next action |
 |---|---|---|---|---|
 | 1 | Remove bundled datasets and prohibited assets | verified | Pass 1: no tracked file carries a dataset extension; no `include_bytes!` or `include_str!`; no `assets/`, `fixtures/`, or `data/` directory; no `build.rs` and no `include`/`exclude` keys in `Cargo.toml`; `src/basemap.rs` acquires OpenFreeMap tiles at runtime | none |
-| 2 | Configuration, profiles, provider registry, cache, attribution foundations | in progress | Pass 2: `src/sources.rs` records 25 sources with coverage, licence, credit, cadence, cache permission and verification level; 17 pass the admission test, 8 are rejected until their terms are verified; `oxrad --sources` renders `docs/SOURCES.md`; RainViewer and Sunrise-Sunset credits now come from the registry. Configuration profiles, the settings surface and the provider manager are not built | Add profiles and a settings surface that reads this registry |
+| 2 | Configuration, profiles, provider registry, cache, attribution foundations | verified | Pass 3: `src/config.rs` is the single typed model, resolved in three layers with per-field origins; units derive from the locale unless fixed; profile and selection files are validated with field-naming errors; `--print-config` prints values, origins, enabled providers and derived credits; saving is a synced temporary file renamed into place. Pass 2 built the registry it draws providers from | none |
 | 3 | OSM-derived basemap acquisition, styling, multi-scale cartography, persistent tile cache | in progress | `src/basemap.rs` and `src/basemap_tiles.rs` fetch and cache at runtime; multi-scale cartography and eviction unverified | Audit label density, zoom hierarchy, cache budget |
 | 4 | Design system, shell, navigation, icons, themes, accessibility, layer manager | not started | | Audit `theme.rs`, `app.rs`, `layer_catalog.rs` |
 | 5 | Separate Map and Radar workspaces | not started | | Map and Radar share `app.rs` presentation state |
@@ -20,6 +20,9 @@ States: not started, in progress, verified, blocked.
 | 10 | Cross-workspace time, location, provenance, provider controls | not started | | Each subsystem tracks its own timestamps |
 | 11 | GUI and scientific validation | blocked | `scripts/gui.sh` present; `.tools/root` absent, so no display, no window capture | Provision the harness under `.tools`, pinned |
 | 12 | Documentation, including removal of environment-specific workflow | not started | `docs/HEADLESS.md` still carries the Xvfb procedure and an install instruction | Move it to the `headless-gui-testing` skill; make `AGENTS.md` instrument-neutral |
+| 13 | Apply the configured cache budget in the store | not started | `CachePolicy` is validated and printed, but `cache.rs` still prunes to its own constants | Pass the policy into `Store::prune` |
+| 14 | Draw every displayed credit from the enabled registry set | not started | The report derives credits; the map still draws the OpenFreeMap credit from the style document and no layer shows its source credit beside the data | Add a credit bar fed by `Config::providers` |
+| 15 | Gate fetches by the enabled provider set | not started | A provider can be disabled in configuration, but no fetcher consults the set yet | Consult `Config::providers` before a request starts |
 
 ## Acceptance criteria
 
@@ -32,7 +35,7 @@ States: not started, in progress, verified, blocked.
 | A5 | Map supports independent visual styles and multi-scale cartography | not started | five style tokens exist in `basemap.rs` |
 | A6 | Map and Radar are distinct workspaces | not started | |
 | A7 | Layer manager controls real spatial and scientific visualizations | not started | |
-| A8 | Configuration covers workspaces, providers, cache, themes, layers, processing, accessibility, profiles | not started | |
+| A8 | Configuration covers workspaces, providers, cache, themes, layers, processing, accessibility, profiles | in progress | Workspaces, providers, cache, theme, units, sampling, storm motion, locale and profiles are typed and resolved; workspace layout, layer order and accessibility scale have no configuration fields | Add the remaining fields on the same model |
 | A9 | Consistent professional design system and iconography | not started | |
 | A10 | Dark, light, high contrast, and color-vision modes throughout | not started | |
 | A11 | Radar gate geometry preserves measured footprints and angular gaps | not started | |
@@ -49,7 +52,7 @@ States: not started, in progress, verified, blocked.
 | A22 | Scientific calculations and transformations have meaningful automated tests | not started | 467 tests recorded in `docs/TESTING.md`; coverage unverified |
 | A23 | Error paths, malformed data, missing metadata handled deliberately and visibly | not started | |
 | A24 | GUI workflows run and visually inspected | blocked | no display; `.tools/root` absent |
-| A25 | Settings and acquired data persist across restarts | not started | |
+| A25 | Settings and acquired data persist across restarts | in progress | Atomic save and reload are covered by a test that also proves the temporary file does not survive; the running application was not restarted on a display, so the restore path is unobserved in a window | Observe a restart under the harness |
 | A26 | Documentation reflects actual behavior, no stale AI document as authority | in progress | `docs/SOURCES.md` is generated from the registry and a test fails when it drifts; `docs/DATA_SOURCES.md` is marked a lead list; the remaining AI documents are unreconciled | Replace or delete each remaining document |
 | A27 | Implementation committed and pushed to the managed development branch | verified | `238b1fb` and `849e2d3` pushed to `freebuff/9adade3717017f6ce0f6c608` |
 
@@ -74,6 +77,17 @@ States: not started, in progress, verified, blocked.
 - Gates: `cargo fmt --all` clean, `cargo clippy -- -D warnings` exit 0, `cargo test --all-targets` 477 passed and 0 failed, `cargo build --release --locked` exit 0, `cargo check --all-targets` exit 0.
 - Not done: configuration profiles, the settings surface and the provider manager. Work item 2 stays in progress.
 
+### Pass 3
+
+- Decision: configuration is one typed model, not a settings subsystem beside the old one. `Config` holds locale, units, site, place, theme, map style, palette, sampling, storm motion, cache budget and the enabled provider set; the shell keeps reading `Config` fields, so no second source of settings exists.
+- Decision: precedence is built-in defaults, then profile file, then `--set` selection. The selection is written as the same `key = "value"` text the profile uses and parsed by the same function, so one parser validates both layers and a selection error names its line. Reason: a second parser would drift.
+- Decision: units are `auto` by default and resolved from the locale region after the final locale is known. Imperial is returned only for US, LR and MM. Reason: a fresh install must not assume a US reader, and an explicit unit choice must survive a later locale change.
+- Decision: providers are identifiers resolved through `src/sources.rs`, never free strings. Enabling runs the admission test, so `dwd-open-data` is refused by name until its licence is verified. Credits are computed by walking the registry in order over the enabled set.
+- Decision: saving writes a synced temporary file in the same directory and renames it, then syncs the directory on Unix. Reason: a crash mid-write must leave the previous file intact, not a truncated one.
+- Observed in the running binary, no window required: `oxrad --print-config` prints 13 fields with origins, 17 enabled providers and 17 derived credit lines; `--set units=imperial --set locale=en-GB` reports both as `selection`; `--profile` reports `theme` as `profile artifacts/profile.conf` while `--set units=metric` reports `units` as `selection`; `cache_max_mb = 99999` exits 1 with the field, the value and the allowed range; `providers=dwd-open-data` exits 1 with the identifier and the missing-licence reason.
+- Gates: `cargo fmt --all` clean, `cargo clippy -- -D warnings` exit 0, `cargo test --all-targets` 479 passed and 0 failed, `cargo build --release --locked` exit 0.
+- Not done and recorded as gaps: the configured cache budget is printed but `cache.rs` still prunes to its own constants; the enabled provider set is not yet consulted before a fetch; no layer displays its registry credit beside its data; number formatting is locale-neutral rather than localised; no window was opened, so no GUI behaviour was observed.
+
 ## Known gate gaps
 
 | Gap | Detail | Next action |
@@ -81,3 +95,5 @@ States: not started, in progress, verified, blocked.
 | Test targets are not linted | `cargo clippy --all-targets` fails on 280 assertion-in-`Result` errors that the documented gate never reaches | Align `STYLE.md` with one test convention, then lint test targets |
 | GUI evidence absent | No display and no `.tools/root`, so no window can be opened or captured | Provision the harness under `.tools` with pinned versions |
 | Basemap credit outside the registry | `walkers` supplies the OpenFreeMap attribution from the style document, so it bypasses `src/sources.rs` | Read the credit from the registry in `draw_attribution` |
+| Cache budget not enforced | `Config::cache` is validated and printed, but `Store::prune` still uses module constants | Give `Store` the policy at construction |
+| Providers not gating fetches | A disabled provider stays listed as enabled in the model but its fetcher does not check | Consult the set before a request starts |

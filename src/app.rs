@@ -338,17 +338,24 @@ fn restore_site(app: &mut OxradApp, restored: Option<SiteId>) {
 }
 
 impl OxradApp {
-    pub fn new(gpu: Option<RadarGpu>, initial: Option<SiteId>) -> Self {
-        let mut config = Config::default();
-        let (mut config_writable, mut notice) = (true, None::<String>);
-        match config::load_default() {
-            Ok(None) => {}
-            Ok(Some(loaded)) => config = loaded,
-            Err(error) => {
-                config_writable = false;
-                notice = Some(format!("Configuration ignored: {error}"));
-            }
-        }
+    pub fn new(gpu: Option<RadarGpu>, initial: Option<SiteId>, resolved: Option<Config>) -> Self {
+        let (config, config_writable, notice) = resolved.map_or_else(
+            || {
+                let mut config = Config::default();
+                let mut writable = true;
+                let mut notice = None::<String>;
+                match config::load_default() {
+                    Ok(None) => {}
+                    Ok(Some(loaded)) => config = loaded,
+                    Err(error) => {
+                        writable = false;
+                        notice = Some(format!("Configuration ignored: {error}"));
+                    }
+                }
+                (config, writable, notice)
+            },
+            |config| (config, true, None::<String>),
+        );
         let (restored_site, restored_place) = (
             initial.or_else(|| config.site.clone()),
             config.place.clone(),
