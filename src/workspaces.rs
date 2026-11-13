@@ -319,6 +319,47 @@ mod tests {
     }
 
     #[test]
+    fn two_measured_corners_report_distance_and_bearing() -> Result<(), TestError> {
+        let mut measure = Measurement::new();
+        measure.toggle();
+        for point in [(38.0, -97.0), (39.0, -97.0)] {
+            measure.add(point).map_err(|error| error.to_string())?;
+        }
+        let text = measure.readout(UnitSystem::Metric)?;
+        assert!(text.contains("111.0 km"), "readout was {text}");
+        assert!(text.contains("0° north"), "readout was {text}");
+        Ok(())
+    }
+
+    /// Four corners on the equator enclose the reference degree-square area, so
+    /// the panel must show both the area and the full closed perimeter rather
+    /// than only the sum of the three open legs.
+    #[test]
+    fn four_measured_corners_report_the_enclosed_area() -> Result<(), TestError> {
+        let mut measure = Measurement::new();
+        measure.toggle();
+        for point in [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)] {
+            measure.add(point).map_err(|error| error.to_string())?;
+        }
+        let text = measure.readout(UnitSystem::Metric)?;
+        assert!(text.contains("4 corners"), "readout was {text}");
+        assert!(text.contains("area 12309 km²"), "readout was {text}");
+        assert!(text.contains("perimeter 443.8 km"), "readout was {text}");
+        assert!(text.contains("path 333.2 km"), "readout was {text}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_unstarted_measurement_asks_for_a_corner() -> Result<(), TestError> {
+        let measure = Measurement::new();
+        assert_eq!(
+            measure.readout(UnitSystem::Imperial)?,
+            "Click a corner to start measuring"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn switching_the_tool_off_discards_the_corners() -> Result<(), TestError> {
         let mut measure = Measurement::new();
         measure.toggle();

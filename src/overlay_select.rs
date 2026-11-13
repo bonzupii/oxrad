@@ -82,6 +82,39 @@ pub fn nearby_station_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stations::{RadarSource, Station, StationKind};
+    use crate::test_support::TestError;
+
+    fn test_station(id: &str, lat: f64, lon: f64) -> Result<Station, TestError> {
+        Ok(Station {
+            id: SiteId::parse(id)?,
+            name: String::from(id),
+            lat,
+            lon,
+            elevation_m: None,
+            kind: StationKind::Wsr88d,
+            source: RadarSource::Nexrad,
+            status: None,
+            last_data: None,
+        })
+    }
+
+    #[test]
+    fn viewport_station_selection_sorts_excludes_and_limits() -> Result<(), TestError> {
+        let stations = vec![
+            test_station("KAAA", 37.05, -88.05)?,
+            test_station("KAAB", 38.0, -88.05)?,
+            test_station("KAAC", 39.0, -88.05)?,
+            test_station("KAAD", 40.0, -88.05)?,
+        ];
+        let excluded = SiteId::parse("KAAA")?;
+        let selected = nearby_station_ids(&stations, 37.05, -88.05, 400.0, Some(&excluded), 2)?;
+        assert_eq!(
+            selected.iter().map(SiteId::as_str).collect::<Vec<_>>(),
+            vec!["KAAB", "KAAC"]
+        );
+        Ok(())
+    }
 
     #[test]
     fn a_selection_the_feed_dropped_is_cleared() {

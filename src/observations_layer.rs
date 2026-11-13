@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, RichText};
 
 use crate::acquire::Acquire;
-use crate::app::toggle_button;
+use crate::canvas::toggle_button;
 use crate::map;
 use crate::observations::{
     self, FlightCategory, Observation, ObservationSet, ObservationState, ObservationView,

@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align2, FontId, Pos2, Rect, RichText, Stroke};
 
 use crate::acquire::Acquire;
-use crate::app::toggle_button;
+use crate::canvas::toggle_button;
 use crate::land::{self, Land, LandState, LandView, SoilBand};
 use crate::map::MapView;
 use crate::projection;

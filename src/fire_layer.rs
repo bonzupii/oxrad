@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, Pos2, Rect, RichText, Shape, Stroke};
 
 use crate::acquire::Acquire;
-use crate::app::toggle_button;
+use crate::canvas::toggle_button;
 use crate::fire::{self, FireKind, FireSet, FireState, FireView};
 use crate::map;
 use crate::projection;

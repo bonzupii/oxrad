@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Stroke};
 
 use crate::acquire::Acquire;
-use crate::app::toggle_button;
+use crate::canvas::toggle_button;
 use crate::map::MapView;
 use crate::ocean::{self, Ocean, OceanState, OceanView, SeaState};
 use crate::projection;

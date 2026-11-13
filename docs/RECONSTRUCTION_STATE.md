@@ -19,13 +19,13 @@ States: not started, in progress, verified, blocked.
 | 2 | Configuration, profiles, provider registry, cache, attribution foundations | verified | Pass 3: `src/config.rs` is the single typed model, resolved in three layers with per-field origins; units derive from the locale unless fixed; profile and selection files are validated with field-naming errors; `--print-config` prints values, origins, enabled providers and derived credits; saving is a synced temporary file renamed into place. Pass 2 built the registry it draws providers from | none |
 | 3 | OSM-derived basemap acquisition, styling, multi-scale cartography, persistent tile cache | in progress | `src/basemap.rs` and `src/basemap_tiles.rs` fetch and cache at runtime; multi-scale cartography and eviction unverified | Audit label density, zoom hierarchy, cache budget |
 | 4 | Design system, shell, navigation, icons, themes, accessibility, layer manager | not started | | Audit `theme.rs`, `app.rs`, `layer_catalog.rs` |
-| 5 | Separate Map and Radar workspaces | not started | | Map and Radar share `app.rs` presentation state |
+| 5 | Separate Map and Radar workspaces | verified | Pass 8: `map_panel.rs` owns the geographic view, layers, domains and warnings; `radar_panel.rs` owns the selected site, pipeline, display, product and viewport radars; each draws its own canvas and `app.rs` routes between them | none |
 | 6 | Radar gate geometry and scientific resampling | not started | | Audit `render.rs` topology and the sampling path |
 | 7 | Radar source expansion (Level III, TDWR, international), mosaics | not started | | NEXRAD Level II only |
 | 8 | Satellite, atmosphere, hydrology, seismic, climate, ocean, environment, space weather workspaces | not started | | Ten workspaces required; one shell exists |
 | 9 | Weather-radio audio streaming | not started | | `src/radio.rs` produces text bulletins |
 | 10 | Cross-workspace time, location, provenance, provider controls | not started | | Each subsystem tracks its own timestamps |
-| 11 | GUI and scientific validation | blocked | `scripts/gui.sh` present; `.tools/root` absent, so no display, no window capture | Provision the harness under `.tools`, pinned |
+| 11 | GUI and scientific validation | blocked | `scripts/gui.sh` present; Pass 8 confirmed Xvfb, xdotool, netpbm, proot and xkbcomp are absent from PATH and `.tools/root`, and this VM user is non-root with empty apt lists, so no display and no window capture | Provision the harness under `.tools`, pinned |
 | 12 | Documentation, including removal of environment-specific workflow | not started | `docs/HEADLESS.md` still carries the Xvfb procedure and an install instruction | Move it to the `headless-gui-testing` skill; make `AGENTS.md` instrument-neutral |
 | 13 | Apply the configured cache budget in the store | verified | Pass 4: `Store::prune` takes the policy from the effective configuration, returns the byte and entry limits it enforced, and the private `MAX_CACHE_*` constants are gone; `oxrad --prune-cache` prints the enforced budget and what it removed | none |
 | 14 | Draw every displayed credit from the enabled registry set | in progress | Pass 5: the basemap credit is read from `sources::OPENFREEMAP.credit` and is drawn only when the effective set enables `openfreemap`; the report derives every credit from the enabled set; layer credits are still not shown beside their data | Feed a credit bar from the enabled set |
@@ -40,7 +40,7 @@ States: not started, in progress, verified, blocked.
 | A3 | External data acquired at runtime and cached per user under explicit policies | in progress | `cache.rs` and `basemap_tiles.rs` cache; per-provider policy unverified |
 | A4 | OSM-derived tiles retrieved, rendered, attributed, cached, reused across restarts | not started | runtime acquisition exists; restart reuse unverified |
 | A5 | Map supports independent visual styles and multi-scale cartography | not started | five style tokens exist in `basemap.rs` |
-| A6 | Map and Radar are distinct workspaces | not started | |
+| A6 | Map and Radar are distinct workspaces | verified | Pass 8: separate state, controls and rendering in `map_panel.rs` and `radar_panel.rs`; the shell only chooses which panel draws |
 | A7 | Layer manager controls real spatial and scientific visualizations | not started | |
 | A8 | Configuration covers workspaces, providers, cache, themes, layers, processing, accessibility, profiles | in progress | Workspaces, providers, cache, theme, units, sampling, storm motion, locale and profiles are typed and resolved; workspace layout, layer order and accessibility scale have no configuration fields | Add the remaining fields on the same model |
 | A9 | Consistent professional design system and iconography | not started | |
@@ -55,10 +55,10 @@ States: not started, in progress, verified, blocked.
 | A18 | Provider attribution and licensing systematic and visible | in progress | 25 sources carry licence and credit; 17 admit; RainViewer, Sunrise-Sunset and OpenFreeMap credits are read from the registry; the report derives credits from the enabled set; 14 admitted sources show no credit in the interface yet | Display each credit beside its layer |
 | A19 | Persistent caches survive restarts and expose their state | in progress | Bodies and metadata persist with integrity checking; `oxrad --prune-cache` exposes the directory, the configured budget and the number removed; no window has shown the cache state | Surface cache state in the interface |
 | A20 | Network behavior provider-aware and robust | in progress | Pass 7: the admission gate precedes every request. Per-provider retry and rate policy still live inside each module | Move retry and rate policy behind the boundary |
-| A21 | Subsystems own state and lifecycle; root is not a god object | not started | `app.rs` is 4681 lines |
+| A21 | Subsystems own state and lifecycle; root is not a god object | verified | Pass 8: `app.rs` is 522 lines with no domain fields; nine panels own state, update handling and rendering; no re-export module or compatibility path remains |
 | A22 | Scientific calculations and transformations have meaningful automated tests | not started | 467 tests recorded in `docs/TESTING.md`; coverage unverified |
 | A23 | Error paths, malformed data, missing metadata handled deliberately and visibly | not started | |
-| A24 | GUI workflows run and visually inspected | blocked | no display; `.tools/root` absent |
+| A24 | GUI workflows run and visually inspected | blocked | no display; Pass 8 found no Xvfb, xdotool, netpbm, proot or xkbcomp on PATH or under `.tools/root`, and this VM user cannot install host packages. Only `--help` and `--print-config` were observed |
 | A25 | Settings and acquired data persist across restarts | in progress | Atomic save and reload are covered by a test that also proves the temporary file does not survive; the running application was not restarted on a display, so the restore path is unobserved in a window | Observe a restart under the harness |
 | A26 | Documentation reflects actual behavior, no stale AI document as authority | in progress | `docs/SOURCES.md` is generated from the registry and a test fails when it drifts; `docs/DATA_SOURCES.md` is marked a lead list; the remaining AI documents are unreconciled | Replace or delete each remaining document |
 | A27 | Implementation committed and pushed to the managed development branch | verified | `238b1fb` and `849e2d3` pushed to `freebuff/9adade3717017f6ce0f6c608` |
@@ -134,11 +134,38 @@ States: not started, in progress, verified, blocked.
 - Gates: `cargo fmt --all -- --check` exit 0, `cargo clippy --message-format=short -- -D warnings` exit 0, `cargo test --all-targets` 486 passed and 0 failed, `cargo build --release --locked` exit 0.
 - Not done: no window was opened, because the environment still has no display and no provisioned harness. Layer credits are still not drawn beside their data.
 
+### Pass 8
+
+- Replaced `src/app.rs` with construction and per-frame composition. It is 522 lines, from 4,292. It owns the acquire gate, the nine panels and `OxradApp::new`; `update` polls the panels, routes their actions, and composes header, status, rail, forecast and canvas.
+- Boundaries chosen:
+  - `shell.rs` owns the effective `Config`, theme application, `SceneMode`, notices, the header and the atomic config save.
+  - `places_panel.rs` owns the search worker, query and selected place.
+  - `station_panel.rs` owns the cached catalog, discovery feed and schedule, picker query and pending site.
+  - `forecast_panel.rs` owns the forecast feed, retry state and right panel.
+  - `radar_panel.rs` owns the selected site, live pipeline, display, product, viewport radars and radar canvas.
+  - `history_panel.rs` owns the archive feed, scan keys, review and playback state and the recent scans rail.
+  - `global_panel.rs` owns the RainViewer feed, frame textures, playback and timeline.
+  - `map_panel.rs` owns the map view and measurement, basemap, layer catalog, domains, quakes, warnings, radio, layer rail and map canvas.
+  - `status_bar.rs` owns the identity, freshness, failure and diagnostics rows.
+  - `canvas.rs` owns stateless geometry, colours, legend splitting, readout and raster placement.
+- Deleted from `app.rs` with the state they described: `SceneMode`, `Canvas`, `GlobalState`, `GlobalPlayback`, `HistoryState`, `HistoryStart`, `HistoryView`, `ViewRadar`, `GlobalTileTexture`, `GlobalFrameTexture`, the `OxradApp` field bag, every method it carried, and the free helpers `global_texture`, `draw_map_display`, `station_details`, `search_results`, `forecast_body`, `forecast_period`, `chrome_obstacles`, `legend_split`, `map_caption`, `north_marker`, `scan_status`, `diagnostics`, `empty_frame_notice`, `gate_label`, the map geometry helpers and the severity colours. No re-export module or compatibility path exists; every call site was rewritten.
+- Rewrote eighteen layer modules that imported `toggle_button` or `action_button` from `crate::app`; they now import `crate::canvas`. `grep 'crate::app::' src` returns nothing.
+- Decision: cross-panel mutations travel as `MapActions` rather than callbacks. The map cannot mutate the composite, the radar or the scene, so layer switches, focus, save and reload requests return to the shell and are applied once. The two bool-heavy action types carry an `expect` whose reason is that they are independent one-way requests, not a state machine.
+- Decision: history drives the radar through explicit `&mut RadarPanel` calls because review replaces the live display. The history panel owns its feed and playback; it does not own a second display.
+- Decision: notices remain one `Option<String>` owned by the shell and passed as `&mut` to each panel, so the newest failure is visible in the rail and status without a logger or global state.
+- Decision: the status bar is free functions over the radar and history panels. It reports their state and owns none.
+- Behavior preserved through the move: layer stacking order, legend reservation, map status stacking, warning hit order, radar frame drawing order, history playback timing, station discovery cadence and config save points. The map's Focus button, dropped by the first cut of `zoom_controls`, was restored before the gates.
+- Tests moved with their behavior: map geometry and scan window to `canvas`, gate labels and empty-frame wording to `canvas`, measurement readout to `workspaces`, viewport station ranking to `overlay_select`. New boundary tests cover shell scene state, map layer actions crossing to composite requests, history readiness from a scan list, and radar empty-state routing. 489 tests pass.
+- Observed in the release binary: `--help` prints this build's interface and exits 0; `--print-config` resolves the configuration and exits 0.
+- Gates: `cargo fmt --all -- --check` exit 0, `cargo clippy --message-format=short -- -D warnings` exit 0, `cargo test --all-targets` 489 passed and 0 failed, `cargo build --release --locked` exit 0.
+- Not observed: no window, layout, interaction or visual comparison. The GUI harness is blocked: Xvfb, xdotool, netpbm, proot and xkbcomp are absent from PATH and `.tools/root`, and this VM user is non-root with empty apt lists. Work item 11 and A24 remain blocked.
+- File sizes after: `app.rs` 522, `map_panel.rs` 1,201, `radar_panel.rs` 909, `history_panel.rs` 583, `canvas.rs` 450, `global_panel.rs` 423, `station_panel.rs` 330, `forecast_panel.rs` 308, `status_bar.rs` 277, `places_panel.rs` 214, `shell.rs` 210.
+
 ## Known gate gaps
 
 | Gap | Detail | Next action |
 |---|---|---|
 | Test targets are not linted | `cargo clippy --all-targets` fails on 280 assertion-in-`Result` errors that the documented gate never reaches | Align `STYLE.md` with one test convention, then lint test targets |
-| GUI evidence absent | No display and no `.tools/root`, so no window can be opened or captured | Provision the harness under `.tools` with pinned versions |
+| GUI evidence absent | No display and no `.tools/root`; Pass 8 confirmed all harness tools missing and no non-root provisioning path, so no window can be opened or captured | Provision the harness under `.tools` with pinned versions |
 | Basemap credit outside the registry | `walkers` supplies the OpenFreeMap attribution from the style document, so it bypasses `src/sources.rs` | Read the credit from the registry in `draw_attribution` |
 | Layer credits not displayed | Registry credit is correct and printed, but only the basemap and RainViewer draw a credit in the interface | Add a credit bar fed by the enabled set |

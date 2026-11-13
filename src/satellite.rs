@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, Pos2, Rect, RichText, TextureHandle};
 
 use crate::acquire::Acquire;
-use crate::app::toggle_button;
+use crate::canvas::toggle_button;
 use crate::global_radar::{self, TileBounds};
 use crate::map;
 use crate::provider::FetchError;

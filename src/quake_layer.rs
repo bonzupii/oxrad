@@ -27,7 +27,7 @@ use eframe::egui::{
 };
 
 use crate::acquire::Acquire;
-use crate::app::{action_button, toggle_button};
+use crate::canvas::{action_button, toggle_button};
 use crate::map;
 use crate::quake::{self, DepthBand, Quake, QuakeState, QuakeView, Window};
 use crate::theme::{self, Palette};

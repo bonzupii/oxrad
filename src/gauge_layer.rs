@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align2, FontId, Painter, Pos2, Rect, RichText, Stroke};
 
 use crate::acquire::Acquire;
-use crate::app::toggle_button;
+use crate::canvas::toggle_button;
 use crate::gauge::{self, Gauge, GaugeSet, GaugeState, GaugeView, History, HistoryState};
 use crate::map::{MapTransform, MapView};
 use crate::theme::{self, Palette};

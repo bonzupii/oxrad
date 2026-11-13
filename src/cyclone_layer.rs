@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align2, Color32, FontId, Painter, Pos2, Rect, RichText, Stroke};
 
 use crate::acquire::Acquire;
-use crate::app::toggle_button;
+use crate::canvas::toggle_button;
 use crate::cyclone::{self, Alert, Cyclone, CycloneState, CycloneView, StormList};
 use crate::map::MapTransform;
 use crate::theme::{self, Palette};

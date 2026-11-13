@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, RichText};
 
-use crate::app::toggle_button;
+use crate::canvas::toggle_button;
 use crate::radio::{self, Bulletin, Input, Urgency};
 use crate::theme::{self, Palette};
 
