@@ -330,7 +330,7 @@ fn fetch_places(acquire: &Acquire, query: &str) -> Result<Served<Vec<Place>>, Fe
 }
 
 /// Parses and ranks a Photon feature collection for one query.
-fn places_from_document(
+pub(crate) fn places_from_document(
     document: &Value,
     url: &str,
     query: &str,

@@ -14,7 +14,7 @@ use walkers::sources::{Attribution, TileSource};
 use walkers::{Style, Tile, TileId, TilePiece, Tiles};
 
 use crate::acquire::Acquire;
-use crate::engine::RequestSpec;
+use crate::engine::{CacheState, Provenance, RequestSpec};
 use crate::provider::FetchError;
 use crate::sources;
 
@@ -80,9 +80,15 @@ struct Job {
     id: TileId,
 }
 
+struct ServedTile {
+    bytes: Vec<u8>,
+    provenance: Provenance,
+    cache: CacheState,
+}
+
 struct Completion {
     id: TileId,
-    result: Result<Vec<u8>, TileError>,
+    result: Result<ServedTile, TileError>,
     warning: Option<TileError>,
 }
 
@@ -121,7 +127,7 @@ fn start_worker(
 }
 
 /// Reads a tile through the engine, which owns the URL, cache and retries.
-fn load_tile(acquire: &Acquire, id: TileId) -> (Result<Vec<u8>, TileError>, Option<TileError>) {
+fn load_tile(acquire: &Acquire, id: TileId) -> (Result<ServedTile, TileError>, Option<TileError>) {
     let zoom = id.zoom.to_string();
     let x = id.x.to_string();
     let y = id.y.to_string();
@@ -138,7 +144,14 @@ fn load_tile(acquire: &Acquire, id: TileId) -> (Result<Vec<u8>, TileError>, Opti
         Err(source) => return (Err(provider_error(source)), None),
     };
     match acquire.fetch(&spec) {
-        Ok(fetched) => (Ok(fetched.body), None),
+        Ok(fetched) => (
+            Ok(ServedTile {
+                bytes: fetched.body,
+                provenance: fetched.provenance,
+                cache: fetched.cache,
+            }),
+            None,
+        ),
         Err(source) => (Err(provider_error(source)), None),
     }
 }
@@ -162,6 +175,8 @@ struct ReadyTile {
     bytes: Vec<u8>,
     tile: Tile,
     touched: u64,
+    provenance: Provenance,
+    cache: CacheState,
 }
 
 struct FailedTile {
@@ -176,6 +191,7 @@ pub struct BasemapTiles<S: TileSource> {
     failed: HashMap<TileId, FailedTile>,
     workers: Vec<Worker>,
     events: Receiver<Completion>,
+    visible: Vec<TileId>,
     clock: u64,
     warning: Option<TileError>,
 }
@@ -206,9 +222,27 @@ impl<S: TileSource> BasemapTiles<S> {
             failed: HashMap::new(),
             workers,
             events: receiver,
+            visible: Vec::new(),
             clock: 0,
             warning: None,
         }
+    }
+
+    /// Starts a draw pass: only tiles `at` is asked for are visible.
+    pub fn begin_frame(&mut self) {
+        self.visible.clear();
+    }
+
+    /// The visible requests that produced decoded pixels, in tile order.
+    pub fn visible_requests(&self) -> Vec<(TileId, Provenance, CacheState)> {
+        self.visible
+            .iter()
+            .filter_map(|id| {
+                self.ready
+                    .get(id)
+                    .map(|ready| (*id, ready.provenance.clone(), ready.cache))
+            })
+            .collect()
     }
 
     /// Takes the most recent non-fatal cache problem, if any.
@@ -305,11 +339,12 @@ impl<S: TileSource> BasemapTiles<S> {
         {
             worker.busy = None;
         }
-        let decoded = completion
-            .result
-            .and_then(|bytes| self.decode(completion.id, bytes));
+        let decoded = completion.result.and_then(|served| {
+            self.decode(completion.id, served.bytes)
+                .map(|(bytes, tile)| (bytes, tile, served.provenance, served.cache))
+        });
         match decoded {
-            Ok((bytes, tile)) => {
+            Ok((bytes, tile, provenance, cache)) => {
                 self.failed.remove(&completion.id);
                 self.ready.insert(
                     completion.id,
@@ -317,6 +352,8 @@ impl<S: TileSource> BasemapTiles<S> {
                         bytes,
                         tile,
                         touched: self.clock,
+                        provenance,
+                        cache,
                     },
                 );
                 self.evict();
@@ -381,6 +418,9 @@ impl<S: TileSource> Tiles for BasemapTiles<S> {
     fn at(&mut self, id: TileId) -> Option<TilePiece> {
         self.drain();
         let (id, uv) = self.limit_zoom(id)?;
+        if !self.visible.contains(&id) {
+            self.visible.push(id);
+        }
         self.schedule(id);
         self.clock = self.clock.saturating_add(1);
         let tile = self.ready.get_mut(&id)?;

@@ -27,8 +27,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use serde_json::Value;
 
 use crate::acquire::Acquire;
-use crate::engine::RequestSpec;
-use crate::engine::Served;
+use crate::engine::{CacheState, Provenance, RequestSpec, Served};
 use crate::error::RadarError;
 use crate::provider::FetchError;
 use crate::sources;
@@ -94,6 +93,10 @@ pub struct TileImage {
 
 /// Messages sent from the global radar worker to the UI.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the served tile carries its provenance beside the decoded pixels"
+)]
 pub enum GlobalEvent {
     Manifest {
         generation: u64,
@@ -102,7 +105,7 @@ pub enum GlobalEvent {
     Frame {
         generation: u64,
         frame: GlobalFrame,
-        tiles: Vec<TileImage>,
+        tiles: Vec<Served<TileImage>>,
     },
     Failed {
         generation: u64,
@@ -223,8 +226,8 @@ impl From<FetchError> for GlobalRadarError {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ManifestSnapshot {
-    host: String,
-    frames: Vec<GlobalFrame>,
+    pub(crate) host: String,
+    pub(crate) frames: Vec<GlobalFrame>,
 }
 
 struct RadarRequest {
@@ -317,7 +320,7 @@ struct Worker {
     requests: Receiver<RadarRequest>,
     acquire: Acquire,
     events: Sender<GlobalEvent>,
-    tiles: HashMap<String, Vec<u8>>,
+    tiles: HashMap<String, (Vec<u8>, Provenance, CacheState)>,
 }
 
 impl Worker {
@@ -375,7 +378,7 @@ impl Worker {
                     return Ok(Some(next));
                 }
                 let key = cache_key(frame, *bounds);
-                let png = match self.tiles.remove(&key) {
+                let (png, tile_provenance, tile_cache) = match self.tiles.remove(&key) {
                     Some(cached) => cached,
                     None => {
                         if !valid_host(&snapshot.host) || !valid_path(&frame.path) {
@@ -401,18 +404,27 @@ impl Worker {
                             ],
                         )
                         .map_err(RadarError::from)?;
-                        self.acquire.fetch(&spec).map_err(RadarError::from)?.body
+                        let fetched = self.acquire.fetch(&spec).map_err(RadarError::from)?;
+                        (fetched.body, fetched.provenance, fetched.cache)
                     }
                 };
                 let image = decode_tile(&png, &frame.path)?;
                 if self.tiles.len() >= MAX_CACHED_TILES {
                     self.tiles.clear();
                 }
-                self.tiles.insert(key, png);
-                decoded.push(TileImage {
-                    bounds: *bounds,
-                    image,
-                });
+                self.tiles
+                    .insert(key, (png, tile_provenance.clone(), tile_cache));
+                decoded.push(
+                    Served::new(
+                        TileImage {
+                            bounds: *bounds,
+                            image,
+                        },
+                        tile_provenance,
+                        tile_cache,
+                    )
+                    .labelled(format!("tile z{} x{} y{}", bounds.zoom, bounds.x, bounds.y)),
+                );
             }
             if self
                 .events
@@ -485,7 +497,7 @@ fn valid_path(path: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.'))
 }
 
-fn parse_manifest(bytes: &[u8]) -> Result<ManifestSnapshot, GlobalRadarError> {
+pub(crate) fn parse_manifest(bytes: &[u8]) -> Result<ManifestSnapshot, GlobalRadarError> {
     let root: Value =
         serde_json::from_slice(bytes).map_err(|source| GlobalRadarError::Json { source })?;
     let host = root

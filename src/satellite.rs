@@ -349,7 +349,7 @@ pub enum SatelliteEvent {
     },
 }
 
-fn decode(url: &str, bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), SatelliteError> {
+pub(crate) fn decode(url: &str, bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), SatelliteError> {
     let image = image::load_from_memory(bytes).map_err(|source| SatelliteError::Image {
         url: String::from(url),
         source,
@@ -661,14 +661,17 @@ impl SatelliteLayer {
                         ),
                         egui::TextureOptions::LINEAR,
                     );
-                    self.tiles.push(Served::new(
-                        PlacedTile {
-                            bounds: tile.bounds,
-                            texture,
-                        },
-                        tile.provenance.clone(),
-                        tile.cache,
-                    ));
+                    self.tiles.push(
+                        Served::new(
+                            PlacedTile {
+                                bounds: tile.bounds,
+                                texture,
+                            },
+                            tile.provenance.clone(),
+                            tile.cache,
+                        )
+                        .labelled(tile_label(&tile.bounds)),
+                    );
                     if let Status::Loading { of, .. } = self.status {
                         self.status = Status::Loading {
                             loaded: self.tiles.len(),
@@ -763,9 +766,14 @@ impl SatelliteLayer {
                 .weak(),
         );
         if let Some(first) = self.tiles.first() {
-            let mut requests = Served::new((), first.provenance.clone(), first.cache);
+            let mut requests = Served::new((), first.provenance.clone(), first.cache)
+                .labelled(tile_label(&first.bounds));
             for tile in self.tiles.iter().skip(1) {
-                requests = requests.with_request(tile.provenance.clone(), tile.cache);
+                requests = requests.with_labelled_request(
+                    tile_label(&tile.bounds),
+                    tile.provenance.clone(),
+                    tile.cache,
+                );
             }
             provenance(ui, &requests);
         }
@@ -906,6 +914,10 @@ impl SatelliteLayer {
 
 fn key_for(bounds: &TileBounds) -> String {
     format!("{}-{}-{}", bounds.zoom, bounds.x, bounds.y)
+}
+
+fn tile_label(bounds: &TileBounds) -> String {
+    format!("tile z{} x{} y{}", bounds.zoom, bounds.x, bounds.y)
 }
 
 #[cfg(test)]

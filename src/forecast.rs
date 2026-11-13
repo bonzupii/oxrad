@@ -355,7 +355,7 @@ fn require_unit(units: &Value, field: &'static str, expected: &str) -> Result<()
     Ok(())
 }
 
-fn parse_document(place: &Place, document: &Value) -> Result<Forecast, ForecastError> {
+pub(crate) fn parse_document(place: &Place, document: &Value) -> Result<Forecast, ForecastError> {
     let timezone = text(document, "timezone")?;
     let timezone_abbreviation = text(document, "timezone_abbreviation")?;
     let current_units = object(document, "current_units")?;

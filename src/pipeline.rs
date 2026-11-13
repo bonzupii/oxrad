@@ -341,11 +341,12 @@ fn fetch(
     jobs: &Sender<Archive>,
     results: &Receiver<Result<RadarVolume, RadarError>>,
 ) -> Result<Option<Fetched>, FetchFailure> {
-    let key = network::latest_volume_key(acquire, site).map_err(|error| FetchFailure {
+    let listed = network::latest_volume_key(acquire, site).map_err(|error| FetchFailure {
         operation: Operation::Fetching,
         error,
         cache_warning: None,
     })?;
+    let key = listed.key;
     if state.last_key.as_ref() == Some(&key)
         || (state.failed_key.as_ref() == Some(&key) && state.decode_failures >= 2)
     {
@@ -386,7 +387,7 @@ fn fetch(
     match results.recv().map_err(|_| decode_failure(site))? {
         Ok(volume) => Ok(Some(Fetched {
             key,
-            volume: Served::new(volume, provenance, cache),
+            volume: served_with_listing(Served::new(volume, provenance, cache), listed.requests),
             from_cache,
             cache_warning,
         })),
@@ -405,6 +406,21 @@ fn fetch(
             })
         }
     }
+}
+
+/// Attaches the discovery pages that found a volume to the volume's own
+/// object request, so both requests stay visible beside the decoded scan.
+pub(crate) fn served_with_listing(
+    mut volume: Served<RadarVolume>,
+    listing: Vec<crate::engine::SourceRecord>,
+) -> Served<RadarVolume> {
+    for record in listing {
+        let label = record
+            .label
+            .unwrap_or_else(|| String::from("discovery listing"));
+        volume = volume.with_labelled_request(label, record.provenance, record.cache);
+    }
+    volume
 }
 
 enum WaitOutcome {
@@ -517,6 +533,8 @@ impl Fetcher {
 mod tests {
     use super::*;
 
+    use crate::engine::{CacheState, RequestSpec, SourceRecord};
+    use crate::sources;
     use crate::test_support::TestError;
 
     fn volume(site: SiteId) -> RadarVolume {
@@ -581,6 +599,46 @@ mod tests {
                 .is_none()
         );
         assert_eq!(fetched.origin, ArchiveOrigin::Cached);
+        Ok(())
+    }
+
+    #[test]
+    fn a_decoded_volume_keeps_the_listing_pages_that_found_it() -> Result<(), TestError> {
+        let site = SiteId::parse("KTWX")?;
+        let object = RequestSpec::for_operation(
+            &sources::NEXRAD_LEVEL_TWO,
+            "object",
+            &[("key", "2026/11/13/KTWX/KTWX20261113_000000_V06")],
+        )
+        .map_err(|error| TestError::from(error.to_string()))?;
+        let listing = RequestSpec::for_operation(
+            &sources::NEXRAD_LEVEL_TWO,
+            "list",
+            &[("prefix", "2026/11/13/KTWX/")],
+        )
+        .map_err(|error| TestError::from(error.to_string()))?;
+        let served = served_with_listing(
+            Served::new(volume(site), object.provenance(), CacheState::Network),
+            vec![SourceRecord {
+                provenance: listing.provenance(),
+                cache: CacheState::NotStored,
+                label: Some(String::from("discovery listing 2026/11/13/KTWX/")),
+            }],
+        );
+        let entries: Vec<_> = served.entries().collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries.first().and_then(|entry| entry.provenance.operation),
+            Some("object")
+        );
+        assert_eq!(
+            entries.get(1).and_then(|entry| entry.provenance.operation),
+            Some("list")
+        );
+        assert_eq!(
+            entries.get(1).and_then(|entry| entry.label),
+            Some("discovery listing 2026/11/13/KTWX/")
+        );
         Ok(())
     }
 

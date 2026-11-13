@@ -20,7 +20,7 @@ use quick_xml::events::Event;
 use std::collections::HashSet;
 
 use crate::acquire::Acquire;
-use crate::engine::{CacheState, RequestSpec};
+use crate::engine::{CacheState, RequestSpec, SourceRecord};
 use crate::error::RadarError;
 use crate::provider::FetchError;
 use crate::sources;
@@ -29,13 +29,13 @@ use crate::time::{MS_PER_DAY, civil_from_days, days_from_civil, now_unix_ms};
 
 const LOOKBACK_DAYS: i64 = 3;
 #[derive(Default)]
-struct ListingPage {
-    keys: Vec<String>,
-    truncated: Option<bool>,
-    continuation: Option<String>,
+pub(crate) struct ListingPage {
+    pub(crate) keys: Vec<String>,
+    pub(crate) truncated: Option<bool>,
+    pub(crate) continuation: Option<String>,
 }
 
-fn listing_xml(prefix: &str, xml: &str) -> Result<ListingPage, RadarError> {
+pub(crate) fn listing_xml(prefix: &str, xml: &str) -> Result<ListingPage, RadarError> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
     let mut names: Vec<Vec<u8>> = Vec::new();
@@ -104,9 +104,15 @@ fn listing_xml(prefix: &str, xml: &str) -> Result<ListingPage, RadarError> {
 /// The most listing pages a single key scan may read.
 const MAX_LIST_PAGES: usize = 64;
 
+struct Listing {
+    keys: Vec<String>,
+    requests: Vec<SourceRecord>,
+}
+
 /// Paginates a bucket listing prefix to exhaustion.
-fn list_keys(acquire: &Acquire, prefix: &str) -> Result<Vec<String>, RadarError> {
+fn list_keys(acquire: &Acquire, prefix: &str) -> Result<Listing, RadarError> {
     let mut keys = Vec::new();
+    let mut requests = Vec::new();
     let mut token: Option<String> = None;
     let mut seen_tokens = HashSet::new();
     loop {
@@ -127,6 +133,15 @@ fn list_keys(acquire: &Acquire, prefix: &str) -> Result<Vec<String>, RadarError>
         let request = RequestSpec::for_operation(&sources::NEXRAD_LEVEL_TWO, operation, &values)
             .map_err(RadarError::from)?;
         let fetched = acquire.fetch(&request).map_err(RadarError::from)?;
+        let label = token.as_deref().map_or_else(
+            || format!("discovery listing {prefix}"),
+            |value| format!("discovery listing {prefix} continuation {value}"),
+        );
+        requests.push(SourceRecord {
+            provenance: fetched.provenance,
+            cache: fetched.cache,
+            label: Some(label),
+        });
         let body = fetched.body;
         let xml = String::from_utf8(body).map_err(|_| RadarError::ListingBody {
             prefix: String::from(prefix),
@@ -151,7 +166,7 @@ fn list_keys(acquire: &Acquire, prefix: &str) -> Result<Vec<String>, RadarError>
             }
         };
     }
-    Ok(keys)
+    Ok(Listing { keys, requests })
 }
 
 fn utc_day(days_ago: i64) -> Result<(i32, u32, u32), RadarError> {
@@ -168,19 +183,36 @@ fn is_volume_key(key: &str) -> bool {
     version.len() == 2 && version.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+/// The newest listed volume and the discovery requests that found it.
+pub struct ListedVolume {
+    pub key: String,
+    pub requests: Vec<SourceRecord>,
+}
+
 /// The newest volume the feed lists for a site, ordered by its UTC timestamp.
-pub fn latest_volume_key(acquire: &Acquire, site: &SiteId) -> Result<String, RadarError> {
+pub fn latest_volume_key(acquire: &Acquire, site: &SiteId) -> Result<ListedVolume, RadarError> {
+    let mut requests = Vec::new();
     for days_ago in 0..LOOKBACK_DAYS {
         let (year, month, day) = utc_day(days_ago)?;
         let prefix = format!("{year:04}/{month:02}/{day:02}/{site}/");
-        let keys = list_keys(acquire, &prefix)?;
-        if let Some(key) = keys.iter().filter(|key| is_volume_key(key)).max() {
-            return Ok(key.clone());
+        let listing = list_keys(acquire, &prefix)?;
+        requests.extend(listing.requests);
+        if let Some(key) = listing.keys.iter().filter(|key| is_volume_key(key)).max() {
+            return Ok(ListedVolume {
+                key: key.clone(),
+                requests,
+            });
         }
     }
     Err(RadarError::NoVolume {
         site: String::from(site.as_str()),
     })
+}
+
+/// Recent listed keys and every discovery request that produced the list.
+pub struct ListedKeys {
+    pub keys: Vec<String>,
+    pub requests: Vec<SourceRecord>,
 }
 
 /// The newest volume keys for a site, oldest first.
@@ -191,19 +223,21 @@ pub fn recent_volume_keys(
     acquire: &Acquire,
     site: &SiteId,
     limit: usize,
-) -> Result<Vec<String>, RadarError> {
+) -> Result<ListedKeys, RadarError> {
     if limit == 0 {
-        return Ok(Vec::new());
+        return Ok(ListedKeys {
+            keys: Vec::new(),
+            requests: Vec::new(),
+        });
     }
     let mut keys = Vec::new();
+    let mut requests = Vec::new();
     for days_ago in 0..LOOKBACK_DAYS {
         let (year, month, day) = utc_day(days_ago)?;
         let prefix = format!("{year:04}/{month:02}/{day:02}/{site}/");
-        keys.extend(
-            list_keys(acquire, &prefix)?
-                .into_iter()
-                .filter(|key| is_volume_key(key)),
-        );
+        let listing = list_keys(acquire, &prefix)?;
+        requests.extend(listing.requests);
+        keys.extend(listing.keys.into_iter().filter(|key| is_volume_key(key)));
         if keys.len() >= limit {
             break;
         }
@@ -211,7 +245,10 @@ pub fn recent_volume_keys(
     keys.sort();
     keys.dedup();
     let start = keys.len().saturating_sub(limit);
-    Ok(keys.into_iter().skip(start).collect())
+    Ok(ListedKeys {
+        keys: keys.into_iter().skip(start).collect(),
+        requests,
+    })
 }
 
 /// The UTC scan instant encoded in an Archive II object key, when it is well formed.
@@ -341,4 +378,30 @@ mod tests {
 
     #[test]
     fn query_values_keep_path_separators() {}
+
+    #[test]
+    fn a_listing_page_records_the_registry_request_that_found_it() -> Result<(), TestError> {
+        let xml = b"<?xml version=\"1.0\"?><ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>2026/11/13/KTWX/KTWX20261113_000000_V06</Key></Contents></ListBucketResult>";
+        let (acquire, _observed) =
+            Acquire::scripted(crate::config::EnabledProviders::all_admitted(), xml);
+        let prefix = "2026/11/13/KTWX/";
+        let listing = list_keys(&acquire, prefix)
+            .map_err(|error| crate::test_support::TestError::from(error.to_string()))?;
+        assert_eq!(listing.keys.len(), 1);
+        let record = listing
+            .requests
+            .first()
+            .ok_or("listing provenance was not recorded")?;
+        let expected =
+            RequestSpec::for_operation(&sources::NEXRAD_LEVEL_TWO, "list", &[("prefix", prefix)])
+                .map_err(|error| crate::test_support::TestError::from(error.to_string()))?;
+        assert_eq!(record.provenance.operation, Some("list"));
+        assert_eq!(record.provenance.url, expected.url);
+        assert_eq!(
+            record.label.as_deref(),
+            Some("discovery listing 2026/11/13/KTWX/")
+        );
+        assert_eq!(record.cache, CacheState::NotStored);
+        Ok(())
+    }
 }

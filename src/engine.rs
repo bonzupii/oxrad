@@ -136,7 +136,7 @@ impl RequestSpec {
         })
     }
 
-    fn provenance(&self) -> Provenance {
+    pub(crate) fn provenance(&self) -> Provenance {
         Provenance {
             source: self.source.id.as_str(),
             source_name: self.source.name,
@@ -205,6 +205,9 @@ pub(crate) struct Fetched {
 pub(crate) struct SourceRecord {
     pub(crate) provenance: Provenance,
     pub(crate) cache: CacheState,
+    /// What this request served when it is one of many, such as a tile's
+    /// coordinates. Empty for a request that needs no separate identity.
+    pub(crate) label: Option<String>,
 }
 
 /// A parsed value beside the request or requests that produced it.
@@ -213,9 +216,18 @@ pub(crate) struct Served<T> {
     pub(crate) value: T,
     pub(crate) provenance: Provenance,
     pub(crate) cache: CacheState,
+    /// What the primary request served when the value is one of many.
+    pub(crate) label: Option<String>,
     /// Further requests a composite readout needed, such as the solar-wind
     /// pair beside the Kp index. Empty for a single-request readout.
     pub(crate) extra: Vec<SourceRecord>,
+}
+
+/// One request and the part of the displayed data it served.
+pub(crate) struct RequestRef<'a> {
+    pub(crate) label: Option<&'a str>,
+    pub(crate) provenance: &'a Provenance,
+    pub(crate) cache: CacheState,
 }
 
 impl<T> Served<T> {
@@ -224,13 +236,39 @@ impl<T> Served<T> {
             value,
             provenance,
             cache,
+            label: None,
             extra: Vec::new(),
         }
     }
 
+    /// Names the part of the displayed data the primary request served.
+    pub(crate) fn labelled(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
     /// Adds one more request behind the same value.
     pub(crate) fn with_request(mut self, provenance: Provenance, cache: CacheState) -> Self {
-        self.extra.push(SourceRecord { provenance, cache });
+        self.extra.push(SourceRecord {
+            provenance,
+            cache,
+            label: None,
+        });
+        self
+    }
+
+    /// Adds one more request and names the part of the data it served.
+    pub(crate) fn with_labelled_request(
+        mut self,
+        label: impl Into<String>,
+        provenance: Provenance,
+        cache: CacheState,
+    ) -> Self {
+        self.extra.push(SourceRecord {
+            provenance,
+            cache,
+            label: Some(label.into()),
+        });
         self
     }
 
@@ -262,18 +300,24 @@ impl<T> Served<T> {
         self.extra.push(SourceRecord {
             provenance: other.provenance.clone(),
             cache: other.cache,
+            label: other.label.clone(),
         });
         self.extra.extend(other.extra.iter().cloned());
         self
     }
 
-    /// Every request behind this value, primary first.
-    pub(crate) fn requests(&self) -> impl Iterator<Item = (&Provenance, CacheState)> {
-        std::iter::once((&self.provenance, self.cache)).chain(
-            self.extra
-                .iter()
-                .map(|record| (&record.provenance, record.cache)),
-        )
+    /// Every request with the part of the data it served, primary first.
+    pub(crate) fn entries(&self) -> impl Iterator<Item = RequestRef<'_>> {
+        std::iter::once(RequestRef {
+            label: self.label.as_deref(),
+            provenance: &self.provenance,
+            cache: self.cache,
+        })
+        .chain(self.extra.iter().map(|record| RequestRef {
+            label: record.label.as_deref(),
+            provenance: &record.provenance,
+            cache: record.cache,
+        }))
     }
 }
 
@@ -797,26 +841,28 @@ mod tests {
         let wind = RequestSpec::for_operation(&sources::NOAA_SWPC, "wind", &[])?;
         let served = Served::new((), kp.provenance(), CacheState::Network)
             .with_request(wind.provenance(), CacheState::Cached);
-        let requests: Vec<_> = served.requests().collect();
+        let requests: Vec<_> = served.entries().collect();
         assert_eq!(requests.len(), 2);
         assert_eq!(
-            requests.first().map(|(entry, _)| entry.url.clone()),
+            requests.first().map(|entry| entry.provenance.url.clone()),
             Some(kp.url)
         );
         assert_eq!(
-            requests.first().map(|(entry, _)| entry.operation),
-            Some(Some("kp"))
+            requests
+                .first()
+                .and_then(|entry| entry.provenance.operation),
+            Some("kp")
         );
         assert_eq!(
-            requests.get(1).map(|(entry, _)| entry.url.clone()),
+            requests.get(1).map(|entry| entry.provenance.url.clone()),
             Some(wind.url)
         );
         assert_eq!(
-            requests.get(1).map(|(_, cache)| *cache),
+            requests.get(1).map(|entry| entry.cache),
             Some(CacheState::Cached)
         );
         assert_eq!(
-            requests.first().map(|(entry, _)| entry.licence),
+            requests.first().map(|entry| entry.provenance.licence),
             Some(
                 sources::NOAA_SWPC
                     .licence
@@ -824,7 +870,7 @@ mod tests {
             )
         );
         assert_eq!(
-            requests.first().map(|(entry, _)| entry.credit),
+            requests.first().map(|entry| entry.provenance.credit),
             Some(sources::NOAA_SWPC.credit)
         );
         Ok(())
@@ -905,6 +951,12 @@ mod tests {
         assert_eq!(entry["scan_unix_ms"], 1_793_600_000_000_u64);
         assert_eq!(entry["credit"], sources::NIFC_WFIGS.credit);
         assert_eq!(entry["licence"], "US Government work, public domain");
+        assert_eq!(
+            entry["licence_url"],
+            sources::NIFC_WFIGS
+                .licence
+                .map_or("", |licence| licence.url)
+        );
         assert_eq!(entry["operation"], serde_json::Value::Null);
         assert_eq!(entry["url"], "https://example.test/document");
         assert_eq!(entry["attempts"], 1);

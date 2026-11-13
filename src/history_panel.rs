@@ -21,11 +21,13 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, RichText};
 
 use crate::acquire::Acquire;
-use crate::canvas::due_after;
+use crate::canvas::{due_after, request_report};
+use crate::engine::SourceRecord;
 use crate::global_panel::GlobalPlayback;
 use crate::history::{self, HistoryError, HistoryEvent, HistoryFeed};
 use crate::radar::{ArchiveOrigin, RetrievedVolume};
 use crate::radar_panel::RadarPanel;
+use crate::request_report::{ReportedRequest, RequestReport};
 use crate::stations::SiteId;
 use crate::theme;
 
@@ -57,6 +59,7 @@ pub(crate) struct HistoryActions {
 pub(crate) struct HistoryPanel {
     feed: HistoryFeed,
     keys: Vec<String>,
+    listing_requests: Vec<SourceRecord>,
     key: Option<String>,
     state: HistoryState,
     error: Option<HistoryError>,
@@ -70,6 +73,7 @@ impl HistoryPanel {
         Self {
             feed: HistoryFeed::new(acquire.clone()),
             keys: Vec::new(),
+            listing_requests: Vec::new(),
             key: None,
             state: HistoryState::Idle,
             error: None,
@@ -104,6 +108,7 @@ impl HistoryPanel {
     pub(crate) fn clear(&mut self) {
         self.feed.cancel();
         self.keys.clear();
+        self.listing_requests.clear();
         self.key = None;
         self.state = HistoryState::Idle;
         self.error = None;
@@ -139,8 +144,14 @@ impl HistoryPanel {
 
     /// Applies keys without a worker. The list is the same event the feed
     /// delivers, so tests can drive the state machine deterministically.
+    #[cfg(test)]
     pub(crate) fn accept_keys(&mut self, keys: Vec<String>) {
+        self.accept_listing(keys, Vec::new());
+    }
+
+    pub(crate) fn accept_listing(&mut self, keys: Vec<String>, requests: Vec<SourceRecord>) {
         self.keys = keys;
+        self.listing_requests = requests;
         self.state = HistoryState::Ready;
     }
 
@@ -151,7 +162,7 @@ impl HistoryPanel {
         notice: &mut Option<String>,
     ) {
         match event {
-            HistoryEvent::Keys { keys, .. } => self.accept_keys(keys),
+            HistoryEvent::Keys { keys, requests, .. } => self.accept_listing(keys, requests),
             HistoryEvent::Volume {
                 key,
                 volume,
@@ -159,6 +170,18 @@ impl HistoryPanel {
                 cache_warning,
                 ..
             } => {
+                let mut volume = volume;
+                for record in &self.listing_requests {
+                    let label = record
+                        .label
+                        .clone()
+                        .unwrap_or_else(|| String::from("discovery listing"));
+                    volume = volume.with_labelled_request(
+                        label,
+                        record.provenance.clone(),
+                        record.cache,
+                    );
+                }
                 self.key = Some(key.clone());
                 self.state = HistoryState::Reviewing;
                 self.scrub_index = None;
@@ -382,6 +405,21 @@ impl HistoryPanel {
                 }
                 if !self.keys.is_empty() && ui.button("Play all scans").clicked() {
                     play_all = true;
+                }
+                if !self.listing_requests.is_empty() {
+                    let requests = self
+                        .listing_requests
+                        .iter()
+                        .map(|record| {
+                            ReportedRequest::new(
+                                record.label.clone(),
+                                record.provenance.clone(),
+                                record.cache,
+                            )
+                        })
+                        .collect();
+                    let report = RequestReport::new("NEXRAD discovery requests", requests);
+                    request_report(ui, &report);
                 }
                 if ui.small_button("Refresh scan list").clicked() {
                     load = true;

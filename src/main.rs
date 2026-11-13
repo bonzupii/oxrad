@@ -75,6 +75,7 @@ mod place;
 mod places_panel;
 mod power;
 mod power_layer;
+mod probe;
 mod product;
 mod projection;
 mod provider;
@@ -89,6 +90,7 @@ mod radio;
 mod radio_layer;
 mod raster;
 mod render;
+mod request_report;
 mod retry;
 mod satellite;
 mod seaice;
@@ -140,7 +142,9 @@ configuration file; with no saved site the picker opens.
   --prune-cache       Enforce the configured cache budget and exit
   --sources           Print the open-source inventory and exit
   --fetch-source ID   Fetch the source's first endpoint twice through the
-                      request engine and print its provenance and cache state
+                      request engine, parse it with the rail's parser, and
+                      print the value, units, station, product, observation
+                      time and request provenance
   --value NAME=VALUE  Supply one endpoint placeholder to --fetch-source;
                       repeatable
   -h, --help          Show this message";
@@ -295,6 +299,7 @@ fn fetch_source(config: &config::Config, id: &str, values: &[(String, String)]) 
             return ExitCode::FAILURE;
         }
     };
+    let mut served = None;
     for pass in 1..=2 {
         match acquire.fetch(&spec) {
             Ok(fetched) => {
@@ -304,12 +309,32 @@ fn fetch_source(config: &config::Config, id: &str, values: &[(String, String)]) 
                     fetched.cache.label(),
                     source.credit
                 );
+                served = Some(fetched);
             }
             Err(error) => {
                 eprintln!("request {pass} failed: {error}");
                 report_provenance(&acquire);
                 return ExitCode::FAILURE;
             }
+        }
+    }
+    let Some(served) = served else {
+        eprintln!("The request produced no body to parse.");
+        report_provenance(&acquire);
+        return ExitCode::FAILURE;
+    };
+    match probe::parse(
+        source,
+        operation.operation,
+        &served.body,
+        &borrowed,
+        &served.provenance.url,
+    ) {
+        Ok(report) => println!("{}", report.render()),
+        Err(error) => {
+            eprintln!("Parse failed: {error}");
+            report_provenance(&acquire);
+            return ExitCode::FAILURE;
         }
     }
     report_provenance(&acquire);

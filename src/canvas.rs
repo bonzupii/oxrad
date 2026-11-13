@@ -99,39 +99,116 @@ pub(crate) fn toggle_button(
 /// exact request URL, credit, licence and licence URL. One function is the
 /// whole provenance surface, so no rail can invent its own wording.
 pub(crate) fn provenance<T>(ui: &mut egui::Ui, served: &crate::engine::Served<T>) {
-    for (provenance, cache) in served.requests() {
+    let report = crate::request_report::RequestReport::from_served("Request provenance", served);
+    request_report(ui, &report);
+}
+
+/// Draws one request set. Single requests show every field; larger sets show a
+/// count, host and template summary plus the complete list, which never leaves
+/// out a request that served displayed data.
+pub(crate) fn request_report(ui: &mut egui::Ui, report: &crate::request_report::RequestReport) {
+    let Some(primary) = report.primary() else {
         ui.label(
-            RichText::new(format!(
-                "{} · operation {} · cache {}",
-                provenance.source_name,
-                provenance
-                    .operation
-                    .map_or("not named", |operation| operation),
-                cache.label()
-            ))
+            RichText::new("No request is recorded for this value.")
+                .size(theme::TYPE_SMALL)
+                .weak(),
+        );
+        return;
+    };
+    ui.label(
+        RichText::new(format!(
+            "{} · {}",
+            report.title(),
+            primary.provenance.source_name
+        ))
+        .size(theme::TYPE_SMALL)
+        .strong(),
+    );
+    if report.count() == 1 {
+        request_line(ui, primary);
+    } else {
+        for line in report.summary() {
+            ui.label(RichText::new(line).size(theme::TYPE_SMALL).weak());
+        }
+        for sample in report.samples(3) {
+            ui.label(RichText::new(sample).size(theme::TYPE_SMALL).weak());
+        }
+        if report.count() > 3 {
+            ui.label(
+                RichText::new(format!(
+                    "Showing 3 of {} requests; the full set is listed below.",
+                    report.count()
+                ))
+                .size(theme::TYPE_SMALL)
+                .weak(),
+            );
+        }
+        egui::CollapsingHeader::new(format!("All {} requests", report.count()))
+            .default_open(report.count() <= 12)
+            .show(ui, |ui| {
+                for request in report.requests() {
+                    request_line(ui, request);
+                }
+            });
+    }
+    ui.horizontal(|ui| {
+        if ui
+            .small_button("Write request list")
+            .on_hover_text(
+                "Write every request in this set, with its URL, cache state, credit and licence, to the cache directory.",
+            )
+            .clicked()
+        {
+            ui.label(match report.write() {
+                Ok(path) => format!("written to {}", path.display()),
+                Err(error) => format!("could not be written: {error}"),
+            });
+        }
+    });
+}
+
+/// One request in a report.
+fn request_line(ui: &mut egui::Ui, request: &crate::request_report::ReportedRequest) {
+    if let Some(label) = &request.label {
+        ui.label(RichText::new(label).size(theme::TYPE_SMALL).strong());
+    }
+    ui.label(
+        RichText::new(format!(
+            "operation {} · cache {}",
+            request
+                .provenance
+                .operation
+                .map_or("not named", |operation| operation),
+            request.cache.label()
+        ))
+        .size(theme::TYPE_SMALL)
+        .weak(),
+    );
+    ui.label(
+        RichText::new(&request.provenance.url)
             .size(theme::TYPE_SMALL)
             .weak(),
-        );
+    );
+    ui.label(
+        RichText::new(format!(
+            "{} · {}",
+            request.provenance.credit, request.provenance.licence
+        ))
+        .size(theme::TYPE_SMALL)
+        .weak(),
+    );
+    if request.provenance.licence_url.is_empty() {
         ui.label(
-            RichText::new(&provenance.url)
+            RichText::new("licence URL not stated")
                 .size(theme::TYPE_SMALL)
                 .weak(),
         );
-        ui.label(
-            RichText::new(format!("{} · {}", provenance.credit, provenance.licence))
-                .size(theme::TYPE_SMALL)
-                .weak(),
-        );
-        if provenance.licence_url.is_empty() {
-            ui.label(
-                RichText::new("licence URL not stated")
-                    .size(theme::TYPE_SMALL)
-                    .weak(),
-            );
-        } else {
-            ui.hyperlink_to(provenance.licence_url, provenance.licence_url)
-                .on_hover_text("Open the licence this source states.");
-        }
+    } else {
+        ui.hyperlink_to(
+            request.provenance.licence_url,
+            request.provenance.licence_url,
+        )
+        .on_hover_text("Open the licence this source states.");
     }
 }
 

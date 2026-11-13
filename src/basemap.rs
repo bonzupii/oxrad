@@ -233,7 +233,17 @@ impl Basemap {
         }
         ui.hyperlink_to(CREDIT, sources::openfreemap_attribution_url());
         if let Some(document) = &self.active_document {
-            provenance(ui, document);
+            let mut requests = Served::new((), document.provenance.clone(), document.cache);
+            if let Some(tiles) = &self.tiles {
+                for (id, provenance, cache) in tiles.visible_requests() {
+                    requests = requests.with_labelled_request(
+                        format!("tile z{} x{} y{}", id.zoom, id.x, id.y),
+                        provenance,
+                        cache,
+                    );
+                }
+            }
+            provenance(ui, &requests);
         }
         (self.selected != previous).then_some(self.selected)
     }
@@ -330,6 +340,9 @@ impl Basemap {
             && let Some(warning) = tiles.take_warning()
         {
             self.tile_warning = Some(warning.to_string());
+        }
+        if let Some(tiles) = &mut self.tiles {
+            tiles.begin_frame();
         }
         ui.painter()
             .rect_filled(rect, 0.0, Color32::from_rgb(34, 43, 51));

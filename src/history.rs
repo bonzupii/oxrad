@@ -25,7 +25,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
 use crate::acquire::Acquire;
-use crate::engine::Served;
+use crate::engine::{Served, SourceRecord};
 use crate::error::RadarError;
 use crate::network;
 use crate::radar::{self, RadarVolume};
@@ -73,6 +73,7 @@ pub enum HistoryEvent {
     Keys {
         generation: u64,
         keys: Vec<String>,
+        requests: Vec<SourceRecord>,
     },
     Volume {
         generation: u64,
@@ -202,7 +203,11 @@ impl HistoryWorker {
             let event = match request {
                 HistoryRequest::Keys { generation, site } => {
                     match network::recent_volume_keys(&acquire, &site, RECENT_LIMIT) {
-                        Ok(keys) => HistoryEvent::Keys { generation, keys },
+                        Ok(listed) => HistoryEvent::Keys {
+                            generation,
+                            keys: listed.keys,
+                            requests: listed.requests,
+                        },
                         Err(error) => HistoryEvent::Failed {
                             generation,
                             error: error.into(),
@@ -312,12 +317,14 @@ mod tests {
             .send(HistoryEvent::Keys {
                 generation: 1,
                 keys: vec![String::from("old")],
+                requests: Vec::new(),
             })
             .map_err(|error| format!("old result could not be sent: {error}"))?;
         events
             .send(HistoryEvent::Keys {
                 generation: 3,
                 keys: vec![String::from("current")],
+                requests: Vec::new(),
             })
             .map_err(|error| format!("current result could not be sent: {error}"))?;
         assert!(matches!(

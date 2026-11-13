@@ -248,9 +248,9 @@ fn text(value: &Value, field: &'static str) -> Result<String, QuakeError> {
         .ok_or_else(|| shape(field))
 }
 
-/// Reads an event's longitude, latitude and depth, refusing a position the
-/// planet cannot hold.
-fn position(feature: &Value) -> Result<(f64, f64, f64), QuakeError> {
+/// Reads an event's longitude and latitude, and the geometry's third ordinate
+/// when it carries one.
+fn horizontal_position(feature: &Value) -> Result<(f64, f64, Option<f64>), QuakeError> {
     let geometry = feature
         .get("geometry")
         .filter(|value| value.is_object())
@@ -275,16 +275,22 @@ fn position(feature: &Value) -> Result<(f64, f64, f64), QuakeError> {
         .ok_or(QuakeError::Shape {
             field: "event latitude",
         })?;
-    let depth_km = coordinates
-        .get(2)
-        .and_then(Value::as_f64)
-        .ok_or(QuakeError::Shape {
-            field: "event depth",
-        })?;
-    if !(-90.0..=90.0).contains(&lat)
-        || !(-180.0..=180.0).contains(&lon)
-        || !(0.0..=800.0).contains(&depth_km)
-    {
+    if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+        return Err(QuakeError::Shape {
+            field: "event position",
+        });
+    }
+    Ok((lon, lat, coordinates.get(2).and_then(Value::as_f64)))
+}
+
+/// Reads a USGS event's longitude, latitude and depth, refusing a position the
+/// planet cannot hold.
+fn position(feature: &Value) -> Result<(f64, f64, f64), QuakeError> {
+    let (lon, lat, depth) = horizontal_position(feature)?;
+    let depth_km = depth.ok_or(QuakeError::Shape {
+        field: "event depth",
+    })?;
+    if !(0.0..=800.0).contains(&depth_km) {
         return Err(QuakeError::Shape {
             field: "event position",
         });
@@ -443,7 +449,12 @@ fn emsc_event(feature: &Value) -> Result<Quake, QuakeError> {
         .ok_or(QuakeError::Shape {
             field: "event properties",
         })?;
-    let (lon, lat, depth_km) = position(feature)?;
+    let (lon, lat, _) = horizontal_position(feature)?;
+    let depth_km = properties
+        .get("depth")
+        .and_then(Value::as_f64)
+        .filter(|depth| (0.0..=800.0).contains(depth))
+        .ok_or_else(|| shape("event depth"))?;
     let magnitude = number(properties, "mag")?;
     if !(-2.0..=10.0).contains(&magnitude) {
         return Err(shape("event magnitude"));
@@ -932,7 +943,7 @@ mod tests {
             "type": "FeatureCollection",
             "features": [{
                 "type": "Feature",
-                "geometry": {"type": "Point", "coordinates": [123.83, -8.23, 141.0]},
+                "geometry": {"type": "Point", "coordinates": [123.83, -8.23, -141.0]},
                 "id": "20261113_0000038",
                 "properties": {
                     "lastupdate": "2026-11-13T03:42:24.104642Z",

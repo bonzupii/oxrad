@@ -30,15 +30,15 @@ use crate::theme;
 use crate::time;
 
 #[derive(Debug)]
-struct SunRecord {
-    latitude: f64,
-    longitude: f64,
-    date: String,
-    timezone: String,
-    status: String,
-    sunrise: Option<String>,
-    sunset: Option<String>,
-    solar_noon: Option<String>,
+pub(crate) struct SunRecord {
+    pub(crate) latitude: f64,
+    pub(crate) longitude: f64,
+    pub(crate) date: String,
+    pub(crate) timezone: String,
+    pub(crate) status: String,
+    pub(crate) sunrise: Option<String>,
+    pub(crate) sunset: Option<String>,
+    pub(crate) solar_noon: Option<String>,
 }
 
 fn required_text<'a>(
@@ -67,7 +67,7 @@ fn event(document: &Value, key: &'static str, url: &str) -> Result<Option<String
     }
 }
 
-fn parse(document: &Value, url: &str) -> Result<SunRecord, FetchError> {
+pub(crate) fn parse(document: &Value, url: &str) -> Result<SunRecord, FetchError> {
     let latitude = document
         .get("lat")
         .and_then(Value::as_f64)

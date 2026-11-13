@@ -402,6 +402,10 @@ pub struct VolcanoRequest {
 
 /// Answers from the worker.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the served value travels whole so its provenance cannot be separated from it"
+)]
 pub enum VolcanoEvent {
     Ready {
         generation: u64,

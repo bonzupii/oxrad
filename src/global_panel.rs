@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align, Color32, Layout, Pos2, Rect, RichText};
 
 use crate::acquire::Acquire;
-use crate::canvas::{due_after, provenance};
+use crate::canvas::{due_after, request_report};
 use crate::config::Config;
 use crate::engine::Served;
 use crate::global_radar::{
@@ -29,6 +29,7 @@ use crate::global_radar::{
     TileBounds, TileImage,
 };
 use crate::map::{self, MapView};
+use crate::request_report::{ReportedRequest, RequestReport};
 use crate::sources;
 use crate::theme;
 use crate::time;
@@ -59,6 +60,7 @@ struct GlobalTileTexture {
 struct GlobalFrameTexture {
     time_unix_ms: u64,
     tiles: Vec<GlobalTileTexture>,
+    requests: Vec<ReportedRequest>,
 }
 
 pub(crate) struct GlobalPanel {
@@ -218,14 +220,26 @@ impl GlobalPanel {
         &mut self,
         context: &egui::Context,
         time_unix_ms: u64,
-        tiles: Vec<TileImage>,
+        tiles: Vec<Served<TileImage>>,
         notice: &mut Option<String>,
     ) {
+        let stamp =
+            time::format_utc(time_unix_ms).unwrap_or_else(|_| String::from("time unavailable"));
         let mut textures = Vec::with_capacity(tiles.len());
+        let mut requests = Vec::with_capacity(tiles.len());
         for tile in tiles {
-            match global_texture(context, time_unix_ms, tile.bounds, tile.image) {
+            let Served {
+                value: image,
+                provenance,
+                cache,
+                label,
+                ..
+            } = tile;
+            let label = format!("frame {stamp} · {}", label.as_deref().unwrap_or("tile"));
+            requests.push(ReportedRequest::new(Some(label), provenance, cache));
+            match global_texture(context, time_unix_ms, image.bounds, image.image) {
                 Ok(texture) => textures.push(GlobalTileTexture {
-                    bounds: tile.bounds,
+                    bounds: image.bounds,
                     texture,
                 }),
                 Err(error) => {
@@ -245,6 +259,7 @@ impl GlobalPanel {
             GlobalFrameTexture {
                 time_unix_ms,
                 tiles: textures,
+                requests,
             },
         );
         if was_live {
@@ -315,6 +330,16 @@ impl GlobalPanel {
         let mut playback = self.playback;
         let mut scrub = false;
         let palette = config.theme.palette();
+        let mut requests = Vec::new();
+        if let Some(manifest) = &self.manifest {
+            requests.push(ReportedRequest::new(
+                Some(String::from("composite manifest")),
+                manifest.provenance.clone(),
+                manifest.cache,
+            ));
+        }
+        requests.extend(frame.requests.iter().cloned());
+        let report = RequestReport::new("RainViewer composite requests", requests);
         egui::Panel::bottom("global_history")
             .exact_size(64.0)
             .resizable(false)
@@ -371,9 +396,7 @@ impl GlobalPanel {
                                 .weak(),
                             sources::RAINVIEWER.home,
                         );
-                        if let Some(served) = &self.manifest {
-                            link.on_hover_ui(|ui| provenance(ui, served));
-                        }
+                        link.on_hover_ui(|ui| request_report(ui, &report));
                     });
                 });
             });

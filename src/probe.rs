@@ -1,0 +1,874 @@
+// oxrad - A storm-chaser-grade NEXRAD weather radar viewer
+// Copyright (C) 2026 Micah Ostrow <bonzupii@protonmail.com>
+// SPDX-License-Identifier: GPL-3.0-or-later
+//! The headless parser behind `--fetch-source`: the fetched body goes through
+//! the same parser the rail uses and comes back as labelled values, units,
+//! station, product and observation time.
+
+use std::error::Error;
+use std::fmt::{self, Display, Formatter};
+
+use serde_json::Value;
+
+use crate::climate;
+use crate::cyclone;
+use crate::fire;
+use crate::forecast;
+use crate::gauge;
+use crate::global_radar;
+use crate::hydro;
+use crate::network;
+use crate::observations;
+use crate::ocean;
+use crate::place;
+use crate::power;
+use crate::quake;
+use crate::quality;
+use crate::satellite;
+use crate::seaice::{self, Hemisphere};
+use crate::sources;
+use crate::spaceweather;
+use crate::stations;
+use crate::sun;
+use crate::time;
+use crate::uk_rivers;
+use crate::volcano;
+
+/// A parsed value with the unit the provider stated.
+#[derive(Debug, Clone)]
+pub(crate) struct ProbeField {
+    pub(crate) label: String,
+    pub(crate) value: String,
+}
+
+/// What one parsed source produced, ready to print.
+#[derive(Debug, Clone)]
+pub(crate) struct ProbeReport {
+    pub(crate) source: &'static str,
+    pub(crate) operation: &'static str,
+    pub(crate) fields: Vec<ProbeField>,
+    pub(crate) station: Option<String>,
+    pub(crate) product: Option<String>,
+    pub(crate) observed: Option<String>,
+}
+
+impl ProbeReport {
+    const fn new(source: &sources::Source, operation: &'static str) -> Self {
+        Self {
+            source: source.id.as_str(),
+            operation,
+            fields: Vec::new(),
+            station: None,
+            product: None,
+            observed: None,
+        }
+    }
+
+    fn field(mut self, label: impl Into<String>, value: impl Into<String>) -> Self {
+        self.fields.push(ProbeField {
+            label: label.into(),
+            value: value.into(),
+        });
+        self
+    }
+
+    fn station(mut self, value: impl Into<String>) -> Self {
+        self.station = Some(value.into());
+        self
+    }
+
+    fn product(mut self, value: impl Into<String>) -> Self {
+        self.product = Some(value.into());
+        self
+    }
+
+    fn observed(mut self, value: impl Into<String>) -> Self {
+        self.observed = Some(value.into());
+        self
+    }
+
+    /// The human-readable report printed by the probe.
+    pub(crate) fn render(&self) -> String {
+        let mut lines = vec![format!(
+            "parsed {} · operation {}",
+            self.source, self.operation
+        )];
+        lines.push(format!(
+            "station: {}",
+            self.station
+                .as_deref()
+                .unwrap_or("not stated by this request")
+        ));
+        lines.push(format!(
+            "product: {}",
+            self.product
+                .as_deref()
+                .unwrap_or("not stated by this request")
+        ));
+        lines.push(format!(
+            "observed: {}",
+            self.observed
+                .as_deref()
+                .unwrap_or("not stated by this request")
+        ));
+        for field in &self.fields {
+            lines.push(format!("{}: {}", field.label, field.value));
+        }
+        lines.join("\n")
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ProbeError {
+    MissingValue {
+        name: &'static str,
+    },
+    InvalidValue {
+        name: &'static str,
+        value: String,
+    },
+    Rejected {
+        parser: &'static str,
+        detail: String,
+    },
+}
+
+impl Display for ProbeError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingValue { name } => {
+                write!(
+                    formatter,
+                    "the request needs --value {name}=VALUE to parse its answer"
+                )
+            }
+            Self::InvalidValue { name, value } => {
+                write!(
+                    formatter,
+                    "--value {name}={value} is not a number this parser accepts"
+                )
+            }
+            Self::Rejected { parser, detail } => {
+                write!(
+                    formatter,
+                    "the {parser} parser rejected the answer: {detail}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for ProbeError {}
+
+fn rejected(parser: &'static str, detail: impl Display) -> ProbeError {
+    ProbeError::Rejected {
+        parser,
+        detail: detail.to_string(),
+    }
+}
+
+fn value<'a>(values: &'a [(&str, &str)], name: &'static str) -> Result<&'a str, ProbeError> {
+    values
+        .iter()
+        .find(|(key, _)| *key == name)
+        .map(|(_, value)| *value)
+        .ok_or(ProbeError::MissingValue { name })
+}
+
+fn number(values: &[(&str, &str)], name: &'static str) -> Result<f64, ProbeError> {
+    let raw = value(values, name)?;
+    raw.parse::<f64>().map_err(|_| ProbeError::InvalidValue {
+        name,
+        value: String::from(raw),
+    })
+}
+
+fn utc(milliseconds: u64) -> String {
+    match time::format_utc(milliseconds) {
+        Ok(text) => text,
+        Err(error) => format!("time unavailable: {error}"),
+    }
+}
+
+fn optional(value: Option<f64>, unit: &str) -> String {
+    value.map_or_else(
+        || String::from("not reported"),
+        |value| format!("{value} {unit}"),
+    )
+}
+
+fn json_body(bytes: &[u8], parser: &'static str) -> Result<Value, ProbeError> {
+    serde_json::from_slice(bytes).map_err(|error| rejected(parser, error))
+}
+
+/// Parses one fetched first-operation answer with the rail's own parser.
+///
+/// # Errors
+///
+/// Returns [`ProbeError`] when a placeholder is missing or the parser rejects
+/// the body. A successful return means the parser produced typed data.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one exhaustive dispatch over the admitted sources' first operations"
+)]
+pub(crate) fn parse(
+    source: &'static sources::Source,
+    operation: &'static str,
+    body: &[u8],
+    values: &[(&str, &str)],
+    request_url: &str,
+) -> Result<ProbeReport, ProbeError> {
+    match (source.id.as_str(), operation) {
+        ("openfreemap", "style") => {
+            let document = json_body(body, "OpenFreeMap style")?;
+            let layers = document
+                .get("layers")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .ok_or_else(|| rejected("OpenFreeMap style", "the document has no layers array"))?;
+            serde_json::from_value::<walkers::Style>(document)
+                .map_err(|error| rejected("OpenFreeMap style", error))?;
+            Ok(ProbeReport::new(source, operation)
+                .field("layers", layers.to_string())
+                .field("document", "accepted by the rail's style parser"))
+        }
+        ("open-meteo-forecast", "forecast") => {
+            let place = probe_place(values)?;
+            let document = json_body(body, "Open-Meteo forecast")?;
+            let record = forecast::parse_document(&place, &document)
+                .map_err(|error| rejected("Open-Meteo forecast", error))?;
+            Ok(ProbeReport::new(source, operation)
+                .station(format!("probe point at {:.4}, {:.4}", place.lat, place.lon))
+                .product("point forecast")
+                .observed(record.current.observed.clone())
+                .field(
+                    "current temperature",
+                    format!("{} {}", record.current.temperature, record.current.unit),
+                )
+                .field(
+                    "apparent temperature",
+                    format!("{} {}", record.current.apparent, record.current.unit),
+                )
+                .field(
+                    "wind",
+                    format!(
+                        "{} km/h from {}°",
+                        record.current.wind_speed_kmh, record.current.wind_direction_deg
+                    ),
+                )
+                .field("conditions", record.current.short)
+                .field(
+                    "periods",
+                    format!(
+                        "{} hourly · {} daily",
+                        record.hourly.len(),
+                        record.daily.len()
+                    ),
+                )
+                .field("timezone", record.timezone))
+        }
+        ("open-meteo-archive", "climate") => {
+            let document = json_body(body, "Open-Meteo archive")?;
+            let record =
+                climate::parse(&document).map_err(|error| rejected("Open-Meteo archive", error))?;
+            let first = record.days.first();
+            let last = record.days.last();
+            Ok(ProbeReport::new(source, operation)
+                .station(format!("{:.4}, {:.4}", record.latitude, record.longitude))
+                .product("ERA5 daily archive")
+                .observed(last.map_or_else(
+                    || String::from("no days"),
+                    |day| {
+                        utc(u64::try_from(day.day)
+                            .map_or(0, |days| days.saturating_mul(86_400_000)))
+                    },
+                ))
+                .field("days", record.days.len().to_string())
+                .field(
+                    "first day temperature",
+                    first.map_or_else(
+                        || String::from("not reported"),
+                        |day| optional(day.temperature, &record.temperature_unit),
+                    ),
+                )
+                .field(
+                    "latest day precipitation",
+                    last.map_or_else(
+                        || String::from("not reported"),
+                        |day| optional(day.precipitation, &record.precipitation_unit),
+                    ),
+                ))
+        }
+        ("open-meteo-air-quality", "quality") => {
+            let document = json_body(body, "Open-Meteo air quality")?;
+            let record = quality::parse(&document)
+                .map_err(|error| rejected("Open-Meteo air quality", error))?;
+            Ok(ProbeReport::new(source, operation)
+                .station(format!("{:.4}, {:.4}", record.latitude, record.longitude))
+                .product("CAMS air quality")
+                .observed(utc(record.current.time_ms))
+                .field(
+                    "US AQI",
+                    optional(record.current.us_aqi, record.unit("us_aqi")),
+                )
+                .field(
+                    "PM2.5",
+                    optional(record.current.pm2_5, record.unit("pm2_5")),
+                )
+                .field("PM10", optional(record.current.pm10, record.unit("pm10")))
+                .field("hours", record.hours.len().to_string()))
+        }
+        ("open-meteo-marine", "ocean") => {
+            let document = json_body(body, "Open-Meteo marine")?;
+            let record =
+                ocean::parse(&document).map_err(|error| rejected("Open-Meteo marine", error))?;
+            let first = record.hours.first().copied();
+            Ok(ProbeReport::new(source, operation)
+                .station(format!("{:.4}, {:.4}", record.latitude, record.longitude))
+                .product("marine forecast")
+                .observed(first.map_or_else(|| String::from("no hours"), |hour| utc(hour.time_ms)))
+                .field(
+                    "wave height",
+                    first.map_or_else(
+                        || String::from("not reported"),
+                        |hour| optional(hour.wave_height, record.unit("wave_height")),
+                    ),
+                )
+                .field(
+                    "sea-surface temperature",
+                    first.map_or_else(
+                        || String::from("not reported"),
+                        |hour| {
+                            optional(hour.sea_temperature, record.unit("sea_surface_temperature"))
+                        },
+                    ),
+                )
+                .field("hours", record.hours.len().to_string()))
+        }
+        ("open-meteo-flood", "hydro") => {
+            let now = time::now_unix_ms().map_err(|error| rejected("Open-Meteo flood", error))?;
+            let document = json_body(body, "Open-Meteo flood")?;
+            let record = hydro::parse(&document, now)
+                .map_err(|error| rejected("Open-Meteo flood", error))?;
+            let peak = record.peak();
+            Ok(ProbeReport::new(source, operation)
+                .station(format!("{:.4}, {:.4}", record.latitude, record.longitude))
+                .product("GloFAS river discharge")
+                .observed(peak.map_or_else(|| String::from("no days"), |day| utc(day.time_ms)))
+                .field(
+                    "peak discharge",
+                    peak.map_or_else(
+                        || String::from("not reported"),
+                        |day| optional(day.discharge, &record.units),
+                    ),
+                )
+                .field("days", record.days.len().to_string()))
+        }
+        ("rainviewer", "manifest") => {
+            let manifest = global_radar::parse_manifest(body)
+                .map_err(|error| rejected("RainViewer manifest", error))?;
+            let first = manifest.frames.first().map(|frame| frame.time_unix_ms);
+            let last = manifest.frames.last().map(|frame| frame.time_unix_ms);
+            Ok(ProbeReport::new(source, operation)
+                .product("global reflectivity composite")
+                .station(manifest.host.clone())
+                .observed(last.map_or_else(|| String::from("no frames"), utc))
+                .field("frames", manifest.frames.len().to_string())
+                .field(
+                    "first frame",
+                    first.map_or_else(|| String::from("no frames"), utc),
+                ))
+        }
+        ("nexrad-level-2", "list") => {
+            let text = String::from_utf8_lossy(body);
+            let prefix = value(values, "prefix")?;
+            let page = network::listing_xml(prefix, &text)
+                .map_err(|error| rejected("NEXRAD listing", error))?;
+            Ok(ProbeReport::new(source, operation)
+                .station(String::from(prefix))
+                .product("Level II object listing")
+                .field("keys", page.keys.len().to_string())
+                .field("truncated", format!("{:?}", page.truncated))
+                .field(
+                    "continuation",
+                    page.continuation.unwrap_or_else(|| String::from("none")),
+                ))
+        }
+        ("nws-api", "stations") => {
+            let document = json_body(body, "NWS stations")?;
+            let stations = stations::parse_document(&document)
+                .map_err(|error| rejected("NWS stations", error))?;
+            let first = stations.first();
+            let observed = first
+                .and_then(|station| station.last_data.as_deref())
+                .map(|text| {
+                    time::parse_iso_utc(text).map_or_else(|| format!("provider text {text}"), utc)
+                });
+            Ok(ProbeReport::new(source, operation)
+                .product("radar station catalogue")
+                .station(first.map_or_else(
+                    || String::from("no stations"),
+                    |station| format!("{} · {}", station.id, station.name),
+                ))
+                .observed(observed.unwrap_or_else(|| String::from("not reported")))
+                .field("stations", stations.len().to_string())
+                .field(
+                    "first position",
+                    first.map_or_else(
+                        || String::from("not reported"),
+                        |station| format!("{:.4}, {:.4}", station.lat, station.lon),
+                    ),
+                ))
+        }
+        ("usgs-earthquakes", "feed") => {
+            let window = match value(values, "window")? {
+                "all_hour" | "hour" => quake::Window::Hour,
+                "4.5_week" | "all_week" | "week" => quake::Window::Week,
+                _ => quake::Window::Day,
+            };
+            let document = json_body(body, "USGS earthquakes")?;
+            let quakes = quake::parse(window, &document)
+                .map_err(|error| rejected("USGS earthquakes", error))?;
+            let strongest = quakes.strongest();
+            Ok(ProbeReport::new(source, operation)
+                .product("earthquake catalogue")
+                .station(quakes.title.clone())
+                .observed(
+                    strongest.map_or_else(|| String::from("no events"), |quake| utc(quake.time_ms)),
+                )
+                .field("events", quakes.events.len().to_string())
+                .field(
+                    "strongest magnitude",
+                    strongest.map_or_else(
+                        || String::from("none"),
+                        |quake| {
+                            format!(
+                                "{} {} at {}",
+                                quake.magnitude, quake.magnitude_type, quake.place
+                            )
+                        },
+                    ),
+                )
+                .field("unreadable", quakes.unreadable.to_string()))
+        }
+        ("usgs-water", "box") => {
+            let document = json_body(body, "USGS water")?;
+            let gauges = gauge::parse(&document).map_err(|error| rejected("USGS water", error))?;
+            let first = gauges.gauges.first();
+            let reading = first.and_then(gauge::Gauge::newest);
+            Ok(ProbeReport::new(source, operation)
+                .product("river gauge observation")
+                .station(first.map_or_else(
+                    || String::from("no gauges"),
+                    |gauge| format!("{} · {}", gauge.site, gauge.name),
+                ))
+                .observed(
+                    reading
+                        .map_or_else(|| String::from("no reading"), |reading| utc(reading.at_ms)),
+                )
+                .field("gauges", gauges.gauges.len().to_string())
+                .field(
+                    "newest value",
+                    reading.map_or_else(
+                        || String::from("not reported"),
+                        |reading| {
+                            format!(
+                                "{} {} (provisional {})",
+                                reading.value, reading.unit, reading.provisional
+                            )
+                        },
+                    ),
+                )
+                .field("rejected", gauges.rejected.to_string()))
+        }
+        ("nasa-gibs", "tile") => {
+            let (width, height, rgba) = satellite::decode("probe tile", body)
+                .map_err(|error| rejected("NASA GIBS tile", error))?;
+            Ok(ProbeReport::new(source, operation)
+                .station(value(values, "layer")?.to_owned())
+                .product(format!(
+                    "GIBS tile z{} x{} y{}",
+                    value(values, "zoom")?,
+                    value(values, "x")?,
+                    value(values, "y")?
+                ))
+                .observed(value(values, "time")?.to_owned())
+                .field("pixels", format!("{width} × {height}"))
+                .field("rgba bytes", rgba.len().to_string()))
+        }
+        ("noaa-swpc", "kp") => {
+            let document = json_body(body, "NOAA SWPC Kp")?;
+            let points = spaceweather::parse_kp(&document)
+                .map_err(|error| rejected("NOAA SWPC Kp", error))?;
+            let latest = points
+                .iter()
+                .rev()
+                .find(|point| !point.status.is_forecast())
+                .copied()
+                .or_else(|| points.last().copied());
+            Ok(ProbeReport::new(source, operation)
+                .product("planetary K index")
+                .observed(
+                    latest.map_or_else(|| String::from("no points"), |point| utc(point.time_ms)),
+                )
+                .field("points", points.len().to_string())
+                .field(
+                    "latest Kp",
+                    latest.map_or_else(
+                        || String::from("not reported"),
+                        |point| format!("{} ({})", point.kp, point.status.label()),
+                    ),
+                ))
+        }
+        ("sunrise-sunset", "day") => {
+            let document = json_body(body, "Sunrise-Sunset")?;
+            let record = sun::parse(&document, request_url)
+                .map_err(|error| rejected("Sunrise-Sunset", error))?;
+            Ok(ProbeReport::new(source, operation)
+                .station(format!("{:.4}, {:.4}", record.latitude, record.longitude))
+                .product("solar events")
+                .observed(record.date)
+                .field("timezone", record.timezone)
+                .field("status", record.status)
+                .field(
+                    "sunrise",
+                    record
+                        .sunrise
+                        .unwrap_or_else(|| String::from("not reported")),
+                )
+                .field(
+                    "sunset",
+                    record
+                        .sunset
+                        .unwrap_or_else(|| String::from("not reported")),
+                )
+                .field(
+                    "solar noon",
+                    record
+                        .solar_noon
+                        .unwrap_or_else(|| String::from("not reported")),
+                ))
+        }
+        ("photon", "search") => {
+            let document = json_body(body, "Photon search")?;
+            let query = value(values, "query")?;
+            let places = place::places_from_document(&document, request_url, query)
+                .map_err(|error| rejected("Photon search", error))?;
+            let first = places.first();
+            Ok(ProbeReport::new(source, operation)
+                .product("place search")
+                .station(first.map_or_else(|| String::from("no places"), |place| place.label()))
+                .field("query", query)
+                .field("places", places.len().to_string())
+                .field(
+                    "first position",
+                    first.map_or_else(
+                        || String::from("not reported"),
+                        |place| format!("{:.4}, {:.4}", place.lat, place.lon),
+                    ),
+                ))
+        }
+        ("gdacs", "search") => {
+            let document = json_body(body, "GDACS")?;
+            let storms = cyclone::parse(&document).map_err(|error| rejected("GDACS", error))?;
+            let strongest = storms.strongest();
+            Ok(ProbeReport::new(source, operation)
+                .product("tropical cyclone episodes")
+                .station(
+                    strongest.map_or_else(|| String::from("no storms"), |storm| storm.name.clone()),
+                )
+                .observed(
+                    strongest
+                        .and_then(|storm| storm.to_ms)
+                        .map_or_else(|| String::from("not reported"), utc),
+                )
+                .field("episodes", storms.cyclones.len().to_string())
+                .field("active", storms.active().to_string())
+                .field(
+                    "strongest wind",
+                    strongest.map_or_else(
+                        || String::from("not reported"),
+                        |storm| format!("{} {}", storm.wind_text, storm.alert_text),
+                    ),
+                ))
+        }
+        ("aviationweather-metar", "box") => {
+            let document = json_body(body, "Aviation Weather METAR")?;
+            let reports = observations::parse(&document)
+                .map_err(|error| rejected("Aviation Weather METAR", error))?;
+            let first = reports.stations.first();
+            Ok(ProbeReport::new(source, operation)
+                .product("surface observation")
+                .station(first.map_or_else(
+                    || String::from("no stations"),
+                    |station| format!("{} · {}", station.station, station.name),
+                ))
+                .observed(first.map_or_else(
+                    || String::from("no time"),
+                    |station| utc(station.observed_ms),
+                ))
+                .field("stations", reports.stations.len().to_string())
+                .field(
+                    "first report",
+                    first.map_or_else(
+                        || String::from("not reported"),
+                        |station| station.raw.clone(),
+                    ),
+                )
+                .field("rejected", reports.rejected.to_string()))
+        }
+        ("nifc-wfigs", "perimeters") => {
+            let document = json_body(body, "NIFC perimeters")?;
+            let perimeters =
+                fire::parse(&document).map_err(|error| rejected("NIFC perimeters", error))?;
+            let first = perimeters.perimeters.first();
+            Ok(ProbeReport::new(source, operation)
+                .product("wildfire perimeter")
+                .station(
+                    first.map_or_else(|| String::from("no perimeters"), |fire| fire.name.clone()),
+                )
+                .observed(
+                    first
+                        .and_then(|fire| fire.mapped_at_ms)
+                        .map_or_else(|| String::from("not reported"), utc),
+                )
+                .field("perimeters", perimeters.perimeters.len().to_string())
+                .field(
+                    "first area",
+                    first.map_or_else(
+                        || String::from("not reported"),
+                        |fire| optional(fire.area_hectares, "ha"),
+                    ),
+                )
+                .field("rejected", perimeters.rejected.to_string()))
+        }
+        ("nsidc-sea-ice", "month") => {
+            let text = String::from_utf8_lossy(body);
+            let month = seaice::parse(&text, Hemisphere::North)
+                .map_err(|error| rejected("NSIDC sea ice", error))?;
+            let latest = month.latest();
+            Ok(ProbeReport::new(source, operation)
+                .product(format!(
+                    "{} monthly sea-ice extent",
+                    month.hemisphere.label()
+                ))
+                .station(value(values, "hemisphere")?.to_owned())
+                .observed(latest.map_or_else(
+                    || String::from("no years"),
+                    |year| format!("{}-{:02}", year.year, month.month),
+                ))
+                .field("years", month.years.len().to_string())
+                .field(
+                    "latest extent",
+                    latest.map_or_else(
+                        || String::from("not reported"),
+                        |year| format!("{} million km²", year.extent_mkm2),
+                    ),
+                )
+                .field("unreadable rows", month.unreadable.to_string()))
+        }
+        ("usgs-volcano", "list") => {
+            let document = json_body(body, "USGS volcanoes")?;
+            let notices = volcano::parse_list(&document)
+                .map_err(|error| rejected("USGS volcanoes", error))?;
+            let first = notices.first();
+            Ok(ProbeReport::new(source, operation)
+                .product("elevated volcano notice")
+                .station(first.map_or_else(
+                    || String::from("no volcanoes"),
+                    |notice| notice.volcano.clone(),
+                ))
+                .observed(
+                    first
+                        .and_then(|notice| notice.sent_ms)
+                        .map_or_else(|| String::from("not reported"), utc),
+                )
+                .field("elevated volcanoes", notices.len().to_string())
+                .field(
+                    "first colour",
+                    first.map_or_else(
+                        || String::from("not reported"),
+                        |notice| notice.colour_text.clone(),
+                    ),
+                ))
+        }
+        ("emsc", "query") => {
+            let document = json_body(body, "EMSC")?;
+            let quakes = quake::parse_emsc(quake::Window::Day, &document)
+                .map_err(|error| rejected("EMSC", error))?;
+            let strongest = quakes.strongest();
+            Ok(ProbeReport::new(source, operation)
+                .product("EMSC earthquake catalogue")
+                .station(quakes.title.clone())
+                .observed(
+                    strongest.map_or_else(|| String::from("no events"), |quake| utc(quake.time_ms)),
+                )
+                .field("events", quakes.events.len().to_string())
+                .field(
+                    "strongest magnitude",
+                    strongest.map_or_else(
+                        || String::from("none"),
+                        |quake| {
+                            format!(
+                                "{} {} at {}",
+                                quake.magnitude, quake.magnitude_type, quake.place
+                            )
+                        },
+                    ),
+                )
+                .field("unreadable", quakes.unreadable.to_string()))
+        }
+        ("uk-ea-flood", "latest-readings") => {
+            let document = json_body(body, "UK Environment Agency")?;
+            let readings = uk_rivers::parse(&document)
+                .map_err(|error| rejected("UK Environment Agency", error))?;
+            let newest = readings.newest();
+            Ok(ProbeReport::new(source, operation)
+                .product("river level reading")
+                .station(newest.map_or_else(
+                    || String::from("no readings"),
+                    |reading| format!("{} · {}", reading.station, reading.station_reference),
+                ))
+                .observed(
+                    newest.map_or_else(|| String::from("no reading"), |reading| utc(reading.at_ms)),
+                )
+                .field("readings", readings.readings.len().to_string())
+                .field(
+                    "newest level",
+                    newest.map_or_else(
+                        || String::from("not reported"),
+                        |reading| {
+                            format!(
+                                "{} {} ({})",
+                                reading.value,
+                                reading.unit,
+                                reading
+                                    .qualifier
+                                    .clone()
+                                    .unwrap_or_else(|| String::from("qualifier not reported"))
+                            )
+                        },
+                    ),
+                )
+                .field("rejected", readings.rejected.to_string()))
+        }
+        ("nasa-power", "climatology") => {
+            let document = json_body(body, "NASA POWER")?;
+            let record = power::parse(&document).map_err(|error| rejected("NASA POWER", error))?;
+            Ok(ProbeReport::new(source, operation)
+                .station(format!("{:.4}, {:.4}", record.latitude, record.longitude))
+                .product("MERRA-2 climatology")
+                .observed(record.period.clone())
+                .field(
+                    "annual temperature",
+                    optional(record.annual_temperature_c, &record.temperature_unit),
+                )
+                .field(
+                    "annual precipitation",
+                    optional(
+                        record.annual_precipitation_mm_per_day,
+                        &record.precipitation_unit,
+                    ),
+                )
+                .field("months", record.months.len().to_string()))
+        }
+        ("cwfis", "perimeters") => {
+            let document = json_body(body, "CWFIS")?;
+            let perimeters =
+                fire::parse_cwfis(&document).map_err(|error| rejected("CWFIS", error))?;
+            let first = perimeters.perimeters.first();
+            Ok(ProbeReport::new(source, operation)
+                .product("wildfire perimeter")
+                .station(
+                    first.map_or_else(|| String::from("no perimeters"), |fire| fire.name.clone()),
+                )
+                .observed(
+                    first
+                        .and_then(|fire| fire.mapped_at_ms)
+                        .map_or_else(|| String::from("not reported"), utc),
+                )
+                .field("perimeters", perimeters.perimeters.len().to_string())
+                .field(
+                    "first area",
+                    first.map_or_else(
+                        || String::from("not reported"),
+                        |fire| optional(fire.area_hectares, "ha"),
+                    ),
+                )
+                .field("rejected", perimeters.rejected.to_string()))
+        }
+        _ => Err(rejected(
+            "probe",
+            format!(
+                "no parse path is registered for {} operation {operation}",
+                source.id.as_str()
+            ),
+        )),
+    }
+}
+
+fn probe_place(values: &[(&str, &str)]) -> Result<place::Place, ProbeError> {
+    let latitude = number(values, "latitude")?;
+    let longitude = number(values, "longitude")?;
+    place::Place::new("probe point", "", "", "", latitude, longitude)
+        .map_err(|error| rejected("probe place", error))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_parsed_report_prints_units_station_product_and_observation() {
+        let report = ProbeReport::new(&sources::NOAA_SWPC, "kp")
+            .station("planetary network")
+            .product("planetary K index")
+            .observed("2026-11-13 00:00:00 UTC")
+            .field("latest Kp", "4.33 (observed)");
+        let rendered = report.render();
+        assert!(rendered.contains("station: planetary network"));
+        assert!(rendered.contains("product: planetary K index"));
+        assert!(rendered.contains("observed: 2026-11-13 00:00:00 UTC"));
+        assert!(rendered.contains("latest Kp: 4.33 (observed)"));
+    }
+
+    #[test]
+    fn the_probe_parses_through_the_rail_parser() -> Result<(), ProbeError> {
+        let body = br#"[{"time_tag":"2026-11-13T00:00:00Z","kp":4.33,"observed":"observed"}]"#;
+        let report = parse(
+            &sources::NOAA_SWPC,
+            "kp",
+            body,
+            &[],
+            "https://services.swpc.noaa.gov/products/noaa-planetary-k-index-forecast.json",
+        )?;
+        assert_eq!(report.source, "noaa-swpc");
+        assert_eq!(report.operation, "kp");
+        assert_eq!(report.observed.as_deref(), Some("2026-11-13 00:00:00 UTC"));
+        assert!(
+            report
+                .fields
+                .iter()
+                .any(|field| field.value == "4.33 (observed)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_unknown_operation_is_reported_without_a_fake_value() {
+        let error = parse(
+            &sources::NOAA_SWPC,
+            "wind",
+            b"[]",
+            &[],
+            "https://services.swpc.noaa.gov/products/summary/solar-wind-speed.json",
+        );
+        assert!(matches!(
+            error,
+            Err(ProbeError::Rejected {
+                parser: "probe",
+                ..
+            })
+        ));
+    }
+}
