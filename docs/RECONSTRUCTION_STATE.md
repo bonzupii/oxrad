@@ -106,6 +106,14 @@ States: not started, in progress, verified, blocked.
 - Gates: `cargo fmt --all` clean, `cargo clippy -- -D warnings` exit 0, `cargo test --all-targets` 481 passed and 0 failed, `cargo build --release --locked` exit 0.
 - Not done: acquisition gating at the request boundary. This pass does not meet its own done-when. The remaining work is a single acquisition boundary that owns the transport and the enabled-set check, with all 24 provider modules routed through it; that refactor did not fit this pass and was not started, because a half-converted boundary would be worse than the current state. No window was opened.
 
+### Pass 6
+
+- This pass did not implement the acquisition boundary. The tree is unchanged and green. The remaining session budget could not cover a refactor that deletes the four transport helpers in `provider.rs`, `network::http_get` and the `reqwest` client in `basemap_tiles.rs`, then converts 24 provider modules, their view and layer constructors, `Domains`, `Basemap` and `app` to route through one gate. Starting it without the capacity to finish would have left a half-converted tree, which this mission treats as worse than an honest gap.
+- The design is fixed so the next pass does not re-derive it. Create `src/acquire.rs` with one `Acquire` value that owns three things: a `SourceAccess` bitmask built once from `Config::providers`, the `CachePolicy`, and a transport. Its `fetch_json`, `fetch_bytes` and `fetch_text` call `admit(source)` before constructing any client. `admit` returns `AcquireError::Disabled { id }` when the source is absent from the mask and `AcquireError::NotAdmitted { id, reason }` when `Source::admits` fails, so both refusals precede DNS and socket work.
+- Make the transport a trait with a live implementation and a test implementation, held by value rather than shared, so a worker owns its `Acquire` and a test can count requests. Delete `provider::get_json`, `get_json_within`, `get_bytes`, `get_text`, `network::http_get` and the `BasemapTiles` client entirely rather than keeping ungated twins; let the compiler enumerate every caller. Each feed takes `Acquire` in `new`, stores it, and passes a copy to its worker; views and layers take it from `Domains::new`, which `app` builds from `config.providers` and `config.cache`. `BasemapTiles` takes it the same way.
+- Tests then live at the boundary: a counting transport proves zero requests for a disabled source and for an unadmitted one, one request for an enabled admitted source, and attribution equality for two enabled sets. No live network.
+- Gates still green at `8897519`: fmt clean, clippy exit 0, 481 tests, release build exit 0. No window was opened; there is still no display or provisioned harness.
+
 ## Known gate gaps
 
 | Gap | Detail | Next action |
