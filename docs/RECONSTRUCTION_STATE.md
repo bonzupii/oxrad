@@ -387,3 +387,64 @@ States: not started, in progress, verified, blocked.
   - Non-composite providers are exercised through their first registry operation. Their other operations have separate parser tests and rail paths, but this pass did not fetch every secondary operation live.
   - No GUI pixels were observed, so visual layout, interaction, palette and export controls remain unverified in this environment.
 - Gates after the final edits: `cargo fmt --all -- --check` exit 0, `cargo clippy --all-targets --message-format=short -- -D warnings` exit 0, `cargo test --all-targets` 508 passed and 0 failed, `cargo build --release --locked` exit 0, and `target/release/oxrad --sources` is byte-identical to `docs/SOURCES.md`.
+
+### Pass 16
+
+- Verification gap: Pass 15 exercised the first registry operation of every admitted provider. The registry declared 40 admitted operations across the 25 admitted sources; 25 had been observed live and 15 had unit tests or rail paths but no live observation. This pass closes that gap by iterating the registry rather than the provider list.
+- Probe restructure: `probe::run(source, operation, acquire, supplied)` is the single entry point. `main::fetch_source` loops over `source.endpoints` and calls it for every operation; there is no `is_composite` predicate, no first-endpoint shortcut and no per-provider fetch path. `RequestSpec::for_operation` still builds every URL and every request still goes through `Acquire`, the engine cache, the pacing clock, the honest User-Agent and the registry attribution. `--value` values are filtered against each operation's placeholders, so one value pool can serve every operation of a source and an unused value does not make a request fail.
+- Removed superseded code: `probe::live`, `probe::is_composite`, `rainviewer_live`, `basemap_live` and `nexrad_live` were deleted. Their live request logic is now in operation runners that return the same `OperationRun { parsed, requests }` as every other operation. The fixed 0, 0, 18,000 km composite probe view and its four hardcoded basemap tiles were deleted; the tile operation now takes the tile coordinates from `--value`.
+- Operations with a prerequisite chain are the only operations with a dedicated runner, because their request needs a value the provider only supplies in another response: `openfreemap/tile` needs a style to decode MVT; `rainviewer/tile` needs the manifest host and frame path; `nexrad/list-page` needs a continuation token; `nexrad/object` needs a listed key and site; `usgs-water/history` needs a gauge site; `usgs-volcano/volcano` needs a vnum; `usgs-volcano/notice` needs a notice identifier. Each runner still fetches its prerequisite through `Acquire`, parses it with the rail's parser, and attaches its provenance to the same `Served`/`RequestReport` as the target. The prerequisite operation is also requested separately when the registry loop reaches it.
+- Live sweep on 2026-11-13, release binary, fresh `HOME=/tmp/oxrad-release-home`: 25 admitted sources, 40 operations, every source exit 0. Every operation printed typed values or an explicit zero/unknown, a product or station where the provider supplied one, an observation/reference time or a stated reason none exists, and a request report with URL, operation, cache state, credit, licence and licence URL. The single-request operations printed a network request and a cache request; chained operations printed the prerequisite requests beside the target.
+- Observed live values by operation:
+
+| provider | operation | live observation |
+|---|---|---|
+| openfreemap | style | 55 layers; style parser accepted the document; no observation time |
+| openfreemap | tile | z2 x1 y1, 977 vector features, 1,293,822 bytes, style plus tile requests, no observation time |
+| open-meteo-forecast | forecast | 8.4 °C, apparent 3.2 °C, 22 km/h from 275°, partly cloudy, 24 hourly and 2 daily periods, 2026-11-13T14:00 Europe/Berlin |
+| open-meteo-forecast | environment | 48 hours, peak CAPE 10 J/kg, surface wind 13.3 km/h from 257°, first shear 110.4 km/h from 255.9°, 2026-11-13 00:00 UTC |
+| open-meteo-forecast | land | 72 hours, first soil temperature 5.4 °C, topsoil moisture 0.19 m³/m³, VPD 0.1 kPa, 2026-11-12 00:00 UTC |
+| open-meteo-forecast | snow | 72 hours, first depth 0 m, first snowfall 0 cm, 2026-11-12 00:00 UTC |
+| open-meteo-forecast | sounding | 12 levels, surface 8.4 °C and 1000.5 hPa, precipitable water 9.087869501215808 mm, deep shear 21.4 m/s over 6,000 m, 2026-11-13 13:00 UTC |
+| open-meteo-archive | climate | 10 days, first day 7.2 °C, latest precipitation 0.3 mm, 2026-11-10 00:00 UTC |
+| open-meteo-air-quality | quality | US AQI 51, PM2.5 4 μg/m³, PM10 9.7 μg/m³, 72 hours, 2026-11-13 12:00 UTC |
+| open-meteo-marine | ocean | wave height 2.52 m, sea-surface temperature 12.4 °C, 48 hours, 2026-11-13 00:00 UTC |
+| open-meteo-flood | hydro | peak 6.87 m³/s, 3 days, 2026-11-12 00:00 UTC |
+| open-meteo-flood | hydro-ensemble | 50 ensemble members, peak 6.87 m³/s, spread 6.87–6.87 m³/s, 3 days, 2026-11-12 00:00 UTC |
+| open-meteo-elevation | elevation | 38 m, dataset Copernicus DEM 2021 release GLO-90, vertical datum explicitly unknown, no observation time |
+| rainviewer | manifest | 13 frames, latest 2026-11-13 13:00 UTC, first 11:00 UTC |
+| rainviewer | tile | frame path `/v2/radar/5f82160bf1a6`, z2 x2 y1, 256 × 256 px, 262,144 RGBA bytes, palette Universal Blue, 2026-11-13 13:00 UTC |
+| nexrad-level-2 | list | 102 keys, not truncated, no continuation, prefix `2026/11/13/KTWX/`; no observation time |
+| nexrad-level-2 | list-page | 1,000 keys, truncated, next continuation token, first page 1,000 keys; no observation time |
+| nexrad-level-2 | object | KTWX 2026-11-13 12:55:50 UTC, 14 sweeps, 720 radials, 0.65°, 459.3 km, 2,651,153 bytes, one discovery page |
+| nws-api | stations | 159 stations, first KLCH Lake Charles at 30.1253, -93.2159, 2026-11-13 12:57:59 UTC |
+| nws-api | alerts | 326 warnings, 323 without geometry, 0 rejected, first moderate Special Weather Statement, sent 2026-11-13T06:58:00-06:00 |
+| usgs-earthquakes | feed | 213 events, 5 unreadable, strongest M5.8 mww 148 km NW of Kavieng, Papua New Guinea, 2026-11-12 22:04:06 UTC |
+| usgs-water | box | 29 gauges, 2 rejected, first 07143330 Arkansas River near Hutchinson, Kansas, 1.88 ft provisional at 2026-11-13 12:30 UTC |
+| usgs-water | history | same gauge, 670 stage and 670 discharge readings, highest stage 1.94 ft, stage range 0.08 ft, 2026-11-13 12:30 UTC |
+| nasa-gibs | tile | VIIRS SNPP corrected reflectance, z2 x1 y1, 256 × 256 px, 262,144 RGBA bytes, 2026-11-02 |
+| noaa-swpc | kp | 81 points, latest 1.67 estimated at 2026-11-13 21:00 UTC |
+| noaa-swpc | wind | proton speed 373 km/s, 2026-11-13 12:54 UTC |
+| noaa-swpc | magnetic-field | total field 5 nT, north-south component 1 nT, 2026-11-13 12:54 UTC |
+| sunrise-sunset | day | sunrise 07:24:23 +01:00, sunset 16:16:11 +01:00, solar noon 11:50:35 +01:00 for 2026-11-13 |
+| open-meteo-geocoding | search | 5 places, first Berlin, State of Berlin at 52.5244, 13.4105 |
+| gdacs | search | MURASU-26 tropical cyclone, observed 2026-11-03 06:00 UTC |
+| aviationweather-metar | box | DIAP Abidjan/Boigny, raw METAR at 2026-11-13 12:30 UTC |
+| nifc-wfigs | perimeters | RX Buck Creek, mapped 2026-03-18 23:34:15 UTC |
+| nsidc-sea-ice | month | 48 years, latest 2026-10, 6.69 million km², 0 unreadable rows |
+| usgs-volcano | list | first Great Sitkin, orange, sent 2026-11-09 21:09:11 UTC |
+| usgs-volcano | volcano | vnum 311120, reference record, no observation time |
+| usgs-volcano | notice | DOI-USGS-AVO-2026-11-09T20:51:49+00:00, synopsis parsed, notice time not stated in the body |
+| emsc | query | 10 events, 0 unreadable, strongest M4.7 m at Central Peru, 2026-11-13 12:37:49 UTC |
+| uk-ea-flood | latest-readings | 10 readings, 0 rejected, A6 Bridge 720215, 0.276 m Stage at 2026-11-13 12:36:16 UTC |
+| nasa-power | climatology | 12 months, annual 9.68 °C and 1.65 mm/day, 25-year climatology January 2001 to December 2025 |
+| cwfis | perimeters | 0 perimeters in the chosen box, reported as 0 with `observed: not reported`, not filled from another source |
+
+- Live-input discoveries: the USGS summary feed answered `404 File Not Found` for `window=day`; the registry template is correct but the valid summary name is `all_day` (the pattern also accepts `all_hour`, `2.5_day`, `4.5_week`, and the other published summary names). The probe was rerun with `all_day` and returned 213 events. NASA GIBS answered 404 for `TIME=2026-11-12` on the VIIRS SNPP true-colour layer; its capabilities offered data only through `2026-11-02` for that layer. The probe was rerun with the offered date and returned a 256 × 256 tile. Neither was a code defect, and neither date or window was hardcoded in production code: the probe inputs are recorded in this ledger and the registry continues to own the endpoint, licence and attribution.
+- NEXRAD listing page: a specific site prefix normally has no continuation token. The `list-page` runner tries the supplied prefix, then the current UTC day prefix, and only runs when a continuation exists; the observed page had 1,000 keys and a next token. This is a probe discovery input, not a production fallback: the rail's own listing path is unchanged.
+- USGS history and volcano chains: when `--value site=`, `vnum=` or `notice=` is absent, the runner follows the first gauge in the box or the first elevated volcano in the list, records the prerequisite request and reports the site/vnum/notice it used. It does not invent an identifier. If the list is empty it returns an explicit reason instead of a placeholder.
+- Terrain, volcano records and listing pages have no observation time; the reports say so explicitly. CWFIS returned a genuine zero; the report says 0 and does not substitute another provider. GIBS reports the date the layer actually offered. No unknown was rendered as a number.
+- Deterministic tests: the suite is now 520 passed and 0 failed. New tests cover `parse_wind_speed`, `parse_magnetic_field` and `parse_notice` with normal, malformed and empty input; a table test drives every admitted operation that has a body parser with an empty body and a malformed body and requires an error, so no operation can return a fabricated value from an absent or unreadable response. Existing module tests continue to cover each parser's normal shape, units, ordering and rejections; the tile, MVT, PNG, NEXRAD volume and listing decoders retain their own generated-input tests. No dataset is committed.
+- GUI: still not observed. `scripts/gui.sh radar /tmp/gui-coverage` exits 1 with `gui: Xvfb is required and was not found`; there is no display or root installation in this environment. No window, rail, map, tooltip, palette, export control or pixel was observed. The claims in this pass are headless request, parser, provenance and test claims only.
+- Remaining limitations: the live sweep used the probe's chosen points, tiles, dates and boxes, not every possible coordinate; the registry is exercised per operation, not per geography. Operations whose value is a static reference (terrain DEM, volcano record, basemap style/tile) state that no observation time exists. USGS, NWS, NEXRAD, NIFC, NSIDC and volcano coverage remains country-limited as recorded in `docs/SOURCES.md`; no global source is invented for them. The probe's NEXRAD page uses the current UTC day prefix when a specific prefix has no continuation, so its object/page selection is a demonstration of the operation, not a claim that every archive prefix paginates.
+- Gates after this pass: `cargo fmt --all -- --check` exit 0, `cargo clippy --all-targets --message-format=short -- -D warnings` exit 0, `cargo test --all-targets` 520 passed and 0 failed, `cargo build --release --locked` exit 0, and `target/release/oxrad --sources` is byte-identical to `docs/SOURCES.md`.

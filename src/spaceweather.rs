@@ -230,6 +230,78 @@ pub fn parse_kp(document: &Value) -> Result<Vec<KpPoint>, SpaceWeatherError> {
     Ok(points)
 }
 
+/// Reads only the solar-wind speed summary.
+///
+/// The speed and magnetic-field summaries are separate registry operations, so
+/// each can be parsed on its own and reported with its own request. The combined
+/// parser below reads both when one rail asks for the pair.
+///
+/// # Errors
+///
+/// Returns [`SpaceWeatherError::Shape`] when the document carries no row, no
+/// readable time, or no non-negative proton speed.
+pub fn parse_wind_speed(speed: &Value) -> Result<SolarWind, SpaceWeatherError> {
+    let row = summary_row(speed, "a solar-wind speed row")?;
+    let time_ms = summary_time(row, "the solar-wind speed row")?;
+    let speed_km_s = row
+        .get("proton_speed")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .ok_or(shape("a non-negative proton speed"))?;
+    Ok(SolarWind {
+        speed_km_s: Some(speed_km_s),
+        bt_nt: None,
+        bz_nt: None,
+        time_ms,
+    })
+}
+
+/// Reads only the solar-wind magnetic-field summary.
+///
+/// # Errors
+///
+/// Returns [`SpaceWeatherError::Shape`] when the document carries no row, no
+/// readable time, or neither a total field nor a north-south component.
+pub fn parse_magnetic_field(magnetic: &Value) -> Result<SolarWind, SpaceWeatherError> {
+    let row = summary_row(magnetic, "a solar-wind magnetic-field row")?;
+    let time_ms = summary_time(row, "the solar-wind magnetic-field row")?;
+    let bt_nt = row
+        .get("bt")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value >= 0.0);
+    let bz_nt = row
+        .get("bz_gsm")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite());
+    if bt_nt.is_none() && bz_nt.is_none() {
+        return Err(shape("a total field or a north-south component"));
+    }
+    Ok(SolarWind {
+        speed_km_s: None,
+        bt_nt,
+        bz_nt,
+        time_ms,
+    })
+}
+
+fn summary_row<'a>(
+    document: &'a Value,
+    detail: &'static str,
+) -> Result<&'a Value, SpaceWeatherError> {
+    document
+        .as_array()
+        .and_then(|rows| rows.first())
+        .ok_or_else(|| shape(detail))
+}
+
+fn summary_time(row: &Value, detail: &'static str) -> Result<u64, SpaceWeatherError> {
+    let stamp = row
+        .get("time_tag")
+        .and_then(Value::as_str)
+        .ok_or_else(|| shape(detail))?;
+    time::parse_iso_utc(stamp).ok_or(shape("timestamps this program can order"))
+}
+
 /// Reads the solar-wind speed summary, whose one row carries the latest value.
 pub fn parse_wind(speed: &Value, magnetic: &Value) -> Result<SolarWind, SpaceWeatherError> {
     let row = speed
@@ -617,5 +689,65 @@ mod tests {
             return;
         };
         assert!(parse_wind(&empty, &empty).is_err());
+    }
+
+    #[test]
+    fn the_speed_summary_parses_on_its_own() -> Result<(), SpaceWeatherError> {
+        let (speed, _) = wind_documents();
+        let wind = parse_wind_speed(&speed)?;
+        assert_eq!(wind.speed_km_s, Some(492.0));
+        assert_eq!(wind.bt_nt, None);
+        assert_eq!(wind.bz_nt, None);
+        assert_eq!(
+            wind.time_ms % time::MS_PER_DAY,
+            20 * 3_600_000 + 24 * 60_000
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_speed_summary_without_a_speed_is_refused() {
+        let Ok(document) =
+            serde_json::from_str::<Value>(r#"[{"time_tag": "2026-11-01T20:24:00Z"}]"#)
+        else {
+            return;
+        };
+        assert!(parse_wind_speed(&document).is_err());
+    }
+
+    #[test]
+    fn an_empty_speed_summary_is_refused() {
+        let Ok(empty) = serde_json::from_str::<Value>("[]") else {
+            return;
+        };
+        assert!(parse_wind_speed(&empty).is_err());
+    }
+
+    #[test]
+    fn the_magnetic_summary_parses_on_its_own() -> Result<(), SpaceWeatherError> {
+        let (_, magnetic) = wind_documents();
+        let field = parse_magnetic_field(&magnetic)?;
+        assert_eq!(field.speed_km_s, None);
+        assert_eq!(field.bt_nt, Some(4.0));
+        assert_eq!(field.bz_nt, Some(-2.0));
+        Ok(())
+    }
+
+    #[test]
+    fn a_magnetic_summary_without_a_field_is_refused() {
+        let Ok(document) =
+            serde_json::from_str::<Value>(r#"[{"time_tag": "2026-11-01T20:24:00Z"}]"#)
+        else {
+            return;
+        };
+        assert!(parse_magnetic_field(&document).is_err());
+    }
+
+    #[test]
+    fn an_empty_magnetic_summary_is_refused() {
+        let Ok(empty) = serde_json::from_str::<Value>("[]") else {
+            return;
+        };
+        assert!(parse_magnetic_field(&empty).is_err());
     }
 }

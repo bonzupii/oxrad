@@ -635,7 +635,7 @@ fn standard_pressure(height_m: f64) -> Option<f64> {
 }
 
 /// The pressure levels and surface fields the request asks for.
-fn fields() -> String {
+pub(crate) fn fields() -> String {
     let mut list = vec![
         String::from("temperature_2m"),
         String::from("relative_humidity_2m"),

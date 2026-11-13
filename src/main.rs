@@ -142,12 +142,12 @@ configuration file; with no saved site the picker opens.
   --print-config      Print the effective configuration and exit
   --prune-cache       Enforce the configured cache budget and exit
   --sources           Print the open-source inventory and exit
-  --fetch-source ID   Fetch the source's first endpoint twice, or a composite
-                      rail's full request set, parse it with the rail's
-                      parser, and print the value, units, station, product,
-                      observation time and every request's provenance
-  --value NAME=VALUE  Supply one endpoint placeholder to --fetch-source;
-                      repeatable
+  --fetch-source ID   Request every operation the source registers, twice each,
+                      through the shared transport and cache; parse each with
+                      the rail's parser and print its typed values, units,
+                      station, product, observation time and request report
+  --value NAME=VALUE  Supply a placeholder for any operation of the source;
+                      values an operation does not use are ignored; repeatable
   -h, --help          Show this message";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -277,106 +277,56 @@ fn prune_cache(policy: config::CachePolicy) -> ExitCode {
     }
 }
 
-/// Fetches one registry endpoint twice through the engine and reports what it
-/// served, so cache state and provenance can be observed without a display.
+/// Requests every operation the registry declares for one source, twice each,
+/// through the engine, and reports what it served. The loop is over the
+/// registry's endpoints, so a new operation is exercised without a new probe
+/// path; only operations with a prerequisite chain have a dedicated runner.
 fn fetch_source(config: &config::Config, id: &str, values: &[(String, String)]) -> ExitCode {
     let Some(source) = sources::find(id) else {
         eprintln!("No registry source is named {id}. Run --sources for the identifiers.");
         return ExitCode::FAILURE;
     };
-    let acquire = acquire::Acquire::new(config.providers.clone());
-    let Some(operation) = source.endpoints.first() else {
+    if source.endpoints.is_empty() {
         eprintln!("{} records no endpoint.", source.id.as_str());
         return ExitCode::FAILURE;
-    };
+    }
+    let acquire = acquire::Acquire::new(config.providers.clone());
     let borrowed: Vec<(&str, &str)> = values
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect();
-    if probe::is_composite(source.id.as_str()) {
-        return fetch_composite(source, &acquire, &borrowed);
-    }
-    let spec = match engine::RequestSpec::for_operation(source, operation.operation, &borrowed) {
-        Ok(spec) => spec,
-        Err(error) => {
-            eprintln!("The request could not be built: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let mut served = None;
-    for pass in 1..=2 {
-        match acquire.fetch(&spec) {
-            Ok(fetched) => {
-                println!(
-                    "request {pass}: {} bytes from {} ({})",
-                    fetched.body.len(),
-                    fetched.cache.label(),
-                    source.credit
-                );
-                served = Some(fetched);
+    let mut failed = 0_usize;
+    for endpoint in source.endpoints {
+        println!(
+            "=== {} · operation {}",
+            source.id.as_str(),
+            endpoint.operation
+        );
+        match probe::run(source, endpoint.operation, &acquire, &borrowed) {
+            Ok(run) => {
+                println!("{}", run.parsed.render());
+                println!();
+                println!("{}", run.requests.text());
+                match run.requests.write() {
+                    Ok(path) => println!("request list: {}", path.display()),
+                    Err(error) => {
+                        eprintln!("The request list could not be written: {error}");
+                        failed = failed.saturating_add(1);
+                    }
+                }
             }
             Err(error) => {
-                eprintln!("request {pass} failed: {error}");
-                report_provenance(&acquire);
-                return ExitCode::FAILURE;
+                eprintln!("Operation {} failed: {error}", endpoint.operation);
+                failed = failed.saturating_add(1);
             }
         }
-    }
-    let Some(served) = served else {
-        eprintln!("The request produced no body to parse.");
-        report_provenance(&acquire);
-        return ExitCode::FAILURE;
-    };
-    match probe::parse(
-        source,
-        operation.operation,
-        &served.body,
-        &borrowed,
-        &served.provenance.url,
-    ) {
-        Ok(report) => println!("{}", report.render()),
-        Err(error) => {
-            eprintln!("Parse failed: {error}");
-            report_provenance(&acquire);
-            return ExitCode::FAILURE;
-        }
+        println!();
     }
     report_provenance(&acquire);
-    ExitCode::SUCCESS
-}
-
-/// Drives a composite rail through its full request set, prints parsed values
-/// and every request, and writes the raw list to the cache directory.
-fn fetch_composite(
-    source: &'static sources::Source,
-    acquire: &acquire::Acquire,
-    values: &[(&str, &str)],
-) -> ExitCode {
-    let run = match probe::live(source, acquire, values) {
-        Ok(run) => run,
-        Err(error) => {
-            eprintln!("Composite observation failed: {error}");
-            report_provenance(acquire);
-            return ExitCode::FAILURE;
-        }
-    };
-    println!("{}", run.parsed.render());
-    println!();
-    println!("{}", run.requests.text());
-    let exported = match run.requests.write() {
-        Ok(path) => {
-            println!("request list: {}", path.display());
-            true
-        }
-        Err(error) => {
-            eprintln!("The request list could not be written: {error}");
-            false
-        }
-    };
-    report_provenance(acquire);
-    if exported {
+    if failed == 0 {
         ExitCode::SUCCESS
     } else {
+        eprintln!("{failed} operation(s) did not produce a live observation.");
         ExitCode::FAILURE
     }
 }

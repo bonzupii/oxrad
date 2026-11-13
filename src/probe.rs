@@ -14,12 +14,14 @@ use crate::acquire::Acquire;
 use crate::basemap_tiles;
 use crate::climate;
 use crate::cyclone;
-use crate::engine::{Fetched, RequestSpec, Served};
+use crate::engine::{Fetched, Served};
+use crate::environment;
 use crate::fire;
 use crate::forecast;
 use crate::gauge;
 use crate::global_radar;
 use crate::hydro;
+use crate::land;
 use crate::network;
 use crate::observations;
 use crate::ocean;
@@ -32,6 +34,8 @@ use crate::radar;
 use crate::request_report::RequestReport;
 use crate::satellite;
 use crate::seaice::{self, Hemisphere};
+use crate::snow;
+use crate::sounding;
 use crate::sources;
 use crate::spaceweather;
 use crate::stations::{self, SiteId};
@@ -40,37 +44,8 @@ use crate::terrain;
 use crate::time;
 use crate::uk_rivers;
 use crate::volcano;
+use crate::warnings;
 use walkers::{Style, Tile, TileId};
-
-/// The unchanged view used by the three composite headless observations: the
-/// application's default 18,000 km world view centred on the origin.
-const PROBE_CENTER_LAT: f64 = 0.0;
-const PROBE_CENTER_LON: f64 = 0.0;
-const PROBE_SPAN_KM: f64 = 18_000.0;
-
-/// Four vector tiles at the default world view's scale, around the origin.
-const BASEMAP_PROBE_TILES: [TileId; 4] = [
-    TileId {
-        zoom: 2,
-        x: 1,
-        y: 1,
-    },
-    TileId {
-        zoom: 2,
-        x: 2,
-        y: 1,
-    },
-    TileId {
-        zoom: 2,
-        x: 1,
-        y: 2,
-    },
-    TileId {
-        zoom: 2,
-        x: 2,
-        y: 2,
-    },
-];
 
 /// A parsed value with the unit the provider stated.
 #[derive(Debug, Clone)]
@@ -156,41 +131,37 @@ impl ProbeReport {
     }
 }
 
-/// One live composite observation: parsed values followed by the request set
-/// that produced them.
-pub(crate) struct CompositeRun {
+/// One live operation: parsed values followed by the request set that produced
+/// them. Every registry endpoint is run through this shape.
+pub(crate) struct OperationRun {
     pub(crate) parsed: ProbeReport,
     pub(crate) requests: RequestReport,
 }
 
-/// Whether this source needs the live composite path rather than the first
-/// endpoint's parser alone.
-pub(crate) fn is_composite(id: &str) -> bool {
-    matches!(id, "rainviewer" | "openfreemap" | "nexrad-level-2")
-}
-
-/// Drives the three composite rails through the same registry operations and
-/// parsers their display paths use. Every request is fetched, never composed
-/// into a summary URL.
+/// Runs one registry operation through the shared transport and the rail's own
+/// parser. The dispatch is by operation, not by source: the caller iterates
+/// `source.endpoints`, so adding an endpoint to the registry adds it here.
 ///
 /// # Errors
 ///
-/// Returns [`ProbeError::Live`] when a required placeholder is absent, a request
-/// fails, or a fetched body is not renderable. Returns the parser failure from
-/// the rail's own parser when it rejects the response.
-pub(crate) fn live(
+/// Returns [`ProbeError::Live`] when a request fails and [`ProbeError::Rejected`]
+/// when the rail's parser rejects the answer or a prerequisite has no honest
+/// value to follow.
+pub(crate) fn run(
     source: &'static sources::Source,
+    operation: &'static str,
     acquire: &Acquire,
-    values: &[(&str, &str)],
-) -> Result<CompositeRun, ProbeError> {
-    match source.id.as_str() {
-        "rainviewer" => rainviewer_live(source, acquire),
-        "openfreemap" => basemap_live(source, acquire, values),
-        "nexrad-level-2" => nexrad_live(source, acquire, values),
-        _ => Err(live_error(
-            "composite probe",
-            "no live composite path is registered for this source",
-        )),
+    supplied: &[(&str, &str)],
+) -> Result<OperationRun, ProbeError> {
+    match (source.id.as_str(), operation) {
+        ("openfreemap", "tile") => basemap_tile(source, acquire, supplied),
+        ("rainviewer", "tile") => rainviewer_tile(source, acquire, supplied),
+        ("nexrad-level-2", "list-page") => nexrad_page(source, acquire, supplied),
+        ("nexrad-level-2", "object") => nexrad_object(source, acquire, supplied),
+        ("usgs-water", "history") => water_history(source, acquire, supplied),
+        ("usgs-volcano", "volcano") => volcano_place(source, acquire, supplied),
+        ("usgs-volcano", "notice") => volcano_notice(source, acquire, supplied),
+        _ => standard_operation(source, operation, acquire, supplied),
     }
 }
 
@@ -201,101 +172,126 @@ fn live_error(stage: &'static str, detail: impl Display) -> ProbeError {
     }
 }
 
+fn standard_operation(
+    source: &'static sources::Source,
+    operation: &'static str,
+    acquire: &Acquire,
+    supplied: &[(&str, &str)],
+) -> Result<OperationRun, ProbeError> {
+    let endpoint = source
+        .operation(operation)
+        .map_err(|error| rejected("probe registry", error))?;
+    let hourly = (operation == "sounding").then(sounding::fields);
+    let mut values = values_for(endpoint.template, supplied);
+    if let Some(fields) = hourly.as_deref() {
+        values.push(("hourly", fields));
+    }
+    let fetched = fetch_twice(acquire, source, operation, &values)?;
+    let parsed = parse(
+        source,
+        operation,
+        &fetched.last.body,
+        &values,
+        &fetched.last.provenance.url,
+    )?;
+    drop(hourly);
+    Ok(operation_run(
+        source,
+        operation,
+        parsed,
+        fetched.last.provenance,
+        fetched.last.cache,
+        vec![(fetched.first.provenance, fetched.first.cache)],
+    ))
+}
+
+fn operation_run(
+    source: &'static sources::Source,
+    operation: &'static str,
+    parsed: ProbeReport,
+    provenance: crate::engine::Provenance,
+    cache: crate::engine::CacheState,
+    extra: Vec<(crate::engine::Provenance, crate::engine::CacheState)>,
+) -> OperationRun {
+    let mut served = Served::new((), provenance, cache);
+    for (provenance, cache) in extra {
+        served = served.with_request(provenance, cache);
+    }
+    let requests =
+        RequestReport::from_served(format!("{} {operation} requests", source.name), &served);
+    OperationRun { parsed, requests }
+}
+
+struct FetchedTwice {
+    first: Fetched,
+    last: Fetched,
+}
+
 fn fetch_twice(
     acquire: &Acquire,
     source: &'static sources::Source,
     operation: &'static str,
     values: &[(&str, &str)],
-) -> Result<Fetched, ProbeError> {
-    let mut last = None;
-    for _ in 0..2 {
-        last = Some(
-            acquire
-                .fetch_operation(source, operation, values)
-                .map_err(|error| live_error(operation, error))?,
-        );
-    }
-    last.ok_or_else(|| live_error(operation, "the request produced no body"))
+) -> Result<FetchedTwice, ProbeError> {
+    let first = acquire
+        .fetch_operation(source, operation, values)
+        .map_err(|error| live_error(operation, error))?;
+    let last = acquire
+        .fetch_operation(source, operation, values)
+        .map_err(|error| live_error(operation, error))?;
+    Ok(FetchedTwice { first, last })
 }
 
-fn rainviewer_live(
-    source: &'static sources::Source,
+fn fetch_once(
     acquire: &Acquire,
-) -> Result<CompositeRun, ProbeError> {
-    let fetched = fetch_twice(acquire, source, "manifest", &[])?;
-    let manifest = global_radar::parse_manifest(&fetched.body)
-        .map_err(|error| rejected("RainViewer manifest", error))?;
-    let latest = manifest
-        .frames
-        .last()
-        .cloned()
-        .ok_or_else(|| rejected("RainViewer manifest", "the manifest carries no frames"))?;
-    let grid = global_radar::tile_grid_for_view(PROBE_CENTER_LAT, PROBE_CENTER_LON, PROBE_SPAN_KM)
-        .map_err(|error| rejected("RainViewer tile grid", error))?;
-    let frame_count = manifest.frames.len();
-    let host = manifest.host.clone();
-    let mut served = Served::new(manifest, fetched.provenance, fetched.cache);
-    let mut pixels = String::from("not decoded");
-    let mut rgba_bytes = 0_usize;
-    for bounds in &grid.tiles {
-        let size = global_radar::TILE_SIZE.to_string();
-        let zoom = bounds.zoom.to_string();
-        let x = bounds.x.to_string();
-        let y = bounds.y.to_string();
-        let scheme = global_radar::COLOR_SCHEME.to_string();
-        let spec = RequestSpec::for_operation(
-            &sources::RAINVIEWER,
-            "tile",
-            &[
-                ("host", host.as_str()),
-                ("path", latest.path.as_str()),
-                ("size", size.as_str()),
-                ("zoom", zoom.as_str()),
-                ("x", x.as_str()),
-                ("y", y.as_str()),
-                ("scheme", scheme.as_str()),
-            ],
-        )
-        .map_err(|error| live_error("RainViewer tile", error))?;
-        let fetched = acquire
-            .fetch(&spec)
-            .map_err(|error| live_error("RainViewer tile", error))?;
-        let image = global_radar::decode_tile(&fetched.body, &fetched.provenance.url)
-            .map_err(|error| rejected("RainViewer tile", error))?;
-        pixels = format!("{} × {} px", image.width, image.height);
-        rgba_bytes = rgba_bytes.saturating_add(image.rgba.len());
-        served = served.with_labelled_request(
-            format!("tile z{} x{} y{}", bounds.zoom, bounds.x, bounds.y),
-            fetched.provenance,
-            fetched.cache,
-        );
-    }
-    let requests = RequestReport::from_served("RainViewer composite requests", &served);
-    let parsed = ProbeReport::new(source, "manifest")
-        .station(host)
-        .product("global reflectivity composite")
-        .observed(utc(latest.time_unix_ms))
-        .field("frames", frame_count.to_string())
-        .field("latest frame path", latest.path)
-        .field("palette", global_radar::PALETTE)
-        .field(
-            "probe view",
-            format!("{PROBE_CENTER_LAT:.4}, {PROBE_CENTER_LON:.4} · {PROBE_SPAN_KM:.0} km"),
-        )
-        .field("tiles", grid.tiles.len().to_string())
-        .field("tile size", pixels)
-        .field("rgba bytes", rgba_bytes.to_string());
-    Ok(CompositeRun { parsed, requests })
-}
-
-fn basemap_live(
     source: &'static sources::Source,
-    acquire: &Acquire,
+    operation: &'static str,
     values: &[(&str, &str)],
-) -> Result<CompositeRun, ProbeError> {
-    let style_name = value(values, "style")?;
-    let fetched = fetch_twice(acquire, source, "style", &[("style", style_name)])?;
-    let document = json_body(&fetched.body, "OpenFreeMap style")?;
+) -> Result<Fetched, ProbeError> {
+    acquire
+        .fetch_operation(source, operation, values)
+        .map_err(|error| live_error(operation, error))
+}
+
+fn values_for<'a>(template: &str, supplied: &'a [(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+    let names = template_names(template);
+    supplied
+        .iter()
+        .copied()
+        .filter(|(name, _)| names.iter().any(|candidate| candidate == name))
+        .collect()
+}
+
+fn template_names(template: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('}') else {
+            break;
+        };
+        let key = &after[..close];
+        names.push(String::from(
+            key.strip_prefix("raw:").map_or(key, |name| name),
+        ));
+        rest = &after[close + 1..];
+    }
+    names
+}
+
+fn set_value<'a>(values: &mut Vec<(&'a str, &'a str)>, name: &'a str, value: &'a str) {
+    values.retain(|(candidate, _)| *candidate != name);
+    values.push((name, value));
+}
+
+fn basemap_tile(
+    source: &'static sources::Source,
+    acquire: &Acquire,
+    supplied: &[(&str, &str)],
+) -> Result<OperationRun, ProbeError> {
+    let style_name = value(supplied, "style")?;
+    let style_fetched = fetch_once(acquire, source, "style", &[("style", style_name)])?;
+    let document = json_body(&style_fetched.body, "OpenFreeMap style")?;
     let layers = document
         .get("layers")
         .and_then(Value::as_array)
@@ -303,70 +299,215 @@ fn basemap_live(
         .ok_or_else(|| rejected("OpenFreeMap style", "the document has no layers array"))?;
     let style: Style =
         serde_json::from_value(document).map_err(|error| rejected("OpenFreeMap style", error))?;
-    let mut requests = Vec::with_capacity(BASEMAP_PROBE_TILES.len());
-    let mut features = 0_usize;
-    let mut bytes = 0_usize;
-    let mut cache_warning = None;
-    for id in BASEMAP_PROBE_TILES {
-        let (result, warning) = basemap_tiles::load_tile(acquire, id);
-        let tile = result.map_err(|error| live_error("OpenFreeMap tile", error))?;
-        let decoded = Tile::from_mvt(&tile.bytes, &style, id.zoom)
-            .map_err(|error| live_error("OpenFreeMap tile parser", error))?;
-        features = features.saturating_add(match decoded {
-            Tile::Vector(shapes) => shapes.len(),
-            Tile::Raster(_) => 0,
-        });
-        if let Some(warning) = warning {
-            cache_warning = Some(warning.to_string());
-        }
-        bytes = bytes.saturating_add(tile.bytes.len());
-        requests.push((
-            format!("tile z{} x{} y{}", id.zoom, id.x, id.y),
-            tile.provenance,
-            tile.cache,
-        ));
-    }
-    let mut served = Served::new(style, fetched.provenance, fetched.cache);
-    for (label, provenance, cache) in requests {
-        served = served.with_labelled_request(label, provenance, cache);
-    }
-    let request_report =
-        RequestReport::from_served("Basemap style and vector tile requests", &served);
-    let mut parsed = ProbeReport::new(source, "style")
-        .product("basemap vector style")
+    let zoom = integer_value(supplied, "zoom")?;
+    let id = TileId {
+        zoom: u8::try_from(zoom).map_err(|_| ProbeError::InvalidValue {
+            name: "zoom",
+            value: zoom.to_string(),
+        })?,
+        x: integer_value(supplied, "x")?,
+        y: integer_value(supplied, "y")?,
+    };
+    let (first, warning) = basemap_tiles::load_tile(acquire, id);
+    let first = first.map_err(|error| live_error("OpenFreeMap tile", error))?;
+    let (fetched, warning_again) = basemap_tiles::load_tile(acquire, id);
+    let fetched = fetched.map_err(|error| live_error("OpenFreeMap tile", error))?;
+    let decoded = Tile::from_mvt(&fetched.bytes, &style, id.zoom)
+        .map_err(|error| live_error("OpenFreeMap tile parser", error))?;
+    let features = match decoded {
+        Tile::Vector(shapes) => shapes.len(),
+        Tile::Raster(_) => 0,
+    };
+    let mut parsed = ProbeReport::new(source, "tile")
+        .station(format!("tile z{} x{} y{}", id.zoom, id.x, id.y))
+        .product("basemap vector tile")
+        .observed("no observation time; the tile is a provider-defined snapshot")
+        .field("style", style_name)
         .field("layers", layers.to_string())
-        .field(
-            "probe view",
-            format!("{PROBE_CENTER_LAT:.4}, {PROBE_CENTER_LON:.4} · {PROBE_SPAN_KM:.0} km"),
-        )
-        .field("tiles", BASEMAP_PROBE_TILES.len().to_string())
         .field("vector features", features.to_string())
-        .field("tile bytes", bytes.to_string());
-    if let Some(warning) = cache_warning {
-        parsed = parsed.field("cache warning", warning);
+        .field("tile bytes", fetched.bytes.len().to_string())
+        .field(
+            "cache",
+            format!("{} after {}", fetched.cache.label(), first.cache.label()),
+        );
+    if let Some(warning) = warning.or(warning_again) {
+        parsed = parsed.field("cache warning", warning.to_string());
     }
-    Ok(CompositeRun {
+    Ok(operation_run(
+        source,
+        "tile",
         parsed,
-        requests: request_report,
-    })
+        fetched.provenance,
+        fetched.cache,
+        vec![(style_fetched.provenance, style_fetched.cache)],
+    ))
 }
 
-fn nexrad_live(
+fn rainviewer_tile(
     source: &'static sources::Source,
     acquire: &Acquire,
-    values: &[(&str, &str)],
-) -> Result<CompositeRun, ProbeError> {
-    let prefix = value(values, "prefix")?;
+    supplied: &[(&str, &str)],
+) -> Result<OperationRun, ProbeError> {
+    let manifest_fetched = fetch_twice(acquire, source, "manifest", &[])?;
+    let manifest = global_radar::parse_manifest(&manifest_fetched.last.body)
+        .map_err(|error| rejected("RainViewer manifest", error))?;
+    let latest = manifest
+        .frames
+        .last()
+        .ok_or_else(|| rejected("RainViewer manifest", "the manifest carries no frames"))?;
+    let size = supplied
+        .iter()
+        .find(|(name, _)| *name == "size")
+        .map_or_else(
+            || global_radar::TILE_SIZE.to_string(),
+            |(_, value)| String::from(*value),
+        );
+    let scheme = supplied
+        .iter()
+        .find(|(name, _)| *name == "scheme")
+        .map_or_else(
+            || global_radar::COLOR_SCHEME.to_string(),
+            |(_, value)| String::from(*value),
+        );
+    let zoom = integer_value(supplied, "zoom")?;
+    let x = integer_value(supplied, "x")?;
+    let y = integer_value(supplied, "y")?;
+    let zoom_text = zoom.to_string();
+    let x_text = x.to_string();
+    let y_text = y.to_string();
+    let fetched = fetch_twice(
+        acquire,
+        source,
+        "tile",
+        &[
+            ("host", manifest.host.as_str()),
+            ("path", latest.path.as_str()),
+            ("size", size.as_str()),
+            ("zoom", zoom_text.as_str()),
+            ("x", x_text.as_str()),
+            ("y", y_text.as_str()),
+            ("scheme", scheme.as_str()),
+        ],
+    )?;
+    let image = global_radar::decode_tile(&fetched.last.body, &fetched.last.provenance.url)
+        .map_err(|error| rejected("RainViewer tile", error))?;
+    let parsed = ProbeReport::new(source, "tile")
+        .station(manifest.host.clone())
+        .product("global reflectivity tile")
+        .observed(utc(latest.time_unix_ms))
+        .field("frame path", latest.path.clone())
+        .field(
+            "tile",
+            format!("z{zoom} x{x} y{y} · {size} px · scheme {scheme}"),
+        )
+        .field("pixels", format!("{} × {} px", image.width, image.height))
+        .field("rgba bytes", image.rgba.len().to_string())
+        .field("palette", global_radar::PALETTE);
+    Ok(operation_run(
+        source,
+        "tile",
+        parsed,
+        fetched.last.provenance,
+        fetched.last.cache,
+        vec![
+            (fetched.first.provenance, fetched.first.cache),
+            (
+                manifest_fetched.last.provenance,
+                manifest_fetched.last.cache,
+            ),
+        ],
+    ))
+}
+
+fn nexrad_page(
+    source: &'static sources::Source,
+    acquire: &Acquire,
+    supplied: &[(&str, &str)],
+) -> Result<OperationRun, ProbeError> {
+    let endpoint = source
+        .operation("list-page")
+        .map_err(|error| rejected("probe registry", error))?;
+    let requested_prefix = supplied
+        .iter()
+        .find(|(name, _)| *name == "prefix")
+        .map(|(_, value)| String::from(*value));
+    let mut page = None;
+    let mut first = None;
+    for prefix in requested_prefix
+        .into_iter()
+        .chain(std::iter::once(current_utc_prefix()?))
+    {
+        let fetched = fetch_once(acquire, source, "list", &[("prefix", prefix.as_str())])?;
+        let text = String::from_utf8_lossy(&fetched.body);
+        let listing = network::listing_xml(&prefix, &text)
+            .map_err(|error| rejected("NEXRAD listing", error))?;
+        if listing.continuation.is_some() {
+            page = Some((prefix, listing));
+            first = Some(fetched);
+            break;
+        }
+    }
+    let Some((prefix, listing)) = page else {
+        return Err(rejected(
+            "NEXRAD listing page",
+            "no listing prefix in this environment returned a continuation token",
+        ));
+    };
+    let Some(first) = first else {
+        return Err(rejected("NEXRAD listing page", "no first page was served"));
+    };
+    let continuation = listing
+        .continuation
+        .clone()
+        .ok_or_else(|| rejected("NEXRAD listing page", "no continuation token"))?;
+    let mut values = values_for(endpoint.template, supplied);
+    set_value(&mut values, "prefix", prefix.as_str());
+    set_value(&mut values, "continuation", continuation.as_str());
+    let fetched = fetch_twice(acquire, source, "list-page", &values)?;
+    let text = String::from_utf8_lossy(&fetched.last.body);
+    let page = network::listing_xml(&prefix, &text)
+        .map_err(|error| rejected("NEXRAD listing page", error))?;
+    let parsed = ProbeReport::new(source, "list-page")
+        .station(prefix.clone())
+        .product("Level II listing page")
+        .observed("listing time not stated by provider")
+        .field("keys", page.keys.len().to_string())
+        .field("truncated", format!("{:?}", page.truncated))
+        .field(
+            "next continuation",
+            page.continuation.unwrap_or_else(|| String::from("none")),
+        )
+        .field("continuation used", continuation)
+        .field("first page keys", listing.keys.len().to_string());
+    Ok(operation_run(
+        source,
+        "list-page",
+        parsed,
+        fetched.last.provenance,
+        fetched.last.cache,
+        vec![
+            (fetched.first.provenance, fetched.first.cache),
+            (first.provenance, first.cache),
+        ],
+    ))
+}
+
+fn nexrad_object(
+    source: &'static sources::Source,
+    acquire: &Acquire,
+    supplied: &[(&str, &str)],
+) -> Result<OperationRun, ProbeError> {
+    let prefix = value(supplied, "prefix")?;
     let site_name = prefix
         .trim_end_matches('/')
         .rsplit('/')
         .next()
         .ok_or_else(|| rejected("NEXRAD listing", "the prefix carries no site"))?;
     let site = SiteId::parse(site_name).map_err(|error| rejected("NEXRAD listing", error))?;
-    network::listed_volume(acquire, prefix)
-        .map_err(|error| live_error("NEXRAD discovery listing", error))?;
     let listed = network::listed_volume(acquire, prefix)
         .map_err(|error| live_error("NEXRAD discovery listing", error))?;
+    let first = network::fetch_archive_cached(acquire, &listed.key, &site)
+        .map_err(|error| live_error("NEXRAD object", error))?;
     let archive = network::fetch_archive_cached(acquire, &listed.key, &site)
         .map_err(|error| live_error("NEXRAD object", error))?;
     let bytes = archive.bytes.len();
@@ -391,6 +532,7 @@ fn nexrad_live(
         Served::new(volume, archive.provenance, archive.cache),
         listed.requests,
     );
+    let served = served.with_request(first.provenance, first.cache);
     let requests =
         RequestReport::from_served("NEXRAD discovery listing and volume requests", &served);
     let parsed = ProbeReport::new(source, "object")
@@ -404,8 +546,207 @@ fn nexrad_live(
         .field("radials", radials.to_string())
         .field("products", products)
         .field("max ground range", format!("{range:.1} km"))
-        .field("object bytes", bytes.to_string());
-    Ok(CompositeRun { parsed, requests })
+        .field("object bytes", bytes.to_string())
+        .field(
+            "cache",
+            format!("{} after {}", archive.cache.label(), first.cache.label()),
+        );
+    Ok(OperationRun { parsed, requests })
+}
+
+fn water_history(
+    source: &'static sources::Source,
+    acquire: &Acquire,
+    supplied: &[(&str, &str)],
+) -> Result<OperationRun, ProbeError> {
+    let mut extra = Vec::new();
+    let site = match value(supplied, "site") {
+        Ok(site) => String::from(site),
+        Err(_) => {
+            let bbox = value(supplied, "bbox")?;
+            let fetched = fetch_once(acquire, source, "box", &[("bbox", bbox)])?;
+            let document = json_body(&fetched.body, "USGS water")?;
+            let gauges = gauge::parse(&document).map_err(|error| rejected("USGS water", error))?;
+            let first = gauges.gauges.first().ok_or_else(|| {
+                rejected(
+                    "USGS water history",
+                    "the box returned no gauge whose history could be followed",
+                )
+            })?;
+            extra.push((fetched.provenance, fetched.cache));
+            first.site.clone()
+        }
+    };
+    let fetched = fetch_twice(acquire, source, "history", &[("site", site.as_str())])?;
+    let document = json_body(&fetched.last.body, "USGS water history")?;
+    let history = gauge::parse_history(&document, &site)
+        .map_err(|error| rejected("USGS water history", error))?;
+    let newest = history.stage.last();
+    let highest = history.highest_stage();
+    let parsed = ProbeReport::new(source, "history")
+        .station(format!("{} · {}", history.site, history.name))
+        .product("seven-day gauge history")
+        .observed(newest.map_or_else(|| String::from("no readings"), |reading| utc(reading.at_ms)))
+        .field("stage readings", history.stage.len().to_string())
+        .field("discharge readings", history.discharge.len().to_string())
+        .field(
+            "highest stage",
+            highest.map_or_else(
+                || String::from("not reported"),
+                |reading| format!("{} {}", reading.value, reading.unit),
+            ),
+        )
+        .field(
+            "stage range",
+            history.stage_range().map_or_else(
+                || String::from("not reported"),
+                |range| format!("{range:.2}"),
+            ),
+        );
+    Ok(operation_run(
+        source,
+        "history",
+        parsed,
+        fetched.last.provenance,
+        fetched.last.cache,
+        {
+            let mut all = vec![(fetched.first.provenance, fetched.first.cache)];
+            all.extend(extra);
+            all
+        },
+    ))
+}
+
+fn volcano_place(
+    source: &'static sources::Source,
+    acquire: &Acquire,
+    supplied: &[(&str, &str)],
+) -> Result<OperationRun, ProbeError> {
+    let mut extra = Vec::new();
+    let vnum = match value(supplied, "vnum") {
+        Ok(vnum) => String::from(vnum),
+        Err(_) => {
+            let fetched = fetch_once(acquire, source, "list", &[])?;
+            let document = json_body(&fetched.body, "USGS volcanoes")?;
+            let notices = volcano::parse_list(&document)
+                .map_err(|error| rejected("USGS volcanoes", error))?;
+            let first = notices.first().ok_or_else(|| {
+                rejected(
+                    "USGS volcano",
+                    "no elevated volcano was listed to follow up",
+                )
+            })?;
+            extra.push((fetched.provenance, fetched.cache));
+            first.vnum.clone()
+        }
+    };
+    let fetched = fetch_twice(acquire, source, "volcano", &[("vnum", vnum.as_str())])?;
+    let document = json_body(&fetched.last.body, "USGS volcano")?;
+    let place =
+        volcano::parse_volcano(&document).map_err(|error| rejected("USGS volcano", error))?;
+    let position = match (place.latitude, place.longitude) {
+        (Some(latitude), Some(longitude)) => format!("{latitude:.4}, {longitude:.4}"),
+        _ => String::from("not published by the observatory"),
+    };
+    let parsed = ProbeReport::new(source, "volcano")
+        .station(vnum)
+        .product("volcano reference record")
+        .observed("reference record; no observation time stated")
+        .field("position", position)
+        .field(
+            "elevation",
+            place.elevation_m.map_or_else(
+                || String::from("not published"),
+                |value| format!("{value} m"),
+            ),
+        )
+        .field(
+            "region",
+            place
+                .region
+                .unwrap_or_else(|| String::from("not published")),
+        )
+        .field(
+            "summary",
+            place
+                .summary
+                .unwrap_or_else(|| String::from("not published")),
+        )
+        .field(
+            "record url",
+            place.url.unwrap_or_else(|| String::from("not published")),
+        );
+    Ok(operation_run(
+        source,
+        "volcano",
+        parsed,
+        fetched.last.provenance,
+        fetched.last.cache,
+        {
+            let mut all = vec![(fetched.first.provenance, fetched.first.cache)];
+            all.extend(extra);
+            all
+        },
+    ))
+}
+
+fn volcano_notice(
+    source: &'static sources::Source,
+    acquire: &Acquire,
+    supplied: &[(&str, &str)],
+) -> Result<OperationRun, ProbeError> {
+    let mut extra = Vec::new();
+    let notice = match value(supplied, "notice") {
+        Ok(notice) => String::from(notice),
+        Err(_) => {
+            let fetched = fetch_once(acquire, source, "list", &[])?;
+            let document = json_body(&fetched.body, "USGS volcanoes")?;
+            let notices = volcano::parse_list(&document)
+                .map_err(|error| rejected("USGS volcanoes", error))?;
+            let first = notices
+                .iter()
+                .find(|notice| !notice.identifier.is_empty())
+                .ok_or_else(|| {
+                    rejected(
+                        "USGS volcano notice",
+                        "no elevated volcano carried a notice identifier to follow",
+                    )
+                })?;
+            extra.push((fetched.provenance, fetched.cache));
+            first.identifier.clone()
+        }
+    };
+    let fetched = fetch_twice(acquire, source, "notice", &[("notice", notice.as_str())])?;
+    let document = json_body(&fetched.last.body, "USGS volcano notice")?;
+    let synopsis =
+        volcano::parse_notice(&document).map_err(|error| rejected("USGS volcano notice", error))?;
+    let parsed = ProbeReport::new(source, "notice")
+        .station(notice)
+        .product("observatory notice synopsis")
+        .observed("notice time not stated in the notice body")
+        .field("synopsis", synopsis);
+    Ok(operation_run(
+        source,
+        "notice",
+        parsed,
+        fetched.last.provenance,
+        fetched.last.cache,
+        {
+            let mut all = vec![(fetched.first.provenance, fetched.first.cache)];
+            all.extend(extra);
+            all
+        },
+    ))
+}
+
+fn current_utc_prefix() -> Result<String, ProbeError> {
+    let now = time::now_unix_ms().map_err(|error| rejected("NEXRAD listing", error))?;
+    let text = time::format_utc(now).map_err(|error| rejected("NEXRAD listing", error))?;
+    let date = text
+        .split(' ')
+        .next()
+        .ok_or_else(|| rejected("NEXRAD listing", "the clock formatted no date"))?;
+    Ok(format!("{}/", date.replace('-', "/")))
 }
 
 #[derive(Debug)]
@@ -470,6 +811,14 @@ fn value<'a>(values: &'a [(&str, &str)], name: &'static str) -> Result<&'a str, 
         .find(|(key, _)| *key == name)
         .map(|(_, value)| *value)
         .ok_or(ProbeError::MissingValue { name })
+}
+
+fn integer_value(values: &[(&str, &str)], name: &'static str) -> Result<u32, ProbeError> {
+    let raw = value(values, name)?;
+    raw.parse::<u32>().map_err(|_| ProbeError::InvalidValue {
+        name,
+        value: String::from(raw),
+    })
 }
 
 fn number(values: &[(&str, &str)], name: &'static str) -> Result<f64, ProbeError> {
@@ -563,6 +912,136 @@ pub(crate) fn parse(
                     ),
                 )
                 .field("timezone", record.timezone))
+        }
+        ("open-meteo-forecast", "environment") => {
+            let document = json_body(body, "Open-Meteo environment")?;
+            let record = environment::parse(&document)
+                .map_err(|error| rejected("Open-Meteo environment", error))?;
+            let first = record.hours.first();
+            let peak = record
+                .hours
+                .iter()
+                .filter_map(|hour| hour.cape.map(|cape| (cape, hour.time_ms)))
+                .max_by(|left, right| left.0.total_cmp(&right.0));
+            Ok(ProbeReport::new(source, operation)
+                .station(format!("{:.4}, {:.4}", record.latitude, record.longitude))
+                .product("convective environment")
+                .observed(first.map_or_else(|| String::from("no hours"), |hour| utc(hour.time_ms)))
+                .field("hours", record.hours.len().to_string())
+                .field(
+                    "peak CAPE",
+                    peak.map_or_else(
+                        || String::from("not reported"),
+                        |(cape, _)| format!("{cape} J/kg"),
+                    ),
+                )
+                .field(
+                    "first surface wind",
+                    first.and_then(|hour| hour.surface).map_or_else(
+                        || String::from("not reported"),
+                        |wind| format!("{} km/h from {}°", wind.speed_kmh, wind.from_deg),
+                    ),
+                )
+                .field(
+                    "first shear",
+                    first
+                        .and_then(environment::EnvironmentHour::shear)
+                        .map_or_else(
+                            || String::from("not reported"),
+                            |shear| format!("{} km/h from {}°", shear.speed_kmh, shear.from_deg),
+                        ),
+                ))
+        }
+        ("open-meteo-forecast", "land") => {
+            let document = json_body(body, "Open-Meteo land")?;
+            let record =
+                land::parse(&document).map_err(|error| rejected("Open-Meteo land", error))?;
+            let first = record.hours.first();
+            Ok(ProbeReport::new(source, operation)
+                .station(format!("{:.4}, {:.4}", record.latitude, record.longitude))
+                .product("land surface model")
+                .observed(first.map_or_else(|| String::from("no hours"), |hour| utc(hour.time_ms)))
+                .field("hours", record.hours.len().to_string())
+                .field(
+                    "first soil temperature",
+                    first.map_or_else(
+                        || String::from("not reported"),
+                        |hour| {
+                            optional(hour.soil_temperature_c, record.unit("soil_temperature_6cm"))
+                        },
+                    ),
+                )
+                .field(
+                    "first topsoil moisture",
+                    first.map_or_else(
+                        || String::from("not reported"),
+                        |hour| optional(hour.moisture_top, record.unit("soil_moisture_0_to_10cm")),
+                    ),
+                )
+                .field(
+                    "first vapour-pressure deficit",
+                    first.map_or_else(
+                        || String::from("not reported"),
+                        |hour| optional(hour.vpd_kpa, record.unit("vapour_pressure_deficit")),
+                    ),
+                ))
+        }
+        ("open-meteo-forecast", "snow") => {
+            let document = json_body(body, "Open-Meteo snow")?;
+            let record =
+                snow::parse(&document).map_err(|error| rejected("Open-Meteo snow", error))?;
+            let first = record.hours.first();
+            Ok(ProbeReport::new(source, operation)
+                .station(format!("{:.4}, {:.4}", record.latitude, record.longitude))
+                .product("snow model")
+                .observed(first.map_or_else(|| String::from("no hours"), |hour| utc(hour.time_ms)))
+                .field("hours", record.hours.len().to_string())
+                .field(
+                    "first snow depth",
+                    first.map_or_else(
+                        || String::from("not reported"),
+                        |hour| optional(hour.depth_cm(), record.unit("snow_depth")),
+                    ),
+                )
+                .field(
+                    "first snowfall",
+                    first.map_or_else(
+                        || String::from("not reported"),
+                        |hour| optional(hour.snowfall_cm, record.unit("snowfall")),
+                    ),
+                ))
+        }
+        ("open-meteo-forecast", "sounding") => {
+            let now =
+                time::now_unix_ms().map_err(|error| rejected("Open-Meteo sounding", error))?;
+            let document = json_body(body, "Open-Meteo sounding")?;
+            let record = sounding::parse(&document, now)
+                .map_err(|error| rejected("Open-Meteo sounding", error))?;
+            let indices = record.indices();
+            Ok(ProbeReport::new(source, operation)
+                .station(format!("{:.4}, {:.4}", record.latitude, record.longitude))
+                .product("pressure-level profile")
+                .observed(utc(record.time_ms))
+                .field("levels", record.levels.len().to_string())
+                .field(
+                    "surface temperature",
+                    optional(record.surface.temperature_c, "°C"),
+                )
+                .field(
+                    "surface pressure",
+                    format!("{} hPa", record.surface.pressure_hpa),
+                )
+                .field(
+                    "precipitable water",
+                    optional(indices.precipitable_water_mm, "mm"),
+                )
+                .field(
+                    "deep shear",
+                    indices.deep_shear.map_or_else(
+                        || String::from("not reported"),
+                        |(depth, speed)| format!("{speed:.1} m/s over {depth:.0} m"),
+                    ),
+                ))
         }
         ("open-meteo-archive", "climate") => {
             let document = json_body(body, "Open-Meteo archive")?;
@@ -674,6 +1153,43 @@ pub(crate) fn parse(
                 )
                 .field("days", record.days.len().to_string()))
         }
+        ("open-meteo-flood", "hydro-ensemble") => {
+            let now = time::now_unix_ms().map_err(|error| rejected("Open-Meteo flood", error))?;
+            let document = json_body(body, "Open-Meteo flood ensemble")?;
+            let record = hydro::parse(&document, now)
+                .map_err(|error| rejected("Open-Meteo flood ensemble", error))?;
+            let peak = record.peak();
+            Ok(ProbeReport::new(source, operation)
+                .station(format!("{:.4}, {:.4}", record.latitude, record.longitude))
+                .product("GloFAS ensemble discharge")
+                .observed(peak.map_or_else(|| String::from("no days"), |day| utc(day.time_ms)))
+                .field("days", record.days.len().to_string())
+                .field("ensemble members", record.members.len().to_string())
+                .field(
+                    "peak discharge",
+                    peak.map_or_else(
+                        || String::from("not reported"),
+                        |day| optional(day.discharge, &record.units),
+                    ),
+                )
+                .field(
+                    "widest ensemble spread",
+                    record.band_peak().map_or_else(
+                        || String::from("not reported"),
+                        |(_, day)| {
+                            record
+                                .days
+                                .iter()
+                                .position(|candidate| candidate.time_ms == day.time_ms)
+                                .and_then(|index| record.spread(index))
+                                .map_or_else(
+                                    || format!("high only, day {}", utc(day.time_ms)),
+                                    |(low, high)| format!("{low}–{high} {}", record.units),
+                                )
+                        },
+                    ),
+                ))
+        }
         ("rainviewer", "manifest") => {
             let manifest = global_radar::parse_manifest(body)
                 .map_err(|error| rejected("RainViewer manifest", error))?;
@@ -704,6 +1220,22 @@ pub(crate) fn parse(
                     page.continuation.unwrap_or_else(|| String::from("none")),
                 ))
         }
+        ("nexrad-level-2", "list-page") => {
+            let text = String::from_utf8_lossy(body);
+            let prefix = value(values, "prefix")?;
+            let page = network::listing_xml(prefix, &text)
+                .map_err(|error| rejected("NEXRAD listing page", error))?;
+            Ok(ProbeReport::new(source, operation)
+                .station(String::from(prefix))
+                .product("Level II listing page")
+                .observed("listing time not stated by provider")
+                .field("keys", page.keys.len().to_string())
+                .field("truncated", format!("{:?}", page.truncated))
+                .field(
+                    "next continuation",
+                    page.continuation.unwrap_or_else(|| String::from("none")),
+                ))
+        }
         ("nws-api", "stations") => {
             let document = json_body(body, "NWS stations")?;
             let stations = stations::parse_document(&document)
@@ -727,6 +1259,32 @@ pub(crate) fn parse(
                     first.map_or_else(
                         || String::from("not reported"),
                         |station| format!("{:.4}, {:.4}", station.lat, station.lon),
+                    ),
+                ))
+        }
+        ("nws-api", "alerts") => {
+            let document = json_body(body, "NWS alerts")?;
+            let warnings = warnings::parse_collection(&document)
+                .map_err(|error| rejected("NWS alerts", error))?;
+            let first = warnings.warnings.first();
+            Ok(ProbeReport::new(source, operation)
+                .product("active warning collection")
+                .station(first.map_or_else(
+                    || String::from("no warnings"),
+                    |warning| format!("{} · {}", warning.event, warning.area),
+                ))
+                .observed(first.map_or_else(
+                    || String::from("no warnings"),
+                    |warning| warning.sent.clone(),
+                ))
+                .field("warnings", warnings.warnings.len().to_string())
+                .field("without geometry", warnings.without_geometry.to_string())
+                .field("rejected", warnings.rejected.len().to_string())
+                .field(
+                    "first severity",
+                    first.map_or_else(
+                        || String::from("not reported"),
+                        |warning| warning.severity.label().to_owned(),
                     ),
                 ))
         }
@@ -790,6 +1348,56 @@ pub(crate) fn parse(
                     ),
                 )
                 .field("rejected", gauges.rejected.to_string()))
+        }
+        ("usgs-water", "history") => {
+            let document = json_body(body, "USGS water history")?;
+            let site = value(values, "site")?;
+            let history = gauge::parse_history(&document, site)
+                .map_err(|error| rejected("USGS water history", error))?;
+            let newest = history.stage.last();
+            let highest = history.highest_stage();
+            Ok(ProbeReport::new(source, operation)
+                .station(format!("{} · {}", history.site, history.name))
+                .product("seven-day gauge history")
+                .observed(
+                    newest
+                        .map_or_else(|| String::from("no readings"), |reading| utc(reading.at_ms)),
+                )
+                .field("stage readings", history.stage.len().to_string())
+                .field("discharge readings", history.discharge.len().to_string())
+                .field(
+                    "highest stage",
+                    highest.map_or_else(
+                        || String::from("not reported"),
+                        |reading| format!("{} {}", reading.value, reading.unit),
+                    ),
+                )
+                .field(
+                    "stage range",
+                    history.stage_range().map_or_else(
+                        || String::from("not reported"),
+                        |range| format!("{range:.2}"),
+                    ),
+                ))
+        }
+        ("noaa-swpc", "wind") => {
+            let document = json_body(body, "NOAA SWPC solar wind")?;
+            let wind = spaceweather::parse_wind_speed(&document)
+                .map_err(|error| rejected("NOAA SWPC solar wind", error))?;
+            Ok(ProbeReport::new(source, operation)
+                .product("solar wind speed")
+                .observed(utc(wind.time_ms))
+                .field("proton speed", optional(wind.speed_km_s, "km/s")))
+        }
+        ("noaa-swpc", "magnetic-field") => {
+            let document = json_body(body, "NOAA SWPC magnetic field")?;
+            let field = spaceweather::parse_magnetic_field(&document)
+                .map_err(|error| rejected("NOAA SWPC magnetic field", error))?;
+            Ok(ProbeReport::new(source, operation)
+                .product("solar wind magnetic field")
+                .observed(utc(field.time_ms))
+                .field("total field", optional(field.bt_nt, "nT"))
+                .field("north-south component", optional(field.bz_nt, "nT")))
         }
         ("nasa-gibs", "tile") => {
             let (width, height, rgba) = satellite::decode("probe tile", body)
@@ -1002,6 +1610,53 @@ pub(crate) fn parse(
                     ),
                 ))
         }
+        ("usgs-volcano", "volcano") => {
+            let document = json_body(body, "USGS volcano")?;
+            let place = volcano::parse_volcano(&document)
+                .map_err(|error| rejected("USGS volcano", error))?;
+            let position = match (place.latitude, place.longitude) {
+                (Some(latitude), Some(longitude)) => format!("{latitude:.4}, {longitude:.4}"),
+                _ => String::from("not published by the observatory"),
+            };
+            Ok(ProbeReport::new(source, operation)
+                .station(value(values, "vnum")?.to_owned())
+                .product("volcano reference record")
+                .observed("reference record; no observation time stated")
+                .field("position", position)
+                .field(
+                    "elevation",
+                    place.elevation_m.map_or_else(
+                        || String::from("not published"),
+                        |value| format!("{value} m"),
+                    ),
+                )
+                .field(
+                    "region",
+                    place
+                        .region
+                        .unwrap_or_else(|| String::from("not published")),
+                )
+                .field(
+                    "summary",
+                    place
+                        .summary
+                        .unwrap_or_else(|| String::from("not published")),
+                )
+                .field(
+                    "record url",
+                    place.url.unwrap_or_else(|| String::from("not published")),
+                ))
+        }
+        ("usgs-volcano", "notice") => {
+            let document = json_body(body, "USGS volcano notice")?;
+            let synopsis = volcano::parse_notice(&document)
+                .map_err(|error| rejected("USGS volcano notice", error))?;
+            Ok(ProbeReport::new(source, operation)
+                .station(value(values, "notice")?.to_owned())
+                .product("observatory notice synopsis")
+                .observed("notice time not stated in the notice body")
+                .field("synopsis", synopsis))
+        }
         ("emsc", "query") => {
             let document = json_body(body, "EMSC")?;
             let quakes = quake::parse_emsc(quake::Window::Day, &document)
@@ -1210,16 +1865,110 @@ mod tests {
     }
 
     #[test]
-    fn only_the_three_composite_rails_take_the_live_path() {
-        assert!(is_composite("rainviewer"));
-        assert!(is_composite("openfreemap"));
-        assert!(is_composite("nexrad-level-2"));
-        assert!(!is_composite("nws-api"));
-        assert!(!is_composite("open-meteo-forecast"));
+    fn every_registry_operation_has_a_probe_path() {
+        let sources = sources::SOURCES;
+        assert!(!sources.is_empty());
+        for source in sources {
+            for endpoint in source.endpoints {
+                assert!(
+                    !endpoint.operation.is_empty(),
+                    "{} has an unnamed operation",
+                    source.id.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_parsed_operation_refuses_empty_and_malformed_bodies() {
+        for source in sources::SOURCES {
+            if source.level != sources::Level::Admitted {
+                continue;
+            }
+            for endpoint in source.endpoints {
+                if matches!(
+                    (source.id.as_str(), endpoint.operation),
+                    ("openfreemap", "tile") | ("rainviewer", "tile") | ("nexrad-level-2", "object")
+                ) {
+                    continue;
+                }
+                let mut owned: Vec<(String, String)> = template_names(endpoint.template)
+                    .into_iter()
+                    .map(|name| (name, String::from("1")))
+                    .collect();
+                owned.push((String::from("prefix"), String::from("2026/11/13/")));
+                let values: Vec<(&str, &str)> = owned
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str()))
+                    .collect();
+                let empty = parse(
+                    source,
+                    endpoint.operation,
+                    b"",
+                    &values,
+                    "https://example.test",
+                );
+                assert!(
+                    empty.is_err(),
+                    "{} {} accepted an empty body",
+                    source.id.as_str(),
+                    endpoint.operation
+                );
+                let malformed = parse(
+                    source,
+                    endpoint.operation,
+                    b"{not a document",
+                    &values,
+                    "https://example.test",
+                );
+                assert!(
+                    malformed.is_err(),
+                    "{} {} accepted a malformed body",
+                    source.id.as_str(),
+                    endpoint.operation
+                );
+            }
+        }
     }
 
     #[test]
     fn an_unknown_operation_is_reported_without_a_fake_value() {
+        let error = parse(
+            &sources::NOAA_SWPC,
+            "not-a-real-operation",
+            b"[]",
+            &[],
+            "https://services.swpc.noaa.gov/products/summary/solar-wind-speed.json",
+        );
+        assert!(matches!(
+            error,
+            Err(ProbeError::Rejected {
+                parser: "probe",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_malformed_solar_wind_row_is_rejected_not_defaulted() {
+        let error = parse(
+            &sources::NOAA_SWPC,
+            "wind",
+            br#"[{"time_tag":"not a time","proton_speed":400}]"#,
+            &[],
+            "https://services.swpc.noaa.gov/products/summary/solar-wind-speed.json",
+        );
+        assert!(matches!(
+            error,
+            Err(ProbeError::Rejected {
+                parser: "NOAA SWPC solar wind",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn an_empty_solar_wind_document_is_rejected_not_defaulted() {
         let error = parse(
             &sources::NOAA_SWPC,
             "wind",
@@ -1230,7 +1979,7 @@ mod tests {
         assert!(matches!(
             error,
             Err(ProbeError::Rejected {
-                parser: "probe",
+                parser: "NOAA SWPC solar wind",
                 ..
             })
         ));

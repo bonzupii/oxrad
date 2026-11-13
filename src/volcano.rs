@@ -305,6 +305,26 @@ pub fn parse_synopsis(document: &Value) -> Option<String> {
     }))
 }
 
+/// Reads one observatory notice and returns its synopsis, or says why the
+/// document is not a notice this program can display.
+///
+/// # Errors
+///
+/// Returns [`VolcanoError::Shape`] when the document is not an object, carries
+/// no notice text, or carries notice text without a synopsis.
+pub fn parse_notice(document: &Value) -> Result<String, VolcanoError> {
+    let Some(row) = document.as_object() else {
+        return Err(shape("an object for the observatory notice"));
+    };
+    let Some(html) = row.get("notice_html").and_then(Value::as_str) else {
+        return Err(shape("notice_html on the observatory notice"));
+    };
+    if html.trim().is_empty() {
+        return Err(shape("a non-empty notice_html"));
+    }
+    parse_synopsis(document).ok_or(shape("a synopsis in the notice text"))
+}
+
 /// Strips markup from the notice text and collapses its whitespace.
 pub fn plain_text(html: &str) -> String {
     let mut text = String::with_capacity(html.len());
@@ -695,12 +715,39 @@ mod tests {
     }
 
     #[test]
-    fn the_synopsis_is_read_as_plain_text() {
-        let summary = parse_synopsis(&notice());
+    fn the_synopsis_is_read_as_plain_text() -> Result<(), VolcanoError> {
+        let summary = parse_notice(&notice())?;
         assert_eq!(
-            summary.as_deref(),
-            Some("Slow eruption of lava within the summit crater continues.")
+            summary,
+            "Slow eruption of lava within the summit crater continues."
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_notice_without_notice_text_is_refused() {
+        let Ok(document) = serde_json::from_str::<Value>("{\"notice_html\": \"\"}") else {
+            return;
+        };
+        assert!(parse_notice(&document).is_err());
+    }
+
+    #[test]
+    fn a_notice_without_a_synopsis_is_refused() {
+        let Ok(document) =
+            serde_json::from_str::<Value>("{\"notice_html\": \"<p>No summary</p>\"}")
+        else {
+            return;
+        };
+        assert!(parse_notice(&document).is_err());
+    }
+
+    #[test]
+    fn a_notice_that_is_not_an_object_is_refused() {
+        let Ok(document) = serde_json::from_str::<Value>("[]") else {
+            return;
+        };
+        assert!(parse_notice(&document).is_err());
     }
 
     #[test]

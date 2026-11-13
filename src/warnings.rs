@@ -302,7 +302,7 @@ fn parse_warning(feature: &Value) -> Result<Warning, WarningError> {
     })
 }
 
-fn parse_collection(document: &Value) -> Result<WarningSet, WarningError> {
+pub(crate) fn parse_collection(document: &Value) -> Result<WarningSet, WarningError> {
     let features =
         document
             .get("features")
