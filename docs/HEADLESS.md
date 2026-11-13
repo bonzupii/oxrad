@@ -1,52 +1,27 @@
 # Headless graphical verification
 
-The following workflow exercised the release binary on Ubuntu 24.04 x86-64 with Xvfb and Mesa lavapipe. It uses a private X display with access control disabled. Run it only in an isolated environment where other users cannot connect to that display. The captured frames contain live provider data, so their contents change over time. Screenshots establish rendering and layout evidence, not meteorological correctness or complete interaction coverage.
+The graphical smoke test runs the release binary on a private Xvfb display with
+Mesa lavapipe and captures the framebuffer. It proves that a frame was drawn
+and that the application stayed alive during the driven input. It does not
+prove meteorological correctness or complete interaction coverage.
 
-The restored workspace contained Xvfb, `xkbcomp`, Mesa's `libvulkan_lvp.so`, and their runtime libraries under `.tools/root`. The host provided XKB configuration under `/usr/share/X11/xkb`. The test additionally used Ubuntu's `proot`, `libtalloc2`, `netpbm`, `libnetpbm11t64`, `xdotool`, `libxdo3`, and `libxtst6`, extracted into `.tools/root`. Their package metadata and checksums are available at https://packages.ubuntu.com/noble/. Install these components locally when they are absent; `.tools` is ignored by Git. Xvfb's hard-coded `/usr/bin/xkbcomp` path is mapped to the local executable with PRoot. The application uses WGPU's Vulkan backend and the local lavapipe driver; it does not run against a simulated window.
+The current evidence, including which frames were inspected and which states
+were not captured, is in
+[RECONSTRUCTION_STATE.md](RECONSTRUCTION_STATE.md).
 
-Create `.tools/lvp-workspace.json` with the absolute path to the local driver, replacing `WORKSPACE` with the absolute project directory:
+## Environment
 
-```json
-{
-  "ICD": {
-    "api_version": "1.1.274",
-    "library_path": "WORKSPACE/.tools/root/usr/lib/x86_64-linux-gnu/libvulkan_lvp.so"
-  },
-  "file_format_version": "1.0.0"
-}
-```
+The documented environment used Xvfb, `xkbcomp`, Mesa `libvulkan_lvp.so`,
+`proot`, `netpbm`, `xdotool` and their runtime libraries. `scripts/gui.sh` finds
+the tools on `PATH` and then under `.tools/root/usr/bin`, which is ignored by
+Git. A restored workspace may need those tools reinstalled; their absence is a
+test failure, not a skipped check.
 
-Build and start the display and application from the project directory. Pick an unused display number. The isolated `HOME` keeps the test's configuration and downloaded cache separate from a user's normal OXRAD data.
+The application uses the Vulkan backend and the local lavapipe driver. It runs
+against a real X server, not a simulated window. WGPU software rendering is
+slow; the harness waits for the window and a settling period before driving it.
 
-```sh
-cargo build --release --locked
-mkdir -p target/local-x11 target/headless-home artifacts
-export LD_LIBRARY_PATH="$PWD/.tools/root/usr/lib/x86_64-linux-gnu"
-.tools/root/usr/bin/proot -b "$PWD/.tools/root/usr/bin/xkbcomp:/usr/bin/xkbcomp" .tools/root/usr/bin/Xvfb :91 -screen 0 1280x800x24 -nolisten tcp -ac -fbdir "$PWD/target/local-x11" > target/local-x11/xvfb.log 2>&1 < /dev/null &
-echo $! > target/local-x11/xvfb.pid
-export DISPLAY=:91 VK_DRIVER_FILES="$PWD/.tools/lvp-workspace.json" WGPU_BACKEND=vulkan HOME="$PWD/target/headless-home"
-target/release/oxrad --site KTWX > target/local-x11/oxrad.log 2>&1 < /dev/null &
-echo $! > target/local-x11/oxrad.pid
-```
-
-Confirm that both recorded processes remain alive and inspect both logs. XKB warnings about unrecognized keysyms appeared in this environment without preventing the server from starting. A running process alone does not establish a usable display.
-
-Use `xdotool search --name oxrad` to find the application window and `xdotool windowsize WINDOW 1040 640` to inspect the minimum size. The map tab, history controls, and other application controls can be exercised with XTEST events through `xdotool`. Capture the actual Xvfb framebuffer as a PNG:
-
-```sh
-set -o pipefail
-.tools/root/usr/bin/xwdtopnm target/local-x11/Xvfb_screen0 | .tools/root/usr/bin/pnmtopng > artifacts/workstation.png
-```
-
-Inspect the resulting PNG and application log. A framebuffer capture is the whole virtual screen, so a resized window occupies only part of the image. Stop only the recorded application and Xvfb processes after the test.
-
-## Assertion harness
-
-`scripts/gui.sh <scenario>` performs the launch, input, capture, and checks above and exits non-zero when any of them fail. It finds its tools on `PATH` and then under `.tools/root/usr/bin`, and reports a missing tool as a failure rather than skipping.
-
-Scenarios: `radar`, `map`, `measure`, `satellite`, `rivers`, `space`, `air`, `climate`, `fires`, `environment`, `ocean`, `observations`, `snow`, `profile`, `seaice`, `land`, `volcanoes`, `gauges`, `cyclones`, `radio`, `pan`, `zoom`, `small`. A scenario that needs a particular geography starts from a seeded place: `OXRAD_GUI_PLACE="46.5 10.0 Alps" scripts/gui.sh snow` writes that place into the run's private configuration before launch, which is how the snow section is read over an alpine grid point instead of a bare plain. Each one asserts that the window appeared, that the process was still alive after the input, that the log contains no panic, and that the captured frame holds at least 16 distinct colours after downscaling to 200×125. A blank or single-colour frame fails. The `measure` scenario additionally clicks four corners on the map and requires at least 400 pixels drawn in the measurement stroke colour inside the map region, so a measurement that stops painting fails the run. The `satellite` scenario captures the map before and after turning the NASA imagery layer on and requires at least 2000 of its downsampled map samples to change, so a layer that reports tiles but paints nothing fails the run. The `rivers` scenario turns the discharge layer on, scrolls the rail to the hydrograph, and requires at least 800 rail samples to change against the same strip before the layer was on, so a record that never arrives fails the run. The `space` scenario scrolls the rail to the geomagnetic section, turns it on, and requires at least 500 rail samples to change, so a Kp chart that never arrives fails the run; the `air` scenario does the same for the air-quality section and its index chart, `climate` waits longer for the decades of reanalysis the section needs, `fires` waits for the interagency perimeter service, `environment` waits for the convective fields, and `ocean` zooms the map out and then into the open Pacific before enabling the layer, so the sea state is read from water rather than from an inland point that has none, and `observations` waits for the METAR feed; `snow` scrolls the rail to its end where the snow section keeps a fixed distance from the alert list, turns it on, and requires at least 500 rail samples to change against the strip before the layer was on, so a snowfall chart that never arrives fails the run; `profile` opens the same rail position for the vertical-profile section, then scrolls on to the skewed chart and hodograph and requires at least 500 rail samples to change against the strip before the layer was on; `radio` turns the information radio on at the end of the rail and requires the bulletin card to change within twenty seconds, so a radio that never opens or never advances fails the run; `seaice` scrolls to the sea-ice section and requires the extent, anomaly, and record strip to change against the same strip before the layer was on; `land` scrolls to the rail's end and requires the soil, evapotranspiration, and hourly moisture chart to change against the strip before the layer was on, so a land-surface record that never arrives fails the run; `volcanoes` turns the volcanic-activity section on, then clicks a raised volcano and requires both that the map recentred on it and that an alert-coloured marker is drawn at the map centre, so a list that never arrives or a marker that never paints fails the run; `gauges` turns the river-gauge section on over Kansas, clicks one gauge, and requires both the list to replace the invitation and a water-coloured hydrograph to be drawn in the rail, so a service answer that never arrives or a week that never draws fails the run. That scenario needs the longer settle budget `OXRAD_GUI_GAUGE_SETTLE=45 OXRAD_GUI_HYDRO_SETTLE=25`, because the water-services host takes tens of seconds to answer. The `cyclones` scenario turns the tropical-cyclone section on, clicks a storm, and requires the rail list, the map recentre, and an alert-coloured marker at the map centre, so a list that never arrives, a click that does not move the map, or a marker that never paints each fail the run.
-
-Each run writes its X framebuffer into its own directory under the output directory and waits for the X server to accept a connection before starting the application, so two runs cannot overwrite each other's captures and a slow server start does not read as a crash. All of these read live provider data, so they need network access. Screenshots and logs land in `target/gui/`.
+## Run
 
 ```sh
 cargo build --release --locked
@@ -57,8 +32,63 @@ scripts/gui.sh pan
 scripts/gui.sh small
 ```
 
-The colour count rejects an empty frame without a golden image, whose contents depend on live provider data. It does not establish that any particular element is drawn in the right place; georeferencing is covered by the placement tests, including the shader test that parses the WGSL the pipeline compiles.
+`scripts/gui.sh <scenario> [output-directory]` creates an isolated `HOME`, starts
+Xvfb on a display it reports itself, launches the release binary with
+`--site KTWX`, finds the window with `xdotool`, and captures the real
+framebuffer to a PNG. It stops only the application and Xvfb it started.
 
-The harness was verified to fail as intended: pointing `OXRAD_GUI_BINARY` at a binary that exits immediately yields `gui: the application never opened a window` and exit status 1.
+A scenario that needs a particular place can seed it:
 
-Coverage still missing: warning refresh, history playback, keyboard navigation, every panel, offline operation, and end-to-end user journeys.
+```sh
+OXRAD_GUI_PLACE="46.5 10.0 Alps" scripts/gui.sh snow
+```
+
+The wait before the scenario is controlled by `OXRAD_GUI_SETTLE`; the
+environmental scenarios also accept their own settle overrides. A shorter wait
+is useful for capturing a loading or cancellation frame, but it may capture
+before the first provider answers.
+
+## Scenarios
+
+The harness includes radar, map, measure, pan, zoom, small, registry, the
+environmental layers, and the `cancel` and `refresh` attempts used to inspect
+the transfer controls. The environmental scenarios click a layer, wait for its
+provider, and compare a region of the rail or map against a capture taken
+before the layer was enabled. A layer that reports success but draws nothing
+fails that comparison.
+
+The basic assertions are:
+
+- the window appeared;
+- the application remained alive after the input;
+- the log contains no panic;
+- the captured frame has at least 16 distinct colours after downscaling.
+
+The `measure` scenario additionally counts the measurement stroke colour. The
+satellite scenario requires at least 2,000 changed map samples. The rail-layer
+scenarios require at least 500 changed rail samples, with a longer wait for the
+climate record and the whole-rail scenarios.
+
+A blank or single-colour frame fails. The colour count does not establish that
+a particular element is in the right place; georeferencing is covered by the
+placement tests.
+
+## Inspect
+
+Open the PNG named for the scenario under `target/gui/` and read the
+application log beside it. A running process alone does not establish a usable
+interface. Stop only the recorded application and Xvfb processes after a manual
+run; the script's trap does this for scripted runs.
+
+## Limits
+
+The provider data is live and changes, so a capture is evidence of one frame.
+The harness does not assert text or individual widget states. Cancellation and
+refreshing are timing-sensitive: if the transfer completes before the click, or
+the revalidation returns before the capture, the frame does not show the
+transition. Those attempts are reported as observed or not observed in the
+ledger rather than assumed to pass.
+
+Coverage still missing: keyboard navigation, every panel, warning refresh,
+history playback, offline operation, cache-budget controls, and complete
+end-to-end journeys.

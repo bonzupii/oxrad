@@ -126,11 +126,18 @@ impl Checksum {
     }
 }
 
-/// A reader-owned cancellation flag. The engine checks it between reads and
-/// before every attempt, so a cancelled transfer never reaches the cache.
+/// A reader-owned cancellation flag and the agent carrying its active socket.
+/// Cancelling sets the flag and shuts down that agent, so a body read blocked
+/// on a silent origin returns instead of waiting for the read-silence limit.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CancelToken {
-    cancelled: Arc<AtomicBool>,
+    state: Arc<CancelState>,
+}
+
+#[derive(Debug, Default)]
+struct CancelState {
+    cancelled: AtomicBool,
+    agent: Mutex<Option<ureq::Agent>>,
 }
 
 impl CancelToken {
@@ -139,15 +146,58 @@ impl CancelToken {
     }
 
     pub(crate) fn cancel(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
+        self.state.cancelled.store(true, Ordering::SeqCst);
+        let active = self
+            .state
+            .agent
+            .lock()
+            .ok()
+            .and_then(|mut agent| agent.take());
+        if let Some(agent) = active {
+            agent.shutdown();
+        }
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
+        self.state.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Attaches the agent whose socket this token can interrupt. Returns false
+    /// when the token was already cancelled; the agent is shut down first.
+    fn arm(&self, agent: ureq::Agent) -> bool {
+        let Ok(mut active) = self.state.agent.lock() else {
+            agent.shutdown();
+            return false;
+        };
+        if self.is_cancelled() {
+            drop(active);
+            agent.shutdown();
+            false
+        } else {
+            *active = Some(agent);
+            true
+        }
+    }
+
+    fn disarm(&self) {
+        if let Ok(mut active) = self.state.agent.lock() {
+            active.take();
+        }
     }
 
     fn same(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.cancelled, &other.cancelled)
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+}
+
+/// Disarms the token when the response, body read or error leaves `live_get`.
+struct ArmedTransfer<'a> {
+    cancel: &'a CancelToken,
+}
+
+impl Drop for ArmedTransfer<'_> {
+    fn drop(&mut self) {
+        self.cancel.disarm();
     }
 }
 
@@ -407,6 +457,20 @@ fn body_limit(source: &Source) -> u64 {
     }
 }
 
+fn transfer_agent(policy: TransferPolicy) -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .timeout_resolve(Some(policy.resolve))
+        .timeout_connect(Some(policy.connect))
+        .timeout_send_request(Some(policy.write))
+        .timeout_send_body(Some(policy.write))
+        .timeout_recv_response(Some(policy.response))
+        .timeout_per_read(Some(policy.read))
+        .timeout_per_write(Some(policy.write))
+        .http_status_as_error(false)
+        .build();
+    ureq::Agent::new_with_config(config)
+}
+
 /// One request a scripted transport was asked to carry.
 #[cfg(test)]
 #[derive(Debug)]
@@ -448,7 +512,14 @@ pub(crate) fn live_get(
     if request.cancel.is_cancelled() {
         return Err(cancelled_failure());
     }
-    let response = call_transfer(request, policy)?;
+    let agent = transfer_agent(policy);
+    if !request.cancel.arm(agent.clone()) {
+        return Err(cancelled_failure());
+    }
+    let _armed = ArmedTransfer {
+        cancel: request.cancel,
+    };
+    let response = call_transfer(&agent, request, policy)?;
     let status = response.status().as_u16();
     let meta = response_meta(&response)?;
     if status == 304 {
@@ -477,14 +548,24 @@ pub(crate) fn live_get(
         ));
     }
     let range_start = checked_range_start(&meta, status, request.offset, request.url)?;
-    read_transfer_body(response, request, limit, meta, status, range_start)
+    read_transfer_body(
+        response,
+        request,
+        limit,
+        policy.read,
+        meta,
+        status,
+        range_start,
+    )
 }
 
 fn call_transfer(
+    agent: &ureq::Agent,
     request: &TransferRequest<'_>,
     policy: TransferPolicy,
 ) -> Result<ureq::http::Response<ureq::Body>, TransferFailure> {
-    let mut builder = ureq::get(request.url)
+    let mut builder = agent
+        .get(request.url)
         .header("User-Agent", crate::sources::USER_AGENT)
         .header("Accept", request.accept);
     if let Some(etag) = request.etag {
@@ -497,27 +578,50 @@ fn call_transfer(
     if request.offset > 0 {
         builder = builder.header("Range", &range);
     }
-    builder
-        .config()
-        .timeout_resolve(Some(policy.resolve))
-        .timeout_connect(Some(policy.connect))
-        .timeout_send_request(Some(policy.write))
-        .timeout_send_body(Some(policy.write))
-        .timeout_recv_response(Some(policy.response))
-        .timeout_per_read(Some(policy.read))
-        .timeout_per_write(Some(policy.write))
-        .http_status_as_error(false)
-        .build()
-        .call()
-        .map_err(|source| TransferFailure {
-            error: Box::new(FetchError::Request {
-                url: String::from(request.url),
-                source: Box::new(source),
-            }),
-            partial: Vec::new(),
-            accept_ranges: false,
-            total_length: None,
-            checksum: None,
+    builder.call().map_err(|source| TransferFailure {
+        error: Box::new(request_failure(source, request.url, policy)),
+        partial: Vec::new(),
+        accept_ranges: false,
+        total_length: None,
+        checksum: None,
+    })
+}
+
+fn request_failure(source: ureq::Error, url: &str, policy: TransferPolicy) -> FetchError {
+    match source {
+        ureq::Error::Timeout(
+            timeout @ (ureq::Timeout::PerRead
+            | ureq::Timeout::RecvResponse
+            | ureq::Timeout::RecvBody),
+        ) => FetchError::Stalled {
+            url: String::from(url),
+            waited: if timeout == ureq::Timeout::RecvResponse {
+                policy.response
+            } else {
+                policy.read
+            },
+        },
+        other => FetchError::Request {
+            url: String::from(url),
+            source: Box::new(other),
+        },
+    }
+}
+
+fn stalled_read(source: &std::io::Error) -> bool {
+    matches!(
+        source.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    ) || source
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<ureq::Error>())
+        .is_some_and(|error| {
+            matches!(
+                error,
+                ureq::Error::Timeout(
+                    ureq::Timeout::PerRead | ureq::Timeout::RecvResponse | ureq::Timeout::RecvBody
+                )
+            )
         })
 }
 
@@ -614,6 +718,7 @@ fn read_transfer_body(
     mut response: ureq::http::Response<ureq::Body>,
     request: &mut TransferRequest<'_>,
     limit: u64,
+    silence: Duration,
     meta: TransferMeta,
     status: u16,
     range_start: Option<u64>,
@@ -666,14 +771,18 @@ fn read_transfer_body(
                 (request.on_read)(body.len() as u64);
             }
             Err(source) => {
-                return Err(fail(
+                let error = if stalled_read(&source) {
+                    FetchError::Stalled {
+                        url: String::from(request.url),
+                        waited: silence,
+                    }
+                } else {
                     FetchError::Body {
                         url: String::from(request.url),
                         source,
-                    },
-                    &meta,
-                    body,
-                ));
+                    }
+                };
+                return Err(fail(error, &meta, body));
             }
         }
     }
@@ -851,6 +960,14 @@ mod tests {
         assert!(binary.response > document.response);
         assert!(binary.read > document.read);
         assert!(document.response >= Duration::from_secs(30));
+    }
+
+    #[test]
+    fn a_body_reset_is_a_failure_and_only_a_timeout_is_a_stall() {
+        let reset = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset");
+        assert!(!stalled_read(&reset));
+        let timed = std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out");
+        assert!(stalled_read(&timed));
     }
 
     #[test]

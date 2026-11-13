@@ -11,6 +11,8 @@
 #   pan       the radar workspace after a 240 px drag east
 #   zoom      the radar workspace after ten scroll-wheel zoom steps
 #   small     the radar workspace in a 940x680 window
+#   cancel    a fresh transfer with the Cancel transfer control pressed
+#   refresh   a revalidation captured while it is in flight
 #
 # The measure scenario clicks fixed points inside the default 1280x800 layout
 # and then counts pixels in the measurement stroke colour, so a polygon that
@@ -210,6 +212,29 @@ drag() {
 
 case "$scenario" in
     radar) ;;
+    cancel)
+        # Start a fresh transfer and press the Cancel transfer button as soon as
+        # the status row offers it. The repeated press also catches a frame that
+        # only appears after a short delay; the button is absent otherwise.
+        "$tool_xwdtopnm" "$framebuffer" | "$tool_pnmtopng" > "$output/cancel-before.png"
+        for _ in $(seq 1 10); do
+            "$tool_xdotool" mousemove 265 466 click 1
+            sleep 0.1
+        done
+        "$tool_xwdtopnm" "$framebuffer" | "$tool_pnmtopng" > "$output/cancel-request.png"
+        ;;
+    refresh)
+        # The NEXRAD listing has a one-minute registry lifetime. Wait out that
+        # lifetime, ask for a refresh, and capture frames while it is in flight.
+        sleep "${OXRAD_GUI_REFRESH_WAIT:-65}"
+        "$tool_xwdtopnm" "$framebuffer" | "$tool_pnmtopng" > "$output/refresh-before.png"
+        "$tool_xdotool" mousemove 380 466 click 1
+        for frame in 1 2 3 4 5; do
+            "$tool_xwdtopnm" "$framebuffer" | "$tool_pnmtopng" > "$output/refresh-during-$frame.png"
+            sleep 0.1
+        done
+        cp "$output/refresh-during-1.png" "$output/refresh-during.png"
+        ;;
     registry)
         "$tool_xwdtopnm" "$framebuffer" | "$tool_pnmtopng" > "$output/registry-before.png"
         click 330 28

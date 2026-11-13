@@ -1,186 +1,131 @@
 # oxrad
 
-A free desktop weather, radar, and environmental observation workstation, written in Rust.
+A free desktop Earth-science workstation in Rust: radar, weather, satellite,
+hydrology, seismicity, climate, ocean, air quality, wildfire, space weather and
+related open feeds in one map and inspection surface.
 
-
-oxrad runs on Linux, macOS, and Windows through `eframe` and `wgpu`. It has no account, subscription, advertisement, or paid tier. It is licensed under GPLv3.
+oxrad runs on Linux, macOS and Windows through `eframe` and `wgpu`. It has no
+account, subscription, advertisement or paid tier. It is licensed under GPLv3.
 
 ## Status
 
-This is a pre-release build. The radar display works. The product around it does not yet meet the standard of a professional workstation.
+This is a pre-release build. The checked behavior, known gaps and the evidence
+for each area are recorded in
+[docs/RECONSTRUCTION_STATE.md](docs/RECONSTRUCTION_STATE.md). That ledger is the
+authority for what is implemented; this README describes how to build and use
+the application and does not claim completeness.
 
-| Area | State |
-|---|---|
-| NEXRAD Level II decode and display | Working |
-| Radar products and tilts | Working: seven moment products and every complete sweep, plus vertically integrated liquid and echo tops computed from the whole volume, and storm-relative velocity against a storm motion the chaser sets |
-| Radar history and playback | Working: eight recent volumes, loop, scrub |
-| OpenFreeMap vector basemap | Partial: runtime tiles and selectable styles; offline reuse and full style fidelity remain unverified |
-| Global radar composite | Working: RainViewer, two-hour loop |
-| Forecast | Working: Open-Meteo, global |
-| Place search | Working: live partial and transposed names via Open-Meteo geocoding; proximity ranking absent |
-| Warnings | United States only |
-| Earthquakes | Working: USGS global feeds by hour, day, and week, with depth and magnitude-scaled symbols, list, and provider event pages |
-| River discharge | Working: Open-Meteo flood service (GloFAS) at the map centre, three weeks behind and one week ahead, drawn as a hydrograph with the forecast and the ensemble range |
-| Satellite imagery | Working: ten NASA GIBS layers — true colour, cloud-top temperature and height, aerosol optical depth, IMERG precipitation, land-surface and sea-surface temperature, ocean chlorophyll, snow cover, and vegetation index — each a provider composite over six days of archive, drawn under the vector map |
-| Geomagnetic activity | Working: NOAA planetary K index for two days past and two days ahead, with measured, estimated, and predicted values drawn differently, the storm scale, and the live solar wind at L1 |
-| Sunrise and sunset | Implemented, not GUI-verified: request the local calendar day's solar events at the map centre from Sunrise-Sunset.org; the result names its date, timezone, and coordinates |
-| Air quality | Working: Open-Meteo CAMS modelled concentrations at the map centre — the United States and European indices, PM2.5, PM10, ozone, nitrogen dioxide, sulphur dioxide, and carbon monoxide — with an hourly index chart for the day behind and two days ahead |
-| Climate | Working: ERA5 reanalysis at the map centre since 1991, with this calendar month's mean, its departure from a baseline computed from 1991–2020 in the same record, its rank among the years, precipitation against the normal, and a chart of every year's departure |
-| Wildfires | Working: NIFC WFIGS mapped perimeters for current incidents — drawn as outlines where they are large enough to see and as markers where they are not, with the nearest fires, their acreage and containment, and the largest in the country |
-| Storm environment | Working: model convective energy, inhibition, lifted index, freezing level, and the surface-to-500 hPa wind difference at the map centre, hour by hour for two days, with a chart that marks the levels at which storms become possible |
-| Ocean | Working: significant wave height with its Douglas sea state, swell, sea-surface temperature, and the surface current at the nearest sea point to the map centre, with a three-day wave chart |
-| Surface observations | Working: every METAR station reporting inside the view, drawn by flight category and listed with temperature, dew point, wind and gusts, visibility, and altimeter setting |
-| Sea ice | Working: this month's ice extent and area in both hemispheres from the NSIDC Sea Ice Index, with the departure from a 1981–2010 baseline computed from the same month's own file, the year's rank among every year on record, the least year, and a chart of every November-style month since 1978 |
-| Tropical cyclones | Working: every tropical cyclone the global disaster alert service is carrying in the last thirty days, wherever in the world it is, with its last reported position, maximum wind, the service's alert level, the countries it affects, and a click that centres the map on the storm |
-| River gauges | Working: measured stage and discharge at the USGS gauges inside the view, nearest first, with the agency's provisional and quality marks and the age of each reading, a marker per gauge, and a click that centres the map and draws that gauge's own seven-day hydrograph |
-| Volcanoes | Working: every volcano an observatory has raised, with its alert level, aviation colour code, elevation, region, the one-line synopsis from its latest notice and the age of that notice, a map marker in the colour code, and a click that centres the map on it |
-| Land surface | Working: soil water in the top ten and the ten-to-forty centimetre layer, soil temperature, the water the atmosphere will pull out of the ground over the next day, vapour-pressure deficit, ultraviolet index, and shortwave and direct radiation at the map centre, with an hourly soil-moisture chart that marks now |
-| Information radio | Working: a running order of what the open layers are holding — the most serious warnings with their areas and expiry, the strongest earthquakes, the worst gusts and visibility on the surface feed, the next six hours of temperature, the air-quality index when it leaves the good band, a geomagnetic storm, and the column's helicity — each with its provider, its age, and whether it is routine, notable, or something to act on, played one bulletin at a time or stepped by hand |
-| Vertical profile | Working: the forecast model's temperature, humidity, and wind on twelve pressure levels above the map centre, drawn as a skewed chart with a hodograph, and the cloud base, freezing level, bulk shear, 0–1 km shear, storm-relative helicity against the Bunkers right-mover, 700–500 hPa lapse rate, and precipitable water worked out from the column |
-| Snowpack | Working: snow depth on the ground at the map centre with the grid elevation the model answered for, what fell in the last day, what the next three days add, the heaviest hour, and an hour-by-hour snowfall chart for the whole record |
-| Radar outside the United States | RainViewer composite only; no national Level II adapter |
-| Units selection | Partial: distance and temperature convert; other quantities do not |
-| Light theme | Implemented for chrome and radar canvas; basemap style is selected independently |
-| Layer management | Not implemented |
-| Radar color tables | Implemented: five tables, persisted; the global raster keeps its provider palette |
-| Performance measurement | Not taken |
+Do not use this build for safety decisions. Coverage, warnings and geographic
+detail are incomplete.
 
-Do not use this build for safety decisions. Coverage, warnings, and geographic detail are incomplete.
-
-The existing [roadmap](ROADMAP.md), [product notes](docs/PRODUCT_REQUIREMENTS.md), and [architecture notes](docs/ARCHITECTURE.md) may be stale. They do not define the current reconstruction requirements.
+The implemented data path keeps provenance and freshness visible. A request is
+reported as `live`, `cached`, `refreshed`, `stale`, `refreshing` or
+`unavailable`; a failed refresh preserves a whole cached body as `stale` rather
+than presenting it as current. Invalid or missing measurements are rejected
+rather than replaced with invented values.
 
 ## Build
 
-```
+```sh
 cargo build --release --locked
 ```
 
-Linux needs an X11 or Wayland client library, `libxkbcommon`, and a Vulkan loader and driver.
+Linux needs an X11 or Wayland client library, `libxkbcommon`, and a Vulkan
+loader and driver.
 
 ## Run
 
-```
+```sh
 cargo run --release
 oxrad --site KTWX
 ```
 
-`--site` starts with that NEXRAD station instead of the saved one. `--help` prints usage.
+`--site` starts with that NEXRAD station instead of the saved one. `--help`
+prints the available commands, including the source inventory and registry
+probes.
 
-## Use
+The window has a left rail, a map or radar workspace, a right-side forecast and
+detail panel, and a status bar. The status bar carries station, product, time,
+age, cache state, controls and provenance. The rail exposes place search,
+station selection, radar product and tilt, history, warnings and the
+environmental layers. Map and radar views share navigation, selection and
+provenance.
 
-The window has three regions.
+## Network and cache
 
-The left rail holds place search, station selection, product and tilt, radar history, and active warnings. The centre is the workspace, switched between Radar and Map. The right panel holds the forecast for the selected place and the selected alert detail. The status bar names the station, product, scan time, scan age, gate counts, and provenance.
+All provider requests pass through one acquisition engine. It owns cache
+lookup, request pacing, retries, response validation and provenance. Timeouts
+are phase and payload aware: there is no fixed total deadline that aborts a
+large archive on a slow link.
 
-A town and a radar station are separate selections. Searching a town sets the forecast point. It also selects the nearest supported radar station, and changing the station afterwards leaves the forecast point unchanged.
+Cached responses retain `ETag` and `Last-Modified` validators. A stale entry is
+revalidated conditionally; a 304 reuses the cached body and refreshes its age
+without transferring it again. A 200 replaces the body, digest and validators
+through one metadata commit. Bodies and metadata are integrity-checked before
+use.
 
-Radar history pauses live acquisition while a scan is reviewed. Returning to live starts a fresh acquisition.
+An interrupted binary transfer keeps the bytes already received. When the
+origin advertises range support, the retry resumes with a `Range` request and
+the assembled body is checked against its declared length and any supplied
+SHA-256 digest. An origin without range support is restarted cleanly. Partial
+bytes live in memory only; resumption across process restarts is not
+implemented.
 
-Map view overlays the selected station and up to three nearby stations when their scans fall within six minutes of the selected scan. Stations outside that window are withheld and named. This is a time-bounded overlay, not a value-composited mosaic.
+The reader can cancel an active transfer. Cancellation shuts down the socket
+agent carrying that transfer, so a read blocked on a silent origin returns
+promptly. A cancelled transfer is distinct from a stalled transfer and from a
+failed transport. Cancellation never commits bytes to the cache. See
+[docs/NETWORK.md](docs/NETWORK.md) for the exact policies.
 
-The header Colors control selects the radar color table: Standard, Deuteranopia, Protanopia, Tritanopia, or High contrast. The selection persists and recolors both the radar mesh and its legend.
-
-## Configuration and stored data
-
-| Path | Contents |
-|---|---|
-| `~/.oxrad/config.toml` | Selected site and saved place |
-| `~/.oxrad/stations.json` | Last station directory and its save time |
-| `~/.oxrad/cache/responses/v1` | Bounded, integrity-checked response cache |
-| `~/.oxrad/cache/basemap` | HTTP tile cache and cached style documents |
-
-The response cache holds up to 256 entries and 128 MiB, and verifies bodies against their SHA-256 digests. The basemap tile cache has separate behavior and does not yet have a configurable storage budget.
+The cache is stored under `~/.oxrad/cache/responses`. Its budget is enforced by
+`--prune-cache`; it is not pruned after every write. HTTP `Cache-Control`
+expiry is not parsed; registry cadence and endpoint overrides own lifetime.
 
 ## Data sources
 
-| Source | Use | Coverage | Licence |
-|---|---|---|---|
-| Unidata NEXRAD Level II archive | Radar volumes | United States WSR-88D | Public domain |
-| National Weather Service station directory | Station discovery | United States and territories | Public domain |
-| National Weather Service active alerts | Warnings | United States and territories | Public domain |
-| Open-Meteo | Forecast | Global | CC BY 4.0 |
-| Open-Meteo, GeoNames | Place search | Global | CC BY 4.0 |
-| OpenFreeMap / OpenMapTiles / OpenStreetMap contributors | Vector basemap | Global | ODbL and provider attribution requirements |
-| [Sunrise-Sunset.org](https://sunrise-sunset.org) | Sunrise, sunset, and solar noon | Global | Free API with attribution; no data license specified |
-| USGS Earthquake Hazards Program | Earthquakes | Global | Public domain |
-| RainViewer | Reflectivity composite | 1,200 or more radars, 150 or more countries | Free terms, attribution required |
+The registry contains only free, public sources that permit display, persistent
+caching and attribution. It records coverage, products, formats, cadence,
+licence, rate limits and cache terms. The generated inventory is
+[docs/SOURCES.md](docs/SOURCES.md); the admission terms and current request
+routes are in [docs/NETWORK.md](docs/NETWORK.md).
 
-Attribution is displayed in the application. Details and researched but unintegrated sources are in [docs/DATA_SOURCES.md](docs/DATA_SOURCES.md).
+The core sources include Unidata NEXRAD Level II, the National Weather Service,
+Open-Meteo, OpenFreeMap and OpenStreetMap contributors, USGS, NASA GIBS,
+RainViewer, Sunrise-Sunset.org, and the public feeds listed by the registry.
+Attribution and licence text are shown with the data and in exported
+provenance. Provider errors are visible; missing coverage is named rather than
+filled with another provider's value.
 
-Requests identify the client as `oxrad/<version> (https://github.com/bonzupii/oxrad)`. Place queries and forecast coordinates are not written to logs.
+Requests identify the client as
+`oxrad/<version> (https://github.com/bonzupii/oxrad)`. Place queries and
+forecast coordinates are not written to logs.
 
-## Limitations
+## Verification
 
-- Radar moments outside the United States are not decoded. No DWD, ECCC, BoM, JMA, CMA, IMD, OPERA, or ODIM reader exists.
-- OpenFreeMap vector tiles use a partial MapLibre-style renderer. Terrain, sprite icons, cross-tile label collision and complete style fidelity are not supported. Tile errors and cache freshness are not yet fully visible, and tile-cache eviction is not bounded. A controlled test verifies fresh tile reuse by a restarted tile source; full application offline restart and expired-tile behavior remain unverified.
-- Sunrise and sunset results are requested manually and are not cached across restarts. The displayed date and coordinates identify the requested result; refresh after changing the map centre or local date.
-- Range rings and spokes render in map view; the product grid remains radar-canvas only.
-- The earthquake layer shows what the USGS summary feeds publish, which is not the same as every earthquake: the day feed starts at M2.5 and the week feed at M4.5, so small events are absent by the provider's own cut. Events the feed lists without a usable magnitude, position, or origin time are counted in the rail instead of being placed at a guessed coordinate.
-- Satellite imagery is a provider composite, not a single satellite pass, and each product states its own limitation in the rail. A product whose composite for the chosen day has not been built yet answers the provider with nothing; the layer then asks for the day before and says which day it settled on, rather than showing an empty map or an outage. The vegetation layer is an eight-day composite, so it usually trails today by a day or more.
-- The layer requests tiles only for the visible map at the deepest level the product publishes, so a wide view is a coarse picture rather than a resampled fine one. A provider failure is retried with a backoff and reported with the wait, and a malformed tile is reported without being drawn.
-- River discharge is a model, not a gauge: the layer reads the GloFAS river network at the map centre, so it reports the modelled channel nearest that point rather than a nearby station, and a point far from any modelled river reads a trickle. The forecast is one deterministic run plus the ensemble range; the rail says which day each peak falls on and states when the plot's scale is set by a single wide ensemble member.
-- Geomagnetic activity comes from the planetary K index, which is a global three-hour average rather than a local reading: it says a storm is under way, not whether the aurora is overhead. The newest value is usually an estimate from an incomplete station set and the chart draws it as such, and the forecast half of the chart is model output. The solar wind is measured at L1, roughly an hour upstream of the magnetosphere, so a southward Bz appears there before the index responds.
-- Air quality is a model on a grid of roughly eleven kilometres, so it describes the air over that grid cell rather than a monitor down the road; a plume that is thinner than a cell is smoothed away. The rail names the grid point the provider answered for, which can sit a little from the map centre. The two indices are not interchangeable — the United States index and the European index use different breakpoints and averaging — so both are shown with their own wording rather than one being converted into the other.
-- The climate layer is a reanalysis, not an observation: ERA5 carries the state of the atmosphere on a grid of about thirty kilometres, so a month's mean at a prairie point is a modelled value at that grid cell. It compares a month against the 1991–2020 baseline computed from the same reanalysis record, which is why the normal is not read from a separate normals product. ERA5 lags the calendar by about a week, so the newest month shown is usually a settled one rather than the one in progress, and the request stops six days back to avoid counting missing days as a cold or dry spell. One request carries every day since 1991 (thousands of days), so a new point takes a moment to arrive; the rail says it is reading.
-- Wildfire perimeters are what a crew last mapped, not the fire's edge at this moment, and the rail names the age of the newest polygon. The interagency service covers the United States only, so Canada and Mexico have no perimeters here even when a fire is burning across the border. The layer receives a simplified ring from the service, which moves an edge by up to a kilometre or so and is honest at the scale a fire is drawn. A fire smaller than eight pixels is drawn as a marker: it is a real detection at a place, not a shape, and pretending a twenty-acre burn has a legible outline would be worse.
-- The storm environment is a model column, not a sounding: the energy, inhibition, and lifted index are grid-box values from the forecast model, so a capping inversion a few kilometres from the grid point is invisible here. The wind difference is computed from the provider's surface and 500 hPa winds, which stands in for 0–6 km shear but is not the same quantity a hodograph gives, and no storm-relative helicity is shown because the model publishes no hodograph to integrate. The inhibition line is called out when it reaches 100 J/kg, since energy that nothing can lift is not a storm day.
-- The ocean layer reads the nearest sea grid point, which the provider picks from its own coastline data, so a map centre just inland reports the coast rather than the field behind it and a centre deep inland reports no sea state at all instead of a zero. Wave heights are significant wave height, the average of the highest third of the waves rather than the largest wave in the set, and the sea state is the Douglas band that height falls in. Wave direction is where the waves come from; current direction is where the water is going, and the rail words the two differently for that reason. Currents come from a global analysis at roughly eight kilometres, so they show the large-scale flow rather than a tidal stream in an inlet.
-- Surface observations are aviation reports, so a station exists where aeroplanes need one rather than where people live: a rural county can be two hundred kilometres from the nearest report, and the rail names each report's age because a station that stopped reporting keeps its old value until the feed drops it. The flight category is the aviation reading of ceiling and visibility, not a measure of how dangerous the ground weather is. The observation is for the station's own point and nothing between stations is interpolated.
-- Tropical cyclones come from the global disaster alert service, which carries the storms every regional centre reports rather than only the Atlantic ones. The alert level is that service's judgement of expected humanitarian impact, not a hurricane category, and no wind is converted into a category either: the rail prints the maximum wind the issuing centre published for the episode, which is not the wind at the marked position now. The marked position is the episode's last reported one, so a storm that has moved since its advisory is drawn where the advisory left it, and the layer says how old its window is rather than implying a live fix.
-- River gauges are measurements from the USGS National Water Information System, which covers the United States and its territories; a view elsewhere stays empty rather than showing a model in place of a gauge. A value the agency marks provisional may still be revised, and the rail prints that mark rather than hiding it. A gauge that reports no measurement is left out instead of being drawn with the service's sentinel number. Stage is measured from the gauge's own local datum, so a stage is comparable over time at one gauge and not between gauges, and the hydrograph axis starts just below the week's lowest stage rather than at zero. The service answers slowly on a busy day, so the layer waits up to a minute and a quarter before it reports a failure.
-- Volcanic activity is read from the observatories' own notices, which cover the volcanoes the USGS and its partner observatories monitor — Alaska, the Cascades, Hawaiʻi, Yellowstone, and the observatories that share the same notice system. A volcano that no observatory lists is not shown as quiet; it is simply not in the report. The alert level and colour code are the observatory's judgement, not a measurement, and a volcano whose record carries no position is listed without a marker rather than drawn at a guessed place. The report is capped at twelve volcanoes, so a day with more raised volcanoes than that says how many were not followed up.
-- The land-surface values are forecast-model fields for the grid box under the map centre, not a measurement at a station. Soil moisture is volumetric water content — a fraction of the soil's volume, not a depth of water — and the rail's dry/moist wording is a rule of thumb for a loam, so it is not a drought index for a sand or a clay. Ultraviolet and shortwave figures are what the model expects at the ground, and a night-time zero is a real zero rather than a missing value.
-- Sea ice comes from the monthly index, not from the present hour: the file for the current calendar month is the newest one that exists, and the rail names the newest year in it rather than implying the number is today's. Extent counts every cell with at least fifteen per cent ice and area weights each cell by its concentration, so area is always the smaller number and the two are not interchangeable. The comparison is against the 1981–2010 years in the same file, so a baseline is never mixed across months, and a month whose file lacks those years says so instead of guessing at a mean. The index covers the ice edge, not its thickness, and the chart is a record of one calendar month rather than a trend line.
-- The information radio is a reading of what is already on screen, not a reporting service: it holds no feed of its own, so a layer that is off says nothing and a provider that has not answered contributes nothing. Its ages are taken from the record's own time, and a bulletin that would need a measurement the record does not carry is not written at all. It plays text, not audio, and it advances on a fixed eight-second cadence rather than in the order events matter.
-- The vertical profile is a forecast-model column, not a balloon: the temperature, humidity, and wind come from one grid box at one forecast hour, so a cap or a dry slot a few kilometres from the point is not in it, and no instrument measured it. The cloud base is the 125 m per degree dew-point-depression estimate rather than a lifted-parcel calculation, the bulk shear runs from the surface to six kilometres or to the column's own top when the model stops lower and the rail names the depth it measured, and the helicity is taken against the Bunkers right-mover computed from this same column rather than a motion you observe. Precipitable water is integrated from the mixing ratio between the levels the model published, so a moist layer that falls between two levels is undercounted.
-- The snowpack is a model grid value, not a measurement: the depth and the snowfall belong to the whole grid box, so a valley and a ridge half a dozen kilometres apart can report the same number, and the rail names the grid elevation the model answered for so a point above the snow line is not read as if it were at the valley floor. Snow depth is metres of settled snow converted to centimetres; snowfall is the water-equivalent-scaled depth of new snow per hour, which the provider reports in centimetres. An hour with no snowfall is drawn as bare rather than as an unknown, but an hour the provider omits keeps its gap: nothing is interpolated across it.
-- Units selection covers distance and temperature; wind speed, precipitation, pressure, and elevation still use provider units.
-- Radar color-table selection covers the seven decoded products; the global RainViewer raster keeps its provider palette.
-- The two computed products are derived from the reflectivity of the decoded volume. Vertically integrated liquid is the trapezoidal integral of `3.44e-3 Z^(4/7)` between neighbouring elevations, in kilograms per square metre, and is not drawn below one kilogram per square metre. Echo tops are the highest gate at or above 18.5 dBZ, reported as height above the radar because the archive record carries no site elevation. Column matching uses ground range, so a higher tilt reads the gate above the same ground point rather than the gate at the same slant range.
-- A computed product needs reflectivity on at least two elevations; a volume with one elevation offers neither.
-- Storm-relative velocity subtracts the component of the set storm motion along each beam from the drawn velocity sweep. It is drawn on the lowest sweep carrying velocity, and with the default motion of zero it equals base velocity. The motion is set with two sliders under the product list and is saved in the configuration; the product is a chaser's estimate, not a motion derived from the storm itself.
-- Search ranks by name match only; results are not biased toward the current map centre.
-- Warnings cover the United States and its territories only.
-- Layers cannot be reordered, grouped, or made partially transparent. Warnings, global radar, and station overlays each have an independent toggle and nothing else.
-- Pan and zoom performance has not been measured.
-
-## Troubleshooting
-
-| Symptom | Cause |
-|---|---|
-| Window fails to open | No Vulkan driver, or no X11 or Wayland client library |
-| Station list empty | Discovery failed and no cached directory exists; the rail shows the error |
-| Radar stays on an old scan | The feed failed; the status bar shows the failure and the scan age |
-| Forecast missing | The place has no forecast from the provider; the panel shows the provider error |
-| Cache warnings | The cache directory is not writable; live data still loads |
-
-## Development
-
-`STYLE.md` governs code and prose. `AGENTS.md` binds changes to the engineering constraints. `ROADMAP.md` records state and phases. `API.md` records the NEXRAD crate interface.
-
-| Document | Contents |
-|---|---|
-| [docs/PRODUCT_REQUIREMENTS.md](docs/PRODUCT_REQUIREMENTS.md) | Personas, requirements, acceptance |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Current structure, defects, target contracts |
-| [docs/UI_DESIGN.md](docs/UI_DESIGN.md) | Tokens, layout, themes, QA matrix |
-| [docs/DATA_SOURCES.md](docs/DATA_SOURCES.md) | Provider inventory and admission protocol |
-| [docs/CACHING.md](docs/CACHING.md) | Cache classes and policy |
-| [docs/TESTING.md](docs/TESTING.md) | Suite, gaps, verification layers |
-| [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | Targets, method, known costs |
-| [docs/NETWORK.md](docs/NETWORK.md) | Network paths and limits |
-| [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md) | Direct dependencies |
-| [docs/HEADLESS.md](docs/HEADLESS.md) | Headless graphical verification |
-
-Gates:
-
-```
+```sh
 cargo fmt --all -- --check
-cargo clippy -- -D warnings
-cargo test
-cargo build
+cargo clippy --all-targets --message-format=short -- -D warnings
+cargo test --all-targets
 cargo build --release --locked
 ```
 
-`cargo test` uses generated provider responses and does not require live network access.
+Tests use generated and loopback responses. They do not bundle provider data.
+The current test count, the exact checks that ran and the remaining gaps are
+recorded in [docs/RECONSTRUCTION_STATE.md](docs/RECONSTRUCTION_STATE.md).
+Graphical checks run the release binary under Xvfb; see
+[docs/HEADLESS.md](docs/HEADLESS.md).
+
+## Documents
+
+| Document | Contents |
+|---|---|
+| [docs/RECONSTRUCTION_STATE.md](docs/RECONSTRUCTION_STATE.md) | Authoritative implementation state, tests, gates and gaps |
+| [docs/NETWORK.md](docs/NETWORK.md) | Transport, retry, cache, revalidation, resume, cancellation |
+| [docs/SOURCES.md](docs/SOURCES.md) | Generated provider inventory |
+| [docs/TESTING.md](docs/TESTING.md) | Test layers and coverage gaps |
+| [docs/HEADLESS.md](docs/HEADLESS.md) | Graphical smoke procedure and limits |
+| [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md) | Direct dependencies |
+| [STYLE.md](STYLE.md) | Code and prose conventions |
+| [AGENTS.md](AGENTS.md) | Engineering constraints |
 
 Copyright (C) 2026 Micah Ostrow <bonzupii@protonmail.com>. GPLv3.

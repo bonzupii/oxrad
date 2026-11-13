@@ -968,10 +968,24 @@ where
             on_read: &mut on_read,
         };
         match fetch(request) {
-            Ok(response) if response.status == 304 => {
-                return serve_revalidated(state, spec, entry, response, attempt);
+            Ok(response) => {
+                if cancel.is_cancelled() {
+                    observe(
+                        state,
+                        spec,
+                        CacheState::Unavailable,
+                        attempt,
+                        run.body.len(),
+                        run.resumed_from,
+                        None,
+                    );
+                    return Err(FetchError::Cancelled);
+                }
+                if response.status == 304 {
+                    return serve_revalidated(state, spec, entry, response, attempt);
+                }
+                return finish_transfer(state, spec, &mut run, response, attempt, cancel);
             }
-            Ok(response) => return finish_transfer(state, spec, &mut run, response, attempt),
             Err(failure) => {
                 if let Some(fetched) =
                     handle_failure(state, spec, &mut run, &mut entry, failure, attempt, cancel)?
@@ -1092,6 +1106,7 @@ fn finish_transfer(
     run: &mut TransferRun,
     response: TransferResponse,
     attempt: u32,
+    cancel: &CancelToken,
 ) -> Result<Fetched, FetchError> {
     let resumed_response = response.status == 206;
     if resumed_response {
@@ -1137,6 +1152,18 @@ fn finish_transfer(
         run.checksum = response.checksum.clone();
     }
     verify_run(state, spec, run, attempt)?;
+    if cancel.is_cancelled() {
+        observe(
+            state,
+            spec,
+            CacheState::Unavailable,
+            attempt,
+            run.body.len(),
+            run.resumed_from,
+            None,
+        );
+        return Err(FetchError::Cancelled);
+    }
     let stored = if resumed_response {
         Validators {
             etag: response.etag.or_else(|| run.validators.etag.clone()),
@@ -1859,6 +1886,144 @@ mod tests {
                 .ok_or_else(|| TestError::from("the restarted body was not cached"))?
                 .body,
             expected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cancelling_a_stalled_body_interrupts_the_read_and_leaves_no_cache_entry()
+    -> Result<(), TestError> {
+        use std::time::Instant;
+
+        let listener =
+            TcpListener::bind("127.0.0.1:0").map_err(|error| TestError::from(error.to_string()))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| TestError::from(error.to_string()))?;
+        let server = std::thread::spawn(move || -> Result<(), TestError> {
+            let (mut stream, _) = listener
+                .accept()
+                .map_err(|error| TestError::from(error.to_string()))?;
+            let _request = read_request(&mut stream)?;
+            send_partial(&mut stream, &[7_u8; 4096], 64, "Accept-Ranges: bytes\r\n")?;
+            std::thread::sleep(Duration::from_secs(2));
+            Ok(())
+        });
+        let url = format!("http://{address}/stalled-cancel");
+        let request = RequestSpec::for_source(
+            &sources::NEXRAD_LEVEL_TWO,
+            url.clone(),
+            "application/octet-stream",
+        );
+        let store = temporary_store("stalled-cancel");
+        let mut state = EngineState::test_with_store(store.clone());
+        let cancel = CancelToken::new();
+        let (chunk_sent, chunk_received) = channel();
+        let (cancel_started, cancel_time) = channel();
+        let canceller = {
+            let cancel = cancel.clone();
+            std::thread::spawn(move || -> Result<(), TestError> {
+                chunk_received
+                    .recv_timeout(Duration::from_secs(2))
+                    .map_err(|_| TestError::from("the first body chunk never arrived"))?;
+                let at = Instant::now();
+                cancel.cancel();
+                cancel_started
+                    .send(at)
+                    .map_err(|_| TestError::from("the cancel observation channel closed"))
+            })
+        };
+        let policy = TransferPolicy {
+            resolve: Duration::from_secs(5),
+            connect: Duration::from_secs(5),
+            response: Duration::from_secs(5),
+            read: Duration::from_secs(5),
+            write: Duration::from_secs(5),
+        };
+        let limit = MAX_BINARY_BYTES;
+        let fetch = |mut request: TransferRequest<'_>| live_get(&mut request, policy, limit);
+        let mut latest = 0;
+        let mut progress = |update: TransferProgress| {
+            latest = update.received;
+            if update.received >= 64 && chunk_sent.send(()).is_err() {}
+        };
+        let result = execute(&mut state, fetch, &request, &cancel, &mut progress);
+        let cancelled_at = cancel_time
+            .recv()
+            .map_err(|_| TestError::from("the cancel never happened"))?;
+        canceller
+            .join()
+            .map_err(|_| TestError::from("the cancelling thread panicked"))??;
+        assert!(matches!(result, Err(FetchError::Cancelled)), "{result:?}");
+        assert!(
+            cancelled_at.elapsed() < Duration::from_millis(500),
+            "cancellation waited {cancelled_at:?}"
+        );
+        assert_eq!(latest, 64, "received-byte accounting changed after cancel");
+        assert!(
+            store
+                .load_aged(&url)
+                .map_err(|error| TestError::from(error.to_string()))?
+                .is_none(),
+            "a cancelled stalled transfer left a readable cache entry"
+        );
+        server
+            .join()
+            .map_err(|_| TestError::from("the stalled server thread panicked"))??;
+        Ok(())
+    }
+
+    #[test]
+    fn a_silent_body_is_stalled_not_cancelled_or_failed() -> Result<(), TestError> {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").map_err(|error| TestError::from(error.to_string()))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| TestError::from(error.to_string()))?;
+        let server = std::thread::spawn(move || -> Result<(), TestError> {
+            for _ in 0..4 {
+                let (mut stream, _) = listener
+                    .accept()
+                    .map_err(|error| TestError::from(error.to_string()))?;
+                let _request = read_request(&mut stream)?;
+                send_partial(&mut stream, &[9_u8; 4096], 64, "Accept-Ranges: bytes\r\n")?;
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            Ok(())
+        });
+        let url = format!("http://{address}/silent");
+        let request = RequestSpec::for_source(
+            &sources::NEXRAD_LEVEL_TWO,
+            url.clone(),
+            "application/octet-stream",
+        );
+        let store = temporary_store("stalled");
+        let mut state = EngineState::test_with_store(store.clone());
+        let cancel = CancelToken::new();
+        let policy = TransferPolicy {
+            resolve: Duration::from_secs(5),
+            connect: Duration::from_secs(5),
+            response: Duration::from_secs(5),
+            read: Duration::from_millis(100),
+            write: Duration::from_secs(5),
+        };
+        let limit = MAX_BINARY_BYTES;
+        let fetch = |mut request: TransferRequest<'_>| live_get(&mut request, policy, limit);
+        let mut progress = |_update| {};
+        let result = execute(&mut state, fetch, &request, &cancel, &mut progress);
+        server
+            .join()
+            .map_err(|_| TestError::from("the silent server thread panicked"))??;
+        assert!(
+            matches!(result, Err(FetchError::Stalled { .. })),
+            "a silent body was not reported as stalled: {result:?}"
+        );
+        assert!(
+            store
+                .load_aged(&url)
+                .map_err(|error| TestError::from(error.to_string()))?
+                .is_none(),
+            "a stalled transfer left a readable cache entry"
         );
         Ok(())
     }

@@ -15,7 +15,7 @@ Documents are capped at 4 MiB and binary responses at 64 MiB. A response over th
 
 ## Retry
 
-A transient transport, body-read, 429 or 5xx failure is retried up to four attempts. The wait starts at 4 seconds and doubles to 32 seconds, with a deterministic per-request spread of up to 500 ms. A valid `Retry-After` header replaces the computed wait and is capped at 60 seconds. A 4xx response other than 429, a malformed body and a decode failure are not retried. Deterministic answers use the same policy in tests.
+A transient transport, body-read, stalled-read, 429 or 5xx failure is retried up to four attempts. The wait starts at 4 seconds and doubles to 32 seconds, with a deterministic per-request spread of up to 500 ms. A valid `Retry-After` header replaces the computed wait and is capped at 60 seconds. A 4xx response other than 429, a malformed body and a decode failure are not retried. Deterministic answers use the same policy in tests.
 
 ## Cache and revalidation
 
@@ -33,7 +33,9 @@ The whole body is verified before it is stored: its length against `Content-Leng
 
 ## Cancellation and progress
 
-A transfer carries a reader-owned cancellation flag. The UI shows `Cancel transfer` while a transfer is active. The engine checks the flag before every attempt, between every body read and during backoff, and returns a distinct cancelled result rather than a transport failure or a stall. A socket blocked waiting for its next byte cannot observe the flag until the read-silence limit expires, so cancellation is prompt while bytes are arriving and bounded by the configured silence limit otherwise.
+A transfer carries a reader-owned cancellation flag and the agent carrying its socket. The UI shows `Cancel transfer` while a transfer is active. Cancelling sets the flag and calls `Agent::shutdown()` on that transfer's agent, which closes the socket and unblocks a read waiting for the next byte. The engine checks the flag before every attempt, between body reads, during backoff, and after a response arrives but before it commits anything. A cancelled transfer returns a distinct cancelled result and never stores bytes.
+
+A read that exceeds the phase silence limit without a cancellation is a stall, reported as `stalled`; a transport error is `failed`. A stall remains retryable, and a whole cached body may still be served as `stale` when retries are exhausted. Name resolution and the TCP connect phase are bounded by their own limits and are not interrupted by `Agent::shutdown()`.
 
 Progress snapshots report the active subject, cache state, bytes received, known total and resumed-from offset. A resumed binary reports the offset it started from rather than restarting the display at zero. A revalidation reports `refreshing` while it is in flight.
 

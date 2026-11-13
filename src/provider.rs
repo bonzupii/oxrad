@@ -17,6 +17,7 @@
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::time::Duration;
 
 use crate::sources::{EndpointError, SourceId};
 
@@ -39,6 +40,10 @@ pub enum FetchError {
     Body {
         url: String,
         source: std::io::Error,
+    },
+    Stalled {
+        url: String,
+        waited: Duration,
     },
     Range {
         url: String,
@@ -72,6 +77,7 @@ impl FetchError {
             self,
             Self::Request { .. }
                 | Self::Body { .. }
+                | Self::Stalled { .. }
                 | Self::Status { status: 429, .. }
                 | Self::Status {
                     status: 500..=599,
@@ -124,6 +130,10 @@ impl FetchError {
             Self::Body { url, source } => {
                 format!("The response from {url} could not be read: {source}")
             }
+            Self::Stalled { url, waited } => format!(
+                "The response from {url} stopped sending data for {:.1} s.",
+                waited.as_secs_f64()
+            ),
             Self::Range { url, detail } => {
                 format!("The ranged response from {url} is not usable: {detail}.")
             }
@@ -167,6 +177,7 @@ impl Error for FetchError {
             | Self::Status { .. }
             | Self::Range { .. }
             | Self::Integrity { .. }
+            | Self::Stalled { .. }
             | Self::Shape { .. }
             | Self::Cancelled
             | Self::WorkerStopped => None,
