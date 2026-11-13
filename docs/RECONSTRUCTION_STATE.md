@@ -61,7 +61,7 @@ States: not started, in progress, verified, blocked.
 | A24 | GUI workflows run and visually inspected | in progress | Pass 17: `scripts/gui.sh radar` passed at 1280x800 with 2,022 colours and live KTWX provenance; `scripts/gui.sh registry` passed with 1,017 colours, 40 operations listed and the shared sweep running. The frames were inspected. Other domains and restart persistence were not |
 | A25 | Settings and acquired data persist across restarts | in progress | Atomic save and reload are covered by a test that also proves the temporary file does not survive; the running application was not restarted on a display, so the restore path is unobserved in a window | Observe a restart under the harness |
 | A26 | Documentation reflects actual behavior, no stale AI document as authority | in progress | Pass 18: `docs/NETWORK.md` now describes validators, conditional requests, resumable transfers, integrity checks, cancellation and the six cache states. `docs/SOURCES.md` remains generated. README, ROADMAP, TESTING and HEADLESS remain unreconciled | Replace or delete the remaining documents |
-| A27 | Implementation committed and pushed to the managed development branch | in progress | Pass 18: the durable-cache and transfer-integrity work is verified locally but not yet committed | Commit and push the verified tree |
+| A27 | Implementation committed and pushed to the managed development branch | verified | Pass 18: `b958169` pushed to `dev`; the remote advanced from `58e6308` to `b958169` | — |
 
 ## Pass log
 
@@ -491,4 +491,5 @@ States: not started, in progress, verified, blocked.
   - `cache::tests::a_truncated_body_is_rejected` and `cache::tests::a_changed_body_is_rejected` prove length and digest failures are corrupt, not usable.
   - Existing cache tests still prove entry and byte budgets and oldest-first pruning. Existing engine tests still prove fresh-cache hits, retry counts, provenance and status retention.
 - Gates after the final edits: `cargo fmt --all -- --check` exit 0, `cargo clippy --all-targets --message-format=short -- -D warnings` exit 0, `cargo test --all-targets` 541 passed and 0 failed, `cargo build --release --locked` exit 0.
+- The verified tree was committed as `b958169` and pushed to `dev`.
 - Remaining limitations: partial bytes are held in memory only, so resumption does not survive a process restart. A socket blocked waiting for its next byte cannot see the cancel flag until the read-silence limit expires; cancellation is prompt while data is arriving. HTTP `Cache-Control` expiry is not parsed; the registry cadence and endpoint override still own lifetime. The cache budget is enforced by `--prune-cache`, not after every write. The new cancel control and refreshing state were compiled and covered by engine tests but were not observed in a GUI frame. README, ROADMAP, TESTING and HEADLESS remain unreconciled AI documents.
