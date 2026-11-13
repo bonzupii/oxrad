@@ -32,8 +32,8 @@ use crate::error::RadarError;
 use crate::provider::FetchError;
 use crate::sources;
 
-const TILE_SIZE: u32 = 512;
-const COLOR_SCHEME: u8 = 2;
+pub(crate) const TILE_SIZE: u32 = 512;
+pub(crate) const COLOR_SCHEME: u8 = 2;
 const MAX_ZOOM: u8 = 7;
 const MAX_FRAMES: usize = 24;
 /// Decoded PNGs kept per worker so playback does not re-fetch or re-decode a
@@ -684,7 +684,7 @@ fn cache_key(frame: &GlobalFrame, bounds: TileBounds) -> String {
     )
 }
 
-fn decode_tile(bytes: &[u8], url: &str) -> Result<DecodedTile, GlobalRadarError> {
+pub(crate) fn decode_tile(bytes: &[u8], url: &str) -> Result<DecodedTile, GlobalRadarError> {
     let image =
         image::load_from_memory_with_format(bytes, image::ImageFormat::Png).map_err(|source| {
             GlobalRadarError::Image {

@@ -32,10 +32,13 @@ use serde_json::Value;
 use crate::config::EnabledProviders;
 use crate::engine::{self, Command, EngineStatus, Fetched, RequestSpec, Status};
 use crate::provider::FetchError;
-use crate::sources::Source;
+use crate::sources::{Format, Source};
 
 /// The largest document a JSON or text request may return.
 pub(crate) const MAX_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
+/// A binary archive is allowed to be larger than a document. Level II volumes
+/// routinely exceed four mebibytes, and the same gate and cache must carry them.
+pub(crate) const MAX_BINARY_BYTES: u64 = 64 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long one address may take to answer, so a dual-stack host with a dead
 /// IPv6 route does not hold up a request the working address answers at once.
@@ -175,7 +178,7 @@ impl Transport {
             return Err(FetchError::Disabled { id: source.id });
         }
         match self {
-            Self::Live => live_get(url, accept, REQUEST_TIMEOUT, MAX_DOCUMENT_BYTES),
+            Self::Live => live_get(url, accept, REQUEST_TIMEOUT, body_limit(source)),
             #[cfg(test)]
             Self::Offline => Err(FetchError::WorkerStopped),
             #[cfg(test)]
@@ -189,6 +192,14 @@ impl Transport {
                 Ok(body.to_vec())
             }
         }
+    }
+}
+
+fn body_limit(source: &Source) -> u64 {
+    if source.format == Format::Binary {
+        MAX_BINARY_BYTES
+    } else {
+        MAX_DOCUMENT_BYTES
     }
 }
 
@@ -269,6 +280,12 @@ mod tests {
 
     fn enabled() -> EnabledProviders {
         EnabledProviders::all_admitted()
+    }
+
+    #[test]
+    fn binary_archives_get_a_larger_body_limit() {
+        assert_eq!(body_limit(&sources::NEXRAD_LEVEL_TWO), MAX_BINARY_BYTES);
+        assert_eq!(body_limit(&sources::OPENFREEMAP), MAX_DOCUMENT_BYTES);
     }
 
     #[test]

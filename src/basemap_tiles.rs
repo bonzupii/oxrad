@@ -80,10 +80,10 @@ struct Job {
     id: TileId,
 }
 
-struct ServedTile {
-    bytes: Vec<u8>,
-    provenance: Provenance,
-    cache: CacheState,
+pub(crate) struct ServedTile {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) provenance: Provenance,
+    pub(crate) cache: CacheState,
 }
 
 struct Completion {
@@ -127,7 +127,10 @@ fn start_worker(
 }
 
 /// Reads a tile through the engine, which owns the URL, cache and retries.
-fn load_tile(acquire: &Acquire, id: TileId) -> (Result<ServedTile, TileError>, Option<TileError>) {
+pub(crate) fn load_tile(
+    acquire: &Acquire,
+    id: TileId,
+) -> (Result<ServedTile, TileError>, Option<TileError>) {
     let zoom = id.zoom.to_string();
     let x = id.x.to_string();
     let y = id.y.to_string();

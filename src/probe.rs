@@ -10,8 +10,11 @@ use std::fmt::{self, Display, Formatter};
 
 use serde_json::Value;
 
+use crate::acquire::Acquire;
+use crate::basemap_tiles;
 use crate::climate;
 use crate::cyclone;
+use crate::engine::{Fetched, RequestSpec, Served};
 use crate::fire;
 use crate::forecast;
 use crate::gauge;
@@ -20,19 +23,53 @@ use crate::hydro;
 use crate::network;
 use crate::observations;
 use crate::ocean;
+use crate::pipeline;
 use crate::place;
 use crate::power;
 use crate::quake;
 use crate::quality;
+use crate::radar;
+use crate::request_report::RequestReport;
 use crate::satellite;
 use crate::seaice::{self, Hemisphere};
 use crate::sources;
 use crate::spaceweather;
-use crate::stations;
+use crate::stations::{self, SiteId};
 use crate::sun;
 use crate::time;
 use crate::uk_rivers;
 use crate::volcano;
+use walkers::{Style, Tile, TileId};
+
+/// The unchanged view used by the three composite headless observations: the
+/// application's default 18,000 km world view centred on the origin.
+const PROBE_CENTER_LAT: f64 = 0.0;
+const PROBE_CENTER_LON: f64 = 0.0;
+const PROBE_SPAN_KM: f64 = 18_000.0;
+
+/// Four vector tiles at the default world view's scale, around the origin.
+const BASEMAP_PROBE_TILES: [TileId; 4] = [
+    TileId {
+        zoom: 2,
+        x: 1,
+        y: 1,
+    },
+    TileId {
+        zoom: 2,
+        x: 2,
+        y: 1,
+    },
+    TileId {
+        zoom: 2,
+        x: 1,
+        y: 2,
+    },
+    TileId {
+        zoom: 2,
+        x: 2,
+        y: 2,
+    },
+];
 
 /// A parsed value with the unit the provider stated.
 #[derive(Debug, Clone)]
@@ -118,6 +155,258 @@ impl ProbeReport {
     }
 }
 
+/// One live composite observation: parsed values followed by the request set
+/// that produced them.
+pub(crate) struct CompositeRun {
+    pub(crate) parsed: ProbeReport,
+    pub(crate) requests: RequestReport,
+}
+
+/// Whether this source needs the live composite path rather than the first
+/// endpoint's parser alone.
+pub(crate) fn is_composite(id: &str) -> bool {
+    matches!(id, "rainviewer" | "openfreemap" | "nexrad-level-2")
+}
+
+/// Drives the three composite rails through the same registry operations and
+/// parsers their display paths use. Every request is fetched, never composed
+/// into a summary URL.
+///
+/// # Errors
+///
+/// Returns [`ProbeError::Live`] when a required placeholder is absent, a request
+/// fails, or a fetched body is not renderable. Returns the parser failure from
+/// the rail's own parser when it rejects the response.
+pub(crate) fn live(
+    source: &'static sources::Source,
+    acquire: &Acquire,
+    values: &[(&str, &str)],
+) -> Result<CompositeRun, ProbeError> {
+    match source.id.as_str() {
+        "rainviewer" => rainviewer_live(source, acquire),
+        "openfreemap" => basemap_live(source, acquire, values),
+        "nexrad-level-2" => nexrad_live(source, acquire, values),
+        _ => Err(live_error(
+            "composite probe",
+            "no live composite path is registered for this source",
+        )),
+    }
+}
+
+fn live_error(stage: &'static str, detail: impl Display) -> ProbeError {
+    ProbeError::Live {
+        stage,
+        detail: detail.to_string(),
+    }
+}
+
+fn fetch_twice(
+    acquire: &Acquire,
+    source: &'static sources::Source,
+    operation: &'static str,
+    values: &[(&str, &str)],
+) -> Result<Fetched, ProbeError> {
+    let mut last = None;
+    for _ in 0..2 {
+        last = Some(
+            acquire
+                .fetch_operation(source, operation, values)
+                .map_err(|error| live_error(operation, error))?,
+        );
+    }
+    last.ok_or_else(|| live_error(operation, "the request produced no body"))
+}
+
+fn rainviewer_live(
+    source: &'static sources::Source,
+    acquire: &Acquire,
+) -> Result<CompositeRun, ProbeError> {
+    let fetched = fetch_twice(acquire, source, "manifest", &[])?;
+    let manifest = global_radar::parse_manifest(&fetched.body)
+        .map_err(|error| rejected("RainViewer manifest", error))?;
+    let latest = manifest
+        .frames
+        .last()
+        .cloned()
+        .ok_or_else(|| rejected("RainViewer manifest", "the manifest carries no frames"))?;
+    let grid = global_radar::tile_grid_for_view(PROBE_CENTER_LAT, PROBE_CENTER_LON, PROBE_SPAN_KM)
+        .map_err(|error| rejected("RainViewer tile grid", error))?;
+    let frame_count = manifest.frames.len();
+    let host = manifest.host.clone();
+    let mut served = Served::new(manifest, fetched.provenance, fetched.cache);
+    let mut pixels = String::from("not decoded");
+    let mut rgba_bytes = 0_usize;
+    for bounds in &grid.tiles {
+        let size = global_radar::TILE_SIZE.to_string();
+        let zoom = bounds.zoom.to_string();
+        let x = bounds.x.to_string();
+        let y = bounds.y.to_string();
+        let scheme = global_radar::COLOR_SCHEME.to_string();
+        let spec = RequestSpec::for_operation(
+            &sources::RAINVIEWER,
+            "tile",
+            &[
+                ("host", host.as_str()),
+                ("path", latest.path.as_str()),
+                ("size", size.as_str()),
+                ("zoom", zoom.as_str()),
+                ("x", x.as_str()),
+                ("y", y.as_str()),
+                ("scheme", scheme.as_str()),
+            ],
+        )
+        .map_err(|error| live_error("RainViewer tile", error))?;
+        let fetched = acquire
+            .fetch(&spec)
+            .map_err(|error| live_error("RainViewer tile", error))?;
+        let image = global_radar::decode_tile(&fetched.body, &fetched.provenance.url)
+            .map_err(|error| rejected("RainViewer tile", error))?;
+        pixels = format!("{} × {} px", image.width, image.height);
+        rgba_bytes = rgba_bytes.saturating_add(image.rgba.len());
+        served = served.with_labelled_request(
+            format!("tile z{} x{} y{}", bounds.zoom, bounds.x, bounds.y),
+            fetched.provenance,
+            fetched.cache,
+        );
+    }
+    let requests = RequestReport::from_served("RainViewer composite requests", &served);
+    let parsed = ProbeReport::new(source, "manifest")
+        .station(host)
+        .product("global reflectivity composite")
+        .observed(utc(latest.time_unix_ms))
+        .field("frames", frame_count.to_string())
+        .field("latest frame path", latest.path)
+        .field("palette", global_radar::PALETTE)
+        .field(
+            "probe view",
+            format!("{PROBE_CENTER_LAT:.4}, {PROBE_CENTER_LON:.4} · {PROBE_SPAN_KM:.0} km"),
+        )
+        .field("tiles", grid.tiles.len().to_string())
+        .field("tile size", pixels)
+        .field("rgba bytes", rgba_bytes.to_string());
+    Ok(CompositeRun { parsed, requests })
+}
+
+fn basemap_live(
+    source: &'static sources::Source,
+    acquire: &Acquire,
+    values: &[(&str, &str)],
+) -> Result<CompositeRun, ProbeError> {
+    let style_name = value(values, "style")?;
+    let fetched = fetch_twice(acquire, source, "style", &[("style", style_name)])?;
+    let document = json_body(&fetched.body, "OpenFreeMap style")?;
+    let layers = document
+        .get("layers")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .ok_or_else(|| rejected("OpenFreeMap style", "the document has no layers array"))?;
+    let style: Style =
+        serde_json::from_value(document).map_err(|error| rejected("OpenFreeMap style", error))?;
+    let mut requests = Vec::with_capacity(BASEMAP_PROBE_TILES.len());
+    let mut features = 0_usize;
+    let mut bytes = 0_usize;
+    let mut cache_warning = None;
+    for id in BASEMAP_PROBE_TILES {
+        let (result, warning) = basemap_tiles::load_tile(acquire, id);
+        let tile = result.map_err(|error| live_error("OpenFreeMap tile", error))?;
+        let decoded = Tile::from_mvt(&tile.bytes, &style, id.zoom)
+            .map_err(|error| live_error("OpenFreeMap tile parser", error))?;
+        features = features.saturating_add(match decoded {
+            Tile::Vector(shapes) => shapes.len(),
+            Tile::Raster(_) => 0,
+        });
+        if let Some(warning) = warning {
+            cache_warning = Some(warning.to_string());
+        }
+        bytes = bytes.saturating_add(tile.bytes.len());
+        requests.push((
+            format!("tile z{} x{} y{}", id.zoom, id.x, id.y),
+            tile.provenance,
+            tile.cache,
+        ));
+    }
+    let mut served = Served::new(style, fetched.provenance, fetched.cache);
+    for (label, provenance, cache) in requests {
+        served = served.with_labelled_request(label, provenance, cache);
+    }
+    let request_report =
+        RequestReport::from_served("Basemap style and vector tile requests", &served);
+    let mut parsed = ProbeReport::new(source, "style")
+        .product("basemap vector style")
+        .field("layers", layers.to_string())
+        .field(
+            "probe view",
+            format!("{PROBE_CENTER_LAT:.4}, {PROBE_CENTER_LON:.4} · {PROBE_SPAN_KM:.0} km"),
+        )
+        .field("tiles", BASEMAP_PROBE_TILES.len().to_string())
+        .field("vector features", features.to_string())
+        .field("tile bytes", bytes.to_string());
+    if let Some(warning) = cache_warning {
+        parsed = parsed.field("cache warning", warning);
+    }
+    Ok(CompositeRun {
+        parsed,
+        requests: request_report,
+    })
+}
+
+fn nexrad_live(
+    source: &'static sources::Source,
+    acquire: &Acquire,
+    values: &[(&str, &str)],
+) -> Result<CompositeRun, ProbeError> {
+    let prefix = value(values, "prefix")?;
+    let site_name = prefix
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .ok_or_else(|| rejected("NEXRAD listing", "the prefix carries no site"))?;
+    let site = SiteId::parse(site_name).map_err(|error| rejected("NEXRAD listing", error))?;
+    network::listed_volume(acquire, prefix)
+        .map_err(|error| live_error("NEXRAD discovery listing", error))?;
+    let listed = network::listed_volume(acquire, prefix)
+        .map_err(|error| live_error("NEXRAD discovery listing", error))?;
+    let archive = network::fetch_archive_cached(acquire, &listed.key, &site)
+        .map_err(|error| live_error("NEXRAD object", error))?;
+    let bytes = archive.bytes.len();
+    let volume = radar::decode_volume(&site, &listed.key, &archive.bytes)
+        .map_err(|error| rejected("NEXRAD object", error))?;
+    let station = String::from(volume.site.as_str());
+    let scan = volume.scan_unix_ms;
+    let sweeps = volume.sweeps.len().saturating_add(1);
+    let elevation = volume.sweep.elevation_deg;
+    let radials = volume.sweep.radials.len();
+    let products = volume
+        .sweep
+        .products
+        .iter()
+        .map(|product| product.label())
+        .collect::<Vec<&str>>()
+        .join(", ");
+    let range = volume.sweep.max_ground_range_km;
+    let pages = listed.requests.len();
+    let key = listed.key;
+    let served = pipeline::served_with_listing(
+        Served::new(volume, archive.provenance, archive.cache),
+        listed.requests,
+    );
+    let requests =
+        RequestReport::from_served("NEXRAD discovery listing and volume requests", &served);
+    let parsed = ProbeReport::new(source, "object")
+        .station(station)
+        .product("Level II base data")
+        .observed(utc(scan))
+        .field("discovery pages", pages.to_string())
+        .field("object key", key)
+        .field("sweeps", sweeps.to_string())
+        .field("selected elevation", format!("{elevation:.2}°"))
+        .field("radials", radials.to_string())
+        .field("products", products)
+        .field("max ground range", format!("{range:.1} km"))
+        .field("object bytes", bytes.to_string());
+    Ok(CompositeRun { parsed, requests })
+}
+
 #[derive(Debug)]
 pub(crate) enum ProbeError {
     MissingValue {
@@ -129,6 +418,10 @@ pub(crate) enum ProbeError {
     },
     Rejected {
         parser: &'static str,
+        detail: String,
+    },
+    Live {
+        stage: &'static str,
         detail: String,
     },
 }
@@ -153,6 +446,9 @@ impl Display for ProbeError {
                     formatter,
                     "the {parser} parser rejected the answer: {detail}"
                 )
+            }
+            Self::Live { stage, detail } => {
+                write!(formatter, "the {stage} live probe failed: {detail}")
             }
         }
     }
@@ -852,6 +1148,15 @@ mod tests {
                 .any(|field| field.value == "4.33 (observed)")
         );
         Ok(())
+    }
+
+    #[test]
+    fn only_the_three_composite_rails_take_the_live_path() {
+        assert!(is_composite("rainviewer"));
+        assert!(is_composite("openfreemap"));
+        assert!(is_composite("nexrad-level-2"));
+        assert!(!is_composite("nws-api"));
+        assert!(!is_composite("open-meteo-forecast"));
     }
 
     #[test]

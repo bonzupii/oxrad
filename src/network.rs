@@ -189,6 +189,25 @@ pub struct ListedVolume {
     pub requests: Vec<SourceRecord>,
 }
 
+/// The newest volume under one explicit prefix, with every discovery page
+/// that found it.
+pub fn listed_volume(acquire: &Acquire, prefix: &str) -> Result<ListedVolume, RadarError> {
+    let listing = list_keys(acquire, prefix)?;
+    let key = listing
+        .keys
+        .iter()
+        .filter(|key| is_volume_key(key))
+        .max()
+        .cloned()
+        .ok_or_else(|| RadarError::NoVolume {
+            site: String::from(prefix),
+        })?;
+    Ok(ListedVolume {
+        key,
+        requests: listing.requests,
+    })
+}
+
 /// The newest volume the feed lists for a site, ordered by its UTC timestamp.
 pub fn latest_volume_key(acquire: &Acquire, site: &SiteId) -> Result<ListedVolume, RadarError> {
     let mut requests = Vec::new();

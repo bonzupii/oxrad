@@ -201,7 +201,6 @@ impl RequestReport {
 
     /// One line per request with every attribution field, for headless output
     /// and deterministic formatter tests.
-    #[cfg(test)]
     pub(crate) fn text(&self) -> String {
         let mut lines = vec![format!("{}: {}", self.title, self.summary().join(" · "))];
         for request in &self.requests {
@@ -245,9 +244,7 @@ impl RequestReport {
 
 /// The host of an absolute URL, without inventing one for a relative value.
 fn host_of(url: &str) -> Option<String> {
-    let rest = url
-        .strip_prefix(sources::HTTPS_SCHEME)
-        .or_else(|| url.strip_prefix("http://"))?;
+    let rest = url.strip_prefix(sources::HTTPS_SCHEME)?;
     let host = rest.split(['/', '?', '#']).next()?;
     if host.is_empty() || host.contains(char::is_whitespace) {
         return None;
@@ -382,9 +379,14 @@ mod tests {
         assert!(text.contains(
             "url https://unidata-nexrad-level2.s3.amazonaws.com?list-type=2&prefix=2026"
         ));
+        assert!(text.contains(
+            "url https://unidata-nexrad-level2.s3.amazonaws.com/2026/11/13/KTWX/KTWX20261113_000000_V06"
+        ));
         assert!(text.contains("credit NOAA NEXRAD, distributed by Unidata"));
         assert!(text.contains("licence US Government work, public domain"));
-        assert!(text.contains("licence_url "));
+        assert!(text.contains("licence_url https://www.usa.gov/government-copyright"));
+        assert!(text.contains("cache network"));
+        assert!(text.contains("cache cache"));
         Ok(())
     }
 
@@ -419,6 +421,8 @@ mod tests {
         assert!(text.contains("tile z4 x3 y7"));
         assert!(text.contains("tile z4 x4 y7"));
         assert!(text.contains("operation tile"));
+        assert!(text.contains("url https://tiles.openfreemap.org/planet/latest/4/3/7.pbf"));
+        assert!(text.contains("url https://tiles.openfreemap.org/planet/latest/4/4/7.pbf"));
         assert!(text.contains("credit OpenFreeMap, OpenMapTiles, OpenStreetMap contributors"));
         assert!(text.contains("licence OpenStreetMap data, ODbL 1.0"));
         assert!(text.contains("licence_url https://www.openstreetmap.org/copyright"));
@@ -476,7 +480,9 @@ mod tests {
         );
         assert!(text.contains("credit Weather data by RainViewer"));
         assert!(text.contains("licence RainViewer free terms, attribution required"));
-        assert!(text.contains("licence_url "));
+        assert!(text.contains("licence_url https://www.rainviewer.com/api.html"));
+        assert!(text.contains("cache cache"));
+        assert!(text.contains("cache network"));
         Ok(())
     }
 

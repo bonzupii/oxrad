@@ -141,10 +141,10 @@ configuration file; with no saved site the picker opens.
   --print-config      Print the effective configuration and exit
   --prune-cache       Enforce the configured cache budget and exit
   --sources           Print the open-source inventory and exit
-  --fetch-source ID   Fetch the source's first endpoint twice through the
-                      request engine, parse it with the rail's parser, and
-                      print the value, units, station, product, observation
-                      time and request provenance
+  --fetch-source ID   Fetch the source's first endpoint twice, or a composite
+                      rail's full request set, parse it with the rail's
+                      parser, and print the value, units, station, product,
+                      observation time and every request's provenance
   --value NAME=VALUE  Supply one endpoint placeholder to --fetch-source;
                       repeatable
   -h, --help          Show this message";
@@ -292,6 +292,9 @@ fn fetch_source(config: &config::Config, id: &str, values: &[(String, String)]) 
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect();
+    if probe::is_composite(source.id.as_str()) {
+        return fetch_composite(source, &acquire, &borrowed);
+    }
     let spec = match engine::RequestSpec::for_operation(source, operation.operation, &borrowed) {
         Ok(spec) => spec,
         Err(error) => {
@@ -339,6 +342,42 @@ fn fetch_source(config: &config::Config, id: &str, values: &[(String, String)]) 
     }
     report_provenance(&acquire);
     ExitCode::SUCCESS
+}
+
+/// Drives a composite rail through its full request set, prints parsed values
+/// and every request, and writes the raw list to the cache directory.
+fn fetch_composite(
+    source: &'static sources::Source,
+    acquire: &acquire::Acquire,
+    values: &[(&str, &str)],
+) -> ExitCode {
+    let run = match probe::live(source, acquire, values) {
+        Ok(run) => run,
+        Err(error) => {
+            eprintln!("Composite observation failed: {error}");
+            report_provenance(acquire);
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("{}", run.parsed.render());
+    println!();
+    println!("{}", run.requests.text());
+    let exported = match run.requests.write() {
+        Ok(path) => {
+            println!("request list: {}", path.display());
+            true
+        }
+        Err(error) => {
+            eprintln!("The request list could not be written: {error}");
+            false
+        }
+    };
+    report_provenance(acquire);
+    if exported {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 fn report_provenance(acquire: &acquire::Acquire) {
