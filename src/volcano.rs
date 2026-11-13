@@ -31,7 +31,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 
-use crate::provider::{self, JsonError};
+use crate::acquire::Acquire;
+use crate::provider::FetchError;
+use crate::sources;
 
 /// The provider, in the words the rail uses.
 pub const SOURCE: &str = "USGS Volcano Hazards Program";
@@ -184,7 +186,7 @@ impl Report {
 /// Why a volcano report could not be read.
 #[derive(Debug)]
 pub enum VolcanoError {
-    Provider { source: JsonError },
+    Provider { source: FetchError },
     Shape { detail: &'static str },
     WorkerStopped,
 }
@@ -358,14 +360,19 @@ pub fn notice_url(notice_id: &str) -> String {
 }
 
 /// Fetches the raised volcanoes and follows each one up for its position.
-pub fn fetch() -> Result<Report, VolcanoError> {
-    let document = provider::get_json(list_url(), "application/json")
+pub fn fetch(acquire: &Acquire) -> Result<Report, VolcanoError> {
+    let document = acquire
+        .json(&sources::USGS_VOLCANO, list_url(), "application/json")
         .map_err(|source| VolcanoError::Provider { source })?;
     let notices = parse_list(&document)?;
     let not_followed = notices.len().saturating_sub(MAX_VOLCANOES);
     let mut volcanoes = Vec::with_capacity(notices.len().min(MAX_VOLCANOES));
     for notice in notices.into_iter().take(MAX_VOLCANOES) {
-        let mut place = match provider::get_json(&volcano_url(&notice.vnum), "application/json") {
+        let mut place = match acquire.json(
+            &sources::USGS_VOLCANO,
+            &volcano_url(&notice.vnum),
+            "application/json",
+        ) {
             Ok(document) => parse_volcano(&document)?,
             Err(_) => Place {
                 latitude: None,
@@ -377,8 +384,11 @@ pub fn fetch() -> Result<Report, VolcanoError> {
             },
         };
         if !notice.identifier.is_empty()
-            && let Ok(document) =
-                provider::get_json(&notice_url(&notice.identifier), "application/json")
+            && let Ok(document) = acquire.json(
+                &sources::USGS_VOLCANO,
+                &notice_url(&notice.identifier),
+                "application/json",
+            )
         {
             place.summary = parse_synopsis(&document);
         }
@@ -418,12 +428,12 @@ pub struct VolcanoFeed {
 }
 
 impl VolcanoFeed {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         let (requests, request_receiver) = mpsc::channel::<VolcanoRequest>();
         let (event_sender, events) = mpsc::channel::<VolcanoEvent>();
         std::thread::spawn(move || {
             while let Ok(request) = request_receiver.recv() {
-                let event = match fetch() {
+                let event = match fetch(&acquire) {
                     Ok(report) => VolcanoEvent::Ready {
                         generation: request.generation,
                         report,
@@ -510,9 +520,9 @@ pub struct VolcanoView {
 }
 
 impl VolcanoView {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         Self {
-            feed: VolcanoFeed::new(),
+            feed: VolcanoFeed::new(acquire),
             state: VolcanoState::Idle,
             generation: 0,
         }

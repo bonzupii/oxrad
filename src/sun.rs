@@ -21,8 +21,10 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, RichText};
 use serde_json::Value;
 
-use crate::provider::{self, JsonError};
+use crate::acquire::Acquire;
+use crate::provider::{self, FetchError};
 use crate::retry;
+use crate::sources;
 use crate::theme;
 use crate::time;
 
@@ -40,34 +42,34 @@ struct SunRecord {
     solar_noon: Option<String>,
 }
 
-fn required_text<'a>(document: &'a Value, key: &'static str) -> Result<&'a str, JsonError> {
+fn required_text<'a>(document: &'a Value, key: &'static str) -> Result<&'a str, FetchError> {
     document
         .get(key)
         .and_then(Value::as_str)
         .filter(|text| !text.is_empty())
-        .ok_or_else(|| JsonError::Shape {
+        .ok_or_else(|| FetchError::Shape {
             url: String::from(BASE),
             field: key,
         })
 }
 
-fn event(document: &Value, key: &'static str) -> Result<Option<String>, JsonError> {
+fn event(document: &Value, key: &'static str) -> Result<Option<String>, FetchError> {
     match document.get(key) {
         Some(Value::Null) => Ok(None),
         Some(Value::String(text)) if time::parse_iso_utc(text).is_some() => Ok(Some(text.clone())),
-        Some(_) | None => Err(JsonError::Shape {
+        Some(_) | None => Err(FetchError::Shape {
             url: String::from(BASE),
             field: key,
         }),
     }
 }
 
-fn parse(document: &Value) -> Result<SunRecord, JsonError> {
+fn parse(document: &Value) -> Result<SunRecord, FetchError> {
     let latitude = document
         .get("lat")
         .and_then(Value::as_f64)
         .filter(|value| (-90.0..=90.0).contains(value))
-        .ok_or_else(|| JsonError::Shape {
+        .ok_or_else(|| FetchError::Shape {
             url: String::from(BASE),
             field: "latitude",
         })?;
@@ -75,13 +77,13 @@ fn parse(document: &Value) -> Result<SunRecord, JsonError> {
         .get("lng")
         .and_then(Value::as_f64)
         .filter(|value| (-180.0..=180.0).contains(value))
-        .ok_or_else(|| JsonError::Shape {
+        .ok_or_else(|| FetchError::Shape {
             url: String::from(BASE),
             field: "longitude",
         })?;
     let status = required_text(document, "sun_status")?;
     if !matches!(status, "normal" | "midnight_sun" | "polar_night") {
-        return Err(JsonError::Shape {
+        return Err(FetchError::Shape {
             url: String::from(BASE),
             field: "sun_status",
         });
@@ -98,23 +100,25 @@ fn parse(document: &Value) -> Result<SunRecord, JsonError> {
     })
 }
 
-fn fetch(latitude: f64, longitude: f64) -> Result<SunRecord, JsonError> {
+fn fetch(acquire: &Acquire, latitude: f64, longitude: f64) -> Result<SunRecord, FetchError> {
     let url = format!("{BASE}?lat={latitude:.4}&lng={longitude:.4}");
-    let document = provider::get_json(&url, "application/json")?;
+    let document = acquire.json(&sources::SUNRISE_SUNSET, &url, "application/json")?;
     parse(&document)
 }
 
 /// User-initiated solar event requests and their last successful result.
 pub struct SunView {
-    request: Option<Receiver<Result<SunRecord, JsonError>>>,
+    acquire: Acquire,
+    request: Option<Receiver<Result<SunRecord, FetchError>>>,
     record: Option<SunRecord>,
-    error: Option<JsonError>,
+    error: Option<FetchError>,
     retry_at: Option<Instant>,
 }
 
 impl SunView {
-    pub const fn new() -> Self {
+    pub const fn new(acquire: Acquire) -> Self {
         Self {
+            acquire,
             request: None,
             record: None,
             error: None,
@@ -129,7 +133,7 @@ impl SunView {
         let result = match receiver.try_recv() {
             Ok(result) => result,
             Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => Err(JsonError::WorkerStopped),
+            Err(TryRecvError::Disconnected) => Err(FetchError::WorkerStopped),
         };
         self.request = None;
         match result {
@@ -151,7 +155,8 @@ impl SunView {
 
     fn start(&mut self, latitude: f64, longitude: f64) {
         let (sender, receiver) = mpsc::channel();
-        std::thread::spawn(move || sender.send(fetch(latitude, longitude)).is_ok());
+        let acquire = self.acquire.clone();
+        std::thread::spawn(move || sender.send(fetch(&acquire, latitude, longitude)).is_ok());
         self.request = Some(receiver);
         self.error = None;
     }
@@ -239,7 +244,7 @@ mod tests {
     }
 
     #[test]
-    fn events_are_independently_nullable() -> Result<(), JsonError> {
+    fn events_are_independently_nullable() -> Result<(), FetchError> {
         let record = parse(&document())?;
         assert_eq!(record.sunrise.as_deref(), Some("2026-06-20T01:00:00+02:00"));
         assert_eq!(record.sunset, None);
@@ -253,7 +258,7 @@ mod tests {
         value["sunrise"] = serde_json::json!("not a timestamp");
         assert!(matches!(
             parse(&value),
-            Err(JsonError::Shape {
+            Err(FetchError::Shape {
                 field: "sunrise",
                 ..
             })
@@ -266,7 +271,7 @@ mod tests {
         value["sun_status"] = serde_json::json!("unknown");
         assert!(matches!(
             parse(&value),
-            Err(JsonError::Shape {
+            Err(FetchError::Shape {
                 field: "sun_status",
                 ..
             })

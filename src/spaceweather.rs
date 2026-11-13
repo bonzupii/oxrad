@@ -28,7 +28,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::provider::{self, JsonError};
+use crate::acquire::Acquire;
+use crate::provider::FetchError;
+use crate::sources;
 use crate::time;
 
 /// The provider, in the words the rail uses.
@@ -42,7 +44,7 @@ const REQUEST_EVERY: Duration = Duration::from_secs(600);
 /// Why the space-weather record could not be read.
 #[derive(Debug)]
 pub enum SpaceWeatherError {
-    Provider { source: JsonError },
+    Provider { source: FetchError },
     Shape { detail: &'static str },
     WorkerStopped,
 }
@@ -277,11 +279,12 @@ pub fn parse_wind(speed: &Value, magnetic: &Value) -> Result<SolarWind, SpaceWea
 
 /// Fetches the whole record. The Kp index is required; a missing wind is
 /// reported as a note beside it rather than taking the record down.
-pub fn fetch() -> Result<SpaceWeather, SpaceWeatherError> {
-    let kp_document = provider::get_json(KP_URL, "application/json")
+pub fn fetch(acquire: &Acquire) -> Result<SpaceWeather, SpaceWeatherError> {
+    let kp_document = acquire
+        .json(&sources::NOAA_SWPC, KP_URL, "application/json")
         .map_err(|source| SpaceWeatherError::Provider { source })?;
     let points = parse_kp(&kp_document)?;
-    let (wind, wind_note) = match fetch_wind() {
+    let (wind, wind_note) = match fetch_wind(acquire) {
         Ok(wind) => (Some(wind), None),
         Err(error) => (None, Some(format!("{error}"))),
     };
@@ -292,10 +295,12 @@ pub fn fetch() -> Result<SpaceWeather, SpaceWeatherError> {
     })
 }
 
-fn fetch_wind() -> Result<SolarWind, SpaceWeatherError> {
-    let speed = provider::get_json(WIND_URL, "application/json")
+fn fetch_wind(acquire: &Acquire) -> Result<SolarWind, SpaceWeatherError> {
+    let speed = acquire
+        .json(&sources::NOAA_SWPC, WIND_URL, "application/json")
         .map_err(|source| SpaceWeatherError::Provider { source })?;
-    let magnetic = provider::get_json(MAG_URL, "application/json")
+    let magnetic = acquire
+        .json(&sources::NOAA_SWPC, MAG_URL, "application/json")
         .map_err(|source| SpaceWeatherError::Provider { source })?;
     parse_wind(&speed, &magnetic)
 }
@@ -321,12 +326,12 @@ pub struct SpaceWeatherFeed {
 }
 
 impl SpaceWeatherFeed {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         let (requests, request_receiver) = mpsc::channel::<u64>();
         let (event_sender, events) = mpsc::channel::<SpaceWeatherEvent>();
         std::thread::spawn(move || {
             while let Ok(generation) = request_receiver.recv() {
-                let event = match fetch() {
+                let event = match fetch(&acquire) {
                     Ok(record) => SpaceWeatherEvent::Ready { generation, record },
                     Err(error) => SpaceWeatherEvent::Failed { generation, error },
                 };
@@ -406,9 +411,9 @@ pub struct SpaceWeatherView {
 }
 
 impl SpaceWeatherView {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         Self {
-            feed: SpaceWeatherFeed::new(),
+            feed: SpaceWeatherFeed::new(acquire),
             state: SpaceWeatherState::Idle,
             generation: 0,
             next_request: None,

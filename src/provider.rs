@@ -13,33 +13,20 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
-//! HTTPS JSON access for the place and forecast providers.
+//! Provider failures, query encoding and timestamp labels.
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::time::Duration;
 
-use serde_json::Value;
+use crate::sources::SourceId;
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long a connection attempt to one address may take.
-///
-/// A dual-stack host answers with an IPv6 address first, and a machine with no
-/// IPv6 route would otherwise sit on that dead address until the operating
-/// system gives up: ten seconds or more for a request that a working address
-/// answers in a tenth of one. A short connect budget makes the resolver's
-/// next address win quickly instead.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-const MAX_BODY_BYTES: u64 = 4 * 1024 * 1024;
-const USER_AGENT: &str = concat!(
-    "oxrad/",
-    env!("CARGO_PKG_VERSION"),
-    " (https://github.com/bonzupii/oxrad)"
-);
-
-/// A provider request that did not produce JSON.
+/// A provider request that did not produce a document.
 #[derive(Debug)]
-pub enum JsonError {
+pub enum FetchError {
+    /// The effective configuration does not enable this source.
+    Disabled {
+        id: SourceId,
+    },
     Request {
         url: String,
         source: ureq::Error,
@@ -64,7 +51,7 @@ pub enum JsonError {
     WorkerStopped,
 }
 
-impl JsonError {
+impl FetchError {
     /// Whether trying the same request again may succeed.
     pub const fn is_transient(&self) -> bool {
         matches!(
@@ -105,6 +92,10 @@ impl JsonError {
 
     fn message(&self) -> String {
         match self {
+            Self::Disabled { id } => format!(
+                "{} is not enabled in this configuration, so it was not requested.",
+                id.as_str()
+            ),
             Self::Request { url, source } => {
                 format!("The request to {url} failed: {source}")
             }
@@ -130,105 +121,23 @@ impl JsonError {
     }
 }
 
-impl Display for JsonError {
+impl Display for FetchError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.message())
     }
 }
 
-impl Error for JsonError {
+impl Error for FetchError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Request { source, .. } | Self::Body { source, .. } => Some(source),
             Self::Json { source, .. } => Some(source),
-            Self::Status { .. } | Self::Shape { .. } | Self::WorkerStopped => None,
+            Self::Disabled { .. }
+            | Self::Status { .. }
+            | Self::Shape { .. }
+            | Self::WorkerStopped => None,
         }
     }
-}
-
-/// Fetches a binary document, such as an imagery tile.
-///
-/// A failed status is a failure, never a body: an error page must not be
-/// decoded as though it were an image.
-pub fn get_bytes(url: &str, accept: &str, limit: u64) -> Result<Vec<u8>, JsonError> {
-    fetch(url, accept, limit)
-}
-
-/// Fetches a document that is not JSON, such as a comma-separated index, and
-/// returns it as text. A body that is not UTF-8 is a shape failure, not a
-/// document to read.
-pub fn get_text(url: &str, accept: &str) -> Result<String, JsonError> {
-    let body = fetch(url, accept, MAX_BODY_BYTES)?;
-    String::from_utf8(body).map_err(|_| JsonError::Shape {
-        url: String::from(url),
-        field: "a body written as text",
-    })
-}
-
-/// Fetches a JSON document within a stated time, for a query whose answer is
-/// known to be heavy.
-pub fn get_json_within(url: &str, accept: &str, timeout: Duration) -> Result<Value, JsonError> {
-    let body = fetch_within(url, accept, MAX_BODY_BYTES, timeout)?;
-    serde_json::from_slice(&body).map_err(|source| JsonError::Json {
-        url: String::from(url),
-        source,
-    })
-}
-
-/// Fetches a JSON document, failing on a non-success status rather than
-/// returning the provider's error page as data.
-pub fn get_json(url: &str, accept: &str) -> Result<Value, JsonError> {
-    let body = fetch(url, accept, MAX_BODY_BYTES)?;
-    serde_json::from_slice(&body).map_err(|source| JsonError::Json {
-        url: String::from(url),
-        source,
-    })
-}
-
-fn fetch(url: &str, accept: &str, limit: u64) -> Result<Vec<u8>, JsonError> {
-    fetch_within(url, accept, limit, REQUEST_TIMEOUT)
-}
-
-fn fetch_within(
-    url: &str,
-    accept: &str,
-    limit: u64,
-    timeout: Duration,
-) -> Result<Vec<u8>, JsonError> {
-    let mut response = ureq::get(url)
-        .header("User-Agent", USER_AGENT)
-        .header("Accept", accept)
-        .config()
-        .timeout_global(Some(timeout))
-        .timeout_connect(Some(CONNECT_TIMEOUT))
-        .http_status_as_error(false)
-        .build()
-        .call()
-        .map_err(|source| JsonError::Request {
-            url: String::from(url),
-            source,
-        })?;
-    let status = response.status().as_u16();
-    if !(200..300).contains(&status) {
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned());
-        return Err(JsonError::Status {
-            url: String::from(url),
-            status,
-            retry_after,
-        });
-    }
-    response
-        .body_mut()
-        .with_config()
-        .limit(limit)
-        .read_to_vec()
-        .map_err(|source| JsonError::Body {
-            url: String::from(url),
-            source,
-        })
 }
 
 /// Percent-encodes a query value, keeping only unreserved characters.
@@ -308,5 +217,12 @@ mod tests {
             "2026-10-30 11:45 UTC"
         );
         assert_eq!(timestamp_label("soon"), "soon");
+    }
+
+    #[test]
+    fn a_disabled_source_is_not_transient() {
+        let id = crate::sources::NIFC_WFIGS.id;
+        assert!(!FetchError::Disabled { id }.is_transient());
+        assert!(!FetchError::Disabled { id }.is_missing());
     }
 }

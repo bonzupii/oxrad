@@ -28,7 +28,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 
-use crate::provider::{self, JsonError};
+use crate::acquire::Acquire;
+use crate::provider::FetchError;
+use crate::sources;
 use crate::time;
 
 /// The provider, in the words the rail uses.
@@ -117,7 +119,7 @@ impl SeaState {
 /// Why a marine record could not be read.
 #[derive(Debug)]
 pub enum OceanError {
-    Provider { source: JsonError },
+    Provider { source: FetchError },
     Shape { detail: &'static str },
     WorkerStopped,
 }
@@ -344,8 +346,13 @@ pub fn request_url(latitude: f64, longitude: f64) -> String {
 }
 
 /// Fetches the marine forecast for one point.
-pub fn fetch(latitude: f64, longitude: f64) -> Result<Ocean, OceanError> {
-    let document = provider::get_json(&request_url(latitude, longitude), "application/json")
+pub fn fetch(acquire: &Acquire, latitude: f64, longitude: f64) -> Result<Ocean, OceanError> {
+    let document = acquire
+        .json(
+            &sources::OPEN_METEO_MARINE,
+            &request_url(latitude, longitude),
+            "application/json",
+        )
         .map_err(|source| OceanError::Provider { source })?;
     parse(&document)
 }
@@ -374,12 +381,12 @@ pub struct OceanFeed {
 }
 
 impl OceanFeed {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         let (requests, request_receiver) = mpsc::channel::<OceanRequest>();
         let (event_sender, events) = mpsc::channel::<OceanEvent>();
         std::thread::spawn(move || {
             while let Ok(request) = request_receiver.recv() {
-                let event = match fetch(request.latitude, request.longitude) {
+                let event = match fetch(&acquire, request.latitude, request.longitude) {
                     Ok(record) => OceanEvent::Ready {
                         generation: request.generation,
                         record,
@@ -466,9 +473,9 @@ pub struct OceanView {
 }
 
 impl OceanView {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         Self {
-            feed: OceanFeed::new(),
+            feed: OceanFeed::new(acquire),
             state: OceanState::Idle,
             generation: 0,
         }

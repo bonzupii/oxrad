@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Stroke};
 
+use crate::acquire::Acquire;
 use crate::app::toggle_button;
 use crate::environment::{
     self, CapeCategory, Environment, EnvironmentHour, EnvironmentState, EnvironmentView,
@@ -46,9 +47,9 @@ pub struct EnvironmentLayer {
 }
 
 impl EnvironmentLayer {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         Self {
-            view: EnvironmentView::new(),
+            view: EnvironmentView::new(acquire),
             shown: false,
             asked: None,
             asked_at: None,
@@ -502,7 +503,7 @@ mod tests {
 
     #[test]
     fn a_new_layer_is_off() {
-        let layer = EnvironmentLayer::new();
+        let layer = EnvironmentLayer::new(Acquire::offline());
         assert!(!layer.shown);
         assert!(matches!(layer.view.state(), EnvironmentState::Idle));
     }

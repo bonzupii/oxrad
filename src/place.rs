@@ -26,9 +26,11 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use crate::acquire::Acquire;
 use crate::error::CoordinateError;
 use crate::projection;
-use crate::provider::{self, JsonError};
+use crate::provider::{self, FetchError};
+use crate::sources;
 use crate::stations::Station;
 
 const PHOTON_SEARCH: &str = "https://photon.komoot.io/api/";
@@ -226,7 +228,7 @@ fn address_field(address: &Value, keys: &[&str]) -> Option<String> {
     None
 }
 
-fn parse_feature(feature: &Value, url: &str) -> Result<Option<Place>, JsonError> {
+fn parse_feature(feature: &Value, url: &str) -> Result<Option<Place>, FetchError> {
     let Some(properties) = feature.get("properties") else {
         return Ok(None);
     };
@@ -258,17 +260,17 @@ fn parse_feature(feature: &Value, url: &str) -> Result<Option<Place>, JsonError>
     if let Some(administrative_region) = address_field(properties, &["state", "county"]) {
         region = administrative_region;
     }
-    let country = text_field(properties, "country").ok_or_else(|| JsonError::Shape {
+    let country = text_field(properties, "country").ok_or_else(|| FetchError::Shape {
         url: String::from(url),
         field: "place country",
     })?;
-    let country_code = text_field(properties, "countrycode").ok_or_else(|| JsonError::Shape {
+    let country_code = text_field(properties, "countrycode").ok_or_else(|| FetchError::Shape {
         url: String::from(url),
         field: "place country code",
     })?;
     Place::new(&name, &region, &country, &country_code, lat, lon)
         .map(Some)
-        .map_err(|source| JsonError::Shape {
+        .map_err(|source| FetchError::Shape {
             url: String::from(url),
             field: match source {
                 PlaceError::Name => "place name",
@@ -286,19 +288,19 @@ fn parse_feature(feature: &Value, url: &str) -> Result<Option<Place>, JsonError>
 /// adjacent transposition of the query is retried (for example `cihcago` for
 /// `chicago`). The original answer is kept if the correction does not produce
 /// a closer match, so a failed retry never hides usable results.
-pub fn search(query: &str) -> Result<Vec<Place>, JsonError> {
+pub fn search(acquire: &Acquire, query: &str) -> Result<Vec<Place>, FetchError> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return Ok(Vec::new());
     }
-    let places = fetch_places(trimmed)?;
+    let places = fetch_places(acquire, trimmed)?;
     if places.iter().any(|place| match_rank(place, trimmed) <= 2) {
         return Ok(places);
     }
     let Some(corrected) = first_inversion_variant(trimmed) else {
         return Ok(places);
     };
-    let Ok(mut corrected_places) = fetch_places(&corrected) else {
+    let Ok(mut corrected_places) = fetch_places(acquire, &corrected) else {
         return Ok(places);
     };
     if corrected_places
@@ -312,21 +314,25 @@ pub fn search(query: &str) -> Result<Vec<Place>, JsonError> {
     }
 }
 
-fn fetch_places(query: &str) -> Result<Vec<Place>, JsonError> {
+fn fetch_places(acquire: &Acquire, query: &str) -> Result<Vec<Place>, FetchError> {
     let url = format!(
         "{PHOTON_SEARCH}?q={}&limit={SEARCH_LIMIT}",
         provider::encode_query(query)
     );
-    let document = provider::get_json(&url, "application/json")?;
+    let document = acquire.json(&sources::PHOTON, &url, "application/json")?;
     places_from_document(&document, &url, query)
 }
 
 /// Parses and ranks a Photon feature collection for one query.
-fn places_from_document(document: &Value, url: &str, query: &str) -> Result<Vec<Place>, JsonError> {
+fn places_from_document(
+    document: &Value,
+    url: &str,
+    query: &str,
+) -> Result<Vec<Place>, FetchError> {
     let features = document
         .get("features")
         .and_then(Value::as_array)
-        .ok_or_else(|| JsonError::Shape {
+        .ok_or_else(|| FetchError::Shape {
             url: String::from(url),
             field: "place results",
         })?;
@@ -396,7 +402,7 @@ pub enum SearchState {
     Idle,
     Working { query: String },
     Ready { places: Vec<Place> },
-    Failed { query: String, error: JsonError },
+    Failed { query: String, error: FetchError },
 }
 
 pub struct SearchInteraction {
@@ -408,10 +414,10 @@ pub struct SearchInteraction {
 }
 
 impl SearchInteraction {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         Self {
             query: String::new(),
-            feed: PlaceSearch::new(),
+            feed: PlaceSearch::new(acquire),
             state: SearchState::Idle,
             due: None,
             last_query: String::new(),
@@ -494,7 +500,7 @@ struct SearchMessage {
 #[derive(Debug)]
 pub enum SearchOutcome {
     Results { places: Vec<Place> },
-    Failed { query: String, error: JsonError },
+    Failed { query: String, error: FetchError },
 }
 
 /// Runs place searches off the UI thread, one at a time.
@@ -512,7 +518,7 @@ pub struct PlaceSearch {
 }
 
 impl PlaceSearch {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         let (requests, request_receiver) = mpsc::channel::<SearchRequest>();
         let (result_sender, results) = mpsc::channel::<SearchMessage>();
         std::thread::spawn(move || {
@@ -539,7 +545,7 @@ impl PlaceSearch {
                         std::thread::sleep(policy - elapsed);
                     }
                 }
-                let outcome = match search(&request.query) {
+                let outcome = match search(&acquire, &request.query) {
                     Ok(places) => SearchOutcome::Results { places },
                     Err(error) => SearchOutcome::Failed {
                         query: request.query,
@@ -568,7 +574,7 @@ impl PlaceSearch {
         }
     }
 
-    pub fn start(&mut self, query: String) -> Result<(), JsonError> {
+    pub fn start(&mut self, query: String) -> Result<(), FetchError> {
         self.generation = self.generation.wrapping_add(1);
         self.latest_query = query.clone();
         let request = SearchRequest {
@@ -577,7 +583,7 @@ impl PlaceSearch {
         };
         if self.requests.send(request).is_err() {
             self.stopped = true;
-            return Err(JsonError::WorkerStopped);
+            return Err(FetchError::WorkerStopped);
         }
         Ok(())
     }
@@ -604,7 +610,7 @@ impl PlaceSearch {
                     self.stopped = true;
                     return Some(SearchOutcome::Failed {
                         query: self.latest_query.clone(),
-                        error: JsonError::WorkerStopped,
+                        error: FetchError::WorkerStopped,
                     });
                 }
             }
@@ -711,7 +717,7 @@ mod tests {
 
     #[test]
     fn cancelling_invalidates_a_pending_search_generation() {
-        let mut search = PlaceSearch::new();
+        let mut search = PlaceSearch::new(Acquire::offline());
         let generation = search.generation;
         search.cancel();
         assert_ne!(search.generation, generation);
@@ -826,7 +832,7 @@ mod tests {
         });
         assert!(matches!(
             parse_feature(&feature, "https://example.invalid"),
-            Err(JsonError::Shape {
+            Err(FetchError::Shape {
                 field: "place country code",
                 ..
             })

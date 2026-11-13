@@ -19,6 +19,7 @@ use std::collections::hash_map::RandomState;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
+use crate::acquire::Acquire;
 use crate::cache::CacheError;
 use crate::error::RadarError;
 use crate::network;
@@ -148,7 +149,7 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
-    pub fn start(site: SiteId) -> Self {
+    pub fn start(site: SiteId, acquire: Acquire) -> Self {
         let (events, event_receiver) = mpsc::channel();
         let (retry, retries) = mpsc::channel();
         let (jobs, decode_jobs) = mpsc::channel();
@@ -166,6 +167,7 @@ impl Pipeline {
         std::thread::spawn(move || {
             Fetcher {
                 site: fetch_site,
+                acquire,
                 events,
                 retries,
                 jobs,
@@ -338,12 +340,13 @@ fn decode_failure(site: &SiteId) -> FetchFailure {
 
 fn fetch(
     state: &mut FetchState,
+    acquire: &Acquire,
     site: &SiteId,
     events: &Sender<Event>,
     jobs: &Sender<Archive>,
     results: &Receiver<Result<RadarVolume, RadarError>>,
 ) -> Result<Option<Fetched>, FetchFailure> {
-    let key = network::latest_volume_key(site).map_err(|error| FetchFailure {
+    let key = network::latest_volume_key(acquire, site).map_err(|error| FetchFailure {
         operation: Operation::Fetching,
         error,
         cache_warning: None,
@@ -357,7 +360,7 @@ fn fetch(
         state.failed_key = None;
         state.decode_failures = 0;
     }
-    let archive = network::fetch_archive_cached(&key).map_err(|error| {
+    let archive = network::fetch_archive_cached(acquire, &key).map_err(|error| {
         if matches!(error, RadarError::VolumeGone { .. }) {
             state.last_key = None;
         }
@@ -432,6 +435,7 @@ fn wait_for_retry(retries: &Receiver<()>, timeout: Duration) -> WaitOutcome {
 
 struct Fetcher {
     site: SiteId,
+    acquire: Acquire,
     events: Sender<Event>,
     retries: Receiver<()>,
     jobs: Sender<Archive>,
@@ -444,6 +448,7 @@ impl Fetcher {
         loop {
             let Self {
                 site,
+                acquire,
                 events,
                 retries,
                 jobs,
@@ -453,7 +458,7 @@ impl Fetcher {
             if events.send(Event::Working(Operation::Fetching)).is_err() {
                 return;
             }
-            let update = match fetch(state, site, events, jobs, results) {
+            let update = match fetch(state, acquire, site, events, jobs, results) {
                 Ok(Some(fetched)) => {
                     state.last_key = Some(fetched.key);
                     state.reset_retry();

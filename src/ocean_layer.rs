@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Stroke};
 
+use crate::acquire::Acquire;
 use crate::app::toggle_button;
 use crate::map::MapView;
 use crate::ocean::{self, Ocean, OceanState, OceanView, SeaState};
@@ -44,9 +45,9 @@ pub struct OceanLayer {
 }
 
 impl OceanLayer {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         Self {
-            view: OceanView::new(),
+            view: OceanView::new(acquire),
             shown: false,
             asked: None,
             asked_at: None,
@@ -507,7 +508,7 @@ mod tests {
 
     #[test]
     fn a_new_layer_is_off() {
-        let layer = OceanLayer::new();
+        let layer = OceanLayer::new(Acquire::offline());
         assert!(!layer.shown);
         assert!(matches!(layer.view.state(), OceanState::Idle));
     }

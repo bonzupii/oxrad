@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Stroke};
 
+use crate::acquire::Acquire;
 use crate::app::toggle_button;
 use crate::hydro::{self, Discharge, HydroState, HydroView};
 use crate::map::MapView;
@@ -42,9 +43,9 @@ pub struct HydroLayer {
 }
 
 impl HydroLayer {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         Self {
-            view: HydroView::new(),
+            view: HydroView::new(acquire),
             shown: false,
             ensemble: false,
             asked: None,
@@ -621,7 +622,7 @@ mod tests {
 
     #[test]
     fn a_new_layer_is_off_and_has_asked_nothing() {
-        let layer = HydroLayer::new();
+        let layer = HydroLayer::new(Acquire::offline());
         assert!(!layer.shown);
         assert!(layer.asked.is_none());
         assert!(matches!(layer.view.state(), HydroState::Idle));

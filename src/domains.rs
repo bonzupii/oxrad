@@ -25,6 +25,7 @@ use std::time::Instant;
 
 use eframe::egui::{self, Painter, Rect};
 
+use crate::acquire::Acquire;
 use crate::climate_layer::ClimateLayer;
 use crate::cyclone::StormList;
 use crate::cyclone_layer::CycloneLayer;
@@ -74,25 +75,25 @@ pub struct Domains {
 }
 
 impl Domains {
-    pub fn new() -> Self {
+    pub fn new(acquire: &Acquire) -> Self {
         Self {
-            satellite: SatelliteLayer::new(),
-            hydro: HydroLayer::new(),
-            space_weather: SpaceWeatherLayer::new(),
-            sun: SunView::new(),
-            air: AirLayer::new(),
-            climate: ClimateLayer::new(),
-            fires: FireLayer::new(),
-            environment: EnvironmentLayer::new(),
-            ocean: OceanLayer::new(),
-            stations_reported: ObservationLayer::new(),
-            snowpack: SnowLayer::new(),
-            profile: SoundingLayer::new(),
-            sea_ice: SeaIceLayer::new(),
-            land_surface: LandLayer::new(),
-            volcanoes: VolcanoLayer::new(),
-            gauges: GaugeLayer::new(),
-            cyclones: CycloneLayer::new(),
+            satellite: SatelliteLayer::new(acquire.clone()),
+            hydro: HydroLayer::new(acquire.clone()),
+            space_weather: SpaceWeatherLayer::new(acquire.clone()),
+            sun: SunView::new(acquire.clone()),
+            air: AirLayer::new(acquire.clone()),
+            climate: ClimateLayer::new(acquire.clone()),
+            fires: FireLayer::new(acquire.clone()),
+            environment: EnvironmentLayer::new(acquire.clone()),
+            ocean: OceanLayer::new(acquire.clone()),
+            stations_reported: ObservationLayer::new(acquire.clone()),
+            snowpack: SnowLayer::new(acquire.clone()),
+            profile: SoundingLayer::new(acquire.clone()),
+            sea_ice: SeaIceLayer::new(acquire.clone()),
+            land_surface: LandLayer::new(acquire.clone()),
+            volcanoes: VolcanoLayer::new(acquire.clone()),
+            gauges: GaugeLayer::new(acquire.clone()),
+            cyclones: CycloneLayer::new(acquire.clone()),
         }
     }
 
@@ -249,7 +250,7 @@ mod tests {
 
     #[test]
     fn a_new_domain_set_holds_nothing_yet() {
-        let domains = Domains::new();
+        let domains = Domains::new(&Acquire::offline());
         assert!(domains.stations().is_none());
         assert!(domains.air().is_none());
         assert!(domains.space().is_none());

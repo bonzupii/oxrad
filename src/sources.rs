@@ -656,6 +656,38 @@ pub const NIFC_WFIGS: Source = Source {
     level: Level::Parsed,
 };
 
+/// Arctic and Antarctic sea-ice extent.
+pub const NSIDC_SEA_ICE: Source = Source {
+    id: SourceId::new("nsidc-sea-ice"),
+    name: "NSIDC Sea Ice Index",
+    domain: Domain::Ocean,
+    coverage: Coverage::Global,
+    home: "https://nsidc.org/data/g02135",
+    endpoint: "https://noaadata.apps.nsidc.org",
+    format: Format::Binary,
+    licence: Some(US_GOVERNMENT),
+    credit: "NSIDC Sea Ice Index, National Snow and Ice Data Center",
+    refresh: Refresh::ProviderDefined,
+    cache: CachePermission::Permitted,
+    level: Level::Parsed,
+};
+
+/// United States volcano activity notices.
+pub const USGS_VOLCANO: Source = Source {
+    id: SourceId::new("usgs-volcano"),
+    name: "USGS Volcano Hazards Program",
+    domain: Domain::Volcano,
+    coverage: Coverage::Extent("United States volcanoes and territories"),
+    home: "https://volcanoes.usgs.gov",
+    endpoint: "https://volcanoes.usgs.gov",
+    format: Format::Json,
+    licence: Some(US_GOVERNMENT),
+    credit: "USGS Volcano Hazards Program",
+    refresh: Refresh::ProviderDefined,
+    cache: CachePermission::Permitted,
+    level: Level::Parsed,
+};
+
 // Candidates below have not had their terms verified against the provider.
 // `admits` rejects every one of them until a licence is recorded, so none can
 // reach the interface by accident.
@@ -809,6 +841,8 @@ pub const SOURCES: &[Source] = &[
     GDACS,
     AVIATION_WEATHER_METAR,
     NIFC_WFIGS,
+    NSIDC_SEA_ICE,
+    USGS_VOLCANO,
     DWD_OPEN_DATA,
     ECCC_GEOMET,
     BOM_RADAR,

@@ -5,6 +5,7 @@
 
 use std::time::{Duration, Instant};
 
+use crate::acquire::Acquire;
 use crate::overlay_select::retain_warning_selection;
 use crate::warnings::{Warning, WarningError, WarningEvent, WarningFeed};
 
@@ -42,9 +43,9 @@ pub struct WarningView {
 }
 
 impl WarningView {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         Self {
-            feed: WarningFeed::new(),
+            feed: WarningFeed::new(acquire),
             generation: 0,
             list: Vec::new(),
             without_geometry: 0,
@@ -170,7 +171,7 @@ mod tests {
 
     #[test]
     fn a_selection_that_left_the_set_is_cleared() -> Result<(), TestError> {
-        let mut view = WarningView::new();
+        let mut view = WarningView::new(Acquire::offline());
         view.list = vec![warning("alert-b", "Updated"), warning("alert-a", "Other")];
         view.selected = Some(String::from("alert-b"));
         assert!(view.selected_warning().is_some());

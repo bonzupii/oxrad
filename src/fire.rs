@@ -27,7 +27,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::provider::{self, JsonError};
+use crate::acquire::Acquire;
+use crate::provider::FetchError;
+use crate::sources;
 use crate::time;
 
 /// The provider, in the words the rail uses.
@@ -50,7 +52,7 @@ const RETRY_MAX: Duration = Duration::from_secs(60);
 /// Why a perimeter record could not be read.
 #[derive(Debug)]
 pub enum FireError {
-    Provider { source: JsonError },
+    Provider { source: FetchError },
     Shape { detail: &'static str },
     WorkerStopped,
 }
@@ -335,8 +337,9 @@ pub fn request_url() -> String {
 }
 
 /// Fetches every current perimeter.
-pub fn fetch() -> Result<FireSet, FireError> {
-    let document = provider::get_json(&request_url(), "application/json")
+pub fn fetch(acquire: &Acquire) -> Result<FireSet, FireError> {
+    let document = acquire
+        .json(&sources::NIFC_WFIGS, &request_url(), "application/json")
         .map_err(|source| FireError::Provider { source })?;
     parse(&document)
 }
@@ -363,12 +366,12 @@ pub struct FireFeed {
 }
 
 impl FireFeed {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         let (requests, request_receiver) = mpsc::channel::<FireRequest>();
         let (event_sender, events) = mpsc::channel::<FireEvent>();
         std::thread::spawn(move || {
             while let Ok(request) = request_receiver.recv() {
-                let event = match fetch() {
+                let event = match fetch(&acquire) {
                     Ok(set) => FireEvent::Ready {
                         generation: request.generation,
                         set,
@@ -455,9 +458,9 @@ pub struct FireView {
 }
 
 impl FireView {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         Self {
-            feed: FireFeed::new(),
+            feed: FireFeed::new(acquire),
             state: FireState::Idle,
             generation: 0,
         }

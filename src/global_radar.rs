@@ -27,9 +27,11 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use crate::acquire::Acquire;
 use crate::cache::Store;
 use crate::error::RadarError;
-use crate::network;
+use crate::provider::FetchError;
+use crate::sources;
 
 const ENDPOINT: &str = "https://api.rainviewer.com/public/weather-maps.json";
 const HOST_PREFIX: &str = "https://";
@@ -41,6 +43,8 @@ const MAX_CACHED_TILES: usize = 120;
 const MAX_VIEW_TILES: usize = 8;
 const MANIFEST_LIFETIME: Duration = Duration::from_secs(90);
 const EARTH_KM_PER_DEGREE: f64 = 111.32;
+const MAX_TILE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_MANIFEST_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Attribution required by the RainViewer public API terms, from the registry.
 pub const ATTRIBUTION: &str = crate::sources::RAINVIEWER.credit;
@@ -209,6 +213,14 @@ impl From<RadarError> for GlobalRadarError {
     }
 }
 
+impl From<FetchError> for GlobalRadarError {
+    fn from(source: FetchError) -> Self {
+        Self::Network {
+            source: RadarError::from(source),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ManifestSnapshot {
     host: String,
@@ -236,7 +248,7 @@ pub struct GlobalRadarFeed {
 }
 
 impl GlobalRadarFeed {
-    pub fn new(budget: crate::config::CachePolicy) -> Self {
+    pub fn new(budget: crate::config::CachePolicy, acquire: Acquire) -> Self {
         let (requests, request_receiver) = mpsc::channel::<RadarRequest>();
         let (event_sender, events) = mpsc::channel::<GlobalEvent>();
         std::thread::spawn(move || {
@@ -246,6 +258,7 @@ impl GlobalRadarFeed {
             };
             Worker {
                 requests: request_receiver,
+                acquire,
                 events: event_sender,
                 cached: None,
                 tiles: HashMap::new(),
@@ -316,6 +329,7 @@ impl GlobalRadarFeed {
 
 struct Worker {
     requests: Receiver<RadarRequest>,
+    acquire: Acquire,
     events: Sender<GlobalEvent>,
     cached: Option<CachedManifest>,
     tiles: HashMap<String, Vec<u8>>,
@@ -390,7 +404,10 @@ impl Worker {
                     None => match self.cached_body(&url, request.generation)? {
                         Some(cached) => cached,
                         None => {
-                            let downloaded = network::http_get(&url)?;
+                            let downloaded = self
+                                .acquire
+                                .bytes(&sources::RAINVIEWER, &url, "image/png", MAX_TILE_BYTES)
+                                .map_err(RadarError::from)?;
                             self.store_body(&url, &downloaded, request.generation)?;
                             downloaded
                         }
@@ -502,7 +519,12 @@ impl Worker {
         {
             return Ok(cached.snapshot.clone());
         }
-        match network::http_get(ENDPOINT) {
+        match self.acquire.bytes(
+            &sources::RAINVIEWER,
+            ENDPOINT,
+            "application/json",
+            MAX_MANIFEST_BYTES,
+        ) {
             Ok(bytes) => {
                 let snapshot = parse_manifest(&bytes)?;
                 self.store_body(ENDPOINT, &bytes, generation)?;

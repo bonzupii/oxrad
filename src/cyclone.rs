@@ -34,7 +34,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::provider::{self, JsonError};
+use crate::acquire::Acquire;
+use crate::provider::FetchError;
+use crate::sources;
 use crate::time;
 
 /// The provider, in the words the rail uses.
@@ -183,7 +185,7 @@ impl StormList {
 /// Why a storm list could not be read.
 #[derive(Debug)]
 pub enum CycloneError {
-    Provider { source: JsonError },
+    Provider { source: FetchError },
     Shape { detail: &'static str },
     WorkerStopped,
 }
@@ -337,8 +339,9 @@ pub fn request_url(now_ms: u64) -> Result<String, CycloneError> {
 }
 
 /// Fetches the storms in the window.
-pub fn fetch(now_ms: u64) -> Result<StormList, CycloneError> {
-    let document = provider::get_json(&request_url(now_ms)?, "application/json")
+pub fn fetch(acquire: &Acquire, now_ms: u64) -> Result<StormList, CycloneError> {
+    let document = acquire
+        .json(&sources::GDACS, &request_url(now_ms)?, "application/json")
         .map_err(|source| CycloneError::Provider { source })?;
     parse(&document)
 }
@@ -372,12 +375,12 @@ pub struct CycloneFeed {
 }
 
 impl CycloneFeed {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         let (requests, request_receiver) = mpsc::channel::<CycloneRequest>();
         let (event_sender, events) = mpsc::channel::<CycloneEvent>();
         std::thread::spawn(move || {
             while let Ok(request) = request_receiver.recv() {
-                let event = match fetch(request.now_ms) {
+                let event = match fetch(&acquire, request.now_ms) {
                     Ok(list) => CycloneEvent::Ready {
                         generation: request.generation,
                         list,
@@ -463,9 +466,9 @@ pub struct CycloneView {
 }
 
 impl CycloneView {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         Self {
-            feed: CycloneFeed::new(),
+            feed: CycloneFeed::new(acquire),
             state: CycloneState::Idle,
             generation: 0,
         }

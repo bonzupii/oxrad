@@ -28,7 +28,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::provider::{self, JsonError};
+use crate::acquire::Acquire;
+use crate::provider::FetchError;
+use crate::sources;
 
 const FEEDS: &str = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary";
 const PROVIDER: &str = "USGS";
@@ -152,7 +154,7 @@ impl Quakes {
 
 #[derive(Debug)]
 pub enum QuakeError {
-    Provider { source: JsonError },
+    Provider { source: FetchError },
     Shape { field: &'static str },
     WorkerStopped,
 }
@@ -355,9 +357,10 @@ pub fn parse(window: Window, document: &Value) -> Result<Quakes, QuakeError> {
     })
 }
 
-pub fn fetch(window: Window) -> Result<Quakes, QuakeError> {
+pub fn fetch(acquire: &Acquire, window: Window) -> Result<Quakes, QuakeError> {
     let url = request_url(window);
-    let document = provider::get_json(&url, "application/geo+json")
+    let document = acquire
+        .json(&sources::USGS_EARTHQUAKES, &url, "application/geo+json")
         .map_err(|source| QuakeError::Provider { source })?;
     parse(window, &document)
 }
@@ -414,13 +417,13 @@ pub struct QuakeFeed {
 }
 
 impl QuakeFeed {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         let (requests, request_receiver) = mpsc::channel::<QuakeRequest>();
         let (result_sender, results) = mpsc::channel::<QuakeMessage>();
         std::thread::spawn(move || {
             while let Ok(request) = request_receiver.recv() {
                 let window = request.window;
-                let result = fetch(window);
+                let result = fetch(&acquire, window);
                 let message = QuakeMessage {
                     generation: request.generation,
                     window,
@@ -526,9 +529,9 @@ pub struct QuakeView {
 }
 
 impl QuakeView {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         Self {
-            feed: QuakeFeed::new(),
+            feed: QuakeFeed::new(acquire),
             state: QuakeState::Idle,
         }
     }

@@ -24,6 +24,7 @@ use std::fmt::{self, Display, Formatter};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
+use crate::acquire::Acquire;
 use crate::error::RadarError;
 use crate::network;
 use crate::radar::{self, RadarVolume};
@@ -100,19 +101,14 @@ pub struct HistoryFeed {
     generation: u64,
 }
 
-impl Default for HistoryFeed {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl HistoryFeed {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         let (request_sender, requests) = mpsc::channel();
         let (event_sender, events) = mpsc::channel();
         thread::spawn(move || {
             HistoryWorker {
                 requests,
+                acquire,
                 events: event_sender,
             }
             .run();
@@ -186,16 +182,21 @@ impl HistoryEvent {
 
 struct HistoryWorker {
     requests: Receiver<HistoryRequest>,
+    acquire: Acquire,
     events: Sender<HistoryEvent>,
 }
 
 impl HistoryWorker {
     fn run(self) {
-        let Self { requests, events } = self;
+        let Self {
+            requests,
+            acquire,
+            events,
+        } = self;
         while let Ok(request) = requests.recv() {
             let event = match request {
                 HistoryRequest::Keys { generation, site } => {
-                    match network::recent_volume_keys(&site, RECENT_LIMIT) {
+                    match network::recent_volume_keys(&acquire, &site, RECENT_LIMIT) {
                         Ok(keys) => HistoryEvent::Keys { generation, keys },
                         Err(error) => HistoryEvent::Failed {
                             generation,
@@ -208,7 +209,7 @@ impl HistoryWorker {
                     generation,
                     site,
                     key,
-                } => match network::fetch_archive_cached(&key) {
+                } => match network::fetch_archive_cached(&acquire, &key) {
                     Ok(archive) => match radar::decode_volume(&site, &key, &archive.bytes) {
                         Ok(volume) => HistoryEvent::Volume {
                             generation,

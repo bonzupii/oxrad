@@ -15,67 +15,22 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 //! The AWS NEXRAD Level II source: listing, ordering, and retrieval.
 
-use std::collections::HashSet;
-use std::time::Duration;
-
 use quick_xml::Reader;
 use quick_xml::events::Event;
+use std::collections::HashSet;
 
+use crate::acquire::Acquire;
 use crate::cache::{CacheError, Store};
 use crate::error::RadarError;
+use crate::provider::FetchError;
+use crate::sources;
 use crate::stations::SiteId;
 use crate::time::{MS_PER_DAY, civil_from_days, now_unix_ms};
 
 const BUCKET_URL: &str = "https://unidata-nexrad-level2.s3.amazonaws.com";
 const LOOKBACK_DAYS: i64 = 3;
 const MAX_BODY_BYTES: u64 = 64 * 1024 * 1024;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long a connection attempt to one address may take, so a dead IPv6
-/// address does not hold up a radar archive download that IPv4 can serve.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_LIST_PAGES: usize = 10_000;
-const USER_AGENT: &str = concat!(
-    "oxrad/",
-    env!("CARGO_PKG_VERSION"),
-    " (https://github.com/bonzupii/oxrad)"
-);
-
-pub(crate) fn http_get(url: &str) -> Result<Vec<u8>, RadarError> {
-    let mut response = ureq::get(url)
-        .header("User-Agent", USER_AGENT)
-        .config()
-        .timeout_global(Some(REQUEST_TIMEOUT))
-        .timeout_connect(Some(CONNECT_TIMEOUT))
-        .http_status_as_error(false)
-        .build()
-        .call()
-        .map_err(|source| RadarError::Http {
-            url: String::from(url),
-            source,
-        })?;
-    let status = response.status().as_u16();
-    if !(200..300).contains(&status) {
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned());
-        return Err(RadarError::HttpStatus {
-            url: String::from(url),
-            status,
-            retry_after,
-        });
-    }
-    response
-        .body_mut()
-        .with_config()
-        .limit(MAX_BODY_BYTES)
-        .read_to_vec()
-        .map_err(|source| RadarError::Http {
-            url: String::from(url),
-            source,
-        })
-}
-
 fn encode_query_value(value: &str) -> String {
     let mut encoded = String::new();
     for byte in value.bytes() {
@@ -172,7 +127,7 @@ fn listing_xml(prefix: &str, xml: &str) -> Result<ListingPage, RadarError> {
 }
 
 /// Paginates a bucket listing prefix to exhaustion.
-fn list_keys(prefix: &str) -> Result<Vec<String>, RadarError> {
+fn list_keys(acquire: &Acquire, prefix: &str) -> Result<Vec<String>, RadarError> {
     let mut keys = Vec::new();
     let mut token: Option<String> = None;
     let mut seen_tokens = HashSet::new();
@@ -190,7 +145,7 @@ fn list_keys(prefix: &str) -> Result<Vec<String>, RadarError> {
             url.push_str("&continuation-token=");
             url.push_str(&encode_query_value(current));
         }
-        let body = http_get(&url)?;
+        let body = acquire.bytes(&sources::NEXRAD_LEVEL_TWO, &url, "*/*", MAX_BODY_BYTES)?;
         let xml = String::from_utf8(body).map_err(|_| RadarError::ListingBody {
             prefix: String::from(prefix),
         })?;
@@ -232,11 +187,11 @@ fn is_volume_key(key: &str) -> bool {
 }
 
 /// The newest volume the feed lists for a site, ordered by its UTC timestamp.
-pub fn latest_volume_key(site: &SiteId) -> Result<String, RadarError> {
+pub fn latest_volume_key(acquire: &Acquire, site: &SiteId) -> Result<String, RadarError> {
     for days_ago in 0..LOOKBACK_DAYS {
         let (year, month, day) = utc_day(days_ago)?;
         let prefix = format!("{year:04}/{month:02}/{day:02}/{site}/");
-        let keys = list_keys(&prefix)?;
+        let keys = list_keys(acquire, &prefix)?;
         if let Some(key) = keys.iter().filter(|key| is_volume_key(key)).max() {
             return Ok(key.clone());
         }
@@ -250,7 +205,11 @@ pub fn latest_volume_key(site: &SiteId) -> Result<String, RadarError> {
 ///
 /// Listing stops once enough keys have been collected; keys are sorted because
 /// the object store does not promise lexicographic ordering within a page.
-pub fn recent_volume_keys(site: &SiteId, limit: usize) -> Result<Vec<String>, RadarError> {
+pub fn recent_volume_keys(
+    acquire: &Acquire,
+    site: &SiteId,
+    limit: usize,
+) -> Result<Vec<String>, RadarError> {
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -259,7 +218,7 @@ pub fn recent_volume_keys(site: &SiteId, limit: usize) -> Result<Vec<String>, Ra
         let (year, month, day) = utc_day(days_ago)?;
         let prefix = format!("{year:04}/{month:02}/{day:02}/{site}/");
         keys.extend(
-            list_keys(&prefix)?
+            list_keys(acquire, &prefix)?
                 .into_iter()
                 .filter(|key| is_volume_key(key)),
         );
@@ -274,13 +233,19 @@ pub fn recent_volume_keys(site: &SiteId, limit: usize) -> Result<Vec<String>, Ra
 }
 
 /// Retrieves one Archive II volume. A 404 means the listing went stale.
-pub fn fetch_archive(key: &str) -> Result<Vec<u8>, RadarError> {
-    match http_get(&format!("{BUCKET_URL}/{key}")) {
+pub fn fetch_archive(acquire: &Acquire, key: &str) -> Result<Vec<u8>, RadarError> {
+    let url = format!("{BUCKET_URL}/{key}");
+    match acquire.bytes(
+        &sources::NEXRAD_LEVEL_TWO,
+        &url,
+        "application/octet-stream",
+        MAX_BODY_BYTES,
+    ) {
         Ok(bytes) => Ok(bytes),
-        Err(RadarError::HttpStatus { status: 404, .. }) => Err(RadarError::VolumeGone {
+        Err(FetchError::Status { status: 404, .. }) => Err(RadarError::VolumeGone {
             key: String::from(key),
         }),
-        Err(other) => Err(other),
+        Err(other) => Err(other.into()),
     }
 }
 
@@ -297,7 +262,7 @@ pub struct CachedArchive {
 /// A cache miss falls back to the live object and stores it for a later
 /// history view. Cache failures do not replace usable live bytes; they travel
 /// with the response so the interface can report them.
-pub fn fetch_archive_cached(key: &str) -> Result<CachedArchive, RadarError> {
+pub fn fetch_archive_cached(acquire: &Acquire, key: &str) -> Result<CachedArchive, RadarError> {
     let mut cache_warning = None;
     let store = match Store::default_location() {
         Ok(store) => Some(store),
@@ -324,7 +289,7 @@ pub fn fetch_archive_cached(key: &str) -> Result<CachedArchive, RadarError> {
             }
         }
     }
-    let bytes = fetch_archive(key)?;
+    let bytes = fetch_archive(acquire, key)?;
     if let Some(store) = &store
         && let Err(error) = store.store(key, &bytes)
     {

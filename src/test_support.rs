@@ -9,7 +9,7 @@ use crate::forecast::ForecastError;
 use crate::global_radar::GlobalRadarError;
 use crate::map::MapError;
 use crate::place::PlaceError;
-use crate::provider::JsonError;
+use crate::provider::FetchError;
 use crate::warnings::WarningError;
 
 #[derive(Debug)]
@@ -19,7 +19,7 @@ pub enum TestError {
     Coordinate(CoordinateError),
     Moment(MomentError),
     Render(RenderError),
-    Json(JsonError),
+    Json(FetchError),
     Forecast(ForecastError),
     Radar(RadarError),
     Place(PlaceError),
@@ -120,8 +120,8 @@ impl From<RenderError> for TestError {
     }
 }
 
-impl From<JsonError> for TestError {
-    fn from(value: JsonError) -> Self {
+impl From<FetchError> for TestError {
+    fn from(value: FetchError) -> Self {
         Self::Json(value)
     }
 }

@@ -28,10 +28,12 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use serde_json::{Value, json};
 
+use crate::acquire::Acquire;
 use crate::error::SiteIdError;
 use crate::paths;
 use crate::product::RadarProduct;
-use crate::provider::{self, JsonError};
+use crate::provider::FetchError;
+use crate::sources;
 
 const STATIONS_URL: &str = "https://api.weather.gov/radar/stations";
 const ACCEPT: &str = "application/geo+json";
@@ -167,7 +169,7 @@ impl Station {
 #[derive(Debug)]
 pub enum StationError {
     Provider {
-        source: JsonError,
+        source: FetchError,
     },
     Shape {
         field: &'static str,
@@ -238,8 +240,8 @@ impl Error for StationError {
     }
 }
 
-impl From<JsonError> for StationError {
-    fn from(source: JsonError) -> Self {
+impl From<FetchError> for StationError {
+    fn from(source: FetchError) -> Self {
         Self::Provider { source }
     }
 }
@@ -362,8 +364,10 @@ pub fn parse_document(document: &Value) -> Result<Vec<Station>, StationError> {
 }
 
 /// Retrieves the live station document without touching the cache.
-pub fn fetch_document() -> Result<Value, StationError> {
-    provider::get_json(STATIONS_URL, ACCEPT).map_err(|source| StationError::Provider { source })
+pub fn fetch_document(acquire: &Acquire) -> Result<Value, StationError> {
+    acquire
+        .json(&sources::NWS_API, STATIONS_URL, ACCEPT)
+        .map_err(|source| StationError::Provider { source })
 }
 
 fn cache_path() -> Result<std::path::PathBuf, StationError> {
@@ -433,8 +437,8 @@ pub struct Discovery {
 }
 
 /// Fetches, parses, and caches the live station list.
-pub fn discover() -> Result<Discovery, StationError> {
-    let document = fetch_document()?;
+pub fn discover(acquire: &Acquire) -> Result<Discovery, StationError> {
+    let document = fetch_document(acquire)?;
     let stations = parse_document(&document)?;
     let cache_warning = save_cache(&document).err();
     Ok(Discovery {
@@ -455,7 +459,7 @@ pub struct StationFeed {
 }
 
 impl StationFeed {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         let (sender, results) = mpsc::channel();
         std::thread::spawn(move || {
             // Discovery either answers or reports why it could not. There is no
@@ -464,7 +468,7 @@ impl StationFeed {
             // broken program look like a working one that had a bad day. A
             // worker that dies now surfaces as a disconnected feed, which the
             // poller already reports as WorkerStopped.
-            let outcome = match discover() {
+            let outcome = match discover(&acquire) {
                 Ok(discovery) => StationOutcome::Ready(discovery),
                 Err(error) => StationOutcome::Failed(error),
             };

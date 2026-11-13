@@ -25,7 +25,9 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
 use serde_json::Value;
 
-use crate::provider::{self, JsonError};
+use crate::acquire::Acquire;
+use crate::provider::FetchError;
+use crate::sources;
 
 const ALERTS_URL: &str = "https://api.weather.gov/alerts/active?status=actual&message_type=alert";
 
@@ -115,7 +117,7 @@ pub struct WarningSet {
 
 #[derive(Debug)]
 pub enum WarningError {
-    Json(JsonError),
+    Json(FetchError),
     Shape { field: &'static str },
     Feature { id: String, detail: &'static str },
     WorkerStopped,
@@ -153,8 +155,8 @@ impl Error for WarningError {
     }
 }
 
-impl From<JsonError> for WarningError {
-    fn from(value: JsonError) -> Self {
+impl From<FetchError> for WarningError {
+    fn from(value: FetchError) -> Self {
         Self::Json(value)
     }
 }
@@ -332,8 +334,8 @@ fn parse_collection(document: &Value) -> Result<WarningSet, WarningError> {
 }
 
 /// Retrieves and parses the current active warning collection.
-pub fn fetch() -> Result<WarningSet, WarningError> {
-    let document = provider::get_json(ALERTS_URL, "application/geo+json")?;
+pub fn fetch(acquire: &Acquire) -> Result<WarningSet, WarningError> {
+    let document = acquire.json(&sources::NWS_API, ALERTS_URL, "application/geo+json")?;
     parse_collection(&document)
 }
 
@@ -354,12 +356,12 @@ pub struct WarningFeed {
 }
 
 impl WarningFeed {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         let (requests, request_receiver) = mpsc::channel();
         let (event_sender, events) = mpsc::channel();
         std::thread::spawn(move || {
             while let Ok(generation) = request_receiver.recv() {
-                let event = match fetch() {
+                let event = match fetch(&acquire) {
                     Ok(set) => WarningEvent::Ready { generation, set },
                     Err(error) => WarningEvent::Failed { generation, error },
                 };

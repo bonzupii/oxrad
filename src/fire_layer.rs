@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Pos2, Rect, RichText, Shape, Stroke};
 
+use crate::acquire::Acquire;
 use crate::app::toggle_button;
 use crate::fire::{self, FireKind, FireSet, FireState, FireView};
 use crate::map;
@@ -47,9 +48,9 @@ pub struct FireLayer {
 }
 
 impl FireLayer {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         Self {
-            view: FireView::new(),
+            view: FireView::new(acquire),
             shown: false,
             asked_at: None,
         }
@@ -395,7 +396,7 @@ mod tests {
 
     #[test]
     fn a_new_layer_is_off() {
-        let layer = FireLayer::new();
+        let layer = FireLayer::new(Acquire::offline());
         assert!(!layer.is_shown());
         assert!(matches!(layer.view.state(), FireState::Idle));
     }

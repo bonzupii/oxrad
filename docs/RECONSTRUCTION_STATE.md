@@ -29,7 +29,7 @@ States: not started, in progress, verified, blocked.
 | 12 | Documentation, including removal of environment-specific workflow | not started | `docs/HEADLESS.md` still carries the Xvfb procedure and an install instruction | Move it to the `headless-gui-testing` skill; make `AGENTS.md` instrument-neutral |
 | 13 | Apply the configured cache budget in the store | verified | Pass 4: `Store::prune` takes the policy from the effective configuration, returns the byte and entry limits it enforced, and the private `MAX_CACHE_*` constants are gone; `oxrad --prune-cache` prints the enforced budget and what it removed | none |
 | 14 | Draw every displayed credit from the enabled registry set | in progress | Pass 5: the basemap credit is read from `sources::OPENFREEMAP.credit` and is drawn only when the effective set enables `openfreemap`; the report derives every credit from the enabled set; layer credits are still not shown beside their data | Feed a credit bar from the enabled set |
-| 15 | Gate fetches by the enabled provider set | not started | A provider can be disabled in configuration, but no fetcher consults the set yet. Gating at the request path means passing the enabled set into 24 provider modules and the three HTTP boundaries | Thread the enabled set to `provider`, `network` and `basemap_tiles` |
+| 15 | Gate fetches by the enabled provider set | verified | Pass 7: one `Acquire` in `src/acquire.rs` refuses a source outside `EnabledProviders` before a socket opens; 24 provider modules, `network`, `global_radar` and `basemap` route through it; the four provider helpers, `network::http_get` and the basemap `reqwest` client are deleted; four offline boundary tests | none |
 
 ## Acceptance criteria
 
@@ -54,7 +54,7 @@ States: not started, in progress, verified, blocked.
 | A17 | Sunrise and sunset integrated with linked attribution and nullable events | not started | |
 | A18 | Provider attribution and licensing systematic and visible | in progress | 25 sources carry licence and credit; 17 admit; RainViewer, Sunrise-Sunset and OpenFreeMap credits are read from the registry; the report derives credits from the enabled set; 14 admitted sources show no credit in the interface yet | Display each credit beside its layer |
 | A19 | Persistent caches survive restarts and expose their state | in progress | Bodies and metadata persist with integrity checking; `oxrad --prune-cache` exposes the directory, the configured budget and the number removed; no window has shown the cache state | Surface cache state in the interface |
-| A20 | Network behavior provider-aware and robust | not started | |
+| A20 | Network behavior provider-aware and robust | in progress | Pass 7: the admission gate precedes every request. Per-provider retry and rate policy still live inside each module | Move retry and rate policy behind the boundary |
 | A21 | Subsystems own state and lifecycle; root is not a god object | not started | `app.rs` is 4681 lines |
 | A22 | Scientific calculations and transformations have meaningful automated tests | not started | 467 tests recorded in `docs/TESTING.md`; coverage unverified |
 | A23 | Error paths, malformed data, missing metadata handled deliberately and visibly | not started | |
@@ -121,6 +121,19 @@ States: not started, in progress, verified, blocked.
 - Tests then live at the boundary: a counting transport proves zero requests for a disabled source and for an unadmitted one, one request for an enabled admitted source, and attribution equality for two enabled sets. No live network.
 - Gates still green at `8897519`: fmt clean, clippy exit 0, 481 tests, release build exit 0. No window was opened; there is still no display or provisioned harness.
 
+### Pass 7
+
+- Implemented the acquisition boundary. `src/acquire.rs` holds `Acquire`: the enabled provider set, one live transport, and `json`, `json_within`, `text` and `bytes`. Every method calls `admit` before a socket opens, and a source outside the set returns `FetchError::Disabled { id }`.
+- Decision: the boundary has one refusal variant. `EnabledProviders` can only hold sources that passed admission and reached `Level::Parsed`, so a second `Source::admits` check at the socket would re-verify a type invariant. Pass 6 named `NotAdmitted` as well; the type makes it unreachable, so it is not represented.
+- Deleted `provider::get_json`, `get_json_within`, `get_bytes`, `get_text`, `network::http_get` and the `reqwest` client in `basemap_tiles.rs` rather than keeping ungated twins. `acquire::live_get` is the only HTTP constructor left in the tree, and `Cargo.toml` no longer depends on `reqwest`, `reqwest-middleware`, `http-cache-reqwest` or `tokio`.
+- The basemap keeps persistent tiles: its worker reads and writes tile bodies through `cache::Store`, and a cache failure travels as a warning beside the tile instead of replacing it. `Basemap` shows that warning in its controls.
+- Decision: `FetchError::Status` becomes `RadarError::HttpStatus` so the retry policy keeps reading 429 and 503 waits. A single lossy conversion would have hidden the server's Retry-After from `retry.rs`.
+- Registry: two fetchers had no entry. `NSIDC_SEA_ICE` and `USGS_VOLCANO` are recorded with US government terms, global or United States coverage, credit, cache permission and `Level::Parsed`. `docs/SOURCES.md` is regenerated and the default admitted set is 19.
+- Boundary tests: a disabled source produces `Disabled` and no observed request; an enabled source is requested once and parsed; a text body keeps its bytes; a non-UTF-8 body is a shape failure. No test opens a socket.
+- Observed in the release binary: `oxrad --print-config` reports 19 enabled providers; `--set providers=rainviewer` reports 1. The refusal itself is proved by the boundary test, not by a window.
+- Gates: `cargo fmt --all -- --check` exit 0, `cargo clippy --message-format=short -- -D warnings` exit 0, `cargo test --all-targets` 486 passed and 0 failed, `cargo build --release --locked` exit 0.
+- Not done: no window was opened, because the environment still has no display and no provisioned harness. Layer credits are still not drawn beside their data.
+
 ## Known gate gaps
 
 | Gap | Detail | Next action |
@@ -128,5 +141,4 @@ States: not started, in progress, verified, blocked.
 | Test targets are not linted | `cargo clippy --all-targets` fails on 280 assertion-in-`Result` errors that the documented gate never reaches | Align `STYLE.md` with one test convention, then lint test targets |
 | GUI evidence absent | No display and no `.tools/root`, so no window can be opened or captured | Provision the harness under `.tools` with pinned versions |
 | Basemap credit outside the registry | `walkers` supplies the OpenFreeMap attribution from the style document, so it bypasses `src/sources.rs` | Read the credit from the registry in `draw_attribution` |
-| Providers not gating fetches | A disabled provider is absent from the effective set but its fetcher does not consult the set, so a request can still start | Thread the set through the three HTTP boundaries and 24 provider modules |
 | Layer credits not displayed | Registry credit is correct and printed, but only the basemap and RainViewer draw a credit in the interface | Add a credit bar fed by the enabled set |

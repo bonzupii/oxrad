@@ -26,7 +26,9 @@ use std::time::{Duration, Instant, SystemTimeError};
 
 use serde_json::Value;
 
-use crate::provider::{self, JsonError};
+use crate::acquire::Acquire;
+use crate::provider::FetchError;
+use crate::sources;
 use crate::time;
 
 /// The provider, in the words the rail uses.
@@ -44,7 +46,7 @@ const RETRY_MAX: Duration = Duration::from_secs(60);
 /// Why a discharge record could not be read.
 #[derive(Debug)]
 pub enum HydroError {
-    Provider { source: JsonError },
+    Provider { source: FetchError },
     Shape { detail: &'static str },
     Clock { source: SystemTimeError },
     WorkerStopped,
@@ -349,9 +351,15 @@ fn day_from_text(text: &str) -> Result<u64, HydroError> {
 }
 
 /// Fetches the record for one point.
-pub fn fetch(latitude: f64, longitude: f64, ensemble: bool) -> Result<Discharge, HydroError> {
+pub fn fetch(
+    acquire: &Acquire,
+    latitude: f64,
+    longitude: f64,
+    ensemble: bool,
+) -> Result<Discharge, HydroError> {
     let url = request_url(latitude, longitude, ensemble);
-    let document = provider::get_json(&url, "application/json")
+    let document = acquire
+        .json(&sources::OPEN_METEO_FORECAST, &url, "application/json")
         .map_err(|source| HydroError::Provider { source })?;
     let now = time::now_unix_ms().map_err(|source| HydroError::Clock { source })?;
     parse(&document, now)
@@ -382,12 +390,17 @@ pub struct HydroFeed {
 }
 
 impl HydroFeed {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         let (requests, request_receiver) = mpsc::channel::<HydroRequest>();
         let (event_sender, events) = mpsc::channel::<HydroEvent>();
         std::thread::spawn(move || {
             while let Ok(request) = request_receiver.recv() {
-                let outcome = fetch(request.latitude, request.longitude, request.ensemble);
+                let outcome = fetch(
+                    &acquire,
+                    request.latitude,
+                    request.longitude,
+                    request.ensemble,
+                );
                 let event = match outcome {
                     Ok(record) => HydroEvent::Ready {
                         generation: request.generation,
@@ -475,9 +488,9 @@ pub struct HydroView {
 }
 
 impl HydroView {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         Self {
-            feed: HydroFeed::new(),
+            feed: HydroFeed::new(acquire),
             state: HydroState::Idle,
             generation: 0,
         }

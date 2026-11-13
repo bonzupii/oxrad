@@ -28,7 +28,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 
-use crate::provider::{self, JsonError};
+use crate::acquire::Acquire;
+use crate::provider::FetchError;
+use crate::sources;
 use crate::time;
 
 /// The provider, in the words the rail uses.
@@ -102,7 +104,7 @@ impl AqiCategory {
 /// Why an air-quality record could not be read.
 #[derive(Debug)]
 pub enum AirError {
-    Provider { source: JsonError },
+    Provider { source: FetchError },
     Shape { detail: &'static str },
     WorkerStopped,
 }
@@ -366,9 +368,10 @@ pub fn request_url(latitude: f64, longitude: f64) -> String {
 }
 
 /// Fetches the record for one point.
-pub fn fetch(latitude: f64, longitude: f64) -> Result<AirQuality, AirError> {
+pub fn fetch(acquire: &Acquire, latitude: f64, longitude: f64) -> Result<AirQuality, AirError> {
     let url = request_url(latitude, longitude);
-    let document = provider::get_json(&url, "application/json")
+    let document = acquire
+        .json(&sources::OPEN_METEO_AIR, &url, "application/json")
         .map_err(|source| AirError::Provider { source })?;
     parse(&document)
 }
@@ -397,12 +400,12 @@ pub struct AirFeed {
 }
 
 impl AirFeed {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         let (requests, request_receiver) = mpsc::channel::<AirRequest>();
         let (event_sender, events) = mpsc::channel::<AirEvent>();
         std::thread::spawn(move || {
             while let Ok(request) = request_receiver.recv() {
-                let outcome = fetch(request.latitude, request.longitude);
+                let outcome = fetch(&acquire, request.latitude, request.longitude);
                 let event = match outcome {
                     Ok(record) => AirEvent::Ready {
                         generation: request.generation,
@@ -490,9 +493,9 @@ pub struct AirView {
 }
 
 impl AirView {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         Self {
-            feed: AirFeed::new(),
+            feed: AirFeed::new(acquire),
             state: AirState::Idle,
             generation: 0,
         }

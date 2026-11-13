@@ -28,7 +28,9 @@ use std::time::{Duration, Instant, SystemTimeError};
 
 use serde_json::Value;
 
-use crate::provider::{self, JsonError};
+use crate::acquire::Acquire;
+use crate::provider::FetchError;
+use crate::sources;
 use crate::time;
 
 /// The provider, in the words the rail uses.
@@ -52,7 +54,7 @@ const RETRY_MAX: Duration = Duration::from_secs(60);
 /// Why a climate record could not be read.
 #[derive(Debug)]
 pub enum ClimateError {
-    Provider { source: JsonError },
+    Provider { source: FetchError },
     Shape { detail: &'static str },
     Clock { source: SystemTimeError },
     WorkerStopped,
@@ -389,13 +391,18 @@ pub fn request_url(latitude: f64, longitude: f64, today: i64) -> String {
 }
 
 /// Fetches the record for one point.
-pub fn fetch(latitude: f64, longitude: f64) -> Result<ClimateRecord, ClimateError> {
+pub fn fetch(
+    acquire: &Acquire,
+    latitude: f64,
+    longitude: f64,
+) -> Result<ClimateRecord, ClimateError> {
     let now = time::now_unix_ms().map_err(|source| ClimateError::Clock { source })?;
     let today = i64::try_from(now / time::MS_PER_DAY).map_err(|_| ClimateError::Shape {
         detail: "a clock the archive dates can follow",
     })?;
     let url = request_url(latitude, longitude, today);
-    let document = provider::get_json(&url, "application/json")
+    let document = acquire
+        .json(&sources::OPEN_METEO_ARCHIVE, &url, "application/json")
         .map_err(|source| ClimateError::Provider { source })?;
     parse(&document)
 }
@@ -430,12 +437,12 @@ pub struct ClimateFeed {
 }
 
 impl ClimateFeed {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         let (requests, request_receiver) = mpsc::channel::<ClimateRequest>();
         let (event_sender, events) = mpsc::channel::<ClimateEvent>();
         std::thread::spawn(move || {
             while let Ok(request) = request_receiver.recv() {
-                let outcome = fetch(request.latitude, request.longitude);
+                let outcome = fetch(&acquire, request.latitude, request.longitude);
                 let event = match outcome {
                     Ok(record) => ClimateEvent::Ready {
                         generation: request.generation,
@@ -523,9 +530,9 @@ pub struct ClimateView {
 }
 
 impl ClimateView {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         Self {
-            feed: ClimateFeed::new(),
+            feed: ClimateFeed::new(acquire),
             state: ClimateState::Idle,
             generation: 0,
         }

@@ -29,7 +29,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 
-use crate::provider::{self, JsonError};
+use crate::acquire::Acquire;
+use crate::provider::FetchError;
+use crate::sources;
 use crate::time;
 
 /// The provider, in the words the rail uses.
@@ -84,7 +86,7 @@ impl SoilBand {
 /// Why a land-surface record could not be read.
 #[derive(Debug)]
 pub enum LandError {
-    Provider { source: JsonError },
+    Provider { source: FetchError },
     Shape { detail: &'static str },
     WorkerStopped,
 }
@@ -334,8 +336,13 @@ pub fn request_url(latitude: f64, longitude: f64) -> String {
 }
 
 /// Fetches the land surface for one point.
-pub fn fetch(latitude: f64, longitude: f64) -> Result<Land, LandError> {
-    let document = provider::get_json(&request_url(latitude, longitude), "application/json")
+pub fn fetch(acquire: &Acquire, latitude: f64, longitude: f64) -> Result<Land, LandError> {
+    let document = acquire
+        .json(
+            &sources::OPEN_METEO_FORECAST,
+            &request_url(latitude, longitude),
+            "application/json",
+        )
         .map_err(|source| LandError::Provider { source })?;
     parse(&document)
 }
@@ -364,12 +371,12 @@ pub struct LandFeed {
 }
 
 impl LandFeed {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         let (requests, request_receiver) = mpsc::channel::<LandRequest>();
         let (event_sender, events) = mpsc::channel::<LandEvent>();
         std::thread::spawn(move || {
             while let Ok(request) = request_receiver.recv() {
-                let event = match fetch(request.latitude, request.longitude) {
+                let event = match fetch(&acquire, request.latitude, request.longitude) {
                     Ok(record) => LandEvent::Ready {
                         generation: request.generation,
                         record,
@@ -456,9 +463,9 @@ pub struct LandView {
 }
 
 impl LandView {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         Self {
-            feed: LandFeed::new(),
+            feed: LandFeed::new(acquire),
             state: LandState::Idle,
             generation: 0,
         }

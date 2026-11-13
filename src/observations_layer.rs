@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
 
+use crate::acquire::Acquire;
 use crate::app::toggle_button;
 use crate::map;
 use crate::observations::{
@@ -46,9 +47,9 @@ pub struct ObservationLayer {
 }
 
 impl ObservationLayer {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         Self {
-            view: ObservationView::new(),
+            view: ObservationView::new(acquire),
             shown: false,
             asked: None,
             asked_at: None,
@@ -391,7 +392,7 @@ mod tests {
 
     #[test]
     fn a_new_layer_is_off() {
-        let layer = ObservationLayer::new();
+        let layer = ObservationLayer::new(Acquire::offline());
         assert!(!layer.is_shown());
         assert!(matches!(layer.view.state(), ObservationState::Idle));
     }

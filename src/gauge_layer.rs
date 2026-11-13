@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, FontId, Painter, Pos2, Rect, RichText, Stroke};
 
+use crate::acquire::Acquire;
 use crate::app::toggle_button;
 use crate::gauge::{self, Gauge, GaugeSet, GaugeState, GaugeView, History, HistoryState};
 use crate::map::{MapTransform, MapView};
@@ -49,9 +50,9 @@ pub struct GaugeLayer {
 }
 
 impl GaugeLayer {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         Self {
-            view: GaugeView::new(),
+            view: GaugeView::new(acquire),
             shown: false,
             asked: None,
             asked_at: None,
@@ -567,7 +568,7 @@ mod tests {
 
     #[test]
     fn a_new_layer_is_off_and_holds_nothing() {
-        let mut layer = GaugeLayer::new();
+        let mut layer = GaugeLayer::new(Acquire::offline());
         assert!(!layer.shown);
         assert!(layer.gauges().is_none());
         assert!(layer.take_focus().is_none());

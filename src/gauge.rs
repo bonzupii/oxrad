@@ -35,7 +35,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 
-use crate::provider::{self, JsonError};
+use crate::acquire::Acquire;
+use crate::provider::FetchError;
+use crate::sources;
 use crate::time;
 
 /// The provider, in the words the rail uses.
@@ -243,7 +245,7 @@ fn axis_step(rough: f64) -> f64 {
 /// Why a gauge record could not be read.
 #[derive(Debug)]
 pub enum GaugeError {
-    Provider { source: JsonError },
+    Provider { source: FetchError },
     Shape { detail: &'static str },
     WorkerStopped,
 }
@@ -450,10 +452,15 @@ pub fn history_url(site: &str) -> String {
 }
 
 /// Fetches the gauges in a box.
-pub fn fetch(bounds: (f64, f64, f64, f64)) -> Result<GaugeSet, GaugeError> {
-    let document =
-        provider::get_json_within(&request_url(bounds), "application/json", REQUEST_TIMEOUT)
-            .map_err(|source| GaugeError::Provider { source })?;
+pub fn fetch(acquire: &Acquire, bounds: (f64, f64, f64, f64)) -> Result<GaugeSet, GaugeError> {
+    let document = acquire
+        .json_within(
+            &sources::USGS_WATER,
+            &request_url(bounds),
+            "application/json",
+            REQUEST_TIMEOUT,
+        )
+        .map_err(|source| GaugeError::Provider { source })?;
     parse(&document)
 }
 
@@ -571,10 +578,15 @@ fn readings_of(entry: &Map<String, Value>) -> Vec<Reading> {
 }
 
 /// Fetches one gauge's week.
-pub fn fetch_history(site: &str) -> Result<History, GaugeError> {
-    let document =
-        provider::get_json_within(&history_url(site), "application/json", REQUEST_TIMEOUT)
-            .map_err(|source| GaugeError::Provider { source })?;
+pub fn fetch_history(acquire: &Acquire, site: &str) -> Result<History, GaugeError> {
+    let document = acquire
+        .json_within(
+            &sources::USGS_WATER,
+            &history_url(site),
+            "application/json",
+            REQUEST_TIMEOUT,
+        )
+        .map_err(|source| GaugeError::Provider { source })?;
     parse_history(&document, site)
 }
 
@@ -608,23 +620,25 @@ pub struct GaugeFeed {
 }
 
 impl GaugeFeed {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         let (requests, request_receiver) = mpsc::channel::<GaugeRequest>();
         let (event_sender, events) = mpsc::channel::<GaugeEvent>();
         std::thread::spawn(move || {
             while let Ok(request) = request_receiver.recv() {
                 let event = match request {
-                    GaugeRequest::Box { generation, bounds } => match fetch(bounds) {
+                    GaugeRequest::Box { generation, bounds } => match fetch(&acquire, bounds) {
                         Ok(set) => GaugeEvent::Ready { generation, set },
                         Err(error) => GaugeEvent::Failed { generation, error },
                     },
-                    GaugeRequest::History { generation, site } => match fetch_history(&site) {
-                        Ok(history) => GaugeEvent::HistoryReady {
-                            generation,
-                            history,
-                        },
-                        Err(error) => GaugeEvent::Failed { generation, error },
-                    },
+                    GaugeRequest::History { generation, site } => {
+                        match fetch_history(&acquire, &site) {
+                            Ok(history) => GaugeEvent::HistoryReady {
+                                generation,
+                                history,
+                            },
+                            Err(error) => GaugeEvent::Failed { generation, error },
+                        }
+                    }
                 };
                 if event_sender.send(event).is_err() {
                     return;
@@ -723,9 +737,9 @@ pub struct GaugeView {
 }
 
 impl GaugeView {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         Self {
-            feed: GaugeFeed::new(),
+            feed: GaugeFeed::new(acquire),
             state: GaugeState::Idle,
             history: HistoryState::Off,
             box_generation: 0,

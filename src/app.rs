@@ -23,6 +23,7 @@ use eframe::egui::{
     Stroke, Vec2,
 };
 
+use crate::acquire::Acquire;
 use crate::basemap::Basemap;
 use crate::colormap::ColorTable;
 use crate::config::{self, Config};
@@ -130,9 +131,9 @@ struct HistoryView {
 }
 
 impl HistoryView {
-    fn new() -> Self {
+    fn new(acquire: Acquire) -> Self {
         Self {
-            feed: HistoryFeed::new(),
+            feed: HistoryFeed::new(acquire),
             keys: Vec::new(),
             key: None,
             state: HistoryState::Idle,
@@ -317,6 +318,7 @@ pub struct OxradApp {
     domains: Domains,
     radio: Radio,
     history: HistoryView,
+    acquire: Acquire,
 }
 
 /// Opens the site the configuration remembered, or says why it did not.
@@ -357,6 +359,7 @@ impl OxradApp {
             |config| (config, true, None::<String>),
         );
         let cache_policy = config.cache;
+        let acquire = Acquire::new(config.providers.clone());
         let (restored_site, restored_place) = (
             initial.or_else(|| config.site.clone()),
             config.place.clone(),
@@ -373,28 +376,28 @@ impl OxradApp {
             gpu: gpu.clone(),
             view_radars: Vec::new(),
             stations,
-            station_feed: StationFeed::new(),
+            station_feed: StationFeed::new(acquire.clone()),
             station_refresh_due: due_after(Duration::from_secs(STATION_REFRESH_SECS)),
             pending_site: restored_site.clone(),
             config,
             applied_theme: None,
             config_writable,
             notice,
-            search: SearchInteraction::new(),
+            search: SearchInteraction::new(acquire.clone()),
             place: restored_place.clone(),
             site: None,
             pipeline: None,
             display: Display::new(gpu, color_table, sampling, motion),
-            forecast: ForecastView::new(),
+            forecast: ForecastView::new(acquire.clone()),
             product: RadarProduct::Reflectivity,
             station_query: String::new(),
             station_picker_open: restored_site.is_none(),
             first_run: true,
             scene_mode: SceneMode::Radar,
-            basemap: Basemap::new(map_style),
+            basemap: Basemap::new(map_style, acquire.clone()),
             map: MapWorkspace::new(),
             radar: RadarWorkspace::new(),
-            global_feed: GlobalRadarFeed::new(cache_policy),
+            global_feed: GlobalRadarFeed::new(cache_policy, acquire.clone()),
             global_generation: 0,
             global_frames: Vec::new(),
             global_index: 0,
@@ -405,11 +408,12 @@ impl OxradApp {
             global_request_due: None,
             global_refresh_due: None,
             global_state: GlobalState::Idle,
-            warning_view: WarningView::new(),
-            quakes: QuakeLayer::new(),
-            domains: Domains::new(),
+            warning_view: WarningView::new(acquire.clone()),
+            quakes: QuakeLayer::new(acquire.clone()),
+            domains: Domains::new(&acquire),
             radio: Radio::new(),
-            history: HistoryView::new(),
+            history: HistoryView::new(acquire.clone()),
+            acquire,
         };
         if let Some(place) = &restored_place {
             match MapView::focus(place.lat, place.lon, 2_200.0) {
@@ -460,7 +464,7 @@ impl OxradApp {
     fn open_site(&mut self, id: SiteId, persist: bool) {
         self.history.clear();
         self.display.reset();
-        self.pipeline = Some(Pipeline::start(id.clone()));
+        self.pipeline = Some(Pipeline::start(id.clone(), self.acquire.clone()));
         self.site = Some(id.clone());
         self.station_picker_open = false;
         self.view_radars.clear();
@@ -575,7 +579,7 @@ impl OxradApp {
         let mut layers = Vec::with_capacity(sites.len());
         for site in sites {
             layers.push(ViewRadar {
-                pipeline: Pipeline::start(site.clone()),
+                pipeline: Pipeline::start(site.clone(), self.acquire.clone()),
                 display: Display::new(
                     Some(gpu.clone()),
                     self.config.color_table,
@@ -715,7 +719,7 @@ impl OxradApp {
             self.apply_stations(outcome);
         }
         if self.station_feed.is_finished() && Instant::now() >= self.station_refresh_due {
-            self.station_feed = StationFeed::new();
+            self.station_feed = StationFeed::new(self.acquire.clone());
             self.station_refresh_due = due_after(Duration::from_secs(STATION_REFRESH_SECS));
         }
         self.search.update(Instant::now());

@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, FontId, Pos2, Rect, RichText, Stroke};
 
+use crate::acquire::Acquire;
 use crate::app::toggle_button;
 use crate::land::{self, Land, LandState, LandView, SoilBand};
 use crate::map::MapView;
@@ -44,9 +45,9 @@ pub struct LandLayer {
 }
 
 impl LandLayer {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         Self {
-            view: LandView::new(),
+            view: LandView::new(acquire),
             shown: false,
             asked: None,
             asked_at: None,
@@ -496,7 +497,7 @@ mod tests {
 
     #[test]
     fn a_new_layer_is_off() {
-        let layer = LandLayer::new();
+        let layer = LandLayer::new(Acquire::offline());
         assert!(!layer.shown);
         assert!(matches!(layer.view.state(), LandState::Idle));
     }

@@ -9,11 +9,12 @@ use eframe::egui::{self, Align2, Color32, FontId, Rect};
 use walkers::sources::{Attribution, TileSource};
 use walkers::{Map, MapMemory, Style, TileId, TilePiece, Tiles};
 
+use crate::acquire::Acquire;
 use crate::basemap_tiles::BasemapTiles;
 use crate::cache::Store;
 use crate::map::MapView;
 use crate::paths;
-use crate::provider;
+use crate::sources;
 
 const WORLD_KM: f64 = 40_075.016_685_578_49;
 const CREDIT: &str = "OpenFreeMap · © OpenMapTiles · © OpenStreetMap contributors";
@@ -141,12 +142,14 @@ fn cached_style(store: &Store, url: &str) -> Result<Option<serde_json::Value>, S
     Ok(Some(document))
 }
 
-fn load_style(style: MapStyle, sender: &mpsc::Sender<StyleResult>) -> bool {
+fn load_style(style: MapStyle, sender: &mpsc::Sender<StyleResult>, acquire: &Acquire) -> bool {
     let cache = paths::cache_directory()
         .map(|path| Store::at(path.join("basemap").join("styles")))
         .map_err(|error| error.to_string());
     load_style_with(style, sender, &cache, |url| {
-        provider::get_json(url, "application/json").map_err(|error| error.to_string())
+        acquire
+            .json(&sources::OPENFREEMAP, url, "application/json")
+            .map_err(|error| error.to_string())
     })
 }
 
@@ -213,6 +216,7 @@ fn load_style_with(
 /// Owns style acquisition, tile requests, and the persistent HTTP cache.
 pub struct Basemap {
     selected: MapStyle,
+    acquire: Acquire,
     active: Option<MapStyle>,
     active_document: Option<serde_json::Value>,
     receiver: Option<Receiver<StyleResult>>,
@@ -220,14 +224,16 @@ pub struct Basemap {
     tiles: Option<BasemapTiles<OpenFreeMap>>,
     missing_tiles: usize,
     tile_error: Option<String>,
+    tile_warning: Option<String>,
     memory: MapMemory,
     error: Option<String>,
 }
 
 impl Basemap {
-    pub fn new(selected: MapStyle) -> Self {
+    pub fn new(selected: MapStyle, acquire: Acquire) -> Self {
         Self {
             selected,
+            acquire,
             active: None,
             active_document: None,
             receiver: None,
@@ -235,6 +241,7 @@ impl Basemap {
             tiles: None,
             missing_tiles: 0,
             tile_error: None,
+            tile_warning: None,
             memory: MapMemory::default(),
             error: None,
         }
@@ -271,6 +278,9 @@ impl Basemap {
                 }
                 self.tile_error = None;
             }
+        }
+        if let Some(warning) = &self.tile_warning {
+            ui.label(format!("Map tile cache: {warning}"));
         } else if self.missing_tiles > 0 {
             ui.label(format!(
                 "{} visible map tiles are loading.",
@@ -284,7 +294,8 @@ impl Basemap {
     fn request_style(&mut self) {
         let style = self.selected;
         let (sender, receiver) = mpsc::channel();
-        std::thread::spawn(move || load_style(style, &sender));
+        let acquire = self.acquire.clone();
+        std::thread::spawn(move || load_style(style, &sender, &acquire));
         self.receiver = Some(receiver);
     }
 
@@ -322,6 +333,7 @@ impl Basemap {
                 style,
                 &path.join("basemap").join("openfreemap"),
                 context,
+                &self.acquire,
             ));
         }
         self.active = Some(selected);
@@ -380,6 +392,11 @@ impl Basemap {
 
     pub fn draw(&mut self, ui: &mut egui::Ui, rect: Rect, view: &MapView) {
         self.poll(ui.ctx());
+        if let Some(tiles) = self.tiles.as_mut()
+            && let Some(warning) = tiles.take_warning()
+        {
+            self.tile_warning = Some(warning.to_string());
+        }
         ui.painter()
             .rect_filled(rect, 0.0, Color32::from_rgb(34, 43, 51));
         let Some(tiles) = self.tiles.as_mut() else {

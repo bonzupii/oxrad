@@ -29,10 +29,12 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Pos2, Rect, RichText, TextureHandle};
 
+use crate::acquire::Acquire;
 use crate::app::toggle_button;
 use crate::global_radar::{self, TileBounds};
 use crate::map;
-use crate::provider::{self, JsonError};
+use crate::provider::FetchError;
+use crate::sources;
 use crate::theme::{self, Palette};
 use crate::time;
 
@@ -194,7 +196,7 @@ impl Imagery {
 #[derive(Debug)]
 pub enum SatelliteError {
     Provider {
-        source: JsonError,
+        source: FetchError,
     },
     Image {
         url: String,
@@ -398,7 +400,7 @@ pub struct SatelliteFeed {
 }
 
 impl SatelliteFeed {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         let (requests, request_receiver) = mpsc::channel::<PlanRequest>();
         let (event_sender, events) = mpsc::channel::<SatelliteEvent>();
         std::thread::spawn(move || {
@@ -411,20 +413,22 @@ impl SatelliteFeed {
                     let url = tile_url(request.imagery, request.day, *tile);
                     let decoded = match cache.get(&url) {
                         Some(cached) => Ok(cached.clone()),
-                        None => provider::get_bytes(
-                            &url,
-                            request.imagery.content_type(),
-                            MAX_TILE_BYTES,
-                        )
-                        .map_err(|source| SatelliteError::Provider { source })
-                        .and_then(|bytes| {
-                            let decoded = decode(&url, &bytes)?;
-                            if cache.len() >= CACHED_TILES {
-                                cache.clear();
-                            }
-                            cache.insert(url.clone(), decoded.clone());
-                            Ok(decoded)
-                        }),
+                        None => acquire
+                            .bytes(
+                                &sources::NASA_GIBS,
+                                &url,
+                                request.imagery.content_type(),
+                                MAX_TILE_BYTES,
+                            )
+                            .map_err(|source| SatelliteError::Provider { source })
+                            .and_then(|bytes| {
+                                let decoded = decode(&url, &bytes)?;
+                                if cache.len() >= CACHED_TILES {
+                                    cache.clear();
+                                }
+                                cache.insert(url.clone(), decoded.clone());
+                                Ok(decoded)
+                            }),
                     };
                     match decoded {
                         Ok((width, height, rgba)) => {
@@ -565,9 +569,9 @@ pub struct SatelliteLayer {
 }
 
 impl SatelliteLayer {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         Self {
-            feed: SatelliteFeed::new(),
+            feed: SatelliteFeed::new(acquire),
             shown: false,
             imagery: Imagery::TrueColor,
             day_offset: 0,
@@ -1103,7 +1107,7 @@ mod tests {
 
     #[test]
     fn a_shape_failure_is_not_retried_but_a_provider_failure_is() {
-        let mut layer = SatelliteLayer::new();
+        let mut layer = SatelliteLayer::new(Acquire::offline());
         layer.shown = true;
         layer.record_failure(String::from("no tiles"), false);
         assert!(layer.retry_due.is_none());
@@ -1119,7 +1123,7 @@ mod tests {
 
     fn status_error(status: u16) -> SatelliteError {
         SatelliteError::Provider {
-            source: JsonError::Status {
+            source: FetchError::Status {
                 url: String::from("https://example.invalid/tile"),
                 status,
                 retry_after: None,
@@ -1129,7 +1133,7 @@ mod tests {
 
     #[test]
     fn a_missing_composite_walks_back_a_day_instead_of_retrying() {
-        let mut layer = SatelliteLayer::new();
+        let mut layer = SatelliteLayer::new(Acquire::offline());
         layer.shown = true;
         layer.planned = Some(String::from("the newest day"));
         layer.failed(&status_error(404));
@@ -1147,7 +1151,7 @@ mod tests {
 
     #[test]
     fn a_provider_outage_retries_where_it_is() {
-        let mut layer = SatelliteLayer::new();
+        let mut layer = SatelliteLayer::new(Acquire::offline());
         layer.shown = true;
         layer.planned = Some(String::from("the same day"));
         layer.failed(&status_error(503));
@@ -1161,7 +1165,7 @@ mod tests {
 
     #[test]
     fn the_archive_walk_stops_at_the_oldest_day_the_layer_offers() {
-        let mut layer = SatelliteLayer::new();
+        let mut layer = SatelliteLayer::new(Acquire::offline());
         layer.shown = true;
         layer.day_offset = DAYS_BACK;
         layer.failed(&status_error(404));
@@ -1177,7 +1181,7 @@ mod tests {
 
     #[test]
     fn a_new_layer_is_off_and_idle() {
-        let layer = SatelliteLayer::new();
+        let layer = SatelliteLayer::new(Acquire::offline());
         assert!(!layer.shown);
         assert_eq!(layer.status, Status::Idle);
         assert!(layer.tiles.is_empty());

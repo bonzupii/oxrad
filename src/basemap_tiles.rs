@@ -11,49 +11,33 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Pos2, Rect};
-use http_cache_reqwest::{CACacheManager, Cache, CacheMode, HttpCache, HttpCacheOptions};
-use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use walkers::sources::{Attribution, TileSource};
 use walkers::{Style, Tile, TileId, TilePiece, Tiles};
 
+use crate::acquire::Acquire;
+use crate::cache::{CacheError, Store};
+use crate::provider::FetchError;
+use crate::sources;
+
 /// Concurrent requests allowed by the OpenFreeMap terms for offline downloads.
 const WORKERS: usize = 4;
-const MAX_TILE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_MEMORY_TILES: usize = 256;
 const RETRY_DELAY: Duration = Duration::from_secs(10);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
-const USER_AGENT: &str = concat!(
-    "oxrad/",
-    env!("CARGO_PKG_VERSION"),
-    " (https://github.com/bonzupii/oxrad)"
-);
 
 /// A tile request or decode that did not produce renderable geometry.
 #[derive(Debug)]
 pub enum TileError {
-    Runtime {
-        source: std::io::Error,
-    },
-    Client {
-        source: reqwest::Error,
-    },
-    Request {
-        url: String,
-        source: reqwest_middleware::Error,
-    },
     Status {
         url: String,
         code: u16,
         retry_after: Option<String>,
     },
-    Body {
-        url: String,
-        source: reqwest::Error,
+    Provider {
+        source: FetchError,
     },
-    TooLarge {
-        url: String,
-        bytes: usize,
+    Cache {
+        source: CacheError,
     },
     Decode {
         url: String,
@@ -66,13 +50,6 @@ pub enum TileError {
 impl TileError {
     fn message(&self) -> String {
         match self {
-            Self::Runtime { source } => {
-                format!("The tile download runtime could not start: {source}")
-            }
-            Self::Client { source } => {
-                format!("The tile HTTP client could not be created: {source}")
-            }
-            Self::Request { url, source } => format!("The request to {url} failed: {source}"),
             Self::Status {
                 url,
                 code,
@@ -81,12 +58,8 @@ impl TileError {
                 || format!("{url} returned {code}."),
                 |value| format!("{url} returned {code} and asked to retry after {value}."),
             ),
-            Self::Body { url, source } => {
-                format!("The tile body from {url} could not be read: {source}")
-            }
-            Self::TooLarge { url, bytes } => format!(
-                "The tile from {url} is {bytes} bytes, above the {MAX_TILE_BYTES} byte limit."
-            ),
+            Self::Provider { source } => format!("The map tile request failed: {source}"),
+            Self::Cache { source } => format!("The map tile cache failed: {source}"),
             Self::Decode { url, zoom, detail } => {
                 format!("The tile from {url} at zoom {zoom} is not renderable: {detail}")
             }
@@ -97,7 +70,11 @@ impl TileError {
     /// How long to wait before repeating this request, when repeating may help.
     fn retry_in(&self) -> Option<Duration> {
         match self {
-            Self::Request { .. } | Self::Body { .. } => Some(RETRY_DELAY),
+            Self::Provider { source } if source.is_transient() => Some(RETRY_DELAY),
+            Self::Provider { .. }
+            | Self::Cache { .. }
+            | Self::Decode { .. }
+            | Self::WorkerStopped => None,
             Self::Status {
                 code: 429 | 503,
                 retry_after: Some(value),
@@ -109,12 +86,7 @@ impl TileError {
                 code: 429 | 500..=599,
                 ..
             } => Some(RETRY_DELAY),
-            Self::Runtime { .. }
-            | Self::Client { .. }
-            | Self::Status { .. }
-            | Self::TooLarge { .. }
-            | Self::Decode { .. }
-            | Self::WorkerStopped => None,
+            Self::Status { .. } => None,
         }
     }
 }
@@ -128,13 +100,9 @@ impl Display for TileError {
 impl Error for TileError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Runtime { source } => Some(source),
-            Self::Client { source } | Self::Body { source, .. } => Some(source),
-            Self::Request { source, .. } => Some(source),
-            Self::Status { .. }
-            | Self::TooLarge { .. }
-            | Self::Decode { .. }
-            | Self::WorkerStopped => None,
+            Self::Provider { source } => Some(source),
+            Self::Cache { source } => Some(source),
+            Self::Status { .. } | Self::Decode { .. } | Self::WorkerStopped => None,
         }
     }
 }
@@ -147,6 +115,7 @@ struct Job {
 struct Completion {
     id: TileId,
     result: Result<Vec<u8>, TileError>,
+    warning: Option<TileError>,
 }
 
 struct Worker {
@@ -154,123 +123,25 @@ struct Worker {
     busy: Option<TileId>,
 }
 
-fn client(path: PathBuf) -> Result<ClientWithMiddleware, TileError> {
-    let http = reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
-        .build()
-        .map_err(|source| TileError::Client { source })?;
-    Ok(ClientBuilder::new(http)
-        .with(Cache(HttpCache {
-            mode: CacheMode::Default,
-            manager: CACacheManager {
-                path,
-                remove_opts: Default::default(),
-            },
-            options: HttpCacheOptions::default(),
-        }))
-        .build())
-}
-
-async fn read_body(response: reqwest::Response, url: &str) -> Result<Vec<u8>, TileError> {
-    let mut response = response;
-    let mut body = Vec::new();
-    loop {
-        let chunk = response.chunk().await.map_err(|source| TileError::Body {
-            url: String::from(url),
-            source,
-        })?;
-        let Some(chunk) = chunk else {
-            return Ok(body);
-        };
-        let next = body.len().saturating_add(chunk.len());
-        if next > MAX_TILE_BYTES {
-            return Err(TileError::TooLarge {
-                url: String::from(url),
-                bytes: next,
-            });
-        }
-        body.extend_from_slice(&chunk);
-    }
-}
-
-async fn fetch(client: &ClientWithMiddleware, url: &str) -> Result<Vec<u8>, TileError> {
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|source| TileError::Request {
-            url: String::from(url),
-            source,
-        })?;
-    let code = response.status().as_u16();
-    if !(200..300).contains(&code) {
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|value| value.to_str().ok())
-            .map(String::from);
-        return Err(TileError::Status {
-            url: String::from(url),
-            code,
-            retry_after,
-        });
-    }
-    read_body(response, url).await
-}
-
-/// Reports a setup failure for the first queued job, then lets the worker exit.
-fn report_setup_failure(
-    receiver: &Receiver<Job>,
-    events: &Sender<Completion>,
-    context: &egui::Context,
-    error: TileError,
-) {
-    let Ok(job) = receiver.recv() else {
-        return;
-    };
-    if events
-        .send(Completion {
-            id: job.id,
-            result: Err(error),
-        })
-        .is_ok()
-    {
-        context.request_repaint();
-    }
-}
-
-fn start_worker(path: PathBuf, events: Sender<Completion>, context: egui::Context) -> Worker {
+fn start_worker(
+    path: PathBuf,
+    events: Sender<Completion>,
+    context: egui::Context,
+    acquire: Acquire,
+) -> Worker {
     let (requests, receiver) = mpsc::channel::<Job>();
     std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build();
-        let client = client(path);
-        let prepared: Result<(tokio::runtime::Runtime, ClientWithMiddleware), TileError> =
-            match (runtime, client) {
-                (Ok(runtime), Ok(client)) => Ok((runtime, client)),
-                (Err(source), _) => {
-                    report_setup_failure(
-                        &receiver,
-                        &events,
-                        &context,
-                        TileError::Runtime { source },
-                    );
-                    return;
-                }
-                (_, Err(error)) => {
-                    report_setup_failure(&receiver, &events, &context, error);
-                    return;
-                }
-            };
-        let Ok((runtime, client)) = prepared else {
-            return;
-        };
+        let store = Store::at(path);
         while let Ok(job) = receiver.recv() {
-            let result = runtime.block_on(fetch(&client, &job.url));
-            if events.send(Completion { id: job.id, result }).is_err() {
+            let (result, warning) = load_tile(&acquire, &store, &job.url);
+            if events
+                .send(Completion {
+                    id: job.id,
+                    result,
+                    warning,
+                })
+                .is_err()
+            {
                 return;
             }
             context.request_repaint();
@@ -279,6 +150,59 @@ fn start_worker(path: PathBuf, events: Sender<Completion>, context: egui::Contex
     Worker {
         requests,
         busy: None,
+    }
+}
+
+/// Reads a tile from the persistent store, or fetches and stores it.
+fn load_tile(
+    acquire: &Acquire,
+    store: &Store,
+    url: &str,
+) -> (Result<Vec<u8>, TileError>, Option<TileError>) {
+    match store.load(url) {
+        Ok(Some(entry)) => (Ok(entry.body), None),
+        Ok(None) => fetch_tile(acquire, store, url),
+        Err(source) => {
+            let (result, warning) = fetch_tile(acquire, store, url);
+            (result, warning.or(Some(TileError::Cache { source })))
+        }
+    }
+}
+
+fn fetch_tile(
+    acquire: &Acquire,
+    store: &Store,
+    url: &str,
+) -> (Result<Vec<u8>, TileError>, Option<TileError>) {
+    match acquire.bytes(
+        &sources::OPENFREEMAP,
+        url,
+        "application/vnd.mapbox-vector-tile",
+        MAX_TILE_BYTES,
+    ) {
+        Ok(bytes) => {
+            let warning = store
+                .store(url, &bytes)
+                .err()
+                .map(|source| TileError::Cache { source });
+            (Ok(bytes), warning)
+        }
+        Err(source) => (Err(provider_error(source)), None),
+    }
+}
+
+fn provider_error(source: FetchError) -> TileError {
+    match source {
+        FetchError::Status {
+            url,
+            status,
+            retry_after,
+        } => TileError::Status {
+            url,
+            code: status,
+            retry_after,
+        },
+        other => TileError::Provider { source: other },
     }
 }
 
@@ -302,13 +226,27 @@ pub struct BasemapTiles<S: TileSource> {
     workers: Vec<Worker>,
     events: Receiver<Completion>,
     clock: u64,
+    warning: Option<TileError>,
 }
 
 impl<S: TileSource> BasemapTiles<S> {
-    pub fn new(source: S, style: Style, path: &Path, context: &egui::Context) -> Self {
+    pub fn new(
+        source: S,
+        style: Style,
+        path: &Path,
+        context: &egui::Context,
+        acquire: &Acquire,
+    ) -> Self {
         let (events, receiver) = mpsc::channel();
         let workers = (0..WORKERS)
-            .map(|_| start_worker(path.to_path_buf(), events.clone(), context.clone()))
+            .map(|_| {
+                start_worker(
+                    path.to_path_buf(),
+                    events.clone(),
+                    context.clone(),
+                    acquire.clone(),
+                )
+            })
             .collect();
         Self {
             source,
@@ -318,7 +256,13 @@ impl<S: TileSource> BasemapTiles<S> {
             workers,
             events: receiver,
             clock: 0,
+            warning: None,
         }
+    }
+
+    /// Takes the most recent non-fatal cache problem, if any.
+    pub const fn take_warning(&mut self) -> Option<TileError> {
+        self.warning.take()
     }
 
     /// Decodes retained tile bytes with the new style, without network access.
@@ -403,6 +347,9 @@ impl<S: TileSource> BasemapTiles<S> {
     }
 
     fn complete(&mut self, completion: Completion) {
+        if let Some(warning) = completion.warning {
+            self.warning = Some(warning);
+        }
         if let Some(worker) = self
             .workers
             .iter_mut()
@@ -560,6 +507,7 @@ mod tests {
             Style::default(),
             root,
             &egui::Context::default(),
+            &Acquire::offline(),
         )
     }
 
@@ -655,6 +603,7 @@ mod tests {
                 code: 404,
                 retry_after: None,
             }),
+            warning: None,
         });
         assert!(matches!(
             tiles.error(id),

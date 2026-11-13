@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, FontId, Pos2, Rect, RichText, Stroke};
 
+use crate::acquire::Acquire;
 use crate::app::toggle_button;
 use crate::seaice::{self, BASELINE_FROM, BASELINE_TO, SeaIceMonth, SeaIceState, SeaIceView};
 use crate::theme::{self, Palette};
@@ -39,9 +40,9 @@ pub struct SeaIceLayer {
 }
 
 impl SeaIceLayer {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         Self {
-            view: SeaIceView::new(),
+            view: SeaIceView::new(acquire),
             shown: false,
             asked_at: None,
             asked_month: None,

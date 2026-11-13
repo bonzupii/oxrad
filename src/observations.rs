@@ -27,7 +27,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::provider::{self, JsonError};
+use crate::acquire::Acquire;
+use crate::provider::FetchError;
+use crate::sources;
 use crate::time;
 
 /// The provider, in the words the rail uses.
@@ -47,7 +49,7 @@ const RETRY_MAX: Duration = Duration::from_secs(60);
 /// Why an observation set could not be read.
 #[derive(Debug)]
 pub enum ObservationError {
-    Provider { source: JsonError },
+    Provider { source: FetchError },
     Shape { detail: &'static str },
     WorkerStopped,
 }
@@ -318,8 +320,16 @@ pub fn request_url(bounds: (f64, f64, f64, f64)) -> String {
 }
 
 /// Fetches the stations in a box.
-pub fn fetch(bounds: (f64, f64, f64, f64)) -> Result<ObservationSet, ObservationError> {
-    let document = provider::get_json(&request_url(bounds), "application/json")
+pub fn fetch(
+    acquire: &Acquire,
+    bounds: (f64, f64, f64, f64),
+) -> Result<ObservationSet, ObservationError> {
+    let document = acquire
+        .json(
+            &sources::AVIATION_WEATHER_METAR,
+            &request_url(bounds),
+            "application/json",
+        )
         .map_err(|source| ObservationError::Provider { source })?;
     parse(&document)
 }
@@ -353,12 +363,12 @@ pub struct ObservationFeed {
 }
 
 impl ObservationFeed {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         let (requests, request_receiver) = mpsc::channel::<ObservationRequest>();
         let (event_sender, events) = mpsc::channel::<ObservationEvent>();
         std::thread::spawn(move || {
             while let Ok(request) = request_receiver.recv() {
-                let event = match fetch(request.bounds) {
+                let event = match fetch(&acquire, request.bounds) {
                     Ok(set) => ObservationEvent::Ready {
                         generation: request.generation,
                         set,
@@ -451,9 +461,9 @@ impl ObservationView {
         self.state.last()
     }
 
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         Self {
-            feed: ObservationFeed::new(),
+            feed: ObservationFeed::new(acquire),
             state: ObservationState::Idle,
             generation: 0,
         }

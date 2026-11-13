@@ -26,6 +26,7 @@ use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Painter, Pos2, Rect, RichText, Stroke, Vec2,
 };
 
+use crate::acquire::Acquire;
 use crate::app::{action_button, toggle_button};
 use crate::map;
 use crate::quake::{self, DepthBand, Quake, QuakeState, QuakeView, Window};
@@ -69,9 +70,9 @@ pub struct QuakeLayer {
 }
 
 impl QuakeLayer {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         Self {
-            view: QuakeView::new(),
+            view: QuakeView::new(acquire),
             shown: false,
             window: Window::Day,
             selected: None,
@@ -553,14 +554,14 @@ mod tests {
 
     #[test]
     fn a_new_layer_is_hidden_and_requests_nothing() {
-        let layer = QuakeLayer::new();
+        let layer = QuakeLayer::new(Acquire::offline());
         assert!(!layer.shown);
         assert!(layer.view.events().is_none());
     }
 
     #[test]
     fn a_hidden_layer_stays_idle_however_long_it_runs() {
-        let mut layer = QuakeLayer::new();
+        let mut layer = QuakeLayer::new(Acquire::offline());
         layer.update(Instant::now());
         assert!(matches!(layer.view.state(), QuakeState::Idle));
     }

@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, Color32, FontId, Painter, Pos2, Rect, RichText, Stroke};
 
+use crate::acquire::Acquire;
 use crate::app::toggle_button;
 use crate::map::MapTransform;
 use crate::theme::{self, Palette};
@@ -51,9 +52,9 @@ pub struct VolcanoLayer {
 }
 
 impl VolcanoLayer {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         Self {
-            view: VolcanoView::new(),
+            view: VolcanoView::new(acquire),
             shown: false,
             asked_at: None,
             focus: None,
@@ -499,7 +500,7 @@ mod tests {
 
     #[test]
     fn a_new_layer_is_off_and_holds_nothing() {
-        let mut layer = VolcanoLayer::new();
+        let mut layer = VolcanoLayer::new(Acquire::offline());
         assert!(!layer.shown);
         assert!(layer.report().is_none());
         assert!(layer.take_focus().is_none());

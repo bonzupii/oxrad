@@ -29,7 +29,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 
-use crate::provider::{self, JsonError};
+use crate::acquire::Acquire;
+use crate::provider::FetchError;
+use crate::sources;
 use crate::time;
 
 /// The provider, in the words the rail uses.
@@ -53,7 +55,7 @@ const MAGNUS_B: f64 = 243.12;
 /// Why a profile could not be read.
 #[derive(Debug)]
 pub enum SoundingError {
-    Provider { source: JsonError },
+    Provider { source: FetchError },
     Shape { detail: &'static str },
     WorkerStopped,
 }
@@ -673,12 +675,17 @@ pub fn request_url(latitude: f64, longitude: f64) -> String {
 }
 
 /// Fetches the profile for one point.
-pub fn fetch(latitude: f64, longitude: f64) -> Result<Sounding, SoundingError> {
+pub fn fetch(acquire: &Acquire, latitude: f64, longitude: f64) -> Result<Sounding, SoundingError> {
     let now_ms = match time::now_unix_ms() {
         Ok(now_ms) => now_ms,
         Err(_) => return Err(shape("a readable system clock to pick the hour")),
     };
-    let document = provider::get_json(&request_url(latitude, longitude), "application/json")
+    let document = acquire
+        .json(
+            &sources::OPEN_METEO_FORECAST,
+            &request_url(latitude, longitude),
+            "application/json",
+        )
         .map_err(|source| SoundingError::Provider { source })?;
     parse(&document, now_ms)
 }
@@ -713,12 +720,12 @@ pub struct SoundingFeed {
 }
 
 impl SoundingFeed {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         let (requests, request_receiver) = mpsc::channel::<SoundingRequest>();
         let (event_sender, events) = mpsc::channel::<SoundingEvent>();
         std::thread::spawn(move || {
             while let Ok(request) = request_receiver.recv() {
-                let event = match fetch(request.latitude, request.longitude) {
+                let event = match fetch(&acquire, request.latitude, request.longitude) {
                     Ok(record) => SoundingEvent::Ready {
                         generation: request.generation,
                         record,
@@ -805,9 +812,9 @@ pub struct SoundingView {
 }
 
 impl SoundingView {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         Self {
-            feed: SoundingFeed::new(),
+            feed: SoundingFeed::new(acquire),
             state: SoundingState::Idle,
             generation: 0,
         }

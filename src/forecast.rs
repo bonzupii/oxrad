@@ -26,8 +26,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use crate::acquire::Acquire;
 use crate::place::Place;
-use crate::provider::{self, JsonError};
+use crate::provider::FetchError;
+use crate::sources;
 
 const OPEN_METEO: &str = "https://api.open-meteo.com/v1/forecast";
 const FORECAST_DAYS: u8 = 7;
@@ -78,7 +80,7 @@ pub struct Forecast {
 /// Why a forecast could not be produced.
 #[derive(Debug)]
 pub enum ForecastError {
-    Provider { source: JsonError },
+    Provider { source: FetchError },
     NoPeriods,
     Shape { field: &'static str },
     Units { field: &'static str, value: String },
@@ -430,9 +432,10 @@ fn parse_document(place: &Place, document: &Value) -> Result<Forecast, ForecastE
 }
 
 /// Fetches the global forecast for the place, using only its coordinates.
-pub fn fetch(place: &Place) -> Result<Forecast, ForecastError> {
+pub fn fetch(acquire: &Acquire, place: &Place) -> Result<Forecast, ForecastError> {
     let url = request_url(place)?;
-    let document = provider::get_json(&url, "application/json")
+    let document = acquire
+        .json(&sources::OPEN_METEO_FORECAST, &url, "application/json")
         .map_err(|source| ForecastError::Provider { source })?;
     parse_document(place, &document)
 }
@@ -462,9 +465,9 @@ pub struct ForecastView {
 }
 
 impl ForecastView {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         Self {
-            feed: ForecastFeed::new(),
+            feed: ForecastFeed::new(acquire),
             state: ForecastState::Empty,
         }
     }
@@ -610,13 +613,13 @@ pub struct ForecastFeed {
 }
 
 impl ForecastFeed {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         let (requests, request_receiver) = mpsc::channel::<ForecastRequest>();
         let (result_sender, results) = mpsc::channel::<ForecastMessage>();
         std::thread::spawn(move || {
             while let Ok(request) = request_receiver.recv() {
                 let place = request.place;
-                let result = fetch(&place);
+                let result = fetch(&acquire, &place);
                 let message = ForecastMessage {
                     generation: request.generation,
                     place,
@@ -733,7 +736,7 @@ mod tests {
 
     fn throttled(retry_after: Option<&str>) -> ForecastError {
         ForecastError::Provider {
-            source: JsonError::Status {
+            source: FetchError::Status {
                 url: String::from("https://api.open-meteo.com/v1/forecast"),
                 status: 503,
                 retry_after: retry_after.map(String::from),
@@ -758,7 +761,7 @@ mod tests {
     fn a_failure_for_an_old_place_cannot_replace_the_current_forecast() -> Result<(), TestError> {
         let current = emporia()?;
         let old = Place::new("Dublin", "Leinster", "Ireland", "ie", 53.35, -6.26)?;
-        let mut forecast = ForecastView::new();
+        let mut forecast = ForecastView::new(Acquire::offline());
         forecast.state = ForecastState::Loading {
             place: current,
             last: None,

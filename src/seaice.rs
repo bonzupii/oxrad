@@ -27,7 +27,9 @@ use std::fmt::{self, Display, Formatter};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
-use crate::provider::{self, JsonError};
+use crate::acquire::Acquire;
+use crate::provider::FetchError;
+use crate::sources;
 use crate::time;
 
 /// The provider, in the words the rail uses.
@@ -151,7 +153,7 @@ impl SeaIceMonth {
 /// Why a month of the index could not be read.
 #[derive(Debug)]
 pub enum SeaIceError {
-    Provider { source: JsonError },
+    Provider { source: FetchError },
     Shape { detail: &'static str },
     WorkerStopped,
 }
@@ -272,9 +274,9 @@ pub fn request_url(hemisphere: Hemisphere, month: u32) -> String {
 }
 
 /// Fetches both hemispheres for one calendar month.
-pub fn fetch(month: u32) -> Result<SeaIce, SeaIceError> {
-    let north = fetch_one(Hemisphere::North, month)?;
-    let south = fetch_one(Hemisphere::South, month)?;
+pub fn fetch(acquire: &Acquire, month: u32) -> Result<SeaIce, SeaIceError> {
+    let north = fetch_one(acquire, Hemisphere::North, month)?;
+    let south = fetch_one(acquire, Hemisphere::South, month)?;
     Ok(SeaIce {
         month,
         north,
@@ -282,8 +284,17 @@ pub fn fetch(month: u32) -> Result<SeaIce, SeaIceError> {
     })
 }
 
-fn fetch_one(hemisphere: Hemisphere, month: u32) -> Result<SeaIceMonth, SeaIceError> {
-    let text = provider::get_text(&request_url(hemisphere, month), "text/csv")
+fn fetch_one(
+    acquire: &Acquire,
+    hemisphere: Hemisphere,
+    month: u32,
+) -> Result<SeaIceMonth, SeaIceError> {
+    let text = acquire
+        .text(
+            &sources::NSIDC_SEA_ICE,
+            &request_url(hemisphere, month),
+            "text/csv",
+        )
         .map_err(|source| SeaIceError::Provider { source })?;
     parse(&text, hemisphere)
 }
@@ -323,12 +334,12 @@ pub struct SeaIceFeed {
 }
 
 impl SeaIceFeed {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         let (requests, request_receiver) = mpsc::channel::<SeaIceRequest>();
         let (event_sender, events) = mpsc::channel::<SeaIceEvent>();
         std::thread::spawn(move || {
             while let Ok(request) = request_receiver.recv() {
-                let event = match fetch(request.month) {
+                let event = match fetch(&acquire, request.month) {
                     Ok(record) => SeaIceEvent::Ready {
                         generation: request.generation,
                         record,
@@ -415,9 +426,9 @@ pub struct SeaIceView {
 }
 
 impl SeaIceView {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         Self {
-            feed: SeaIceFeed::new(),
+            feed: SeaIceFeed::new(acquire),
             state: SeaIceState::Idle,
             generation: 0,
         }

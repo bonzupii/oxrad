@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Stroke};
 
+use crate::acquire::Acquire;
 use crate::app::toggle_button;
 use crate::map::MapView;
 use crate::projection;
@@ -45,9 +46,9 @@ pub struct SnowLayer {
 }
 
 impl SnowLayer {
-    pub fn new() -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         Self {
-            view: SnowView::new(),
+            view: SnowView::new(acquire),
             shown: false,
             asked: None,
             asked_at: None,
@@ -455,7 +456,7 @@ mod tests {
 
     #[test]
     fn a_new_layer_is_off() {
-        let layer = SnowLayer::new();
+        let layer = SnowLayer::new(Acquire::offline());
         assert!(!layer.shown);
         assert!(matches!(layer.view.state(), SnowState::Idle));
     }

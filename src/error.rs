@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use crate::config::{CachePolicyError, LocaleError, ProviderError};
 use crate::place::PlaceError;
 use crate::product::RadarProduct;
+use crate::provider::FetchError;
 
 /// A volume product that could not be computed from the decoded sweeps.
 #[derive(Debug)]
@@ -701,14 +702,13 @@ impl Error for VolumeDefect {}
 /// A failure acquiring, decoding, or assembling a radar volume.
 #[derive(Debug)]
 pub enum RadarError {
-    Http {
-        url: String,
-        source: ureq::Error,
-    },
     HttpStatus {
         url: String,
         status: u16,
         retry_after: Option<String>,
+    },
+    Provider {
+        source: FetchError,
     },
     VolumeGone {
         key: String,
@@ -805,7 +805,6 @@ pub enum RadarError {
 impl RadarError {
     fn message(&self) -> String {
         match self {
-            Self::Http { url, source } => format!("The request to {url} failed: {source}"),
             Self::HttpStatus {
                 url,
                 status,
@@ -813,6 +812,7 @@ impl RadarError {
             } => {
                 format!("{url} returned {status}; Retry-After {retry_after:?}.")
             }
+            Self::Provider { source } => format!("The source request failed: {source}"),
             Self::VolumeGone { key } => {
                 format!("Volume {key} left the feed; the listing is refreshed.")
             }
@@ -905,10 +905,27 @@ impl Display for RadarError {
     }
 }
 
+impl From<FetchError> for RadarError {
+    fn from(source: FetchError) -> Self {
+        match source {
+            FetchError::Status {
+                url,
+                status,
+                retry_after,
+            } => Self::HttpStatus {
+                url,
+                status,
+                retry_after,
+            },
+            other => Self::Provider { source: other },
+        }
+    }
+}
+
 impl Error for RadarError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Http { source, .. } => Some(source),
+            Self::Provider { source } => Some(source),
             Self::Decompress { source, .. } => Some(source),
             Self::Decode { source, .. } => Some(source),
             Self::MessageStructure { defect, .. } => Some(defect),
