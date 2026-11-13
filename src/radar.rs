@@ -1726,6 +1726,18 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_archive_is_refused() -> Result<(), TestError> {
+        assert!(decode_volume(&site()?, "key", b"").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_malformed_archive_is_refused() -> Result<(), TestError> {
+        assert!(decode_volume(&site()?, "key", b"not an archive").is_err());
+        Ok(())
+    }
+
+    #[test]
     fn header_only_archive_reports_an_incomplete_volume() -> Result<(), TestError> {
         let site = site()?;
         match decode_volume(&site, "key", &archive_header()) {

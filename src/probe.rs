@@ -312,8 +312,7 @@ fn basemap_tile(
     let first = first.map_err(|error| live_error("OpenFreeMap tile", error))?;
     let (fetched, warning_again) = basemap_tiles::load_tile(acquire, id);
     let fetched = fetched.map_err(|error| live_error("OpenFreeMap tile", error))?;
-    let decoded = Tile::from_mvt(&fetched.bytes, &style, id.zoom)
-        .map_err(|error| live_error("OpenFreeMap tile parser", error))?;
+    let decoded = decode_basemap_tile(&fetched.bytes, &style, id.zoom)?;
     let features = match decoded {
         Tile::Vector(shapes) => shapes.len(),
         Tile::Raster(_) => 0,
@@ -341,6 +340,16 @@ fn basemap_tile(
         fetched.cache,
         vec![(style_fetched.provenance, style_fetched.cache)],
     ))
+}
+
+fn decode_basemap_tile(bytes: &[u8], style: &Style, zoom: u8) -> Result<Tile, ProbeError> {
+    if bytes.is_empty() {
+        return Err(rejected(
+            "OpenFreeMap tile",
+            "the provider returned an empty tile body",
+        ));
+    }
+    Tile::from_mvt(bytes, style, zoom).map_err(|error| live_error("OpenFreeMap tile parser", error))
 }
 
 fn rainviewer_tile(
@@ -1947,6 +1956,19 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn an_empty_basemap_tile_is_refused() {
+        assert!(decode_basemap_tile(b"", &Style::default(), 2).is_err());
+    }
+
+    #[test]
+    fn a_malformed_basemap_tile_is_refused() {
+        assert!(
+            decode_basemap_tile(b"not an mvt", &Style::default(), 2).is_err(),
+            "a non-MVT body must not decode into geometry"
+        );
     }
 
     #[test]

@@ -752,6 +752,19 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_tile_is_refused() {
+        assert!(decode_tile(b"", "https://example.test/tile.png").is_err());
+    }
+
+    #[test]
+    fn a_malformed_tile_is_refused() {
+        assert!(
+            decode_tile(b"not a png", "https://example.test/tile.png").is_err(),
+            "a non-PNG body must not decode into pixels"
+        );
+    }
+
+    #[test]
     fn manifest_rejects_a_foreign_host() {
         let document = br#"{"generated":1609402525,"host":"http://example.com","radar":{"past":[{"time":1609401600,"path":"/v2/radar/a"}]}}"#;
         assert!(matches!(
