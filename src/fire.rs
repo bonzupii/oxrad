@@ -27,12 +27,95 @@ use std::sync::mpsc::Receiver;
 use serde_json::Value;
 
 use crate::acquire::Acquire;
+use crate::engine::Served;
 use crate::provider::FetchError;
 use crate::sources;
 use crate::time;
 
-/// The provider, in the words the rail uses.
-pub const SOURCE: &str = "NIFC WFIGS interagency perimeters";
+/// The wildfire catalogues the layer can read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FireProvider {
+    Nifc,
+    Cwfis,
+}
+
+impl FireProvider {
+    pub const ALL: [Self; 2] = [Self::Nifc, Self::Cwfis];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Nifc => "NIFC WFIGS",
+            Self::Cwfis => "CWFIS",
+        }
+    }
+
+    pub const fn coverage(self) -> &'static str {
+        match self {
+            Self::Nifc => "United States",
+            Self::Cwfis => "Canada",
+        }
+    }
+
+    /// Whether the catalogue is the national one for this position. The
+    /// envelope is coarse near a shared border, so the selector stays available
+    /// and the rail names the catalogue it is reading.
+    pub fn covers(self, lat: f64, lon: f64) -> bool {
+        if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+            return false;
+        }
+        match self {
+            Self::Nifc => !canada(lat, lon) && united_states(lat, lon),
+            Self::Cwfis => canada(lat, lon),
+        }
+    }
+
+    /// The catalogue that covers a position, if one does.
+    pub fn for_point(lat: f64, lon: f64) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|provider| provider.covers(lat, lon))
+    }
+}
+
+/// A coarse national envelope, enough to choose a default catalogue rather
+/// than a survey boundary. Longitude bands follow the southern border west to
+/// east; the caller still names the catalogue it reads.
+fn canada(lat: f64, lon: f64) -> bool {
+    if !(41.0..=84.0).contains(&lat) || !(-141.0..=-52.0).contains(&lon) {
+        return false;
+    }
+    let border = if lon < -95.0 {
+        49.0
+    } else if lon < -79.0 {
+        43.0
+    } else if lon < -67.0 {
+        45.0
+    } else {
+        44.0
+    };
+    lat >= border
+}
+
+fn united_states(lat: f64, lon: f64) -> bool {
+    let contiguous = (-125.0..=-66.0).contains(&lon)
+        && lat <= 49.0
+        && lat
+            >= if lon < -117.0 {
+                32.5
+            } else if lon < -106.0 {
+                31.3
+            } else if lon < -103.0 {
+                29.5
+            } else if lon < -97.0 {
+                25.8
+            } else {
+                24.5
+            };
+    contiguous
+        || ((51.0..=72.0).contains(&lat) && (-170.0..=-129.0).contains(&lon))
+        || ((18.0..=23.0).contains(&lat) && (-161.0..=-154.0).contains(&lon))
+        || ((17.0..=19.0).contains(&lat) && (-68.0..=-64.0).contains(&lon))
+}
 
 /// The fields the layer reads, so the service does not ship every attribute it
 /// keeps for an incident.
@@ -114,7 +197,9 @@ impl FireKind {
 pub struct FirePerimeter {
     pub name: String,
     pub kind: FireKind,
-    pub acres: Option<f64>,
+    /// The mapped area in hectares, the source's metric area or a converted
+    /// acreage from a source that publishes acres.
+    pub area_hectares: Option<f64>,
     pub contained: Option<f64>,
     pub state: Option<String>,
     /// When the polygon was drawn, in milliseconds since the epoch.
@@ -154,6 +239,7 @@ impl FirePerimeter {
 /// Every perimeter the service published, with what it refused to read.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FireSet {
+    pub provider: FireProvider,
     pub perimeters: Vec<FirePerimeter>,
     /// Features the layer could not use, counted so the rail can say so.
     pub rejected: usize,
@@ -176,18 +262,22 @@ impl FireSet {
         distances
     }
 
-    /// The largest perimeter by mapped acres.
+    /// The largest perimeter by mapped area.
     pub fn largest(&self) -> Option<&FirePerimeter> {
         self.perimeters
             .iter()
-            .filter_map(|fire| fire.acres.map(|acres| (acres, fire)))
+            .filter_map(|fire| fire.area_hectares.map(|hectares| (hectares, fire)))
             .max_by(|left, right| left.0.total_cmp(&right.0))
             .map(|(_, fire)| fire)
     }
 
-    /// The total mapped acres, counting only the perimeters that report them.
-    pub fn total_acres(&self) -> f64 {
-        self.perimeters.iter().filter_map(|fire| fire.acres).sum()
+    /// The total mapped area in hectares, counting only the perimeters that
+    /// report it.
+    pub fn total_hectares(&self) -> f64 {
+        self.perimeters
+            .iter()
+            .filter_map(|fire| fire.area_hectares)
+            .sum()
     }
 }
 
@@ -281,7 +371,9 @@ fn perimeter_of(feature: &Value) -> Option<FirePerimeter> {
     Some(FirePerimeter {
         name,
         kind: FireKind::of(text_of(properties, "attr_IncidentTypeCategory").as_deref()),
-        acres: number_of(properties, "poly_GISAcres").filter(|acres| *acres >= 0.0),
+        area_hectares: number_of(properties, "poly_GISAcres")
+            .filter(|acres| *acres >= 0.0)
+            .map(|acres| acres * ACRES_TO_HECTARES),
         contained: number_of(properties, "attr_PercentContained")
             .filter(|value| (0.0..=100.0).contains(value)),
         state: text_of(properties, "attr_POOState"),
@@ -291,7 +383,10 @@ fn perimeter_of(feature: &Value) -> Option<FirePerimeter> {
     })
 }
 
-/// Reads the service's answer into a set of perimeters.
+/// One acre in hectares, the exact international definition.
+pub const ACRES_TO_HECTARES: f64 = 0.404_685_642_24;
+
+/// Reads the NIFC service's answer into a set of perimeters.
 pub fn parse(document: &Value) -> Result<FireSet, FireError> {
     let Some(features) = document.get("features").and_then(Value::as_array) else {
         return Err(shape("a feature collection"));
@@ -308,19 +403,120 @@ pub fn parse(document: &Value) -> Result<FireSet, FireError> {
         return Err(shape("at least one perimeter it could read"));
     }
     Ok(FireSet {
+        provider: FireProvider::Nifc,
         perimeters,
         rejected,
     })
 }
-/// Fetches every current perimeter through the request engine.
-pub fn fetch(acquire: &Acquire) -> Result<FireSet, FireError> {
+
+/// Reads a CWFIS WFS response. Its perimeter estimates carry an area in
+/// hectares and a last mapping time but no incident name.
+pub fn parse_cwfis(document: &Value) -> Result<FireSet, FireError> {
+    let Some(features) = document.get("features").and_then(Value::as_array) else {
+        return Err(shape("a feature collection"));
+    };
+    let mut perimeters = Vec::new();
+    let mut rejected = 0_usize;
+    for feature in features {
+        let Some(properties) = feature.get("properties").and_then(Value::as_object) else {
+            rejected += 1;
+            continue;
+        };
+        let Some(rings) = feature.get("geometry").and_then(rings_of) else {
+            rejected += 1;
+            continue;
+        };
+        let Some(outer) = rings.first() else {
+            rejected += 1;
+            continue;
+        };
+        let count = outer.len() as f64;
+        let latitude = outer.iter().map(|(lat, _)| lat).sum::<f64>() / count;
+        let longitude = outer.iter().map(|(_, lon)| lon).sum::<f64>() / count;
+        let mapped_at_ms = properties
+            .get("lastdate")
+            .and_then(Value::as_str)
+            .and_then(time::parse_iso_utc);
+        perimeters.push(FirePerimeter {
+            name: String::from("unnamed perimeter estimate"),
+            kind: FireKind::Unclassified,
+            area_hectares: number_of(properties, "area").filter(|area| *area >= 0.0),
+            contained: None,
+            state: None,
+            mapped_at_ms,
+            rings,
+            centre: (latitude, longitude),
+        });
+    }
+    if perimeters.is_empty() && rejected > 0 {
+        return Err(shape("at least one perimeter it could read"));
+    }
+    Ok(FireSet {
+        provider: FireProvider::Cwfis,
+        perimeters,
+        rejected,
+    })
+}
+
+/// Half the widest box a map-centred wildfire request may cover, in degrees.
+const MAX_HALF_DEG: f64 = 10.0;
+
+/// The box the wildfire request asks for, from the map view.
+pub fn bounds(centre_lat: f64, centre_lon: f64, span_km: f64) -> (f64, f64, f64, f64) {
+    let half_lat = (span_km / 2.0 / 111.0).clamp(0.5, MAX_HALF_DEG);
+    let cosine = centre_lat.to_radians().cos().abs().max(0.2);
+    let half_lon = (half_lat / cosine).clamp(0.5, MAX_HALF_DEG);
+    let south = (centre_lat - half_lat).clamp(-89.0, 89.0);
+    let north = (centre_lat + half_lat).clamp(-89.0, 89.0);
+    let west = (centre_lon - half_lon).clamp(-180.0, 180.0);
+    let east = (centre_lon + half_lon).clamp(-180.0, 180.0);
+    (south, west, north, east)
+}
+
+/// A provider's request operation, its values and the parser for its body.
+type FireRequestPlan = (
+    &'static crate::sources::Source,
+    &'static str,
+    Vec<(&'static str, String)>,
+    fn(&Value) -> Result<FireSet, FireError>,
+);
+
+/// Fetches current perimeters through the request engine.
+pub fn fetch(
+    acquire: &Acquire,
+    provider: FireProvider,
+    bounds: (f64, f64, f64, f64),
+) -> Result<Served<FireSet>, FireError> {
+    let (south, west, north, east) = bounds;
+    let (source, operation, values, parse_fn): FireRequestPlan = match provider {
+        FireProvider::Nifc => (&sources::NIFC_WFIGS, "perimeters", Vec::new(), parse),
+        FireProvider::Cwfis => {
+            let bbox = format!("{west:.4},{south:.4},{east:.4},{north:.4},EPSG:4326");
+            (
+                &sources::CWFIS,
+                "perimeters",
+                vec![("bbox", bbox)],
+                parse_cwfis,
+            )
+        }
+    };
+    let borrowed: Vec<(&str, &str)> = values
+        .iter()
+        .map(|(name, value)| (*name, value.as_str()))
+        .collect();
     let fetched = acquire
-        .fetch_operation(&sources::NIFC_WFIGS, "perimeters", &[])
+        .fetch_operation(source, operation, &borrowed)
         .map_err(|source| FireError::Provider { source })?;
-    let document = fetched
-        .json()
-        .map_err(|source| FireError::Provider { source })?;
-    parse(&document)
+    let value = parse_fn(
+        &fetched
+            .json()
+            .map_err(|source| FireError::Provider { source })?,
+    )?;
+    Ok(Served {
+        value,
+        provenance: fetched.provenance,
+        cache: fetched.cache,
+    })
 }
 
 /// Where the layer's request stands.
@@ -328,22 +524,22 @@ pub fn fetch(acquire: &Acquire) -> Result<FireSet, FireError> {
 pub enum FireState {
     Idle,
     Loading {
-        last: Option<FireSet>,
+        last: Option<Served<FireSet>>,
     },
     Ready {
-        set: FireSet,
+        served: Served<FireSet>,
     },
     Failed {
         error: FireError,
-        last: Option<FireSet>,
+        last: Option<Served<FireSet>>,
     },
 }
 
 impl FireState {
     /// The most recent set still worth drawing.
-    pub const fn last(&self) -> Option<&FireSet> {
+    pub const fn last(&self) -> Option<&Served<FireSet>> {
         match self {
-            Self::Ready { set } => Some(set),
+            Self::Ready { served } => Some(served),
             Self::Loading { last } | Self::Failed { last, .. } => last.as_ref(),
             Self::Idle => None,
         }
@@ -354,7 +550,7 @@ impl FireState {
 /// this view only holds what the layer draws.
 pub struct FireView {
     acquire: Acquire,
-    pending: Option<Receiver<Result<FireSet, FireError>>>,
+    pending: Option<Receiver<Result<Served<FireSet>, FireError>>>,
     state: FireState,
 }
 
@@ -371,8 +567,8 @@ impl FireView {
         &self.state
     }
 
-    pub const fn set(&self) -> Option<&FireSet> {
-        self.state.last()
+    pub fn set(&self) -> Option<&FireSet> {
+        self.state.last().map(|served| &served.value)
     }
 
     /// Whether a read is already in flight.
@@ -380,12 +576,21 @@ impl FireView {
         self.pending.is_some()
     }
 
-    /// Starts one engine read, keeping the last set on screen meanwhile.
-    pub fn start(&mut self) {
-        let last = take_last(&mut self.state);
+    /// Drops the last answer and any read in flight, for a catalogue change.
+    pub fn reset(&mut self) {
+        self.pending = None;
+        self.state = FireState::Idle;
+    }
+
+    /// Starts one engine read, keeping a set from the same provider on screen
+    /// while a new provider's request is in flight.
+    pub fn start(&mut self, provider: FireProvider, bounds: (f64, f64, f64, f64)) {
+        let last = take_last(&mut self.state).filter(|served| served.value.provider == provider);
         self.state = FireState::Loading { last };
         let acquire = self.acquire.clone();
-        self.pending = Some(crate::engine::task(move || fetch(&acquire)));
+        self.pending = Some(crate::engine::task(move || {
+            fetch(&acquire, provider, bounds)
+        }));
     }
 
     /// Takes in the read's single answer.
@@ -394,8 +599,8 @@ impl FireView {
             return;
         };
         match receiver.try_recv() {
-            Ok(Ok(set)) => {
-                self.state = FireState::Ready { set };
+            Ok(Ok(served)) => {
+                self.state = FireState::Ready { served };
                 self.pending = None;
             }
             Ok(Err(error)) => {
@@ -417,10 +622,10 @@ impl FireView {
 }
 
 /// Empties the state and returns the set it was holding.
-fn take_last(state: &mut FireState) -> Option<FireSet> {
+fn take_last(state: &mut FireState) -> Option<Served<FireSet>> {
     match std::mem::replace(state, FireState::Idle) {
         FireState::Loading { last } | FireState::Failed { last, .. } => last,
-        FireState::Ready { set } => Some(set),
+        FireState::Ready { served } => Some(served),
         FireState::Idle => None,
     }
 }
@@ -486,6 +691,36 @@ mod tests {
     }
 
     #[test]
+    fn the_catalogue_follows_the_map_centre() {
+        assert_eq!(
+            FireProvider::for_point(39.0, -98.0),
+            Some(FireProvider::Nifc)
+        );
+        assert_eq!(
+            FireProvider::for_point(43.65, -79.38),
+            Some(FireProvider::Cwfis)
+        );
+        assert_eq!(
+            FireProvider::for_point(49.28, -123.12),
+            Some(FireProvider::Cwfis)
+        );
+        assert_eq!(
+            FireProvider::for_point(45.50, -73.57),
+            Some(FireProvider::Cwfis)
+        );
+        assert_eq!(
+            FireProvider::for_point(47.60, -122.33),
+            Some(FireProvider::Nifc)
+        );
+        assert_eq!(
+            FireProvider::for_point(61.20, -149.90),
+            Some(FireProvider::Nifc)
+        );
+        assert_eq!(FireProvider::for_point(19.43, -99.13), None);
+        assert_eq!(FireProvider::for_point(51.50, -0.12), None);
+    }
+
+    #[test]
     fn a_perimeter_keeps_its_rings_and_its_attributes() -> Result<(), FireError> {
         let set = set()?;
         assert_eq!(set.perimeters.len(), 2);
@@ -493,7 +728,11 @@ mod tests {
         let first = &set.perimeters[0];
         assert_eq!(first.name, "Prairie");
         assert_eq!(first.kind, FireKind::Wildfire);
-        assert_eq!(first.acres, Some(1250.0));
+        assert!(
+            first
+                .area_hectares
+                .is_some_and(|hectares| (hectares - 505.857).abs() < 0.01)
+        );
         assert_eq!(first.contained, Some(40.0));
         assert_eq!(first.state.as_deref(), Some("US-KS"));
         assert_eq!(first.rings[0].len(), 5);
@@ -523,14 +762,48 @@ mod tests {
     }
 
     #[test]
-    fn the_largest_perimeter_is_the_one_with_the_most_acres() -> Result<(), FireError> {
+    fn the_largest_perimeter_is_the_one_with_the_most_hectares() -> Result<(), FireError> {
         let set = set()?;
         assert_eq!(
             set.largest().map(|fire| fire.name.as_str()),
             Some("Two Bits")
         );
-        assert_eq!(set.total_acres(), 9250.0);
+        assert!((set.total_hectares() - 3_743.34).abs() < 0.01);
         Ok(())
+    }
+
+    #[test]
+    fn a_cwfis_perimeter_keeps_its_hectares_and_mapping_time() {
+        let body = r#"{
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "geometry": {"type": "Polygon", "coordinates": [[
+                    [-96.4, 39.1], [-96.2, 39.1], [-96.2, 39.3], [-96.4, 39.3], [-96.4, 39.1]
+                ]]},
+                "properties": {
+                    "hcount": 227,
+                    "firstdate": "2026-07-14T07:17:00Z",
+                    "lastdate": "2026-07-19T17:59:00Z",
+                    "area": 1517.6168
+                }
+            }]
+        }"#;
+        let Ok(document) = serde_json::from_str::<Value>(body) else {
+            return;
+        };
+        let Ok(set) = parse_cwfis(&document) else {
+            return;
+        };
+        assert_eq!(set.provider, FireProvider::Cwfis);
+        assert_eq!(set.perimeters.len(), 1);
+        let fire = &set.perimeters[0];
+        assert!(
+            fire.area_hectares
+                .is_some_and(|hectares| (hectares - 1517.6168).abs() < 1e-6)
+        );
+        assert!(fire.mapped_at_ms.is_some());
+        assert_eq!(fire.kind, FireKind::Unclassified);
     }
 
     #[test]

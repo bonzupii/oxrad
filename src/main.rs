@@ -61,6 +61,8 @@ mod paths;
 mod pipeline;
 mod place;
 mod places_panel;
+mod power;
+mod power_layer;
 mod product;
 mod projection;
 mod provider;
@@ -96,6 +98,8 @@ mod test_support;
 mod text;
 mod theme;
 mod time;
+mod uk_rivers;
+mod uk_rivers_layer;
 mod units;
 mod volcano;
 mod volcano_layer;
@@ -112,6 +116,7 @@ use stations::SiteId;
 const USAGE: &str = "\
 Usage: oxrad [--site IDENTIFIER] [--profile PATH] [--set key=value]...
              [--print-config | --prune-cache | --sources | --fetch-source ID]
+             [--value NAME=VALUE]...
 
 Runs the radar viewer. The last selected site is restored from the
 configuration file; with no saved site the picker opens.
@@ -122,8 +127,10 @@ configuration file; with no saved site the picker opens.
   --print-config      Print the effective configuration and exit
   --prune-cache       Enforce the configured cache budget and exit
   --sources           Print the open-source inventory and exit
-  --fetch-source ID   Fetch one registry endpoint twice through the request
-                      engine and print its provenance and cache state
+  --fetch-source ID   Fetch the source's first endpoint twice through the
+                      request engine and print its provenance and cache state
+  --value NAME=VALUE  Supply one endpoint placeholder to --fetch-source;
+                      repeatable
   -h, --help          Show this message";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -144,6 +151,7 @@ struct Invocation {
     selection: Vec<String>,
     action: Action,
     fetch_source: Option<String>,
+    fetch_values: Vec<(String, String)>,
 }
 
 fn choose(action: &mut Action, chosen: Action) -> Result<(), String> {
@@ -193,9 +201,35 @@ fn parse_arguments() -> Result<Invocation, String> {
                 choose(&mut invocation.action, Action::FetchSource)?;
                 invocation.fetch_source = Some(value);
             }
+            "--value" => {
+                let value = arguments.next().ok_or_else(|| {
+                    String::from("--value needs a placeholder and value, such as limit=12.")
+                })?;
+                let (name, value) = value.split_once('=').ok_or_else(|| {
+                    String::from("--value needs a name and value separated by =.")
+                })?;
+                if name.is_empty() || value.is_empty() {
+                    return Err(String::from(
+                        "--value needs a name and value separated by =.",
+                    ));
+                }
+                if invocation
+                    .fetch_values
+                    .iter()
+                    .any(|(existing, _)| existing == name)
+                {
+                    return Err(format!("--value names {name} more than once."));
+                }
+                invocation
+                    .fetch_values
+                    .push((String::from(name), String::from(value)));
+            }
             "--help" | "-h" => choose(&mut invocation.action, Action::Help)?,
             unexpected => return Err(format!("Unexpected argument {unexpected}.")),
         }
+    }
+    if !invocation.fetch_values.is_empty() && invocation.action != Action::FetchSource {
+        return Err(String::from("--value is only read with --fetch-source."));
     }
     Ok(invocation)
 }
@@ -228,20 +262,21 @@ fn prune_cache(policy: config::CachePolicy) -> ExitCode {
 
 /// Fetches one registry endpoint twice through the engine and reports what it
 /// served, so cache state and provenance can be observed without a display.
-fn fetch_source(config: &config::Config, id: &str) -> ExitCode {
+fn fetch_source(config: &config::Config, id: &str, values: &[(String, String)]) -> ExitCode {
     let Some(source) = sources::find(id) else {
         eprintln!("No registry source is named {id}. Run --sources for the identifiers.");
         return ExitCode::FAILURE;
     };
     let acquire = acquire::Acquire::new(config.providers.clone());
-    let Some(operation) = source.static_operation() else {
-        eprintln!(
-            "{} has no operation that can be fetched without values; use it from the workstation.",
-            source.id.as_str()
-        );
+    let Some(operation) = source.endpoints.first() else {
+        eprintln!("{} records no endpoint.", source.id.as_str());
         return ExitCode::FAILURE;
     };
-    let spec = match engine::RequestSpec::for_operation(source, operation.operation, &[]) {
+    let borrowed: Vec<(&str, &str)> = values
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    let spec = match engine::RequestSpec::for_operation(source, operation.operation, &borrowed) {
         Ok(spec) => spec,
         Err(error) => {
             eprintln!("The request could not be built: {error}");
@@ -342,7 +377,7 @@ fn main() -> ExitCode {
                     eprintln!("--fetch-source needs a registry identifier.");
                     return ExitCode::FAILURE;
                 };
-                return fetch_source(&effective.config, id);
+                return fetch_source(&effective.config, id, &invocation.fetch_values);
             }
             Action::Run | Action::PrintSources | Action::Help => {}
         }

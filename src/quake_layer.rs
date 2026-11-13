@@ -27,9 +27,9 @@ use eframe::egui::{
 };
 
 use crate::acquire::Acquire;
-use crate::canvas::{action_button, toggle_button};
+use crate::canvas::{action_button, provenance, toggle_button};
 use crate::map;
-use crate::quake::{self, DepthBand, Quake, QuakeState, QuakeView, Window};
+use crate::quake::{self, DepthBand, Provider, Quake, QuakeState, QuakeView, Window};
 use crate::theme::{self, Palette};
 use crate::time;
 
@@ -64,6 +64,7 @@ pub const fn colour(band: DepthBand) -> Color32 {
 pub struct QuakeLayer {
     view: QuakeView,
     shown: bool,
+    provider: Provider,
     window: Window,
     selected: Option<String>,
     refresh_due: Option<Instant>,
@@ -74,6 +75,7 @@ impl QuakeLayer {
         Self {
             view: QuakeView::new(acquire),
             shown: false,
+            provider: Provider::Usgs,
             window: Window::Day,
             selected: None,
             refresh_due: None,
@@ -100,7 +102,7 @@ impl QuakeLayer {
     }
 
     fn refresh(&mut self) {
-        self.view.start(self.window);
+        self.view.start(self.provider, self.window);
         self.refresh_due = Instant::now().checked_add(Duration::from_secs(quake::REFRESH_SECS));
     }
 
@@ -180,10 +182,26 @@ impl QuakeLayer {
         ui.add_space(theme::SPACE_M);
         ui.label(RichText::new("Earthquakes").size(theme::TYPE_LABEL).weak());
         ui.label(
-            RichText::new("USGS · worldwide, no key required")
-                .size(theme::TYPE_SMALL)
-                .weak(),
+            RichText::new(format!(
+                "{} · {} · no key required",
+                self.provider.label(),
+                self.provider.coverage()
+            ))
+            .size(theme::TYPE_SMALL)
+            .weak(),
         );
+        let mut provider = self.provider;
+        ui.horizontal(|ui| {
+            for candidate in Provider::ALL {
+                ui.selectable_value(&mut provider, candidate, candidate.label())
+                    .on_hover_text(format!("Read the {} catalogue.", candidate.label()));
+            }
+        });
+        if provider != self.provider {
+            self.provider = provider;
+            self.selected = None;
+            self.refresh();
+        }
         let label = if self.shown {
             "Earthquakes: on"
         } else {
@@ -192,7 +210,7 @@ impl QuakeLayer {
         if ui
             .add_sized([150.0, 30.0], toggle_button(palette, label, self.shown))
             .on_hover_text(
-                "Live epicentres from the USGS summary feeds. Symbol size follows magnitude, colour follows depth.",
+                "Live epicentres from the selected public catalogue. Symbol size follows magnitude, colour follows depth.",
             )
             .clicked()
         {
@@ -271,46 +289,46 @@ impl QuakeLayer {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label(
-                        RichText::new("Requesting the USGS feed…")
+                        RichText::new(format!("Requesting the {} feed…", self.provider.label()))
                             .size(theme::TYPE_SMALL)
                             .weak(),
                     );
                 });
                 if let Some(last) = last {
                     ui.label(
-                        RichText::new(format!("Still showing {}", quake::describe(last)))
+                        RichText::new(format!("Still showing {}", quake::describe(&last.value)))
                             .size(theme::TYPE_SMALL)
                             .weak(),
                     );
                 }
             }
-            QuakeState::Ready { quakes } => {
+            QuakeState::Ready { served } => {
                 ui.label(
-                    RichText::new(quake::describe(quakes))
+                    RichText::new(quake::describe(&served.value))
                         .size(theme::TYPE_SMALL)
                         .weak(),
                 )
-                .on_hover_text(&quakes.title);
-                let built = match time::format_utc(quakes.generated_ms) {
-                    Ok(when) => when,
-                    Err(error) => format!("feed time unavailable: {error}"),
-                };
-                ui.label(
-                    RichText::new(format!("Feed built {built}"))
-                        .size(theme::TYPE_SMALL)
-                        .weak(),
+                .on_hover_text(&served.value.title);
+                let built = served.value.generated_ms.map_or_else(
+                    || String::from("Feed publication time not stated"),
+                    |generated_ms| match time::format_utc(generated_ms) {
+                        Ok(when) => format!("Feed built {when}"),
+                        Err(error) => format!("feed time unavailable: {error}"),
+                    },
                 );
+                ui.label(RichText::new(built).size(theme::TYPE_SMALL).weak());
+                provenance(ui, &served.provenance, served.cache);
             }
             QuakeState::Failed { error, last, .. } => {
                 ui.colored_label(
                     ui.visuals().error_fg_color,
-                    format!("USGS feed failed: {error}"),
+                    format!("{} feed failed: {error}", self.provider.label()),
                 );
                 if let Some(last) = last {
                     ui.label(
                         RichText::new(format!(
                             "Showing the last feed received: {}",
-                            quake::describe(last)
+                            quake::describe(&last.value)
                         ))
                         .size(theme::TYPE_SMALL)
                         .weak(),
@@ -401,6 +419,7 @@ fn details(ui: &mut egui::Ui, title: &str, quake: &Quake) {
             .strong(),
     );
     let mut lines = vec![
+        format!("Catalogue {}", quake.provider.label()),
         format!("Scale {}", quake.magnitude_type),
         format!(
             "{:.1} km deep · {}",
@@ -411,8 +430,13 @@ fn details(ui: &mut egui::Ui, title: &str, quake: &Quake) {
             Ok(when) => when,
             Err(error) => format!("Origin time unavailable: {error}"),
         },
-        format!("Status {}", quake.status),
     ];
+    if let Some(status) = &quake.status {
+        lines.push(format!("Status {status}"));
+    }
+    if let Some(agency) = &quake.agency {
+        lines.push(format!("Contributing agency {agency}"));
+    }
     if let Some(felt) = quake.felt {
         lines.push(format!("Felt reports · {felt}"));
     }
@@ -425,7 +449,9 @@ fn details(ui: &mut egui::Ui, title: &str, quake: &Quake) {
     for line in lines {
         ui.label(RichText::new(line).size(theme::TYPE_SMALL).weak());
     }
-    ui.hyperlink_to("USGS event page", &quake.url);
+    if let Some(url) = &quake.url {
+        ui.hyperlink_to("Event page", url);
+    }
 }
 
 fn nearest<'a>(hits: &'a [(&'a Quake, Pos2, f32)], at: Pos2) -> Option<&'a (&'a Quake, Pos2, f32)> {
@@ -472,9 +498,18 @@ fn tooltip(quake: &Quake, now: &Result<u64, SystemTimeError>) -> String {
         Ok(now) => lines.push(format!(
             "{} · {}",
             time::age_label(*now, quake.time_ms),
-            quake.status
+            quake
+                .status
+                .as_deref()
+                .map_or("status not published", |status| status)
         )),
-        Err(error) => lines.push(format!("{} · age unavailable: {error}", quake.status)),
+        Err(error) => lines.push(format!(
+            "{} · age unavailable: {error}",
+            quake
+                .status
+                .as_deref()
+                .map_or("status not published", |status| status)
+        )),
     }
     if quake.tsunami {
         lines.push(String::from("Tsunami flag set by the provider"));
@@ -491,6 +526,7 @@ mod tests {
 
     fn quake(magnitude: f64, depth_km: f64) -> Quake {
         Quake {
+            provider: Provider::Usgs,
             id: String::from("id"),
             magnitude,
             magnitude_type: String::from("mww"),
@@ -501,9 +537,10 @@ mod tests {
             lon: -97.0,
             tsunami: false,
             alert: None,
-            status: String::from("reviewed"),
+            status: Some(String::from("reviewed")),
+            agency: None,
             felt: None,
-            url: String::from("https://earthquake.usgs.gov/e"),
+            url: Some(String::from("https://earthquake.usgs.gov/e")),
         }
     }
 

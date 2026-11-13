@@ -95,6 +95,37 @@ pub(crate) fn toggle_button(
         .stroke(Stroke::new(1.0_f32, palette.border))
 }
 
+/// Draws the source, operation, cache state, request URL, credit and licence
+/// for one served value, so a readout can account for itself.
+pub(crate) fn provenance(
+    ui: &mut egui::Ui,
+    provenance: &crate::engine::Provenance,
+    cache: crate::engine::CacheState,
+) {
+    ui.label(
+        RichText::new(format!(
+            "{} · operation {} · cache {}",
+            provenance.source_name,
+            provenance
+                .operation
+                .map_or("not named", |operation| operation),
+            cache.label()
+        ))
+        .size(theme::TYPE_SMALL)
+        .weak(),
+    );
+    ui.label(
+        RichText::new(&provenance.url)
+            .size(theme::TYPE_SMALL)
+            .weak(),
+    );
+    ui.label(
+        RichText::new(format!("{} · {}", provenance.credit, provenance.licence))
+            .size(theme::TYPE_SMALL)
+            .weak(),
+    );
+}
+
 pub(crate) fn action_button(palette: &crate::theme::Palette, label: &str) -> egui::Button<'static> {
     egui::Button::new(
         RichText::new(label)

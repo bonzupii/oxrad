@@ -673,10 +673,12 @@ mod tests {
     #[test]
     fn a_tsunami_flag_makes_a_quake_critical() {
         let quakes = Quakes {
+            provider: crate::quake::Provider::Usgs,
             window: crate::quake::Window::Day,
-            generated_ms: NOW,
+            generated_ms: Some(NOW),
             title: String::from("test"),
             events: vec![Quake {
+                provider: crate::quake::Provider::Usgs,
                 id: String::from("us1"),
                 magnitude: 6.8,
                 magnitude_type: String::from("mww"),
@@ -687,9 +689,10 @@ mod tests {
                 lon: 0.0,
                 tsunami: true,
                 alert: None,
-                status: String::from("reviewed"),
+                status: Some(String::from("reviewed")),
+                agency: None,
                 felt: None,
-                url: String::new(),
+                url: None,
             }],
             unreadable: 0,
         };

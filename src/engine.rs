@@ -50,6 +50,8 @@ pub(crate) struct RequestSpec {
     pub(crate) key: String,
     /// What this value is, in the reader's terms.
     pub(crate) subject: String,
+    /// The registry operation that produced the URL, when one did.
+    pub(crate) operation: Option<&'static str>,
     pub(crate) station: Option<String>,
     pub(crate) product: Option<String>,
     pub(crate) scan_unix_ms: Option<u64>,
@@ -72,6 +74,7 @@ impl RequestSpec {
             url,
             accept,
             subject: String::from(source.name),
+            operation: None,
             station: None,
             product: None,
             scan_unix_ms: None,
@@ -99,6 +102,7 @@ impl RequestSpec {
             .map_err(|error| template_error(source, operation, error))?;
         let mut spec = Self::for_source(source, url, endpoint.accept);
         spec.subject = String::from(endpoint.subject);
+        spec.operation = Some(endpoint.operation);
         spec.ttl = endpoint.ttl_seconds.map(Duration::from_secs);
         Ok(spec)
     }
@@ -136,6 +140,12 @@ impl RequestSpec {
             source: self.source.id.as_str(),
             source_name: self.source.name,
             credit: self.source.credit,
+            licence: self
+                .source
+                .licence
+                .map_or("unverified", |licence| licence.name),
+            licence_url: self.source.licence.map_or("", |licence| licence.url),
+            operation: self.operation,
             subject: self.subject.clone(),
             station: self.station.clone(),
             product: self.product.clone(),
@@ -170,6 +180,9 @@ pub(crate) struct Provenance {
     pub(crate) source: &'static str,
     pub(crate) source_name: &'static str,
     pub(crate) credit: &'static str,
+    pub(crate) licence: &'static str,
+    pub(crate) licence_url: &'static str,
+    pub(crate) operation: Option<&'static str>,
     pub(crate) subject: String,
     pub(crate) station: Option<String>,
     pub(crate) product: Option<String>,
@@ -182,6 +195,14 @@ pub(crate) struct Provenance {
 #[derive(Debug)]
 pub(crate) struct Fetched {
     pub(crate) body: Vec<u8>,
+    pub(crate) provenance: Provenance,
+    pub(crate) cache: CacheState,
+}
+
+/// A parsed value beside the request that produced it.
+#[derive(Debug)]
+pub(crate) struct Served<T> {
+    pub(crate) value: T,
     pub(crate) provenance: Provenance,
     pub(crate) cache: CacheState,
 }
@@ -220,6 +241,9 @@ impl Record {
             "source": self.provenance.source,
             "source_name": self.provenance.source_name,
             "credit": self.provenance.credit,
+            "licence": self.provenance.licence,
+            "licence_url": self.provenance.licence_url,
+            "operation": self.provenance.operation,
             "subject": self.provenance.subject,
             "station": self.provenance.station,
             "product": self.provenance.product,
@@ -758,6 +782,8 @@ mod tests {
         assert_eq!(entry["product"], "reflectivity");
         assert_eq!(entry["scan_unix_ms"], 1_793_600_000_000_u64);
         assert_eq!(entry["credit"], sources::NIFC_WFIGS.credit);
+        assert_eq!(entry["licence"], "US Government work, public domain");
+        assert_eq!(entry["operation"], serde_json::Value::Null);
         assert_eq!(entry["url"], "https://example.test/document");
         assert_eq!(entry["attempts"], 1);
         assert_eq!(

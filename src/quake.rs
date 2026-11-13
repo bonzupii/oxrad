@@ -28,10 +28,35 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use serde_json::Value;
 
 use crate::acquire::Acquire;
+use crate::engine::Served;
 use crate::provider::FetchError;
 use crate::sources;
+use crate::time;
 
-const PROVIDER: &str = "USGS";
+/// The two public earthquake catalogues the layer can read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provider {
+    Usgs,
+    Emsc,
+}
+
+impl Provider {
+    pub const ALL: [Self; 2] = [Self::Usgs, Self::Emsc];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Usgs => "USGS",
+            Self::Emsc => "EMSC",
+        }
+    }
+
+    pub const fn coverage(self) -> &'static str {
+        match self {
+            Self::Usgs => "worldwide",
+            Self::Emsc => "worldwide, Euro-Mediterranean aggregation",
+        }
+    }
+}
 
 /// How often the layer is allowed to ask the provider again.
 pub const REFRESH_SECS: u64 = 120;
@@ -73,11 +98,30 @@ impl Window {
             Self::Week => "M4.5 and above",
         }
     }
+
+    /// The minimum magnitude the EMSC query uses for this window.
+    pub const fn emsc_floor(self) -> &'static str {
+        match self {
+            Self::Hour => "0",
+            Self::Day => "2.5",
+            Self::Week => "4.5",
+        }
+    }
+
+    /// The window length in milliseconds.
+    pub const fn duration_ms(self) -> u64 {
+        match self {
+            Self::Hour => 3_600_000,
+            Self::Day => 86_400_000,
+            Self::Week => 604_800_000,
+        }
+    }
 }
 
 /// One earthquake, as the provider published it.
 #[derive(Debug, Clone)]
 pub struct Quake {
+    pub provider: Provider,
     pub id: String,
     pub magnitude: f64,
     pub magnitude_type: String,
@@ -88,9 +132,13 @@ pub struct Quake {
     pub lon: f64,
     pub tsunami: bool,
     pub alert: Option<String>,
-    pub status: String,
+    /// The review status the provider published, when it publishes one.
+    pub status: Option<String>,
+    /// The contributing agency, when the provider names one.
+    pub agency: Option<String>,
     pub felt: Option<u64>,
-    pub url: String,
+    /// The provider's event page, when it publishes one.
+    pub url: Option<String>,
 }
 
 impl Quake {
@@ -131,8 +179,12 @@ impl DepthBand {
 /// A parsed feed.
 #[derive(Debug, Clone)]
 pub struct Quakes {
+    pub provider: Provider,
     pub window: Window,
-    pub generated_ms: u64,
+    /// When the provider published this catalogue, when it states one. An
+    /// empty EMSC answer states no publication time, so this stays absent
+    /// rather than borrowing the request clock.
+    pub generated_ms: Option<u64>,
     pub title: String,
     pub events: Vec<Quake>,
     /// Events the provider listed without the data needed to plot them.
@@ -162,8 +214,10 @@ const fn shape(field: &'static str) -> QuakeError {
 impl Display for QuakeError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Provider { source } => write!(formatter, "{PROVIDER}: {source}"),
-            Self::Shape { field } => write!(formatter, "{PROVIDER} sent no usable {field}"),
+            Self::Provider { source } => {
+                write!(formatter, "The earthquake request failed: {source}")
+            }
+            Self::Shape { field } => write!(formatter, "The earthquake feed has no usable {field}"),
             Self::WorkerStopped => formatter.write_str("the earthquake worker stopped"),
         }
     }
@@ -194,13 +248,9 @@ fn text(value: &Value, field: &'static str) -> Result<String, QuakeError> {
         .ok_or_else(|| shape(field))
 }
 
-fn event(feature: &Value, index: usize) -> Result<Quake, QuakeError> {
-    let properties = feature
-        .get("properties")
-        .filter(|value| value.is_object())
-        .ok_or(QuakeError::Shape {
-            field: "event properties",
-        })?;
+/// Reads an event's longitude, latitude and depth, refusing a position the
+/// planet cannot hold.
+fn position(feature: &Value) -> Result<(f64, f64, f64), QuakeError> {
     let geometry = feature
         .get("geometry")
         .filter(|value| value.is_object())
@@ -239,6 +289,17 @@ fn event(feature: &Value, index: usize) -> Result<Quake, QuakeError> {
             field: "event position",
         });
     }
+    Ok((lon, lat, depth_km))
+}
+
+fn event(feature: &Value, index: usize) -> Result<Quake, QuakeError> {
+    let properties = feature
+        .get("properties")
+        .filter(|value| value.is_object())
+        .ok_or(QuakeError::Shape {
+            field: "event properties",
+        })?;
+    let (lon, lat, depth_km) = position(feature)?;
     let magnitude = number(properties, "mag")?;
     if !(-2.0..=10.0).contains(&magnitude) {
         return Err(shape("event magnitude"));
@@ -277,6 +338,7 @@ fn event(feature: &Value, index: usize) -> Result<Quake, QuakeError> {
         .to_ascii_lowercase();
     let status = text(properties, "status")?;
     Ok(Quake {
+        provider: Provider::Usgs,
         id: format!("{id}#{index}"),
         magnitude,
         magnitude_type,
@@ -290,9 +352,10 @@ fn event(feature: &Value, index: usize) -> Result<Quake, QuakeError> {
             .and_then(Value::as_u64)
             .is_some_and(|flag| flag == 1),
         alert,
-        status,
+        status: Some(status),
+        agency: None,
         felt,
-        url: text(properties, "url")?,
+        url: Some(text(properties, "url")?),
     })
 }
 
@@ -324,30 +387,169 @@ pub fn parse(window: Window, document: &Value) -> Result<Quakes, QuakeError> {
     }
     events.sort_by_key(|quake| std::cmp::Reverse(quake.time_ms));
     Ok(Quakes {
+        provider: Provider::Usgs,
         window,
-        generated_ms,
+        generated_ms: Some(generated_ms),
         title,
         events,
         unreadable,
     })
 }
 
-pub fn fetch(acquire: &Acquire, window: Window) -> Result<Quakes, QuakeError> {
-    let document = acquire
-        .fetch_operation(
-            &sources::USGS_EARTHQUAKES,
-            "feed",
-            &[("window", window.slug())],
-        )
-        .and_then(|fetched| fetched.json())
-        .map_err(|source| QuakeError::Provider { source })?;
-    parse(window, &document)
+/// Reads an EMSC FDSN event response. Its origin time is written as ISO text
+/// and its review state is not published, so those fields stay absent rather
+/// than being filled from another provider's conventions.
+pub fn parse_emsc(window: Window, document: &Value) -> Result<Quakes, QuakeError> {
+    if document.get("type").and_then(Value::as_str) != Some("FeatureCollection") {
+        return Err(shape("feature collection"));
+    }
+    let features = document
+        .get("features")
+        .and_then(Value::as_array)
+        .ok_or_else(|| shape("feed features"))?;
+    let mut events = Vec::with_capacity(features.len());
+    let mut unreadable = 0_usize;
+    for feature in features {
+        match emsc_event(feature) {
+            Ok(quake) => events.push(quake),
+            Err(_) => unreadable += 1,
+        }
+    }
+    let generated_ms = features
+        .iter()
+        .filter_map(|feature| {
+            feature
+                .get("properties")
+                .and_then(|properties| properties.get("lastupdate"))
+                .and_then(Value::as_str)
+                .and_then(time::parse_iso_utc)
+        })
+        .max();
+    events.sort_by_key(|quake| std::cmp::Reverse(quake.time_ms));
+    Ok(Quakes {
+        provider: Provider::Emsc,
+        window,
+        generated_ms,
+        title: String::from("EMSC SeismicPortal earthquake catalogue"),
+        events,
+        unreadable,
+    })
+}
+
+fn emsc_event(feature: &Value) -> Result<Quake, QuakeError> {
+    let properties = feature
+        .get("properties")
+        .filter(|value| value.is_object())
+        .ok_or(QuakeError::Shape {
+            field: "event properties",
+        })?;
+    let (lon, lat, depth_km) = position(feature)?;
+    let magnitude = number(properties, "mag")?;
+    if !(-2.0..=10.0).contains(&magnitude) {
+        return Err(shape("event magnitude"));
+    }
+    let time_ms = properties
+        .get("time")
+        .and_then(Value::as_str)
+        .and_then(time::parse_iso_utc)
+        .ok_or_else(|| shape("event time"))?;
+    let id = feature
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .map(String::from)
+        .or_else(|| {
+            properties
+                .get("unid")
+                .and_then(Value::as_str)
+                .map(String::from)
+        })
+        .ok_or_else(|| QuakeError::Shape {
+            field: "event identity",
+        })?;
+    let magnitude_type = text(properties, "magtype")?.to_ascii_lowercase();
+    Ok(Quake {
+        provider: Provider::Emsc,
+        id,
+        magnitude,
+        magnitude_type,
+        place: text(properties, "flynn_region")?,
+        time_ms,
+        depth_km,
+        lat,
+        lon,
+        tsunami: false,
+        alert: None,
+        status: None,
+        agency: properties
+            .get("auth")
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .map(String::from),
+        felt: None,
+        url: None,
+    })
+}
+
+/// Fetches one catalogue window through the request engine.
+pub fn fetch(
+    acquire: &Acquire,
+    provider: Provider,
+    window: Window,
+) -> Result<Served<Quakes>, QuakeError> {
+    match provider {
+        Provider::Usgs => {
+            let fetched = acquire
+                .fetch_operation(
+                    &sources::USGS_EARTHQUAKES,
+                    "feed",
+                    &[("window", window.slug())],
+                )
+                .map_err(|source| QuakeError::Provider { source })?;
+            let document = fetched
+                .json()
+                .map_err(|source| QuakeError::Provider { source })?;
+            let value = parse(window, &document)?;
+            Ok(Served {
+                value,
+                provenance: fetched.provenance,
+                cache: fetched.cache,
+            })
+        }
+        Provider::Emsc => {
+            let now = time::now_unix_ms().map_err(|_| shape("a readable clock"))?;
+            let start_ms = now.saturating_sub(window.duration_ms());
+            let start = time::format_iso_utc(start_ms);
+            let limit = "500";
+            let fetched = acquire
+                .fetch_operation(
+                    &sources::EMSC,
+                    "query",
+                    &[
+                        ("limit", limit),
+                        ("start", start.as_str()),
+                        ("min_magnitude", window.emsc_floor()),
+                    ],
+                )
+                .map_err(|source| QuakeError::Provider { source })?;
+            let document = fetched
+                .json()
+                .map_err(|source| QuakeError::Provider { source })?;
+            let value = parse_emsc(window, &document)?;
+            Ok(Served {
+                value,
+                provenance: fetched.provenance,
+                cache: fetched.cache,
+            })
+        }
+    }
 }
 
 /// A notice in plain words, for the status line.
 pub fn describe(quakes: &Quakes) -> String {
     let text = format!(
-        "{} earthquakes · {} · {}",
+        "{} earthquakes · {} · {} · {}",
+        quakes.provider.label(),
         quakes.events.len(),
         quakes.window.label().to_ascii_lowercase(),
         quakes.window.floor()
@@ -360,6 +562,7 @@ pub fn describe(quakes: &Quakes) -> String {
 
 #[derive(Debug)]
 struct QuakeRequest {
+    provider: Provider,
     window: Window,
     generation: u64,
 }
@@ -367,13 +570,18 @@ struct QuakeRequest {
 #[derive(Debug)]
 struct QuakeMessage {
     generation: u64,
+    provider: Provider,
     window: Window,
-    result: Result<Quakes, QuakeError>,
+    result: Result<Served<Quakes>, QuakeError>,
 }
 
 pub enum QuakeOutcome {
-    Ready(Quakes),
-    Failed { window: Window, error: QuakeError },
+    Ready(Box<Served<Quakes>>),
+    Failed {
+        provider: Provider,
+        window: Window,
+        error: QuakeError,
+    },
 }
 
 /// Runs feed requests off the UI thread, one at a time.
@@ -381,7 +589,7 @@ pub struct QuakeFeed {
     requests: Sender<QuakeRequest>,
     results: Receiver<QuakeMessage>,
     generation: u64,
-    latest: Option<Window>,
+    latest: Option<(Provider, Window)>,
     stopped: bool,
 }
 
@@ -391,10 +599,12 @@ impl QuakeFeed {
         let (result_sender, results) = mpsc::channel::<QuakeMessage>();
         std::thread::spawn(move || {
             while let Ok(request) = request_receiver.recv() {
+                let provider = request.provider;
                 let window = request.window;
-                let result = fetch(&acquire, window);
+                let result = fetch(&acquire, provider, window);
                 let message = QuakeMessage {
                     generation: request.generation,
+                    provider,
                     window,
                     result,
                 };
@@ -412,10 +622,11 @@ impl QuakeFeed {
         }
     }
 
-    pub fn start(&mut self, window: Window) -> Result<(), QuakeError> {
+    pub fn start(&mut self, provider: Provider, window: Window) -> Result<(), QuakeError> {
         self.generation = self.generation.wrapping_add(1);
-        self.latest = Some(window);
+        self.latest = Some((provider, window));
         let request = QuakeRequest {
+            provider,
             window,
             generation: self.generation,
         };
@@ -434,8 +645,9 @@ impl QuakeFeed {
                 Ok(message) => {
                     if message.generation == self.generation {
                         return Some(match message.result {
-                            Ok(quakes) => QuakeOutcome::Ready(quakes),
+                            Ok(served) => QuakeOutcome::Ready(Box::new(served)),
                             Err(error) => QuakeOutcome::Failed {
+                                provider: message.provider,
                                 window: message.window,
                                 error,
                             },
@@ -448,8 +660,9 @@ impl QuakeFeed {
                         return None;
                     }
                     self.stopped = true;
-                    let window = self.latest?;
+                    let (provider, window) = self.latest?;
                     return Some(QuakeOutcome::Failed {
+                        provider,
                         window,
                         error: QuakeError::WorkerStopped,
                     });
@@ -464,23 +677,24 @@ impl QuakeFeed {
 pub enum QuakeState {
     Idle,
     Loading {
+        provider: Provider,
         window: Window,
-        last: Option<Quakes>,
+        last: Option<Served<Quakes>>,
     },
     Ready {
-        quakes: Quakes,
+        served: Served<Quakes>,
     },
     Failed {
         error: QuakeError,
-        last: Option<Quakes>,
+        last: Option<Served<Quakes>>,
     },
 }
 
 impl QuakeState {
     /// The most recent data that is still worth drawing, however old.
-    pub const fn last(&self) -> Option<&Quakes> {
+    pub const fn last(&self) -> Option<&Served<Quakes>> {
         match self {
-            Self::Ready { quakes } => Some(quakes),
+            Self::Ready { served } => Some(served),
             Self::Loading { last, .. } | Self::Failed { last, .. } => last.as_ref(),
             Self::Idle => None,
         }
@@ -508,18 +722,25 @@ impl QuakeView {
     /// Data worth drawing: the newest feed, or the last one if a refresh is
     /// under way or failed.
     pub const fn events(&self) -> Option<&Quakes> {
-        self.state.last()
+        match self.state.last() {
+            Some(served) => Some(&served.value),
+            None => None,
+        }
     }
 
-    pub fn start(&mut self, window: Window) {
+    pub fn start(&mut self, provider: Provider, window: Window) {
         let previous = std::mem::replace(&mut self.state, QuakeState::Idle);
         let last = match previous {
             QuakeState::Loading { last, .. } | QuakeState::Failed { last, .. } => last,
-            QuakeState::Ready { quakes } => Some(quakes),
+            QuakeState::Ready { served } => Some(served),
             QuakeState::Idle => None,
         };
-        self.state = match self.feed.start(window) {
-            Ok(()) => QuakeState::Loading { window, last },
+        self.state = match self.feed.start(provider, window) {
+            Ok(()) => QuakeState::Loading {
+                provider,
+                window,
+                last,
+            },
             Err(error) => QuakeState::Failed { error, last },
         };
     }
@@ -532,19 +753,28 @@ impl QuakeView {
 
     fn apply(&mut self, outcome: QuakeOutcome) {
         let previous = std::mem::replace(&mut self.state, QuakeState::Idle);
-        let QuakeState::Loading { window, last } = previous else {
+        let QuakeState::Loading {
+            provider,
+            window,
+            last,
+        } = previous
+        else {
             self.state = previous;
             return;
         };
-        let answer_window = match &outcome {
-            QuakeOutcome::Ready(quakes) => quakes.window,
-            QuakeOutcome::Failed { window: failed, .. } => *failed,
+        let answer = match &outcome {
+            QuakeOutcome::Ready(served) => (served.value.provider, served.value.window),
+            QuakeOutcome::Failed {
+                provider: failed_provider,
+                window: failed_window,
+                ..
+            } => (*failed_provider, *failed_window),
         };
-        if answer_window != window {
+        if answer != (provider, window) {
             return;
         }
         self.state = match outcome {
-            QuakeOutcome::Ready(quakes) => QuakeState::Ready { quakes },
+            QuakeOutcome::Ready(served) => QuakeState::Ready { served: *served },
             QuakeOutcome::Failed { error, .. } => QuakeState::Failed { error, last },
         };
     }
@@ -611,7 +841,7 @@ mod tests {
         let quakes = parse(Window::Day, &fixture()?)?;
         assert_eq!(quakes.events.len(), 2);
         assert_eq!(quakes.unreadable, 1);
-        assert_eq!(quakes.generated_ms, 1_793_557_411_000);
+        assert_eq!(quakes.generated_ms, Some(1_793_557_411_000));
         assert_eq!(quakes.title, "USGS Magnitude 2.5+ Earthquakes, Past Day");
         let newest = &quakes.events[0];
         assert_eq!(newest.magnitude, 5.1);
@@ -619,7 +849,7 @@ mod tests {
         assert!((newest.depth_km - 108.234).abs() < 1e-9);
         assert!((newest.lat + 56.2566).abs() < 1e-9);
         assert!((newest.lon + 27.1985).abs() < 1e-9);
-        assert_eq!(newest.status, "reviewed");
+        assert_eq!(newest.status.as_deref(), Some("reviewed"));
         assert!(!newest.tsunami);
         assert_eq!(newest.depth_band(), DepthBand::Deep);
         Ok(())
@@ -668,6 +898,7 @@ mod tests {
     #[test]
     fn depth_bands_follow_the_seismological_classes() {
         let mut quake = Quake {
+            provider: Provider::Usgs,
             id: String::from("x"),
             magnitude: 3.0,
             magnitude_type: String::from("ml"),
@@ -678,9 +909,10 @@ mod tests {
             lon: 0.0,
             tsunami: false,
             alert: None,
-            status: String::from("reviewed"),
+            status: Some(String::from("reviewed")),
+            agency: None,
             felt: None,
-            url: String::new(),
+            url: None,
         };
         assert_eq!(quake.depth_band(), DepthBand::Shallow);
         quake.depth_km = 35.0;
@@ -695,10 +927,57 @@ mod tests {
     fn a_description_states_the_window_floor_and_unreadable_events() -> Result<(), QuakeError> {
         let quakes = parse(Window::Day, &fixture()?)?;
         let text = describe(&quakes);
-        assert!(text.starts_with("2 earthquakes"));
+        assert!(text.starts_with("USGS earthquakes · 2"), "{text}");
         assert!(text.contains("past day"));
         assert!(text.contains("M2.5 and above"));
         assert!(text.contains("1 without usable data"));
+        Ok(())
+    }
+
+    #[test]
+    fn an_emsc_event_keeps_its_iso_time_agency_and_scale() -> Result<(), QuakeError> {
+        let body = r#"{
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [123.83, -8.23, 141.0]},
+                "id": "20261113_0000038",
+                "properties": {
+                    "lastupdate": "2026-11-13T03:42:24.104642Z",
+                    "time": "2026-11-13T03:30:01.0Z",
+                    "flynn_region": "FLORES REGION, INDONESIA",
+                    "depth": 141.0,
+                    "auth": "BMKG",
+                    "mag": 3.6,
+                    "magtype": "m"
+                }
+            }]
+        }"#;
+        let document = serde_json::from_str(body).map_err(|_| shape("test fixture"))?;
+        let quakes = parse_emsc(Window::Day, &document)?;
+        assert_eq!(quakes.provider, Provider::Emsc);
+        assert_eq!(quakes.events.len(), 1);
+        let event = &quakes.events[0];
+        assert_eq!(event.place, "FLORES REGION, INDONESIA");
+        assert_eq!(event.agency.as_deref(), Some("BMKG"));
+        assert_eq!(event.magnitude, 3.6);
+        assert_eq!(event.magnitude_type, "m");
+        assert_eq!(event.depth_km, 141.0);
+        assert_eq!(event.time_ms, 1_794_540_601_000);
+        assert_eq!(quakes.generated_ms, Some(1_794_541_344_104));
+        Ok(())
+    }
+
+    #[test]
+    fn an_empty_emsc_answer_is_an_empty_catalogue() -> Result<(), QuakeError> {
+        let document = json!({
+            "type": "FeatureCollection",
+            "features": []
+        });
+        let quakes = parse_emsc(Window::Day, &document)?;
+        assert!(quakes.events.is_empty());
+        assert_eq!(quakes.generated_ms, None);
+        assert_eq!(quakes.unreadable, 0);
         Ok(())
     }
 }

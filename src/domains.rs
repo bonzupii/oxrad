@@ -39,6 +39,7 @@ use crate::map::{MapTransform, MapView};
 use crate::observations::ObservationSet;
 use crate::observations_layer::ObservationLayer;
 use crate::ocean_layer::OceanLayer;
+use crate::power_layer::PowerLayer;
 use crate::quality::AirQuality;
 use crate::quality_layer::AirLayer;
 use crate::satellite::SatelliteLayer;
@@ -50,6 +51,7 @@ use crate::spaceweather::SpaceWeather;
 use crate::spaceweather_layer::SpaceWeatherLayer;
 use crate::sun::SunView;
 use crate::theme::Palette;
+use crate::uk_rivers_layer::UkRiverLayer;
 use crate::volcano;
 use crate::volcano_layer::VolcanoLayer;
 
@@ -57,10 +59,12 @@ use crate::volcano_layer::VolcanoLayer;
 pub struct Domains {
     satellite: SatelliteLayer,
     hydro: HydroLayer,
+    uk_rivers: UkRiverLayer,
     space_weather: SpaceWeatherLayer,
     sun: SunView,
     air: AirLayer,
     climate: ClimateLayer,
+    power: PowerLayer,
     fires: FireLayer,
     environment: EnvironmentLayer,
     ocean: OceanLayer,
@@ -79,10 +83,12 @@ impl Domains {
         Self {
             satellite: SatelliteLayer::new(acquire.clone()),
             hydro: HydroLayer::new(acquire.clone()),
+            uk_rivers: UkRiverLayer::new(acquire.clone()),
             space_weather: SpaceWeatherLayer::new(acquire.clone()),
             sun: SunView::new(acquire.clone()),
             air: AirLayer::new(acquire.clone()),
             climate: ClimateLayer::new(acquire.clone()),
+            power: PowerLayer::new(acquire.clone()),
             fires: FireLayer::new(acquire.clone()),
             environment: EnvironmentLayer::new(acquire.clone()),
             ocean: OceanLayer::new(acquire.clone()),
@@ -101,11 +107,13 @@ impl Domains {
     pub fn update(&mut self, now: Instant, context: &egui::Context, view: &MapView) {
         self.satellite.update(context, view);
         self.hydro.update(now, view);
+        self.uk_rivers.update(now);
         self.space_weather.update(now);
         self.sun.update(now);
         self.air.update(now, view);
         self.climate.update(now, view);
-        self.fires.update();
+        self.power.update(now, view);
+        self.fires.update(now, view);
         self.environment.update(now, view);
         self.ocean.update(now, view);
         self.stations_reported.update(now, view);
@@ -137,10 +145,12 @@ impl Domains {
     pub fn rail(&mut self, ui: &mut egui::Ui, palette: &Palette, centre: Option<(f64, f64)>) {
         self.satellite.rail(ui, palette);
         self.hydro.rail(ui, palette);
+        self.uk_rivers.rail(ui, palette);
         self.space_weather.rail(ui, palette);
         self.sun.rail(ui, centre);
         self.air.rail(ui, palette);
         self.climate.rail(ui, palette);
+        self.power.rail(ui, palette);
         self.fires.rail(ui, palette, centre);
         self.environment.rail(ui, palette);
         self.ocean.rail(ui, palette);

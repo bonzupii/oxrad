@@ -16,12 +16,14 @@
 //! The wildfire layer: its rail section, the nearest fires, and the perimeters
 //! drawn over the map.
 
+use std::time::{Duration, Instant};
+
 use eframe::egui::{self, Color32, Pos2, Rect, RichText, Shape, Stroke};
 
 use crate::acquire::Acquire;
-use crate::canvas::toggle_button;
-use crate::fire::{self, FireKind, FireSet, FireState, FireView};
-use crate::map;
+use crate::canvas::{provenance, toggle_button};
+use crate::fire::{self, FireKind, FireProvider, FireSet, FireState, FireView};
+use crate::map::{self, MapView};
 use crate::projection;
 use crate::theme::{self, Palette};
 use crate::time;
@@ -35,11 +37,20 @@ const MAX_RING_WIDTHS: f32 = 4.0;
 /// twenty-acre fire would be invisible at any zoom a chaser works at.
 const MARKER_BELOW: f32 = 8.0;
 const MARKER_RADIUS: f32 = 2.5;
+/// How far the map may move before the perimeters are asked for again.
+const MOVE_KM: f64 = 50.0;
+/// How long a set stands before it is refreshed even without movement.
+const REFRESH_AFTER: Duration = Duration::from_secs(1_800);
 
 /// The wildfire layer.
 pub struct FireLayer {
     view: FireView,
     shown: bool,
+    provider: FireProvider,
+    chosen: bool,
+    asked: Option<(f64, f64, FireProvider)>,
+    asked_at: Option<Instant>,
+    bounds: Option<(f64, f64, f64, f64)>,
 }
 
 impl FireLayer {
@@ -47,14 +58,56 @@ impl FireLayer {
         Self {
             view: FireView::new(acquire),
             shown: false,
+            provider: FireProvider::Nifc,
+            chosen: false,
+            asked: None,
+            asked_at: None,
+            bounds: None,
         }
     }
 
-    /// Takes in the engine's answer and starts one read while the layer is on.
-    pub fn update(&mut self) {
+    /// Takes in the engine's answer and follows the map while the layer is on.
+    pub fn update(&mut self, now: Instant, view: &MapView) {
         self.view.update();
-        if self.shown && !self.view.started() {
-            self.view.start();
+        if !self.shown {
+            return;
+        }
+        let Ok((lat, lon)) = view.center_latlon() else {
+            return;
+        };
+        let bounds = fire::bounds(lat, lon, view.span_km());
+        self.bounds = Some(bounds);
+        let wanted = if self.chosen {
+            Some(self.provider)
+        } else {
+            FireProvider::for_point(lat, lon)
+        };
+        let Some(wanted) = wanted else {
+            self.view.reset();
+            self.asked = None;
+            self.asked_at = None;
+            return;
+        };
+        if wanted != self.provider {
+            self.provider = wanted;
+            self.view.reset();
+            self.asked = None;
+            self.asked_at = None;
+        }
+        let moved = match self.asked {
+            Some((asked_lat, asked_lon, asked_provider)) => {
+                asked_provider != self.provider
+                    || distance_km(asked_lat, asked_lon, lat, lon) > MOVE_KM
+            }
+            None => true,
+        };
+        let stale = self
+            .asked_at
+            .is_some_and(|at| now.duration_since(at) >= REFRESH_AFTER);
+        if (moved || stale) && !self.view.started() {
+            self.asked = Some((lat, lon, self.provider));
+            self.asked_at = Some(now);
+            self.view.start(self.provider, bounds);
         }
     }
 
@@ -111,10 +164,28 @@ impl FireLayer {
         ui.add_space(theme::SPACE_M);
         ui.label(RichText::new("Wildfires").size(theme::TYPE_LABEL).weak());
         ui.label(
-            RichText::new(format!("{} · United States, no key", fire::SOURCE))
-                .size(theme::TYPE_SMALL)
-                .weak(),
+            RichText::new(format!(
+                "{} · {} · no key",
+                self.provider.label(),
+                self.provider.coverage()
+            ))
+            .size(theme::TYPE_SMALL)
+            .weak(),
         );
+        let mut provider = self.provider;
+        ui.horizontal(|ui| {
+            for candidate in FireProvider::ALL {
+                ui.selectable_value(&mut provider, candidate, candidate.label())
+                    .on_hover_text(format!("Read {} perimeters.", candidate.coverage()));
+            }
+        });
+        if provider != self.provider {
+            self.provider = provider;
+            self.chosen = true;
+            self.view.reset();
+            self.asked = None;
+            self.asked_at = None;
+        }
         let label = if self.shown {
             "Fires: on"
         } else {
@@ -123,7 +194,7 @@ impl FireLayer {
         if ui
             .add_sized([150.0, 30.0], toggle_button(palette, label, self.shown))
             .on_hover_text(
-                "Every perimeter the interagency service holds for a current incident, drawn over the map and listed by distance from its centre.",
+                "Current mapped perimeters from the selected national catalogue, drawn over the map and listed by distance from its centre. The default catalogue follows the map centre.",
             )
             .clicked()
         {
@@ -137,19 +208,44 @@ impl FireLayer {
             );
             return;
         }
+        let waiting = !self.chosen
+            && centre
+                .and_then(|(lat, lon)| FireProvider::for_point(lat, lon))
+                .is_none();
+        if waiting {
+            ui.label(
+                RichText::new(
+                    "No open perimeter catalogue covers this map centre. Pan into the United States or Canada, or choose a catalogue explicitly.",
+                )
+                .size(theme::TYPE_SMALL)
+                .weak(),
+            );
+            return;
+        }
         self.status(ui);
         let Some(set) = self.view.set() else {
             return;
         };
+        if centre.is_some_and(|(lat, lon)| !self.provider.covers(lat, lon)) {
+            ui.label(
+                RichText::new(format!(
+                    "The map centre is outside {}; pan into it for an on-map reading.",
+                    self.provider.coverage()
+                ))
+                .size(theme::TYPE_SMALL)
+                .weak(),
+            );
+        }
         summary(ui, set, palette);
         if let Some((lat, lon)) = centre {
             nearest(ui, set, lat, lon, palette);
         }
         largest(ui, set);
         ui.label(
-            RichText::new(
-                "A perimeter is what a crew last mapped, not the fire's edge now; the service covers the United States only.",
-            )
+            RichText::new(format!(
+                "A perimeter is what a crew last mapped, not the fire's edge now; {} coverage.",
+                self.provider.coverage()
+            ))
             .size(theme::TYPE_SMALL)
             .weak(),
         );
@@ -161,9 +257,12 @@ impl FireLayer {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label(
-                        RichText::new("Reading the interagency perimeter service…")
-                            .size(theme::TYPE_SMALL)
-                            .weak(),
+                        RichText::new(format!(
+                            "Reading the {} perimeter service…",
+                            self.provider.label()
+                        ))
+                        .size(theme::TYPE_SMALL)
+                        .weak(),
                     );
                 });
             }
@@ -174,7 +273,9 @@ impl FireLayer {
                         .weak(),
                 );
             }
-            FireState::Ready { .. } => {}
+            FireState::Ready { served } => {
+                provenance(ui, &served.provenance, served.cache);
+            }
             FireState::Failed { error, last, .. } => {
                 ui.colored_label(
                     ui.visuals().error_fg_color,
@@ -201,15 +302,15 @@ fn summary(ui: &mut egui::Ui, set: &FireSet, palette: &Palette) {
         .count();
     let text = if set.rejected == 0 {
         format!(
-            "{} perimeters · {:.0} acres mapped · {prescribed} prescribed",
+            "{} perimeters · {:.0} ha mapped · {prescribed} prescribed",
             set.perimeters.len(),
-            set.total_acres()
+            set.total_hectares()
         )
     } else {
         format!(
-            "{} perimeters · {:.0} acres mapped · {prescribed} prescribed · {} unreadable",
+            "{} perimeters · {:.0} ha mapped · {prescribed} prescribed · {} unreadable",
             set.perimeters.len(),
-            set.total_acres(),
+            set.total_hectares(),
             set.rejected
         )
     };
@@ -251,9 +352,9 @@ fn nearest(ui: &mut egui::Ui, set: &FireSet, latitude: f64, longitude: f64, pale
                 |_| String::from("distance unavailable"),
                 |(distance, _)| format!("{distance:.0} km"),
             );
-        let acres = fire.acres.map_or_else(
-            || String::from("acres not reported"),
-            |acres| format!("{acres:.0} acres"),
+        let hectares = fire.area_hectares.map_or_else(
+            || String::from("area not reported"),
+            |hectares| format!("{hectares:.0} ha"),
         );
         let contained = fire.contained.map_or_else(
             || String::from("containment not reported"),
@@ -261,7 +362,7 @@ fn nearest(ui: &mut egui::Ui, set: &FireSet, latitude: f64, longitude: f64, pale
         );
         ui.label(
             RichText::new(format!(
-                "{} · {distance} · {acres} · {contained}",
+                "{} · {distance} · {hectares} · {contained}",
                 fire.name
             ))
             .size(theme::TYPE_SMALL)
@@ -290,20 +391,27 @@ fn largest(ui: &mut egui::Ui, set: &FireSet) {
     let Some(fire) = set.largest() else {
         return;
     };
-    let acres = match fire.acres {
-        Some(acres) => format!("{acres:.0} acres"),
+    let hectares = match fire.area_hectares {
+        Some(hectares) => format!("{hectares:.0} ha"),
         None => return,
     };
     ui.add_space(theme::SPACE_S);
     ui.label(
         RichText::new(format!(
-            "Largest: {} · {acres} · {:.0} km across",
+            "Largest: {} · {hectares} · {:.0} km across",
             fire.name,
             fire.span_km()
         ))
         .size(theme::TYPE_SMALL)
         .weak(),
     );
+}
+
+fn distance_km(from_lat: f64, from_lon: f64, to_lat: f64, to_lon: f64) -> f64 {
+    match projection::inverse(from_lat, from_lon, to_lat, to_lon) {
+        Ok((distance, _)) => distance,
+        Err(_) => f64::MAX,
+    }
 }
 
 /// The larger side of a ring's screen box, which is how big it looks.
@@ -346,7 +454,7 @@ mod tests {
         FirePerimeter {
             name: String::from(name),
             kind,
-            acres: Some(100.0),
+            area_hectares: Some(100.0),
             contained: Some(10.0),
             state: Some(String::from("US-KS")),
             mapped_at_ms: None,
@@ -362,6 +470,7 @@ mod tests {
 
     fn set() -> FireSet {
         FireSet {
+            provider: FireProvider::Nifc,
             perimeters: vec![
                 fire("Near", FireKind::Wildfire, 39.0, -96.0),
                 fire("Far", FireKind::Prescribed, 45.0, -110.0),

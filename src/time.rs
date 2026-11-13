@@ -59,8 +59,9 @@ pub const fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
     (era as i64) * 146_097 + day_of_era - 719_468
 }
 
-/// Reads `YYYY-MM-DDTHH:MM:SS` with an optional trailing `Z` into milliseconds
-/// since the epoch. Anything else is not a timestamp this program can order.
+/// Reads `YYYY-MM-DDTHH:MM:SS` with optional fractional seconds and an optional
+/// trailing `Z` into milliseconds since the epoch. Anything else is not a
+/// timestamp this program can order.
 pub fn parse_iso_utc(text: &str) -> Option<u64> {
     let text = text.trim_end_matches('Z');
     let (day_text, time_text) = text.split_once('T')?;
@@ -77,10 +78,11 @@ pub fn parse_iso_utc(text: &str) -> Option<u64> {
         None => (rest, "0"),
     };
     // A provider may write fractional seconds, as the water-services API does
-    // with its ``.000``; the whole second is the instant that matters here.
-    let second_text = match second_text.split_once('.') {
-        Some((whole, _fraction)) => whole,
-        None => second_text,
+    // with its ``.000`` and EMSC with microseconds. Milliseconds are the
+    // precision this program orders, so digits beyond them are dropped.
+    let (second_text, fraction_ms) = match second_text.split_once('.') {
+        Some((whole, fraction)) => (whole, fraction_ms(fraction)?),
+        None => (second_text, 0_u64),
     };
     let mut date = day_text.split('-');
     let year = date.next()?.parse::<i32>().ok()?;
@@ -96,10 +98,25 @@ pub fn parse_iso_utc(text: &str) -> Option<u64> {
         return None;
     }
     let days = u64::try_from(days_from_civil(year, month, day)).ok()?;
-    let of_day = hour * 3_600_000 + minute * 60_000 + second * 1_000;
+    let of_day = hour * 3_600_000 + minute * 60_000 + second * 1_000 + fraction_ms;
     let local = days.checked_mul(MS_PER_DAY)?.checked_add(of_day)?;
     let shifted = i128::from(local).checked_sub(i128::from(offset_ms))?;
     u64::try_from(shifted).ok()
+}
+
+/// Reads the fractional part of a second as whole milliseconds.
+fn fraction_ms(text: &str) -> Option<u64> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let mut value = 0_u64;
+    for byte in text.bytes().take(3) {
+        value = value * 10 + u64::from(byte - b'0');
+    }
+    for _ in text.len().min(3)..3 {
+        value *= 10;
+    }
+    Some(value)
 }
 
 /// Splits a written offset from a time and returns it in milliseconds east of
@@ -119,6 +136,17 @@ fn split_offset(time_text: &str) -> Option<(&str, i64)> {
         return None;
     }
     Some((clock, sign * (hours * 3_600_000 + minutes * 60_000)))
+}
+
+/// Writes milliseconds since the epoch as `YYYY-MM-DDTHH:MM:SSZ`.
+pub fn format_iso_utc(unix_ms: u64) -> String {
+    let days = unix_ms / MS_PER_DAY;
+    let of_day = unix_ms % MS_PER_DAY;
+    let (year, month, day) = civil_from_days(days as i64);
+    let hour = of_day / 3_600_000;
+    let minute = (of_day % 3_600_000) / 60_000;
+    let second = (of_day % 60_000) / 1_000;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 pub fn format_utc(unix_ms: u64) -> Result<String, RadarError> {

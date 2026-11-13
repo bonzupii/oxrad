@@ -326,11 +326,6 @@ impl Endpoint {
         }
         Ok(url)
     }
-
-    /// Whether the operation needs no caller-supplied values.
-    pub fn is_static(&self) -> bool {
-        !self.template.contains('{')
-    }
 }
 
 /// Why a registry endpoint could not produce a URL.
@@ -431,11 +426,6 @@ impl Source {
                 source: self.id,
                 operation,
             })
-    }
-
-    /// The first operation whose URL needs no values, for a headless probe.
-    pub fn static_operation(&self) -> Option<&'static Endpoint> {
-        self.endpoints.iter().find(|endpoint| endpoint.is_static())
     }
 
     /// Whether this source may be used at all.
@@ -612,6 +602,16 @@ const US_GOVERNMENT: Licence = Licence {
 const OSM_COPYRIGHT: Licence = Licence {
     name: "OpenStreetMap data, ODbL 1.0",
     url: "https://www.openstreetmap.org/copyright",
+};
+
+const OGL_UK: Licence = Licence {
+    name: "Open Government Licence v3.0",
+    url: "https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/",
+};
+
+const OGL_CANADA: Licence = Licence {
+    name: "Open Government Licence - Canada 2.0",
+    url: "https://open.canada.ca/en/open-government-licence-canada",
 };
 
 /// OpenFreeMap vector tiles and styles.
@@ -1289,26 +1289,96 @@ pub const METEOALARM: Source = Source {
     level: Level::Documented,
 };
 
-/// European-Mediterranean earthquakes.
+/// European-Mediterranean earthquakes, including the global EMSC catalogue.
 pub const EMSC: Source = Source {
     id: SourceId::new("emsc"),
-    name: "European-Mediterranean Seismological Centre",
+    name: "EMSC SeismicPortal",
     domain: Domain::Seismicity,
     coverage: Coverage::Global,
     home: "https://www.seismicportal.eu",
     endpoints: &[Endpoint::new(
-        "site",
-        "EMSC candidate site",
-        "https://www.seismicportal.eu",
-        "*/*",
-    )],
+        "query",
+        "earthquake catalogue",
+        "https://www.seismicportal.eu/fdsnws/event/1/query?format=json&limit={limit}&start={start}&minmagnitude={min_magnitude}&orderby=time",
+        "application/json",
+    )
+    .ttl(60)],
     format: Format::GeoJson,
-    licence: None,
-    credit: "European-Mediterranean Seismological Centre",
+    licence: Some(CC_BY),
+    credit: "EMSC-CSEM SeismicPortal",
+    refresh: Refresh::Seconds(60),
+    rate_limit_seconds: 1,
+    cache: CachePermission::Permitted,
+    level: Level::Admitted,
+};
+
+/// England's real-time river levels and flows.
+pub const UK_EA_FLOOD: Source = Source {
+    id: SourceId::new("uk-ea-flood"),
+    name: "Environment Agency flood-monitoring",
+    domain: Domain::Hydrology,
+    coverage: Coverage::Extent("England"),
+    home: "https://environment.data.gov.uk/flood-monitoring/doc/reference",
+    endpoints: &[Endpoint::new(
+        "latest-readings",
+        "latest river levels",
+        "https://environment.data.gov.uk/flood-monitoring/data/readings?latest&parameter=level&_view=full&_limit={limit}",
+        "application/json",
+    )
+    .ttl(900)],
+    format: Format::Json,
+    licence: Some(OGL_UK),
+    credit: "This uses Environment Agency flood and river level data from the real-time data API (Beta)",
+    refresh: Refresh::Seconds(900),
+    rate_limit_seconds: 1,
+    cache: CachePermission::Permitted,
+    level: Level::Admitted,
+};
+
+/// NASA POWER's MERRA-2 monthly climatology.
+pub const NASA_POWER: Source = Source {
+    id: SourceId::new("nasa-power"),
+    name: "NASA POWER climatology",
+    domain: Domain::Climate,
+    coverage: Coverage::Global,
+    home: "https://power.larc.nasa.gov",
+    endpoints: &[Endpoint::new(
+        "climatology",
+        "MERRA-2 monthly climatology",
+        "https://power.larc.nasa.gov/api/temporal/climatology/point?parameters=T2M,PRECTOTCORR&community=RE&longitude={longitude}&latitude={latitude}&format=JSON",
+        "application/json",
+    )
+    .ttl(2_592_000)],
+    format: Format::Json,
+    licence: Some(CC_BY),
+    credit: "NASA POWER, MERRA-2",
     refresh: Refresh::ProviderDefined,
     rate_limit_seconds: 1,
     cache: CachePermission::Permitted,
-    level: Level::Documented,
+    level: Level::Admitted,
+};
+
+/// Natural Resources Canada's current fire-perimeter estimates.
+pub const CWFIS: Source = Source {
+    id: SourceId::new("cwfis"),
+    name: "Canadian Wildland Fire Information System",
+    domain: Domain::Fire,
+    coverage: Coverage::Countries(&["CA"]),
+    home: "https://cwfis.cfs.nrcan.gc.ca",
+    endpoints: &[Endpoint::new(
+        "perimeters",
+        "current fire perimeter estimates",
+        "https://cwfis.cfs.nrcan.gc.ca/geoserver/ows?service=WFS&version=2.0.0&request=GetFeature&typeName=public:m3_polygons_current&outputFormat=application/json&srsName=EPSG:4326&bbox={raw:bbox}&count=250&sortBy=lastdate+D",
+        "application/json",
+    )
+    .ttl(3_600)],
+    format: Format::GeoJson,
+    licence: Some(OGL_CANADA),
+    credit: "Natural Resources Canada, Canadian Wildland Fire Information System",
+    refresh: Refresh::Seconds(3_600),
+    rate_limit_seconds: 1,
+    cache: CachePermission::Permitted,
+    level: Level::Admitted,
 };
 
 /// Norwegian global forecast.
@@ -1405,6 +1475,9 @@ pub const SOURCES: &[Source] = &[
     BOM_RADAR,
     METEOALARM,
     EMSC,
+    UK_EA_FLOOD,
+    NASA_POWER,
+    CWFIS,
     MET_NORWAY,
     COPERNICUS_DEM,
     SMITHSONIAN_GVP,
@@ -1660,6 +1733,8 @@ mod tests {
             "hourly" => "temperature_2m",
             "query" => "Emporia, KS",
             "limit" => "8",
+            "start" => "2026-11-12T00:00:00Z",
+            "min_magnitude" => "2.5",
             "from_date" => "11/01/2026",
             "to_date" => "11/13/2026",
             "hours" => "2",
@@ -1837,6 +1912,38 @@ mod tests {
         assert_eq!(
             built("usgs-volcano", "notice"),
             "https://volcanoes.usgs.gov/hans-public/api/notice/getNotice/abc123"
+        );
+    }
+
+    fn built_from(source: &str, operation: &str, values: &[(&str, &str)]) -> String {
+        let endpoint = endpoint(source, operation);
+        match endpoint.build(values) {
+            Ok(url) => url,
+            Err(error) => panic!("{source}/{operation} did not build: {error}"),
+        }
+    }
+
+    #[test]
+    fn the_non_us_operations_compose_exact_urls() {
+        assert_eq!(
+            built("emsc", "query"),
+            "https://www.seismicportal.eu/fdsnws/event/1/query?format=json&limit=8&start=2026-11-12T00%3A00%3A00Z&minmagnitude=2.5&orderby=time"
+        );
+        assert_eq!(
+            built("uk-ea-flood", "latest-readings"),
+            "https://environment.data.gov.uk/flood-monitoring/data/readings?latest&parameter=level&_view=full&_limit=8"
+        );
+        assert_eq!(
+            built("nasa-power", "climatology"),
+            "https://power.larc.nasa.gov/api/temporal/climatology/point?parameters=T2M,PRECTOTCORR&community=RE&longitude=-96.225&latitude=39.025&format=JSON"
+        );
+        assert_eq!(
+            built_from(
+                "cwfis",
+                "perimeters",
+                &[("bbox", "-98.0000,37.0000,-97.0000,38.0000,EPSG:4326")]
+            ),
+            "https://cwfis.cfs.nrcan.gc.ca/geoserver/ows?service=WFS&version=2.0.0&request=GetFeature&typeName=public:m3_polygons_current&outputFormat=application/json&srsName=EPSG:4326&bbox=-98.0000,37.0000,-97.0000,38.0000,EPSG:4326&count=250&sortBy=lastdate+D"
         );
     }
 
