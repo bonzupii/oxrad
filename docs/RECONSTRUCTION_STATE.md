@@ -4,6 +4,13 @@ Campaign ledger for the reconstruction mission. One row per work item and per ac
 
 States: not started, in progress, verified, blocked.
 
+## Working rules
+
+- Gates run when a change is complete. A refactor may leave the build broken while it is in progress; that is expected and is not a reason to shrink the change, add a compatibility shim, or keep a defective structure.
+- A half-converted subsystem is a failure. Convert the whole subsystem, or leave it untouched and say so plainly.
+- Context is managed by the harness, which compacts automatically. Session limits and budget pressure are never a reason to skip a file or defer a refactor.
+- Every log entry states what was observed in the binary, what was only covered by a test, and what was not observed at all.
+
 ## Work items
 
 | # | Work item | State | Evidence | Next action |
