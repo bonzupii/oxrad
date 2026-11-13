@@ -38,6 +38,7 @@ mod config;
 mod cyclone;
 mod cyclone_layer;
 mod derived;
+mod dispatch;
 mod display;
 mod domains;
 mod engine;
@@ -89,6 +90,7 @@ mod radar_panel;
 mod radio;
 mod radio_layer;
 mod raster;
+mod registry_panel;
 mod render;
 mod request_report;
 mod retry;
@@ -130,7 +132,8 @@ use stations::SiteId;
 
 const USAGE: &str = "\
 Usage: oxrad [--site IDENTIFIER] [--profile PATH] [--set key=value]...
-             [--print-config | --prune-cache | --sources | --fetch-source ID]
+             [--print-config | --prune-cache | --sources | --fetch-source ID |
+              --render-registry]
              [--value NAME=VALUE]...
 
 Runs the radar viewer. The last selected site is restored from the
@@ -146,6 +149,8 @@ configuration file; with no saved site the picker opens.
                       through the shared transport and cache; parse each with
                       the rail's parser and print its typed values, units,
                       station, product, observation time and request report
+  --render-registry   Request every admitted registry operation through the
+                      shared queue and print the Earth-systems workspace model
   --value NAME=VALUE  Supply a placeholder for any operation of the source;
                       values an operation does not use are ignored; repeatable
   -h, --help          Show this message";
@@ -158,6 +163,7 @@ enum Action {
     PruneCache,
     PrintSources,
     FetchSource,
+    RenderRegistry,
     Help,
 }
 
@@ -174,7 +180,7 @@ struct Invocation {
 fn choose(action: &mut Action, chosen: Action) -> Result<(), String> {
     if *action != Action::Run {
         return Err(String::from(
-            "only one of --print-config, --prune-cache, --sources, --fetch-source and --help may be given.",
+            "only one of --print-config, --prune-cache, --sources, --fetch-source, --render-registry and --help may be given.",
         ));
     }
     *action = chosen;
@@ -209,6 +215,7 @@ fn parse_arguments() -> Result<Invocation, String> {
             "--print-config" => choose(&mut invocation.action, Action::PrintConfig)?,
             "--prune-cache" => choose(&mut invocation.action, Action::PruneCache)?,
             "--sources" => choose(&mut invocation.action, Action::PrintSources)?,
+            "--render-registry" => choose(&mut invocation.action, Action::RenderRegistry)?,
             "--fetch-source" => {
                 let value = arguments.next().ok_or_else(|| {
                     String::from(
@@ -338,6 +345,27 @@ fn report_provenance(acquire: &acquire::Acquire) {
     }
 }
 
+fn render_registry() -> ExitCode {
+    let acquire = acquire::Acquire::new(config::EnabledProviders::all_admitted());
+    let (panel, complete) =
+        registry_panel::render_headless(acquire, std::time::Duration::from_secs(300));
+    print!("{}", panel.render_text());
+    if complete && panel.failed() == 0 {
+        ExitCode::SUCCESS
+    } else {
+        if !complete {
+            eprintln!("The registry sweep did not finish inside 300 seconds.");
+        }
+        if panel.failed() > 0 {
+            eprintln!(
+                "{} operation(s) did not produce a live observation.",
+                panel.failed()
+            );
+        }
+        ExitCode::FAILURE
+    }
+}
+
 fn print_inventory() -> ExitCode {
     match sources::inventory_markdown() {
         Ok(inventory) => {
@@ -365,6 +393,7 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Action::PrintSources => return print_inventory(),
+        Action::RenderRegistry => return render_registry(),
 
         Action::Run | Action::PrintConfig | Action::PruneCache | Action::FetchSource => {}
     }
@@ -406,7 +435,7 @@ fn main() -> ExitCode {
                 };
                 return fetch_source(&effective.config, id, &invocation.fetch_values);
             }
-            Action::Run | Action::PrintSources | Action::Help => {}
+            Action::Run | Action::PrintSources | Action::RenderRegistry | Action::Help => {}
         }
         resolved = Some(effective.config);
     }

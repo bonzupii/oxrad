@@ -22,12 +22,12 @@
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::Instant;
 
 use serde_json::{Map, Value};
 
 use crate::acquire::Acquire;
+use crate::dispatch;
 use crate::engine::Served;
 use crate::provider::FetchError;
 use crate::sources;
@@ -396,57 +396,43 @@ pub enum EnvironmentEvent {
     },
 }
 
-/// Fetches convective fields off the UI thread.
+/// Fetches convective fields on the shared job queue.
 pub struct EnvironmentFeed {
-    requests: Sender<EnvironmentRequest>,
-    events: Receiver<EnvironmentEvent>,
+    feed: dispatch::Feed<EnvironmentEvent>,
     generation: u64,
     stopped: bool,
 }
 
 impl EnvironmentFeed {
     pub fn new(acquire: Acquire) -> Self {
-        let (requests, request_receiver) = mpsc::channel::<EnvironmentRequest>();
-        let (event_sender, events) = mpsc::channel::<EnvironmentEvent>();
-        std::thread::spawn(move || {
-            while let Ok(request) = request_receiver.recv() {
-                let event = match fetch(&acquire, request.latitude, request.longitude) {
-                    Ok(record) => EnvironmentEvent::Ready {
-                        generation: request.generation,
-                        record,
-                    },
-                    Err(error) => EnvironmentEvent::Failed {
-                        generation: request.generation,
-                        error,
-                    },
-                };
-                if event_sender.send(event).is_err() {
-                    return;
-                }
-            }
-        });
         Self {
-            requests,
-            events,
+            feed: dispatch::Feed::new(acquire),
             generation: 0,
             stopped: false,
         }
     }
 
-    pub fn request(&mut self, request: EnvironmentRequest) -> Result<(), EnvironmentError> {
+    pub fn request(&mut self, request: &EnvironmentRequest) -> Result<(), EnvironmentError> {
         self.generation = request.generation;
-        if self.requests.send(request).is_err() {
-            self.stopped = true;
-            return Err(EnvironmentError::WorkerStopped);
-        }
-        Ok(())
+        let generation = request.generation;
+        let latitude = request.latitude;
+        let longitude = request.longitude;
+        self.feed
+            .request(move |acquire| match fetch(acquire, latitude, longitude) {
+                Ok(record) => EnvironmentEvent::Ready { generation, record },
+                Err(error) => EnvironmentEvent::Failed { generation, error },
+            })
+            .map_err(|_| {
+                self.stopped = true;
+                EnvironmentError::WorkerStopped
+            })
     }
 
     pub fn poll(&mut self) -> Option<EnvironmentEvent> {
-        match self.events.try_recv() {
-            Ok(event) => Some(event),
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => {
+        match self.feed.poll() {
+            Ok(Some(event)) => Some(event),
+            Ok(None) => None,
+            Err(dispatch::Disconnected) => {
                 if self.stopped {
                     return None;
                 }
@@ -524,7 +510,7 @@ impl EnvironmentView {
             latitude,
             longitude,
         };
-        if let Err(error) = self.feed.request(request) {
+        if let Err(error) = self.feed.request(&request) {
             self.state = EnvironmentState::Failed { error, last: None };
         }
     }

@@ -21,11 +21,11 @@
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
 use serde_json::Value;
 
 use crate::acquire::Acquire;
+use crate::dispatch;
 use crate::engine::Served;
 use crate::provider::FetchError;
 use crate::sources;
@@ -355,39 +355,29 @@ pub enum WarningEvent {
 }
 
 pub struct WarningFeed {
-    requests: Sender<u64>,
-    events: Receiver<WarningEvent>,
+    feed: dispatch::Feed<WarningEvent>,
 }
 
 impl WarningFeed {
     pub fn new(acquire: Acquire) -> Self {
-        let (requests, request_receiver) = mpsc::channel();
-        let (event_sender, events) = mpsc::channel();
-        std::thread::spawn(move || {
-            while let Ok(generation) = request_receiver.recv() {
-                let event = match fetch(&acquire) {
-                    Ok(set) => WarningEvent::Ready { generation, set },
-                    Err(error) => WarningEvent::Failed { generation, error },
-                };
-                if event_sender.send(event).is_err() {
-                    return;
-                }
-            }
-        });
-        Self { requests, events }
+        Self {
+            feed: dispatch::Feed::new(acquire),
+        }
     }
 
     pub fn request(&self, generation: u64) -> Result<(), WarningError> {
-        self.requests
-            .send(generation)
+        self.feed
+            .request(move |acquire| match fetch(acquire) {
+                Ok(set) => WarningEvent::Ready { generation, set },
+                Err(error) => WarningEvent::Failed { generation, error },
+            })
             .map_err(|_| WarningError::WorkerStopped)
     }
 
     pub fn poll(&self) -> Result<Option<WarningEvent>, WarningError> {
-        match self.events.try_recv() {
-            Ok(event) => Ok(Some(event)),
-            Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => Err(WarningError::WorkerStopped),
+        match self.feed.poll() {
+            Ok(event) => Ok(event),
+            Err(dispatch::Disconnected) => Err(WarningError::WorkerStopped),
         }
     }
 }

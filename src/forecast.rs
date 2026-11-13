@@ -21,11 +21,11 @@
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
 use serde_json::Value;
 
 use crate::acquire::Acquire;
+use crate::dispatch;
 use crate::engine::Served;
 use crate::place::Place;
 use crate::provider::FetchError;
@@ -514,11 +514,6 @@ impl ForecastState {
     }
 }
 
-struct ForecastRequest {
-    place: Place,
-    generation: u64,
-}
-
 struct ForecastMessage {
     generation: u64,
     place: Place,
@@ -536,10 +531,9 @@ pub enum ForecastOutcome {
     Failed { place: Place, error: ForecastError },
 }
 
-/// Runs forecast requests off the UI thread, one at a time.
+/// Runs forecast requests on the shared job queue, one at a time.
 pub struct ForecastFeed {
-    requests: Sender<ForecastRequest>,
-    results: Receiver<ForecastMessage>,
+    feed: dispatch::Feed<ForecastMessage>,
     generation: u64,
     latest: Option<Place>,
     stopped: bool,
@@ -547,25 +541,8 @@ pub struct ForecastFeed {
 
 impl ForecastFeed {
     pub fn new(acquire: Acquire) -> Self {
-        let (requests, request_receiver) = mpsc::channel::<ForecastRequest>();
-        let (result_sender, results) = mpsc::channel::<ForecastMessage>();
-        std::thread::spawn(move || {
-            while let Ok(request) = request_receiver.recv() {
-                let place = request.place;
-                let result = fetch(&acquire, &place);
-                let message = ForecastMessage {
-                    generation: request.generation,
-                    place,
-                    result,
-                };
-                if result_sender.send(message).is_err() {
-                    return;
-                }
-            }
-        });
         Self {
-            requests,
-            results,
+            feed: dispatch::Feed::new(acquire),
             generation: 0,
             latest: None,
             stopped: false,
@@ -575,22 +552,29 @@ impl ForecastFeed {
     pub fn start(&mut self, place: &Place) -> Result<(), ForecastError> {
         self.generation = self.generation.wrapping_add(1);
         self.latest = Some(place.clone());
-        let request = ForecastRequest {
-            place: place.clone(),
-            generation: self.generation,
-        };
-        if self.requests.send(request).is_err() {
-            self.stopped = true;
-            return Err(ForecastError::WorkerStopped);
-        }
-        Ok(())
+        let generation = self.generation;
+        let request_place = place.clone();
+        self.feed
+            .request(move |acquire| {
+                let place = request_place;
+                let result = fetch(acquire, &place);
+                ForecastMessage {
+                    generation,
+                    place,
+                    result,
+                }
+            })
+            .map_err(|_| {
+                self.stopped = true;
+                ForecastError::WorkerStopped
+            })
     }
 
     /// The newest answer, with earlier superseded requests discarded.
     pub fn poll(&mut self) -> Option<ForecastOutcome> {
         loop {
-            match self.results.try_recv() {
-                Ok(message) => {
+            match self.feed.poll() {
+                Ok(Some(message)) => {
                     if message.generation == self.generation {
                         return Some(match message.result {
                             Ok(served) => ForecastOutcome::Ready(served),
@@ -601,8 +585,8 @@ impl ForecastFeed {
                         });
                     }
                 }
-                Err(TryRecvError::Empty) => return None,
-                Err(TryRecvError::Disconnected) => {
+                Ok(None) => return None,
+                Err(dispatch::Disconnected) => {
                     if self.stopped {
                         return None;
                     }

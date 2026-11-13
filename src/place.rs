@@ -20,12 +20,12 @@
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
 use crate::acquire::Acquire;
+use crate::dispatch;
 use crate::engine::Served;
 use crate::error::CoordinateError;
 use crate::projection;
@@ -464,11 +464,6 @@ impl SearchInteraction {
     }
 }
 
-struct SearchRequest {
-    query: String,
-    generation: u64,
-}
-
 struct SearchMessage {
     generation: u64,
     outcome: SearchOutcome,
@@ -481,15 +476,13 @@ pub enum SearchOutcome {
     Failed { query: String, error: FetchError },
 }
 
-/// Runs place searches off the UI thread, one at a time.
+/// Runs place searches on the shared job queue, one at a time.
 ///
-/// The worker spaces requests to stay within the public geocoder's fair-use
-/// expectations and caches successful answers for this session. Results from
+/// The engine owns the source's pacing and response cache. Results from
 /// superseded queries are delivered with their generation and discarded by
 /// `poll`.
 pub struct PlaceSearch {
-    requests: Sender<SearchRequest>,
-    results: Receiver<SearchMessage>,
+    feed: dispatch::Feed<SearchMessage>,
     generation: u64,
     latest_query: String,
     stopped: bool,
@@ -497,38 +490,8 @@ pub struct PlaceSearch {
 
 impl PlaceSearch {
     pub fn new(acquire: Acquire) -> Self {
-        let (requests, request_receiver) = mpsc::channel::<SearchRequest>();
-        let (result_sender, results) = mpsc::channel::<SearchMessage>();
-        std::thread::spawn(move || {
-            let mut last_request: Option<Instant> = None;
-            while let Ok(request) = request_receiver.recv() {
-                if let Some(last) = last_request {
-                    let elapsed = last.elapsed();
-                    let policy = Duration::from_secs(1);
-                    if elapsed < policy {
-                        std::thread::sleep(policy - elapsed);
-                    }
-                }
-                let outcome = match search(&acquire, &request.query) {
-                    Ok(places) => SearchOutcome::Results { places },
-                    Err(error) => SearchOutcome::Failed {
-                        query: request.query,
-                        error,
-                    },
-                };
-                last_request = Some(Instant::now());
-                let message = SearchMessage {
-                    generation: request.generation,
-                    outcome,
-                };
-                if result_sender.send(message).is_err() {
-                    return;
-                }
-            }
-        });
         Self {
-            requests,
-            results,
+            feed: dispatch::Feed::new(acquire),
             generation: 0,
             latest_query: String::new(),
             stopped: false,
@@ -538,15 +501,22 @@ impl PlaceSearch {
     pub fn start(&mut self, query: String) -> Result<(), FetchError> {
         self.generation = self.generation.wrapping_add(1);
         self.latest_query = query.clone();
-        let request = SearchRequest {
-            query,
-            generation: self.generation,
-        };
-        if self.requests.send(request).is_err() {
-            self.stopped = true;
-            return Err(FetchError::WorkerStopped);
-        }
-        Ok(())
+        let generation = self.generation;
+        self.feed
+            .request(move |acquire| {
+                let outcome = match search(acquire, &query) {
+                    Ok(places) => SearchOutcome::Results { places },
+                    Err(error) => SearchOutcome::Failed { query, error },
+                };
+                SearchMessage {
+                    generation,
+                    outcome,
+                }
+            })
+            .map_err(|_| {
+                self.stopped = true;
+                FetchError::WorkerStopped
+            })
     }
 
     /// Discards any answer still in flight after the user chooses a station.
@@ -557,14 +527,14 @@ impl PlaceSearch {
     /// The newest answer, with earlier superseded searches discarded.
     pub fn poll(&mut self) -> Option<SearchOutcome> {
         loop {
-            match self.results.try_recv() {
-                Ok(message) => {
+            match self.feed.poll() {
+                Ok(Some(message)) => {
                     if message.generation == self.generation {
                         return Some(message.outcome);
                     }
                 }
-                Err(TryRecvError::Empty) => return None,
-                Err(TryRecvError::Disconnected) => {
+                Ok(None) => return None,
+                Err(dispatch::Disconnected) => {
                     if self.stopped {
                         return None;
                     }
@@ -640,13 +610,11 @@ mod tests {
 
     #[test]
     fn editing_invalidates_an_in_flight_search_before_debounce() -> Result<(), TestError> {
-        let (requests, _request_receiver) = mpsc::channel();
-        let (results, receiver) = mpsc::channel();
+        let (queued, results) = dispatch::Feed::test_pair();
         let mut interaction = SearchInteraction {
             query: String::from("Chicago"),
             feed: PlaceSearch {
-                requests,
-                results: receiver,
+                feed: queued,
                 generation: 1,
                 latest_query: String::from("Chicago"),
                 stopped: false,

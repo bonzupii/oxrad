@@ -30,6 +30,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::config::EnabledProviders;
+use crate::dispatch::{self, Job};
 use crate::engine::{self, Command, EngineStatus, Fetched, RequestSpec, Status};
 use crate::provider::FetchError;
 use crate::sources::{Format, Source};
@@ -39,14 +40,48 @@ pub(crate) const MAX_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
 /// A binary archive is allowed to be larger than a document. Level II volumes
 /// routinely exceed four mebibytes, and the same gate and cache must carry them.
 pub(crate) const MAX_BINARY_BYTES: u64 = 64 * 1024 * 1024;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long one address may take to answer, so a dual-stack host with a dead
-/// IPv6 route does not hold up a request the working address answers at once.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// The time limits for one transfer class.
+///
+/// A policy bounds each phase and the silence between reads. It carries no
+/// total deadline, so a large body on a slow link may finish while a stalled
+/// socket still fails in bounded time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TransferPolicy {
+    pub(crate) resolve: Duration,
+    pub(crate) connect: Duration,
+    pub(crate) response: Duration,
+    pub(crate) read: Duration,
+    pub(crate) write: Duration,
+}
+
+impl TransferPolicy {
+    /// Selects limits from the registry's wire format.
+    pub(crate) const fn for_source(source: &Source) -> Self {
+        match source.format {
+            Format::Binary => Self {
+                resolve: Duration::from_secs(30),
+                connect: Duration::from_secs(30),
+                response: Duration::from_secs(60),
+                read: Duration::from_secs(60),
+                write: Duration::from_secs(30),
+            },
+            Format::Json | Format::GeoJson | Format::Xml | Format::Tiles | Format::VectorTiles => {
+                Self {
+                    resolve: Duration::from_secs(20),
+                    connect: Duration::from_secs(20),
+                    response: Duration::from_secs(30),
+                    read: Duration::from_secs(30),
+                    write: Duration::from_secs(20),
+                }
+            }
+        }
+    }
+}
 /// A handle to the engine thread and the sources this configuration enables.
 #[derive(Clone)]
 pub struct Acquire {
     commands: Sender<Command>,
+    jobs: Option<Sender<Job>>,
 }
 
 impl Acquire {
@@ -78,7 +113,35 @@ impl Acquire {
                 updates.as_ref(),
             );
         });
-        Self { commands }
+        let (jobs, job_receiver) = channel::<Job>();
+        let worker_commands = commands.clone();
+        std::thread::spawn(move || {
+            let worker = Self {
+                commands: worker_commands,
+                jobs: None,
+            };
+            while let Ok(job) = job_receiver.recv() {
+                job(&worker);
+            }
+        });
+        Self {
+            commands,
+            jobs: Some(jobs),
+        }
+    }
+
+    /// Queues one off-thread read on the single shared queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`dispatch::Disconnected`] when the queue has stopped.
+    pub(crate) fn offload<F>(&self, work: F) -> Result<(), dispatch::Disconnected>
+    where
+        F: FnOnce(&Self) + Send + 'static,
+    {
+        let jobs = self.jobs.as_ref().ok_or(dispatch::Disconnected)?;
+        jobs.send(Box::new(work))
+            .map_err(|_| dispatch::Disconnected)
     }
 
     /// Runs one request through the engine: cache, pacing, retry and record.
@@ -178,7 +241,12 @@ impl Transport {
             return Err(FetchError::Disabled { id: source.id });
         }
         match self {
-            Self::Live => live_get(url, accept, REQUEST_TIMEOUT, body_limit(source)),
+            Self::Live => live_get(
+                url,
+                accept,
+                TransferPolicy::for_source(source),
+                body_limit(source),
+            ),
             #[cfg(test)]
             Self::Offline => Err(FetchError::WorkerStopped),
             #[cfg(test)]
@@ -234,13 +302,23 @@ impl Acquire {
     }
 }
 
-fn live_get(url: &str, accept: &str, timeout: Duration, limit: u64) -> Result<Vec<u8>, FetchError> {
+fn live_get(
+    url: &str,
+    accept: &str,
+    policy: TransferPolicy,
+    limit: u64,
+) -> Result<Vec<u8>, FetchError> {
     let mut response = ureq::get(url)
         .header("User-Agent", crate::sources::USER_AGENT)
         .header("Accept", accept)
         .config()
-        .timeout_global(Some(timeout))
-        .timeout_connect(Some(CONNECT_TIMEOUT))
+        .timeout_resolve(Some(policy.resolve))
+        .timeout_connect(Some(policy.connect))
+        .timeout_send_request(Some(policy.write))
+        .timeout_send_body(Some(policy.write))
+        .timeout_recv_response(Some(policy.response))
+        .timeout_per_read(Some(policy.read))
+        .timeout_per_write(Some(policy.write))
         .http_status_as_error(false)
         .build()
         .call()
@@ -286,6 +364,55 @@ mod tests {
     fn binary_archives_get_a_larger_body_limit() {
         assert_eq!(body_limit(&sources::NEXRAD_LEVEL_TWO), MAX_BINARY_BYTES);
         assert_eq!(body_limit(&sources::OPENFREEMAP), MAX_DOCUMENT_BYTES);
+    }
+
+    #[test]
+    fn binary_archives_get_longer_phase_limits_than_documents() {
+        let binary = TransferPolicy::for_source(&sources::NEXRAD_LEVEL_TWO);
+        let document = TransferPolicy::for_source(&sources::OPENFREEMAP);
+        assert!(binary.connect > document.connect);
+        assert!(binary.response > document.response);
+        assert!(binary.read > document.read);
+        assert!(document.response >= Duration::from_secs(30));
+    }
+
+    #[test]
+    fn a_slow_response_is_not_cut_off_by_a_total_deadline() -> Result<(), TestError> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener =
+            TcpListener::bind("127.0.0.1:0").map_err(|error| TestError::from(error.to_string()))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| TestError::from(error.to_string()))?;
+        let server = std::thread::spawn(move || -> Result<(), TestError> {
+            let (mut stream, _) = listener
+                .accept()
+                .map_err(|error| TestError::from(error.to_string()))?;
+            let mut request = [0_u8; 1024];
+            stream
+                .read(&mut request)
+                .map_err(|error| TestError::from(error.to_string()))?;
+            std::thread::sleep(Duration::from_secs(11));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nslow")
+                .map_err(|error| TestError::from(error.to_string()))?;
+            Ok(())
+        });
+        let url = format!("http://{address}/slow");
+        let body = live_get(
+            &url,
+            "text/plain",
+            TransferPolicy::for_source(&sources::OPENFREEMAP),
+            1024,
+        )
+        .map_err(TestError::from);
+        server
+            .join()
+            .map_err(|_| TestError::from("the slow server thread panicked"))??;
+        assert_eq!(body?, b"slow");
+        Ok(())
     }
 
     #[test]

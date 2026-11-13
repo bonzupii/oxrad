@@ -19,15 +19,15 @@
 //! reflectivity composite, not a single site's sweep. The worker keeps the
 //! two-hour, ten-minute frame sequence so the map can scrub and loop it.
 
-use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::Sender;
 
 use serde_json::Value;
 
 use crate::acquire::Acquire;
-use crate::engine::{CacheState, Provenance, RequestSpec, Served};
+use crate::dispatch;
+use crate::engine::{RequestSpec, Served};
 use crate::error::RadarError;
 use crate::provider::FetchError;
 use crate::sources;
@@ -40,7 +40,6 @@ const MAX_FRAMES: usize = 24;
 /// frame tile it has already shown. This is playback frame state: it carries no
 /// TTL, retry or provenance and is cleared wholesale at the bound. The engine's
 /// response cache remains the owner of the hour-long request TTL.
-const MAX_CACHED_TILES: usize = 120;
 const MAX_VIEW_TILES: usize = 8;
 const EARTH_KM_PER_DEGREE: f64 = 111.32;
 
@@ -237,30 +236,17 @@ struct RadarRequest {
     generation: u64,
 }
 
-/// Runs global radar requests off the UI thread.
+/// Runs global radar requests on the shared job queue.
 pub struct GlobalRadarFeed {
-    requests: Sender<RadarRequest>,
-    events: Receiver<GlobalEvent>,
+    feed: dispatch::Feed<GlobalEvent>,
     generation: u64,
     stopped: bool,
 }
 
 impl GlobalRadarFeed {
     pub fn new(acquire: Acquire) -> Self {
-        let (requests, request_receiver) = mpsc::channel::<RadarRequest>();
-        let (event_sender, events) = mpsc::channel::<GlobalEvent>();
-        std::thread::spawn(move || {
-            Worker {
-                requests: request_receiver,
-                acquire,
-                events: event_sender,
-                tiles: HashMap::new(),
-            }
-            .run();
-        });
         Self {
-            requests,
-            events,
+            feed: dispatch::Feed::new(acquire),
             generation: 0,
             stopped: false,
         }
@@ -270,7 +256,7 @@ impl GlobalRadarFeed {
     ///
     /// # Errors
     ///
-    /// Returns [`GlobalRadarError::WorkerStopped`] when the worker has exited.
+    /// Returns [`GlobalRadarError::WorkerStopped`] when the queue has exited.
     pub fn request(
         &mut self,
         center_lat: f64,
@@ -281,187 +267,151 @@ impl GlobalRadarFeed {
         if self.generation == 0 {
             self.generation = 1;
         }
-        if self
-            .requests
-            .send(RadarRequest {
-                center_lat,
-                center_lon,
-                span_km,
-                generation: self.generation,
-            })
-            .is_err()
-        {
-            self.stopped = true;
-            return Err(GlobalRadarError::WorkerStopped);
-        }
-        Ok(self.generation)
-    }
-
-    /// Returns the next event from the current request.
-    pub fn poll(&mut self) -> Option<GlobalEvent> {
-        match self.events.try_recv() {
-            Ok(event) => Some(event),
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => {
-                if self.stopped {
-                    return None;
-                }
-                self.stopped = true;
-                Some(GlobalEvent::Failed {
-                    generation: self.generation,
-                    error: GlobalRadarError::WorkerStopped,
-                })
-            }
-        }
-    }
-}
-
-struct Worker {
-    requests: Receiver<RadarRequest>,
-    acquire: Acquire,
-    events: Sender<GlobalEvent>,
-    tiles: HashMap<String, (Vec<u8>, Provenance, CacheState)>,
-}
-
-impl Worker {
-    fn run(mut self) {
-        let Ok(mut request) = self.requests.recv() else {
-            return;
+        let request = RadarRequest {
+            center_lat,
+            center_lon,
+            span_km,
+            generation: self.generation,
         };
-        loop {
-            match self.refresh(&request) {
-                Ok(Some(next)) => {
-                    request = next;
-                    continue;
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    if self
-                        .events
+        self.feed
+            .request_stream(move |acquire, sender| {
+                if let Err(error) = refresh(acquire, &request, sender)
+                    && sender
                         .send(GlobalEvent::Failed {
                             generation: request.generation,
                             error,
                         })
                         .is_err()
-                    {
-                        return;
+                {}
+            })
+            .map_err(|_| {
+                self.stopped = true;
+                GlobalRadarError::WorkerStopped
+            })?;
+        Ok(self.generation)
+    }
+
+    /// Returns the next event from the current request.
+    pub fn poll(&mut self) -> Option<GlobalEvent> {
+        loop {
+            match self.feed.poll() {
+                Ok(Some(event)) if event.generation() == self.generation => return Some(event),
+                Ok(Some(_)) => continue,
+                Ok(None) => return None,
+                Err(dispatch::Disconnected) => {
+                    if self.stopped {
+                        return None;
                     }
+                    self.stopped = true;
+                    return Some(GlobalEvent::Failed {
+                        generation: self.generation,
+                        error: GlobalRadarError::WorkerStopped,
+                    });
                 }
-            }
-            match self.requests.recv() {
-                Ok(next) => request = next,
-                Err(_) => return,
             }
         }
     }
+}
 
-    fn refresh(
-        &mut self,
-        request: &RadarRequest,
-    ) -> Result<Option<RadarRequest>, GlobalRadarError> {
-        let snapshot = self.manifest(request.generation)?;
-        let grid = tile_grid_for_view(request.center_lat, request.center_lon, request.span_km)?;
-        if self
-            .events
-            .send(GlobalEvent::Manifest {
+impl GlobalEvent {
+    const fn generation(&self) -> u64 {
+        match self {
+            Self::Manifest { generation, .. }
+            | Self::Frame { generation, .. }
+            | Self::Failed { generation, .. }
+            | Self::Notice { generation, .. } => *generation,
+        }
+    }
+}
+
+fn refresh(
+    acquire: &Acquire,
+    request: &RadarRequest,
+    events: &Sender<GlobalEvent>,
+) -> Result<(), GlobalRadarError> {
+    let snapshot = manifest(acquire, request.generation, events)?;
+    let grid = tile_grid_for_view(request.center_lat, request.center_lon, request.span_km)?;
+    if events
+        .send(GlobalEvent::Manifest {
+            generation: request.generation,
+            served: snapshot.clone(),
+        })
+        .is_err()
+    {
+        return Err(GlobalRadarError::WorkerStopped);
+    }
+    for frame in snapshot.frames.iter().rev() {
+        let mut decoded = Vec::with_capacity(grid.tiles.len());
+        for bounds in &grid.tiles {
+            if !valid_host(&snapshot.host) || !valid_path(&frame.path) {
+                return Err(GlobalRadarError::Shape {
+                    detail: "a valid tile host and frame path",
+                });
+            }
+            let size = TILE_SIZE.to_string();
+            let zoom = bounds.zoom.to_string();
+            let x = bounds.x.to_string();
+            let y = bounds.y.to_string();
+            let spec = RequestSpec::for_operation(
+                &sources::RAINVIEWER,
+                "tile",
+                &[
+                    ("host", snapshot.host.as_str()),
+                    ("path", frame.path.as_str()),
+                    ("size", size.as_str()),
+                    ("zoom", zoom.as_str()),
+                    ("x", x.as_str()),
+                    ("y", y.as_str()),
+                    ("scheme", &COLOR_SCHEME.to_string()),
+                ],
+            )
+            .map_err(RadarError::from)?;
+            let fetched = acquire.fetch(&spec).map_err(RadarError::from)?;
+            let image = decode_tile(&fetched.body, &frame.path)?;
+            decoded.push(
+                Served::new(
+                    TileImage {
+                        bounds: *bounds,
+                        image,
+                    },
+                    fetched.provenance,
+                    fetched.cache,
+                )
+                .labelled(format!("tile z{} x{} y{}", bounds.zoom, bounds.x, bounds.y)),
+            );
+        }
+        if events
+            .send(GlobalEvent::Frame {
                 generation: request.generation,
-                served: snapshot.clone(),
+                frame: frame.clone(),
+                tiles: decoded,
             })
             .is_err()
         {
             return Err(GlobalRadarError::WorkerStopped);
         }
-        for frame in snapshot.frames.iter().rev() {
-            let mut decoded = Vec::with_capacity(grid.tiles.len());
-            for bounds in &grid.tiles {
-                if let Some(next) = self.next_request()? {
-                    return Ok(Some(next));
-                }
-                let key = cache_key(frame, *bounds);
-                let (png, tile_provenance, tile_cache) = match self.tiles.remove(&key) {
-                    Some(cached) => cached,
-                    None => {
-                        if !valid_host(&snapshot.host) || !valid_path(&frame.path) {
-                            return Err(GlobalRadarError::Shape {
-                                detail: "a valid tile host and frame path",
-                            });
-                        }
-                        let size = TILE_SIZE.to_string();
-                        let zoom = bounds.zoom.to_string();
-                        let x = bounds.x.to_string();
-                        let y = bounds.y.to_string();
-                        let spec = RequestSpec::for_operation(
-                            &sources::RAINVIEWER,
-                            "tile",
-                            &[
-                                ("host", snapshot.host.as_str()),
-                                ("path", frame.path.as_str()),
-                                ("size", size.as_str()),
-                                ("zoom", zoom.as_str()),
-                                ("x", x.as_str()),
-                                ("y", y.as_str()),
-                                ("scheme", &COLOR_SCHEME.to_string()),
-                            ],
-                        )
-                        .map_err(RadarError::from)?;
-                        let fetched = self.acquire.fetch(&spec).map_err(RadarError::from)?;
-                        (fetched.body, fetched.provenance, fetched.cache)
-                    }
-                };
-                let image = decode_tile(&png, &frame.path)?;
-                if self.tiles.len() >= MAX_CACHED_TILES {
-                    self.tiles.clear();
-                }
-                self.tiles
-                    .insert(key, (png, tile_provenance.clone(), tile_cache));
-                decoded.push(
-                    Served::new(
-                        TileImage {
-                            bounds: *bounds,
-                            image,
-                        },
-                        tile_provenance,
-                        tile_cache,
-                    )
-                    .labelled(format!("tile z{} x{} y{}", bounds.zoom, bounds.x, bounds.y)),
-                );
-            }
-            if self
-                .events
-                .send(GlobalEvent::Frame {
-                    generation: request.generation,
-                    frame: frame.clone(),
-                    tiles: decoded,
-                })
-                .is_err()
-            {
-                return Err(GlobalRadarError::WorkerStopped);
-            }
-        }
-        self.next_request()
     }
-    fn next_request(&self) -> Result<Option<RadarRequest>, GlobalRadarError> {
-        match self.requests.try_recv() {
-            Ok(request) => Ok(Some(request)),
-            Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => Err(GlobalRadarError::WorkerStopped),
-        }
-    }
+    Ok(())
+}
 
-    fn manifest(&mut self, generation: u64) -> Result<Served<ManifestSnapshot>, GlobalRadarError> {
-        let fetched = self
-            .acquire
-            .fetch_operation(&sources::RAINVIEWER, "manifest", &[])
-            .map_err(RadarError::from)?;
-        if let Some(message) = self.acquire.cache_error() {
-            let _ = self.events.send(GlobalEvent::Notice {
+fn manifest(
+    acquire: &Acquire,
+    generation: u64,
+    events: &Sender<GlobalEvent>,
+) -> Result<Served<ManifestSnapshot>, GlobalRadarError> {
+    let fetched = acquire
+        .fetch_operation(&sources::RAINVIEWER, "manifest", &[])
+        .map_err(RadarError::from)?;
+    if let Some(message) = acquire.cache_error() {
+        events
+            .send(GlobalEvent::Notice {
                 generation,
                 message,
-            });
-        }
-        let value = parse_manifest(&fetched.body)?;
-        Ok(Served::new(value, fetched.provenance, fetched.cache))
+            })
+            .map_err(|_| GlobalRadarError::WorkerStopped)?;
     }
+    let value = parse_manifest(&fetched.body)?;
+    Ok(Served::new(value, fetched.provenance, fetched.cache))
 }
 
 fn parse_time(value: &Value, field: &'static str) -> Result<u64, GlobalRadarError> {
@@ -677,13 +627,6 @@ fn grid_at_zoom(
     }
     Ok(TileGrid { zoom, tiles })
 }
-fn cache_key(frame: &GlobalFrame, bounds: TileBounds) -> String {
-    format!(
-        "{}:{}:{}:{}",
-        frame.time_unix_ms, bounds.zoom, bounds.x, bounds.y
-    )
-}
-
 pub(crate) fn decode_tile(bytes: &[u8], url: &str) -> Result<DecodedTile, GlobalRadarError> {
     let image =
         image::load_from_memory_with_format(bytes, image::ImageFormat::Png).map_err(|source| {

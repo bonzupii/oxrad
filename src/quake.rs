@@ -23,11 +23,11 @@
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
 use serde_json::Value;
 
 use crate::acquire::Acquire;
+use crate::dispatch;
 use crate::engine::Served;
 use crate::provider::FetchError;
 use crate::sources;
@@ -564,13 +564,6 @@ pub fn describe(quakes: &Quakes) -> String {
 }
 
 #[derive(Debug)]
-struct QuakeRequest {
-    provider: Provider,
-    window: Window,
-    generation: u64,
-}
-
-#[derive(Debug)]
 struct QuakeMessage {
     generation: u64,
     provider: Provider,
@@ -587,10 +580,9 @@ pub enum QuakeOutcome {
     },
 }
 
-/// Runs feed requests off the UI thread, one at a time.
+/// Runs feed requests on the shared job queue, one at a time.
 pub struct QuakeFeed {
-    requests: Sender<QuakeRequest>,
-    results: Receiver<QuakeMessage>,
+    feed: dispatch::Feed<QuakeMessage>,
     generation: u64,
     latest: Option<(Provider, Window)>,
     stopped: bool,
@@ -598,27 +590,8 @@ pub struct QuakeFeed {
 
 impl QuakeFeed {
     pub fn new(acquire: Acquire) -> Self {
-        let (requests, request_receiver) = mpsc::channel::<QuakeRequest>();
-        let (result_sender, results) = mpsc::channel::<QuakeMessage>();
-        std::thread::spawn(move || {
-            while let Ok(request) = request_receiver.recv() {
-                let provider = request.provider;
-                let window = request.window;
-                let result = fetch(&acquire, provider, window);
-                let message = QuakeMessage {
-                    generation: request.generation,
-                    provider,
-                    window,
-                    result,
-                };
-                if result_sender.send(message).is_err() {
-                    return;
-                }
-            }
-        });
         Self {
-            requests,
-            results,
+            feed: dispatch::Feed::new(acquire),
             generation: 0,
             latest: None,
             stopped: false,
@@ -628,24 +601,29 @@ impl QuakeFeed {
     pub fn start(&mut self, provider: Provider, window: Window) -> Result<(), QuakeError> {
         self.generation = self.generation.wrapping_add(1);
         self.latest = Some((provider, window));
-        let request = QuakeRequest {
-            provider,
-            window,
-            generation: self.generation,
-        };
-        if self.requests.send(request).is_err() {
-            self.stopped = true;
-            return Err(QuakeError::WorkerStopped);
-        }
-        Ok(())
+        let generation = self.generation;
+        self.feed
+            .request(move |acquire| {
+                let result = fetch(acquire, provider, window);
+                QuakeMessage {
+                    generation,
+                    provider,
+                    window,
+                    result,
+                }
+            })
+            .map_err(|_| {
+                self.stopped = true;
+                QuakeError::WorkerStopped
+            })
     }
 
     /// The newest answer; a superseded request is discarded rather than
     /// overwriting a newer one.
     pub fn poll(&mut self) -> Option<QuakeOutcome> {
         loop {
-            match self.results.try_recv() {
-                Ok(message) => {
+            match self.feed.poll() {
+                Ok(Some(message)) => {
                     if message.generation == self.generation {
                         return Some(match message.result {
                             Ok(served) => QuakeOutcome::Ready(Box::new(served)),
@@ -657,8 +635,8 @@ impl QuakeFeed {
                         });
                     }
                 }
-                Err(TryRecvError::Empty) => return None,
-                Err(TryRecvError::Disconnected) => {
+                Ok(None) => return None,
+                Err(dispatch::Disconnected) => {
                     if self.stopped {
                         return None;
                     }

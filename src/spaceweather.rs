@@ -23,12 +23,12 @@
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
 use crate::acquire::Acquire;
+use crate::dispatch;
 use crate::engine::Served;
 use crate::provider::FetchError;
 use crate::sources;
@@ -403,32 +403,17 @@ pub enum SpaceWeatherEvent {
     },
 }
 
-/// Fetches the record off the UI thread.
+/// Fetches the record on the shared job queue.
 pub struct SpaceWeatherFeed {
-    requests: Sender<u64>,
-    events: Receiver<SpaceWeatherEvent>,
+    feed: dispatch::Feed<SpaceWeatherEvent>,
     generation: u64,
     stopped: bool,
 }
 
 impl SpaceWeatherFeed {
     pub fn new(acquire: Acquire) -> Self {
-        let (requests, request_receiver) = mpsc::channel::<u64>();
-        let (event_sender, events) = mpsc::channel::<SpaceWeatherEvent>();
-        std::thread::spawn(move || {
-            while let Ok(generation) = request_receiver.recv() {
-                let event = match fetch(&acquire) {
-                    Ok(record) => SpaceWeatherEvent::Ready { generation, record },
-                    Err(error) => SpaceWeatherEvent::Failed { generation, error },
-                };
-                if event_sender.send(event).is_err() {
-                    return;
-                }
-            }
-        });
         Self {
-            requests,
-            events,
+            feed: dispatch::Feed::new(acquire),
             generation: 0,
             stopped: false,
         }
@@ -436,18 +421,22 @@ impl SpaceWeatherFeed {
 
     pub fn request(&mut self, generation: u64) -> Result<(), SpaceWeatherError> {
         self.generation = generation;
-        if self.requests.send(generation).is_err() {
-            self.stopped = true;
-            return Err(SpaceWeatherError::WorkerStopped);
-        }
-        Ok(())
+        self.feed
+            .request(move |acquire| match fetch(acquire) {
+                Ok(record) => SpaceWeatherEvent::Ready { generation, record },
+                Err(error) => SpaceWeatherEvent::Failed { generation, error },
+            })
+            .map_err(|_| {
+                self.stopped = true;
+                SpaceWeatherError::WorkerStopped
+            })
     }
 
     pub fn poll(&mut self) -> Option<SpaceWeatherEvent> {
-        match self.events.try_recv() {
-            Ok(event) => Some(event),
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => {
+        match self.feed.poll() {
+            Ok(Some(event)) => Some(event),
+            Ok(None) => None,
+            Err(dispatch::Disconnected) => {
                 if self.stopped {
                     return None;
                 }

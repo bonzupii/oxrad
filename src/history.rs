@@ -21,10 +21,9 @@
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::thread;
 
 use crate::acquire::Acquire;
+use crate::dispatch;
 use crate::engine::{Served, SourceRecord};
 use crate::error::RadarError;
 use crate::network;
@@ -102,26 +101,14 @@ enum HistoryRequest {
 }
 
 pub struct HistoryFeed {
-    requests: Sender<HistoryRequest>,
-    events: Receiver<HistoryEvent>,
+    feed: dispatch::Feed<HistoryEvent>,
     generation: u64,
 }
 
 impl HistoryFeed {
     pub fn new(acquire: Acquire) -> Self {
-        let (request_sender, requests) = mpsc::channel();
-        let (event_sender, events) = mpsc::channel();
-        thread::spawn(move || {
-            HistoryWorker {
-                requests,
-                acquire,
-                events: event_sender,
-            }
-            .run();
-        });
         Self {
-            requests: request_sender,
-            events,
+            feed: dispatch::Feed::new(acquire),
             generation: 0,
         }
     }
@@ -147,11 +134,11 @@ impl HistoryFeed {
 
     pub fn poll(&self) -> Result<Option<HistoryEvent>, HistoryError> {
         loop {
-            match self.events.try_recv() {
-                Ok(event) if event.generation() == self.generation => return Ok(Some(event)),
-                Ok(_) => continue,
-                Err(TryRecvError::Empty) => return Ok(None),
-                Err(TryRecvError::Disconnected) => return Err(HistoryError::WorkerStopped),
+            match self.feed.poll() {
+                Ok(Some(event)) if event.generation() == self.generation => return Ok(Some(event)),
+                Ok(Some(_)) => continue,
+                Ok(None) => return Ok(None),
+                Err(dispatch::Disconnected) => return Err(HistoryError::WorkerStopped),
             }
         }
     }
@@ -169,40 +156,10 @@ impl HistoryFeed {
                 ..
             } => *request_generation = generation,
         }
-        self.requests
-            .send(request)
-            .map_err(|_| HistoryError::WorkerStopped)?;
-        Ok(())
-    }
-}
-
-impl HistoryEvent {
-    const fn generation(&self) -> u64 {
-        match self {
-            Self::Keys { generation, .. }
-            | Self::Volume { generation, .. }
-            | Self::Failed { generation, .. } => *generation,
-        }
-    }
-}
-
-struct HistoryWorker {
-    requests: Receiver<HistoryRequest>,
-    acquire: Acquire,
-    events: Sender<HistoryEvent>,
-}
-
-impl HistoryWorker {
-    fn run(self) {
-        let Self {
-            requests,
-            acquire,
-            events,
-        } = self;
-        while let Ok(request) = requests.recv() {
-            let event = match request {
+        self.feed
+            .request(move |acquire| match request {
                 HistoryRequest::Keys { generation, site } => {
-                    match network::recent_volume_keys(&acquire, &site, RECENT_LIMIT) {
+                    match network::recent_volume_keys(acquire, &site, RECENT_LIMIT) {
                         Ok(listed) => HistoryEvent::Keys {
                             generation,
                             keys: listed.keys,
@@ -219,7 +176,7 @@ impl HistoryWorker {
                     generation,
                     site,
                     key,
-                } => match network::fetch_archive_cached(&acquire, &key, &site) {
+                } => match network::fetch_archive_cached(acquire, &key, &site) {
                     Ok(archive) => match radar::decode_volume(&site, &key, &archive.bytes) {
                         Ok(volume) => HistoryEvent::Volume {
                             generation,
@@ -229,7 +186,7 @@ impl HistoryWorker {
                             cache_warning: archive.cache_warning,
                         },
                         Err(error) => {
-                            let cache_warning = network::evict_archive(&acquire, &key).err();
+                            let cache_warning = network::evict_archive(acquire, &key).err();
                             HistoryEvent::Failed {
                                 generation,
                                 error: error.into(),
@@ -243,10 +200,18 @@ impl HistoryWorker {
                         cache_warning: None,
                     },
                 },
-            };
-            if events.send(event).is_err() {
-                return;
-            }
+            })
+            .map_err(|_| HistoryError::WorkerStopped)?;
+        Ok(())
+    }
+}
+
+impl HistoryEvent {
+    const fn generation(&self) -> u64 {
+        match self {
+            Self::Keys { generation, .. }
+            | Self::Volume { generation, .. }
+            | Self::Failed { generation, .. } => *generation,
         }
     }
 }
@@ -300,19 +265,11 @@ mod tests {
     #[test]
     fn cancelled_results_cannot_match_a_later_request() -> Result<(), crate::test_support::TestError>
     {
-        let (requests, _request_receiver) = mpsc::channel();
-        let (events, receiver) = mpsc::channel();
-        let mut feed = HistoryFeed {
-            requests,
-            events: receiver,
-            generation: 0,
+        let (queued, events) = dispatch::Feed::test_pair();
+        let feed = HistoryFeed {
+            feed: queued,
+            generation: 3,
         };
-        let site = SiteId::parse("KTWX")?;
-        feed.request_keys(&site)
-            .map_err(|error| format!("first request failed: {error}"))?;
-        feed.cancel();
-        feed.request_keys(&site)
-            .map_err(|error| format!("second request failed: {error}"))?;
         events
             .send(HistoryEvent::Keys {
                 generation: 1,

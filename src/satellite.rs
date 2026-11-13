@@ -23,12 +23,13 @@
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::Sender;
 
 use eframe::egui::{self, Color32, Pos2, Rect, RichText, TextureHandle};
 
 use crate::acquire::Acquire;
 use crate::canvas::{provenance, toggle_button};
+use crate::dispatch;
 use crate::engine::{RequestSpec, Served};
 use crate::global_radar::{self, TileBounds};
 use crate::map;
@@ -358,126 +359,17 @@ pub(crate) fn decode(url: &str, bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), Sat
     Ok((rgba.width(), rgba.height(), rgba.into_raw()))
 }
 
-/// Fetches and decodes tiles off the UI thread, keeping a bounded copy of what
-/// it has already seen.
+/// Fetches and decodes one tile plan on the shared job queue.
 pub struct SatelliteFeed {
-    requests: Sender<PlanRequest>,
-    events: Receiver<SatelliteEvent>,
+    feed: dispatch::Feed<SatelliteEvent>,
     generation: u64,
     stopped: bool,
 }
 
 impl SatelliteFeed {
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the worker is one ordered loop over the plan's tiles"
-    )]
     pub fn new(acquire: Acquire) -> Self {
-        let (requests, request_receiver) = mpsc::channel::<PlanRequest>();
-        let (event_sender, events) = mpsc::channel::<SatelliteEvent>();
-        std::thread::spawn(move || {
-            while let Ok(request) = request_receiver.recv() {
-                let mut loaded = 0;
-                let mut failed = 0;
-                let mut first_error = None;
-                for tile in &request.tiles {
-                    let layer = String::from(request.imagery.layer());
-                    let level = request.imagery.level().to_string();
-                    let format = String::from(request.imagery.format());
-                    let day = request.day.path();
-                    let zoom = tile.zoom.to_string();
-                    let x = tile.x.to_string();
-                    let y = tile.y.to_string();
-                    let spec = match RequestSpec::for_operation(
-                        &sources::NASA_GIBS,
-                        "tile",
-                        &[
-                            ("layer", layer.as_str()),
-                            ("level", level.as_str()),
-                            ("format", format.as_str()),
-                            ("time", day.as_str()),
-                            ("zoom", zoom.as_str()),
-                            ("x", x.as_str()),
-                            ("y", y.as_str()),
-                        ],
-                    ) {
-                        Ok(spec) => spec,
-                        Err(source) => {
-                            failed += 1;
-                            if first_error.is_none() {
-                                first_error = Some(SatelliteError::Provider { source });
-                            }
-                            continue;
-                        }
-                    };
-                    let decoded = acquire
-                        .fetch(&spec)
-                        .map_err(|source| SatelliteError::Provider { source })
-                        .and_then(|fetched| {
-                            let (width, height, rgba) =
-                                decode(&fetched.provenance.url, &fetched.body)?;
-                            Ok((width, height, rgba, fetched.provenance, fetched.cache))
-                        });
-                    match decoded {
-                        Ok((width, height, rgba, tile_provenance, tile_cache)) => {
-                            loaded += 1;
-                            let image = Served::new(
-                                TileImage {
-                                    bounds: *tile,
-                                    width,
-                                    height,
-                                    rgba,
-                                },
-                                tile_provenance,
-                                tile_cache,
-                            );
-                            if event_sender
-                                .send(SatelliteEvent::Tile {
-                                    generation: request.generation,
-                                    tile: image,
-                                })
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                        Err(error) => {
-                            failed += 1;
-                            if first_error.is_none() {
-                                first_error = Some(error);
-                            }
-                        }
-                    }
-                }
-                if loaded == 0
-                    && let Some(error) = first_error
-                {
-                    if event_sender
-                        .send(SatelliteEvent::Failed {
-                            generation: request.generation,
-                            error,
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
-                    continue;
-                }
-                if event_sender
-                    .send(SatelliteEvent::Done {
-                        generation: request.generation,
-                        loaded,
-                        failed,
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-            }
-        });
         Self {
-            requests,
-            events,
+            feed: dispatch::Feed::new(acquire),
             generation: 0,
             stopped: false,
         }
@@ -485,18 +377,19 @@ impl SatelliteFeed {
 
     pub fn request(&mut self, request: PlanRequest) -> Result<(), SatelliteError> {
         self.generation = request.generation;
-        if self.requests.send(request).is_err() {
-            self.stopped = true;
-            return Err(SatelliteError::WorkerStopped);
-        }
-        Ok(())
+        self.feed
+            .request_stream(move |acquire, sender| load_plan(acquire, &request, sender))
+            .map_err(|_| {
+                self.stopped = true;
+                SatelliteError::WorkerStopped
+            })
     }
 
     pub fn poll(&mut self) -> Option<SatelliteEvent> {
-        match self.events.try_recv() {
-            Ok(event) => Some(event),
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => {
+        match self.feed.poll() {
+            Ok(Some(event)) => Some(event),
+            Ok(None) => None,
+            Err(dispatch::Disconnected) => {
                 if self.stopped {
                     return None;
                 }
@@ -508,6 +401,94 @@ impl SatelliteFeed {
             }
         }
     }
+}
+
+fn load_plan(acquire: &Acquire, request: &PlanRequest, event_sender: &Sender<SatelliteEvent>) {
+    let mut loaded = 0;
+    let mut failed = 0;
+    let mut first_error = None;
+    for tile in &request.tiles {
+        let layer = String::from(request.imagery.layer());
+        let level = request.imagery.level().to_string();
+        let format = String::from(request.imagery.format());
+        let day = request.day.path();
+        let zoom = tile.zoom.to_string();
+        let x = tile.x.to_string();
+        let y = tile.y.to_string();
+        let spec = match RequestSpec::for_operation(
+            &sources::NASA_GIBS,
+            "tile",
+            &[
+                ("layer", layer.as_str()),
+                ("level", level.as_str()),
+                ("format", format.as_str()),
+                ("time", day.as_str()),
+                ("zoom", zoom.as_str()),
+                ("x", x.as_str()),
+                ("y", y.as_str()),
+            ],
+        ) {
+            Ok(spec) => spec,
+            Err(source) => {
+                failed += 1;
+                if first_error.is_none() {
+                    first_error = Some(SatelliteError::Provider { source });
+                }
+                continue;
+            }
+        };
+        let decoded = acquire
+            .fetch(&spec)
+            .map_err(|source| SatelliteError::Provider { source })
+            .and_then(|fetched| {
+                let (width, height, rgba) = decode(&fetched.provenance.url, &fetched.body)?;
+                Ok((width, height, rgba, fetched.provenance, fetched.cache))
+            });
+        match decoded {
+            Ok((width, height, rgba, tile_provenance, tile_cache)) => {
+                loaded += 1;
+                let image = Served::new(
+                    TileImage {
+                        bounds: *tile,
+                        width,
+                        height,
+                        rgba,
+                    },
+                    tile_provenance,
+                    tile_cache,
+                );
+                if event_sender
+                    .send(SatelliteEvent::Tile {
+                        generation: request.generation,
+                        tile: image,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(error) => {
+                failed += 1;
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+    if loaded == 0
+        && let Some(error) = first_error
+    {
+        drop(event_sender.send(SatelliteEvent::Failed {
+            generation: request.generation,
+            error,
+        }));
+        return;
+    }
+    drop(event_sender.send(SatelliteEvent::Done {
+        generation: request.generation,
+        loaded,
+        failed,
+    }));
 }
 
 struct PlacedTile {

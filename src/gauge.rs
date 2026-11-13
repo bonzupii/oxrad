@@ -30,12 +30,12 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::Instant;
 
 use serde_json::{Map, Value};
 
 use crate::acquire::Acquire;
+use crate::dispatch;
 use crate::engine::Served;
 use crate::provider::FetchError;
 use crate::sources;
@@ -593,43 +593,17 @@ pub enum GaugeEvent {
     },
 }
 
-/// Fetches gauges off the UI thread.
+/// Fetches gauges on the shared job queue.
 pub struct GaugeFeed {
-    requests: Sender<GaugeRequest>,
-    events: Receiver<GaugeEvent>,
+    feed: dispatch::Feed<GaugeEvent>,
     generation: u64,
     stopped: bool,
 }
 
 impl GaugeFeed {
     pub fn new(acquire: Acquire) -> Self {
-        let (requests, request_receiver) = mpsc::channel::<GaugeRequest>();
-        let (event_sender, events) = mpsc::channel::<GaugeEvent>();
-        std::thread::spawn(move || {
-            while let Ok(request) = request_receiver.recv() {
-                let event = match request {
-                    GaugeRequest::Box { generation, bounds } => match fetch(&acquire, bounds) {
-                        Ok(set) => GaugeEvent::Ready { generation, set },
-                        Err(error) => GaugeEvent::Failed { generation, error },
-                    },
-                    GaugeRequest::History { generation, site } => {
-                        match fetch_history(&acquire, &site) {
-                            Ok(history) => GaugeEvent::HistoryReady {
-                                generation,
-                                history,
-                            },
-                            Err(error) => GaugeEvent::Failed { generation, error },
-                        }
-                    }
-                };
-                if event_sender.send(event).is_err() {
-                    return;
-                }
-            }
-        });
         Self {
-            requests,
-            events,
+            feed: dispatch::Feed::new(acquire),
             generation: 0,
             stopped: false,
         }
@@ -641,18 +615,31 @@ impl GaugeFeed {
                 generation
             }
         };
-        if self.requests.send(request).is_err() {
-            self.stopped = true;
-            return Err(GaugeError::WorkerStopped);
-        }
-        Ok(())
+        self.feed
+            .request(move |acquire| match request {
+                GaugeRequest::Box { generation, bounds } => match fetch(acquire, bounds) {
+                    Ok(set) => GaugeEvent::Ready { generation, set },
+                    Err(error) => GaugeEvent::Failed { generation, error },
+                },
+                GaugeRequest::History { generation, site } => match fetch_history(acquire, &site) {
+                    Ok(history) => GaugeEvent::HistoryReady {
+                        generation,
+                        history,
+                    },
+                    Err(error) => GaugeEvent::Failed { generation, error },
+                },
+            })
+            .map_err(|_| {
+                self.stopped = true;
+                GaugeError::WorkerStopped
+            })
     }
 
     pub fn poll(&mut self) -> Option<GaugeEvent> {
-        match self.events.try_recv() {
-            Ok(event) => Some(event),
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => {
+        match self.feed.poll() {
+            Ok(Some(event)) => Some(event),
+            Ok(None) => None,
+            Err(dispatch::Disconnected) => {
                 if self.stopped {
                     return None;
                 }

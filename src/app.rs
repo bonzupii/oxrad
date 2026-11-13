@@ -35,6 +35,7 @@ use crate::map_panel::{MapActions, MapPanel};
 use crate::place::{self, Place};
 use crate::places_panel::PlacesPanel;
 use crate::radar_panel::RadarPanel;
+use crate::registry_panel::RegistryPanel;
 use crate::shell::{SceneMode, Shell};
 use crate::station_panel::StationPanel;
 use crate::stations::SiteId;
@@ -56,6 +57,7 @@ pub struct OxradApp {
     history: HistoryPanel,
     global: GlobalPanel,
     map: MapPanel,
+    registry: RegistryPanel,
 }
 
 /// Opens the site the configuration remembered, or says why it did not.
@@ -103,6 +105,7 @@ impl OxradApp {
         let history = HistoryPanel::new(&acquire);
         let global = GlobalPanel::new(&acquire);
         let map = MapPanel::new(map_style, &acquire);
+        let registry = RegistryPanel::new(acquire.clone());
         let shell = Shell::new(config, config_writable, notice);
         let mut app = Self {
             acquire,
@@ -115,6 +118,7 @@ impl OxradApp {
             history,
             global,
             map,
+            registry,
         };
         if let Some(place) = &restored_place {
             app.focus_place(place);
@@ -293,6 +297,7 @@ impl OxradApp {
         }
         self.places.update(now);
         self.forecast.update(now);
+        self.registry.poll();
         let active = self.shell.scene_mode() == SceneMode::Map;
         self.map.update_warnings(active, self.shell.notice_mut());
         self.map.update(now, context);
@@ -317,6 +322,7 @@ impl OxradApp {
             || self.global.is_playing()
             || self.history.is_loading()
             || self.history.is_playing()
+            || self.registry.is_loading()
             || self.radar.is_busy()
     }
 
@@ -387,9 +393,12 @@ impl OxradApp {
                                     notice,
                                 );
                             }
+                            SceneMode::Registry => self.registry.rail(ui),
                         }
-                        let (config, notice) = self.shell.config_and_notice_mut();
-                        self.map.warning_section(ui, config, &mut actions, notice);
+                        if self.shell.scene_mode() != SceneMode::Registry {
+                            let (config, notice) = self.shell.config_and_notice_mut();
+                            self.map.warning_section(ui, config, &mut actions, notice);
+                        }
                         self.apply_map_actions(actions);
                         if let Some(notice) = self.shell.notice() {
                             ui.add_space(theme::SPACE_M);
@@ -475,6 +484,10 @@ impl OxradApp {
                     self.choose_site(id);
                 }
             }
+            SceneMode::Registry => {
+                let palette = self.shell.config().theme.palette();
+                self.registry.ui(ui, &palette);
+            }
         }
     }
 }
@@ -492,7 +505,10 @@ impl eframe::App for OxradApp {
                 &mut self.radar,
                 &self.stations,
                 &self.history,
-                (&self.acquire, &self.engine_status),
+                status_bar::EngineView {
+                    acquire: &self.acquire,
+                    status: &mut self.engine_status,
+                },
                 notice,
             );
         }

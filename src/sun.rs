@@ -15,7 +15,6 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 //! Sunrise and sunset for a requested map centre.
 
-use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Instant;
 
 use eframe::egui::{self, RichText};
@@ -23,6 +22,7 @@ use serde_json::Value;
 
 use crate::acquire::Acquire;
 use crate::canvas::provenance;
+use crate::dispatch;
 use crate::engine::Served;
 use crate::provider::{self, FetchError};
 use crate::sources;
@@ -125,32 +125,29 @@ fn fetch(
 
 /// User-initiated solar event requests and their last successful result.
 pub struct SunView {
-    acquire: Acquire,
-    request: Option<Receiver<Result<Served<SunRecord>, FetchError>>>,
+    feed: dispatch::Feed<Result<Served<SunRecord>, FetchError>>,
     record: Option<Served<SunRecord>>,
     error: Option<FetchError>,
+    loading: bool,
 }
 
 impl SunView {
-    pub const fn new(acquire: Acquire) -> Self {
+    pub fn new(acquire: Acquire) -> Self {
         Self {
-            acquire,
-            request: None,
+            feed: dispatch::Feed::new(acquire),
             record: None,
             error: None,
+            loading: false,
         }
     }
 
     pub fn update(&mut self, _now: Instant) {
-        let Some(receiver) = &self.request else {
-            return;
+        let result = match self.feed.poll() {
+            Ok(Some(result)) => result,
+            Ok(None) => return,
+            Err(dispatch::Disconnected) => Err(FetchError::WorkerStopped),
         };
-        let result = match receiver.try_recv() {
-            Ok(result) => result,
-            Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => Err(FetchError::WorkerStopped),
-        };
-        self.request = None;
+        self.loading = false;
         match result {
             Ok(record) => {
                 self.record = Some(record);
@@ -163,11 +160,16 @@ impl SunView {
     }
 
     fn start(&mut self, latitude: f64, longitude: f64) {
-        let (sender, receiver) = mpsc::channel();
-        let acquire = self.acquire.clone();
-        std::thread::spawn(move || sender.send(fetch(&acquire, latitude, longitude)).is_ok());
-        self.request = Some(receiver);
+        self.loading = true;
         self.error = None;
+        if self
+            .feed
+            .request(move |acquire| fetch(acquire, latitude, longitude))
+            .is_err()
+        {
+            self.loading = false;
+            self.error = Some(FetchError::WorkerStopped);
+        }
     }
 
     pub fn rail(&mut self, ui: &mut egui::Ui, centre: Option<(f64, f64)>) {
@@ -183,7 +185,7 @@ impl SunView {
         );
         if ui
             .add_enabled(
-                centre.is_some() && self.request.is_none(),
+                centre.is_some() && !self.loading,
                 egui::Button::new("Get sun times for map centre"),
             )
             .clicked()
@@ -191,7 +193,7 @@ impl SunView {
         {
             self.start(latitude, longitude);
         }
-        if self.request.is_some() {
+        if self.loading {
             ui.label("Loading sun times…");
         }
         if let Some(error) = &self.error {
@@ -203,7 +205,7 @@ impl SunView {
         if let Some(record) = &self.record {
             provenance(ui, record);
             ui.label("Requested local date and location; refresh manually.");
-            if self.request.is_some() || self.error.is_some() {
+            if self.loading || self.error.is_some() {
                 ui.label("Previous result:");
             }
             ui.label(format!(

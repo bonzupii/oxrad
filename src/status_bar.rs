@@ -32,15 +32,21 @@ use crate::theme;
 use crate::time;
 
 /// Draws the status bar and applies its retry controls.
+pub(crate) struct EngineView<'a> {
+    pub(crate) acquire: &'a Acquire,
+    pub(crate) status: &'a mut crate::engine::EngineStatus,
+}
+
 pub(crate) fn status(
     ui: &mut egui::Ui,
     config: &Config,
     radar: &mut RadarPanel,
     stations: &StationPanel,
     history: &HistoryPanel,
-    engine: (&Acquire, &crate::engine::EngineStatus),
+    engine: EngineView<'_>,
     notice: &mut Option<String>,
 ) {
+    let EngineView { acquire, status } = engine;
     let mut retry_pipeline = false;
     let mut refresh_now = false;
     let failed = radar.failed();
@@ -49,7 +55,7 @@ pub(crate) fn status(
         ui.add_space(6.0);
         refresh_now = identity_row(ui, radar, stations, history, failed);
         retry_pipeline = failure_rows(ui, radar);
-        requests_row(ui, engine.0, engine.1, notice);
+        requests_row(ui, acquire, status, notice);
         if let Some(frame) = &radar.display().frame {
             crate::canvas::provenance(ui, &frame.volume);
             diagnostics(ui, frame, radar.selected_station(stations));
@@ -65,16 +71,15 @@ pub(crate) fn status(
 fn requests_row(
     ui: &mut egui::Ui,
     acquire: &Acquire,
-    status: &crate::engine::EngineStatus,
+    status: &mut crate::engine::EngineStatus,
     notice: &mut Option<String>,
 ) {
     ui.horizontal_wrapped(|ui| {
         let latest = status.latest();
         let summary = latest
-            .as_ref()
             .and_then(|status| status.summary.clone())
             .unwrap_or_else(|| String::from("No requests yet · the engine is idle"));
-        let requests = latest.as_ref().map_or(0, |status| status.requests);
+        let requests = latest.map_or(0, |status| status.requests);
         ui.label(
             RichText::new(format!("Requests {requests} · {summary}"))
                 .size(theme::TYPE_SMALL)
@@ -96,7 +101,7 @@ fn requests_row(
                 }
             }
         }
-        if let Some(error) = latest.and_then(|status| status.cache_error) {
+        if let Some(error) = latest.and_then(|status| status.cache_error.clone()) {
             ui.label(
                 RichText::new(format!("Cache unavailable: {error}"))
                     .size(theme::TYPE_SMALL)

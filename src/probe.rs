@@ -133,9 +133,130 @@ impl ProbeReport {
 
 /// One live operation: parsed values followed by the request set that produced
 /// them. Every registry endpoint is run through this shape.
+#[derive(Debug)]
 pub(crate) struct OperationRun {
     pub(crate) parsed: ProbeReport,
     pub(crate) requests: RequestReport,
+}
+
+/// Runs one admitted registry operation with the workspace's default inputs.
+///
+/// # Errors
+///
+/// Returns [`ProbeError`] when the clock or a live request or parser fails.
+pub(crate) fn run_live(
+    source: &'static sources::Source,
+    operation: &'static str,
+    acquire: &Acquire,
+) -> Result<OperationRun, ProbeError> {
+    let values = live_values(source, operation)?;
+    let borrowed: Vec<(&str, &str)> = values
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    run(source, operation, acquire, &borrowed)
+}
+
+fn live_values(
+    source: &'static sources::Source,
+    operation: &'static str,
+) -> Result<Vec<(String, String)>, ProbeError> {
+    let today = utc_date(0)?;
+    let yesterday = utc_date(1)?;
+    let bbox = match (source.id.as_str(), operation) {
+        ("cwfis", _) => "-140,40,-50,75",
+        _ => "-98,37,-97,38",
+    };
+    let mut values = vec![
+        (String::from("latitude"), String::from("52.52")),
+        (String::from("longitude"), String::from("13.41")),
+        (String::from("forecast_days"), String::from("7")),
+        (String::from("past_days"), String::from("3")),
+        (String::from("start_date"), utc_date(8)?),
+        (String::from("end_date"), yesterday.clone()),
+        (String::from("start"), yesterday),
+        (String::from("from_date"), utc_date(7)?),
+        (String::from("to_date"), today.clone()),
+        (String::from("bbox"), String::from(bbox)),
+        (String::from("query"), String::from("Berlin")),
+        (String::from("limit"), String::from("10")),
+        (String::from("min_magnitude"), String::from("2")),
+        (String::from("hours"), String::from("2")),
+        (String::from("window"), String::from("all_day")),
+        (String::from("style"), String::from("positron")),
+        (String::from("size"), String::from("256")),
+        (String::from("zoom"), String::from("2")),
+        (String::from("x"), String::from("1")),
+        (String::from("y"), String::from("1")),
+        (String::from("scheme"), String::from("4")),
+        (String::from("hemisphere"), String::from("north")),
+        (String::from("code"), String::from("N")),
+        (String::from("month"), previous_month()?),
+        (
+            String::from("layer"),
+            String::from("VIIRS_SNPP_CorrectedReflectance_TrueColor"),
+        ),
+        (String::from("level"), String::from("9")),
+        (String::from("format"), String::from("image/jpeg")),
+        (String::from("time"), utc_date(11)?),
+        (
+            String::from("prefix"),
+            format!("{}/KTWX/", today.replace('-', "/")),
+        ),
+    ];
+    values.retain(|(name, _)| {
+        source.operation(operation).is_ok_and(|endpoint| {
+            template_names(endpoint.template)
+                .iter()
+                .any(|key| key == name)
+        }) || matches!(
+            name.as_str(),
+            "prefix"
+                | "bbox"
+                | "site"
+                | "vnum"
+                | "notice"
+                | "continuation"
+                | "style"
+                | "zoom"
+                | "x"
+                | "y"
+                | "size"
+                | "scheme"
+                | "host"
+                | "path"
+                | "key"
+                | "latitude"
+                | "longitude"
+                | "hourly"
+        )
+    });
+    Ok(values)
+}
+
+fn utc_date(days_back: u64) -> Result<String, ProbeError> {
+    let now = time::now_unix_ms().map_err(|error| rejected("probe clock", error))?;
+    let days = now / time::MS_PER_DAY;
+    let days = days
+        .checked_sub(days_back)
+        .ok_or_else(|| rejected("probe clock", "the date precedes the Unix epoch"))?;
+    let days = i64::try_from(days)
+        .map_err(|_| rejected("probe clock", "the date exceeds the civil calendar range"))?;
+    let (year, month, day) = time::civil_from_days(days);
+    Ok(format!("{year:04}-{month:02}-{day:02}"))
+}
+
+fn previous_month() -> Result<String, ProbeError> {
+    let today = utc_date(0)?;
+    let month = today
+        .get(5..7)
+        .and_then(|text| text.parse::<u32>().ok())
+        .ok_or_else(|| rejected("probe clock", "the date carries no month"))?;
+    Ok(if month == 1 {
+        String::from("12")
+    } else {
+        format!("{:02}", month - 1)
+    })
 }
 
 /// Runs one registry operation through the shared transport and the rail's own
@@ -856,6 +977,22 @@ fn json_body(bytes: &[u8], parser: &'static str) -> Result<Value, ProbeError> {
     serde_json::from_slice(bytes).map_err(|error| rejected(parser, error))
 }
 
+/// Reads an array endpoint whose provider answers 204 for no rows.
+fn json_body_or_empty_collection(bytes: &[u8], parser: &'static str) -> Result<Value, ProbeError> {
+    if bytes.is_empty() {
+        return Ok(Value::Array(Vec::new()));
+    }
+    json_body(bytes, parser)
+}
+
+/// Reads a feature-collection endpoint whose provider answers 204 for no rows.
+fn json_body_or_empty_features(bytes: &[u8], parser: &'static str) -> Result<Value, ProbeError> {
+    if bytes.is_empty() {
+        return Ok(serde_json::json!({ "features": [] }));
+    }
+    json_body(bytes, parser)
+}
+
 /// Parses one fetched first-operation answer with the rail's own parser.
 ///
 /// # Errors
@@ -1496,7 +1633,7 @@ pub(crate) fn parse(
                 ))
         }
         ("gdacs", "search") => {
-            let document = json_body(body, "GDACS")?;
+            let document = json_body_or_empty_features(body, "GDACS")?;
             let storms = cyclone::parse(&document).map_err(|error| rejected("GDACS", error))?;
             let strongest = storms.strongest();
             Ok(ProbeReport::new(source, operation)
@@ -1520,7 +1657,7 @@ pub(crate) fn parse(
                 ))
         }
         ("aviationweather-metar", "box") => {
-            let document = json_body(body, "Aviation Weather METAR")?;
+            let document = json_body_or_empty_collection(body, "Aviation Weather METAR")?;
             let reports = observations::parse(&document)
                 .map_err(|error| rejected("Aviation Weather METAR", error))?;
             let first = reports.stations.first();

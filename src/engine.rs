@@ -21,6 +21,7 @@
 //! retry, cache or rate state.
 
 use std::collections::BTreeMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -349,6 +350,16 @@ impl Fetched {
             source,
         })
     }
+
+    /// Parses a collection endpoint whose provider answers 204 when it has no
+    /// rows. An object endpoint keeps using [`Self::json`] and fails on an
+    /// empty body.
+    pub(crate) fn json_or_empty_collection(&self) -> Result<Value, FetchError> {
+        if self.body.is_empty() {
+            return Ok(Value::Array(Vec::new()));
+        }
+        self.json()
+    }
 }
 
 /// One engine record: the last request with this identity and what it cost.
@@ -514,20 +525,23 @@ pub(crate) struct Status {
 /// The receiving end of the engine's status snapshots.
 pub(crate) struct EngineStatus {
     receiver: Receiver<Status>,
+    last: Option<Status>,
 }
 
 impl EngineStatus {
     pub(crate) const fn new(receiver: Receiver<Status>) -> Self {
-        Self { receiver }
+        Self {
+            receiver,
+            last: None,
+        }
     }
 
-    /// Returns the newest snapshot, discarding older ones.
-    pub(crate) fn latest(&self) -> Option<Status> {
-        let mut latest = None;
+    /// Returns the newest snapshot and retains it for later frames.
+    pub(crate) fn latest(&mut self) -> Option<&Status> {
         while let Ok(status) = self.receiver.try_recv() {
-            latest = Some(status);
+            self.last = Some(status);
         }
-        latest
+        self.last.as_ref()
     }
 }
 
@@ -659,8 +673,16 @@ fn now_unix_ms() -> Result<u64, CacheError> {
     })
 }
 
+/// A deterministic spread for one request and attempt, so retries from a
+/// fleet of clients do not arrive in lockstep.
+fn jitter_seed(key: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// The backoff for one attempt, honoring the server's Retry-After.
-pub(crate) fn backoff(error: &FetchError, attempt: u32) -> Option<Duration> {
+pub(crate) fn backoff(error: &FetchError, attempt: u32, seed: u64) -> Option<Duration> {
     if !error.is_transient() || attempt >= MAX_ATTEMPTS {
         return None;
     }
@@ -670,7 +692,9 @@ pub(crate) fn backoff(error: &FetchError, attempt: u32) -> Option<Duration> {
         return Some(delay.min(RETRY_MAX));
     }
     let steps = attempt.min(5);
-    Some(RETRY_BASE.saturating_mul(1_u32 << steps).min(RETRY_MAX))
+    let base = RETRY_BASE.saturating_mul(1_u32 << steps).min(RETRY_MAX);
+    let spread = seed.wrapping_mul(u64::from(attempt).wrapping_add(1)) % 501;
+    Some(base.saturating_add(Duration::from_millis(spread)))
 }
 
 /// Records one served request.
@@ -764,7 +788,7 @@ pub(crate) fn execute(
                 });
             }
             Err(error) => {
-                if let Some(delay) = backoff(&error, attempt) {
+                if let Some(delay) = backoff(&error, attempt, jitter_seed(&spec.key)) {
                     #[cfg(test)]
                     if state.immediate_retries {
                         continue;
@@ -817,6 +841,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use crate::sources;
+    use crate::test_support::TestError;
 
     fn temporary_store(name: &str) -> Store {
         let path = std::env::temp_dir().join(format!(
@@ -885,11 +910,32 @@ mod tests {
     }
 
     #[test]
-    fn backoff_grows_and_stops_at_the_attempt_limit() {
-        assert_eq!(backoff(&status(503), 1), Some(Duration::from_secs(4)));
-        assert_eq!(backoff(&status(503), 2), Some(Duration::from_secs(8)));
-        assert_eq!(backoff(&status(503), 4), None);
-        assert_eq!(backoff(&status(404), 1), None);
+    fn a_status_snapshot_is_kept_between_frames() -> Result<(), TestError> {
+        let (sender, receiver) = channel();
+        let mut status = EngineStatus::new(receiver);
+        sender
+            .send(Status {
+                requests: 2,
+                summary: Some(String::from("2 requests")),
+                cache_error: None,
+            })
+            .map_err(|_| TestError::from("the status channel closed"))?;
+        assert_eq!(status.latest().map(|snapshot| snapshot.requests), Some(2));
+        assert_eq!(status.latest().map(|snapshot| snapshot.requests), Some(2));
+        Ok(())
+    }
+
+    #[test]
+    fn backoff_grows_with_jitter_and_stops_at_the_attempt_limit() -> Result<(), TestError> {
+        let first = backoff(&status(503), 1, 7).ok_or("the first retry must wait")?;
+        let second = backoff(&status(503), 2, 7).ok_or("the second retry must wait")?;
+        assert!(first >= Duration::from_secs(4));
+        assert!(first <= Duration::from_millis(4_500));
+        assert!(second >= Duration::from_secs(8));
+        assert!(second <= Duration::from_millis(8_500));
+        assert_eq!(backoff(&status(503), 4, 7), None);
+        assert_eq!(backoff(&status(404), 1, 7), None);
+        Ok(())
     }
 
     #[test]

@@ -24,10 +24,10 @@
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::Instant;
 
 use crate::acquire::Acquire;
+use crate::dispatch;
 use crate::engine::Served;
 use crate::provider::FetchError;
 use crate::sources;
@@ -326,57 +326,42 @@ pub enum SeaIceEvent {
     },
 }
 
-/// Reads the index off the UI thread.
+/// Reads the index on the shared job queue.
 pub struct SeaIceFeed {
-    requests: Sender<SeaIceRequest>,
-    events: Receiver<SeaIceEvent>,
+    feed: dispatch::Feed<SeaIceEvent>,
     generation: u64,
     stopped: bool,
 }
 
 impl SeaIceFeed {
     pub fn new(acquire: Acquire) -> Self {
-        let (requests, request_receiver) = mpsc::channel::<SeaIceRequest>();
-        let (event_sender, events) = mpsc::channel::<SeaIceEvent>();
-        std::thread::spawn(move || {
-            while let Ok(request) = request_receiver.recv() {
-                let event = match fetch(&acquire, request.month) {
-                    Ok(record) => SeaIceEvent::Ready {
-                        generation: request.generation,
-                        record,
-                    },
-                    Err(error) => SeaIceEvent::Failed {
-                        generation: request.generation,
-                        error,
-                    },
-                };
-                if event_sender.send(event).is_err() {
-                    return;
-                }
-            }
-        });
         Self {
-            requests,
-            events,
+            feed: dispatch::Feed::new(acquire),
             generation: 0,
             stopped: false,
         }
     }
 
-    pub fn request(&mut self, request: SeaIceRequest) -> Result<(), SeaIceError> {
+    pub fn request(&mut self, request: &SeaIceRequest) -> Result<(), SeaIceError> {
         self.generation = request.generation;
-        if self.requests.send(request).is_err() {
-            self.stopped = true;
-            return Err(SeaIceError::WorkerStopped);
-        }
-        Ok(())
+        let generation = request.generation;
+        let month = request.month;
+        self.feed
+            .request(move |acquire| match fetch(acquire, month) {
+                Ok(record) => SeaIceEvent::Ready { generation, record },
+                Err(error) => SeaIceEvent::Failed { generation, error },
+            })
+            .map_err(|_| {
+                self.stopped = true;
+                SeaIceError::WorkerStopped
+            })
     }
 
     pub fn poll(&mut self) -> Option<SeaIceEvent> {
-        match self.events.try_recv() {
-            Ok(event) => Some(event),
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => {
+        match self.feed.poll() {
+            Ok(Some(event)) => Some(event),
+            Ok(None) => None,
+            Err(dispatch::Disconnected) => {
                 if self.stopped {
                     return None;
                 }
@@ -454,7 +439,7 @@ impl SeaIceView {
             generation: self.generation,
             month,
         };
-        if let Err(error) = self.feed.request(request) {
+        if let Err(error) = self.feed.request(&request) {
             self.state = SeaIceState::Failed { error, last: None };
         }
     }

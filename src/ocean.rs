@@ -23,12 +23,12 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::Instant;
 
 use serde_json::{Map, Value};
 
 use crate::acquire::Acquire;
+use crate::dispatch;
 use crate::engine::Served;
 use crate::provider::FetchError;
 use crate::sources;
@@ -374,57 +374,43 @@ pub enum OceanEvent {
     },
 }
 
-/// Fetches the sea state off the UI thread.
+/// Fetches the sea state on the shared job queue.
 pub struct OceanFeed {
-    requests: Sender<OceanRequest>,
-    events: Receiver<OceanEvent>,
+    feed: dispatch::Feed<OceanEvent>,
     generation: u64,
     stopped: bool,
 }
 
 impl OceanFeed {
     pub fn new(acquire: Acquire) -> Self {
-        let (requests, request_receiver) = mpsc::channel::<OceanRequest>();
-        let (event_sender, events) = mpsc::channel::<OceanEvent>();
-        std::thread::spawn(move || {
-            while let Ok(request) = request_receiver.recv() {
-                let event = match fetch(&acquire, request.latitude, request.longitude) {
-                    Ok(record) => OceanEvent::Ready {
-                        generation: request.generation,
-                        record,
-                    },
-                    Err(error) => OceanEvent::Failed {
-                        generation: request.generation,
-                        error,
-                    },
-                };
-                if event_sender.send(event).is_err() {
-                    return;
-                }
-            }
-        });
         Self {
-            requests,
-            events,
+            feed: dispatch::Feed::new(acquire),
             generation: 0,
             stopped: false,
         }
     }
 
-    pub fn request(&mut self, request: OceanRequest) -> Result<(), OceanError> {
+    pub fn request(&mut self, request: &OceanRequest) -> Result<(), OceanError> {
         self.generation = request.generation;
-        if self.requests.send(request).is_err() {
-            self.stopped = true;
-            return Err(OceanError::WorkerStopped);
-        }
-        Ok(())
+        let generation = request.generation;
+        let latitude = request.latitude;
+        let longitude = request.longitude;
+        self.feed
+            .request(move |acquire| match fetch(acquire, latitude, longitude) {
+                Ok(record) => OceanEvent::Ready { generation, record },
+                Err(error) => OceanEvent::Failed { generation, error },
+            })
+            .map_err(|_| {
+                self.stopped = true;
+                OceanError::WorkerStopped
+            })
     }
 
     pub fn poll(&mut self) -> Option<OceanEvent> {
-        match self.events.try_recv() {
-            Ok(event) => Some(event),
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => {
+        match self.feed.poll() {
+            Ok(Some(event)) => Some(event),
+            Ok(None) => None,
+            Err(dispatch::Disconnected) => {
                 if self.stopped {
                     return None;
                 }
@@ -502,7 +488,7 @@ impl OceanView {
             latitude,
             longitude,
         };
-        if let Err(error) = self.feed.request(request) {
+        if let Err(error) = self.feed.request(&request) {
             self.state = OceanState::Failed { error, last: None };
         }
     }

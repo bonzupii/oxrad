@@ -24,12 +24,12 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::Instant;
 
 use serde_json::{Map, Value};
 
 use crate::acquire::Acquire;
+use crate::dispatch;
 use crate::engine::Served;
 use crate::provider::FetchError;
 use crate::sources;
@@ -360,57 +360,43 @@ pub enum LandEvent {
     },
 }
 
-/// Fetches the land surface off the UI thread.
+/// Fetches the land surface on the shared job queue.
 pub struct LandFeed {
-    requests: Sender<LandRequest>,
-    events: Receiver<LandEvent>,
+    feed: dispatch::Feed<LandEvent>,
     generation: u64,
     stopped: bool,
 }
 
 impl LandFeed {
     pub fn new(acquire: Acquire) -> Self {
-        let (requests, request_receiver) = mpsc::channel::<LandRequest>();
-        let (event_sender, events) = mpsc::channel::<LandEvent>();
-        std::thread::spawn(move || {
-            while let Ok(request) = request_receiver.recv() {
-                let event = match fetch(&acquire, request.latitude, request.longitude) {
-                    Ok(record) => LandEvent::Ready {
-                        generation: request.generation,
-                        record,
-                    },
-                    Err(error) => LandEvent::Failed {
-                        generation: request.generation,
-                        error,
-                    },
-                };
-                if event_sender.send(event).is_err() {
-                    return;
-                }
-            }
-        });
         Self {
-            requests,
-            events,
+            feed: dispatch::Feed::new(acquire),
             generation: 0,
             stopped: false,
         }
     }
 
-    pub fn request(&mut self, request: LandRequest) -> Result<(), LandError> {
+    pub fn request(&mut self, request: &LandRequest) -> Result<(), LandError> {
         self.generation = request.generation;
-        if self.requests.send(request).is_err() {
-            self.stopped = true;
-            return Err(LandError::WorkerStopped);
-        }
-        Ok(())
+        let generation = request.generation;
+        let latitude = request.latitude;
+        let longitude = request.longitude;
+        self.feed
+            .request(move |acquire| match fetch(acquire, latitude, longitude) {
+                Ok(record) => LandEvent::Ready { generation, record },
+                Err(error) => LandEvent::Failed { generation, error },
+            })
+            .map_err(|_| {
+                self.stopped = true;
+                LandError::WorkerStopped
+            })
     }
 
     pub fn poll(&mut self) -> Option<LandEvent> {
-        match self.events.try_recv() {
-            Ok(event) => Some(event),
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => {
+        match self.feed.poll() {
+            Ok(Some(event)) => Some(event),
+            Ok(None) => None,
+            Err(dispatch::Disconnected) => {
                 if self.stopped {
                     return None;
                 }
@@ -488,7 +474,7 @@ impl LandView {
             latitude,
             longitude,
         };
-        if let Err(error) = self.feed.request(request) {
+        if let Err(error) = self.feed.request(&request) {
             self.state = LandState::Failed { error, last: None };
         }
     }

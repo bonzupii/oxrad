@@ -28,6 +28,7 @@ use crate::theme::{self, Theme};
 pub(crate) enum SceneMode {
     Radar,
     Map,
+    Registry,
 }
 
 #[derive(Debug, Default)]
@@ -145,6 +146,13 @@ impl Shell {
                     {
                         self.scene_mode = SceneMode::Map;
                         actions.switched_to_map = true;
+                    }
+                    if ui
+                        .selectable_label(self.scene_mode == SceneMode::Registry, "Earth systems")
+                        .clicked()
+                    {
+                        self.scene_mode = SceneMode::Registry;
+                        self.notice = None;
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.selectable_value(&mut theme, Theme::Light, Theme::Light.label());

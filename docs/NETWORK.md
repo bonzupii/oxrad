@@ -1,79 +1,28 @@
 # Network behavior
 
-This document describes the network paths in the current implementation. It does not describe planned sources as if they exist.
+Every provider request passes through `Acquire`. The request engine owns identity, cache lookup, pacing, retries, response validation and provenance. Domain modules pass a registry operation and values; they do not open sockets, own a cache or sleep on a retry.
 
-## Hosts
+## Transport policy
 
-| Host | Purpose | Current use |
-|---|---|---|
-| `api.weather.gov` | Radar-station discovery and active warnings | `GET /radar/stations` and `GET /alerts/active?status=actual&message_type=alert`, both with `Accept: application/geo+json` |
-| `geocoding-api.open-meteo.com` | Place search | `GET /v1/search` with `name`, `count`, and a user agent |
-| `api.open-meteo.com` | Global forecast | `GET /v1/forecast` for current, hourly, and daily data |
-| `unidata-nexrad-level2.s3.amazonaws.com` | NEXRAD Level II archive | S3 list and object GET |
-| `api.rainviewer.com` | Global radar manifest | `GET /public/weather-maps.json` |
-| `tilecache.rainviewer.com` | Global radar image tiles | 512-pixel PNG tile GETs for each manifest frame |
+Transfer limits come from the registry wire format. They bound each phase and the silence between reads. There is no total deadline on a response, so a large archive can finish over a slow link while a stalled socket still fails.
 
-All requests identify the client as `oxrad/<CARGO_PKG_VERSION> (https://github.com/bonzupii/oxrad)`.
+| Format class | Resolve | Connect | Response headers | Read or write silence |
+|---|---|---|---|---|
+| JSON, GeoJSON, XML, tiles | 20 s | 20 s | 30 s | 30 s |
+| Binary archives | 30 s | 30 s | 60 s | 60 s |
 
-## Timeouts and body limits
+Documents are capped at 4 MiB and binary responses at 64 MiB. A response over the cap is rejected rather than truncated.
 
-| Path | Timeout | Body limit |
-|---|---|---|
-| JSON providers (`provider.rs`) | 10 seconds | 4 MiB |
-| NEXRAD S3 and RainViewer tiles (`network.rs`, `global_radar.rs`) | 30 seconds | 64 MiB |
+## Retry
 
-The NEXRAD body limit is whole-response buffering. It is sufficient for an Archive II volume today and is a known memory limitation. Streaming acquisition is not implemented.
+A transient transport, body-read, 429 or 5xx failure is retried up to four attempts. The wait starts at 4 seconds and doubles to 32 seconds, with a deterministic per-request spread of up to 500 ms. A valid `Retry-After` header replaces the computed wait and is capped at 60 seconds. A 4xx response other than 429, a malformed body and a decode failure are not retried. Deterministic answers use the same policy in tests.
 
-## Discovery and cache
+## Cache and provenance
 
-The NWS station document is fetched at application start. A successful response is parsed, every feature must have a supported station type, and duplicate identifiers are rejected. The raw document and a save timestamp are written atomically to `~/.oxrad/stations.json`. If the cache path cannot be written, the live stations remain usable and the UI reports the cache warning. A successful feed is refreshed after six hours; a failed feed retries after fifteen minutes.
+The engine stores successful bodies in the per-user cache with a SHA-256 digest and metadata. The registry refresh cadence selects the lifetime unless an endpoint carries an override. Every served value names its source, operation, station, product, scan time, URL, cache state, attempt count and byte count. `--render-registry`, the status row and `--fetch-source` expose the same records.
 
-On startup, the cached document is read before the network request. A missing cache is not fatal: the station list shows that discovery is in progress. If live discovery fails and a cache is already loaded, the cached metadata remains visible with a notice. If no cached metadata exists, the failure is shown in the station panel. The station feed refreshes after six hours and retries failed requests after fifteen minutes.
+HTTP validators, conditional requests and range resumption are not implemented. A body is downloaded whole before it is committed. Transfer cancellation is not implemented; a superseded generation is discarded after it answers.
 
-The place cache is in memory only. Successful searches are cached for the session. Search requests are serialized with a one-request-per-second minimum interval; a query with no close name match issues at most one adjacent-transposition retry.
+## Shared queue
 
-## Forecast
-
-Open-Meteo is requested with the selected place's latitude and longitude and `timezone=auto`. The response must contain `current`, `current_units`, `hourly`, `hourly_units`, `daily`, and `timezone`. Missing fields are typed shape errors, not defaults. A failed refresh keeps the last forecast for the same place and labels it as last received. A failed forecast for a different place cannot replace the current place's forecast.
-
-The forecast request is one provider call. It does not use NWS gridpoints and is not limited to the United States.
-
-## Active warnings
-
-The active-alert feed is requested without coordinates; it returns the national collection of actual, non-test alerts. Each feature must have a nonempty identifier and event name, and any polygon or multipolygon geometry must be valid. A feature without geometry is retained and counted as such. A feature that fails validation is counted as unreadable and does not discard the rest of the collection; the first error is shown in the notice. Geometry coordinates are longitude then latitude and must fall in valid WGS84 ranges. Severity and urgency come from the provider's fields; an absent or unknown value is shown as unknown rather than assigned a value.
-
-The feed is parsed in a worker and superseded generations are discarded. A successful collection is refreshed after five minutes; a failed request retries after two minutes and is shown in the map status and notice. The layer draws polygons in both the Map and Radar scenes; the left rail list is shared. The most severe active alert shows its issuance time and urgency. The left rail lists up to 40 active alerts sorted by severity; selecting one centres the map on its first polygon and highlights the outline. The list and map can be restricted to the visible map, and the selected alert shows its headline, description, and instructions. The selected alert is retained by identifier across refreshes while it remains in the feed. Coverage is the United States and its territories.
-
-## NEXRAD acquisition
-
-The archive client lists each UTC day under `{year}/{month}/{day}/{site}/`, filters keys ending in `_V06` with a two-digit version, and selects the lexicographically newest key. Listing XML is parsed with `quick-xml`, including nested `Contents/Key`, whitespace, entities, `IsTruncated`, and `NextContinuationToken`. Pagination is capped at 10,000 pages.
-
-The object is downloaded into memory and decoded in a worker. A 404 is reported as a stale listing (`VolumeGone`), not as an empty sky. A volume is accepted only when assembly sees volume-start and volume-end radials, complete sweep boundaries, and valid site coordinates. NEXRAD volumes use the shared response cache: a cached body is verified before decoding, a successful live body is stored after download, and a body that fails to decode is evicted. The NEXRAD listing and latest-key selection are still uncached.
-
-## Global radar composite
-
-RainViewer supplies a manifest of 10-minute reflectivity frames for the previous two hours. The manifest is accepted only from an HTTPS host and only with validated frame paths and times. The manifest is cached in the worker for 90 seconds; PNG bodies are cached in memory for up to 120 tiles.
-
-The viewport is covered by a bounded grid of at most eight Web Mercator tiles at the highest zoom that fits the budget. Tile bounds travel with each frame so the renderer places every tile independently, including views that cross the antimeridian. Uncovered areas remain uncovered only where RainViewer itself has no radar coverage or the source supplied no echo.
-
-A new viewport request supersedes the previous generation; stale manifest, frame, and error messages are discarded. A source failure is reported in the UI and retried after 60 seconds. RainViewer requires visible attribution in the application, which the map shows as "Weather data by RainViewer".
-
-## RainViewer cache
-
-RainViewer manifest bytes and decoded-source PNG bodies are stored under `~/.oxrad/cache/responses/v1`. Cache keys are URLs; file names are SHA-256 digests of those keys. Each entry has a JSON metadata sidecar containing the schema, key, fetch time, byte length, and SHA-256 body digest. A body is usable only when its length and digest match the sidecar.
-
-Writes go to a temporary file and are renamed into place, with metadata written last. A failed or interrupted write leaves no committed entry. A damaged entry is removed when it is encountered and the live request is attempted; the cache problem is surfaced in the notice area. Pruning runs after a complete viewport refresh and keeps at most 256 entries and 128 MiB, removing the oldest fetch times first. Bodies larger than 32 MiB are not cached.
-
-The in-memory tile map holds up to 120 PNG bodies and is cleared when that limit is reached. The manifest remains fresh for 90 seconds in memory. If a live manifest request fails and a cached manifest exists, the cached manifest is used and a notice says so; tiles that were never cached still require the network. HTTP ETag, Last-Modified, conditional requests, and stale-while-revalidate are not implemented. NEXRAD archive bodies use the same store; NEXRAD listings, latest-key metadata, forecast, place, and warning responses are not yet cached.
-
-## Retry behavior
-
-Forecast retries use a 2 second base, exponential growth to 60 seconds, jitter, and `Retry-After` when a provider supplies it. NEXRAD fetch retries use the same base and cap. A deterministic decode failure retries once and then waits for a new volume or a manual retry. A changed forecast place supersedes the previous request; a stale answer is discarded by generation.
-
-## Request cancellation
-
-The forecast, place, global-radar, and active-warning workers use generation numbers so a superseded answer cannot overwrite a newer selection. The radar pipeline stops when it is dropped. There is no transfer-level cancellation: a request already in flight completes or reaches its timeout. Bounded worker shutdown and streaming cancellation are not implemented.
-
-## Privacy
-
-Place queries are sent to Open-Meteo geocoding (GeoNames data). Forecast coordinates are sent to Open-Meteo. Global radar requests send the map-centre tile coordinates to RainViewer. NEXRAD requests send only the site and time prefix. Active-warning requests send no coordinates or user identity and receive the national United States collection. No account, API key, or device identifier is sent.
+Parsing and live probes run on one shared job queue. The queue owns no cache, retry clock or socket. Dropping a readout drops its answer channel and the job queue continues.

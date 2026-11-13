@@ -21,11 +21,11 @@
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use serde_json::Value;
 
 use crate::acquire::Acquire;
+use crate::dispatch;
 use crate::engine::Served;
 use crate::error::SiteIdError;
 use crate::product::RadarProduct;
@@ -348,45 +348,35 @@ pub enum StationOutcome {
     Failed(StationError),
 }
 
-/// Discovers stations once on a worker thread.
+/// Discovers stations once on the shared job queue.
 pub struct StationFeed {
-    results: Receiver<StationOutcome>,
+    feed: dispatch::Feed<StationOutcome>,
     stopped: bool,
 }
 
 impl StationFeed {
     pub fn new(acquire: Acquire) -> Self {
-        let (sender, results) = mpsc::channel();
-        std::thread::spawn(move || {
-            // Discovery either answers or reports why it could not. There is no
-            // panic catcher around it: a panic here would be a defect in this
-            // code, and reporting it as a station-feed error would only make a
-            // broken program look like a working one that had a bad day. A
-            // worker that dies now surfaces as a disconnected feed, which the
-            // poller already reports as WorkerStopped.
-            let outcome = match discover(&acquire) {
+        let feed = dispatch::Feed::new(acquire);
+        // Discovery either answers or reports why it could not. A queue that
+        // has stopped is reported as a stopped feed.
+        let stopped = feed
+            .request(|acquire| match discover(acquire) {
                 Ok(discovery) => StationOutcome::Ready(discovery),
                 Err(error) => StationOutcome::Failed(error),
-            };
-            if sender.send(outcome).is_err() {
-                // Nothing is waiting for the answer: the feed was dropped.
-            }
-        });
-        Self {
-            results,
-            stopped: false,
-        }
+            })
+            .is_err();
+        Self { feed, stopped }
     }
 
     pub fn poll(&mut self) -> Option<StationOutcome> {
-        match self.results.try_recv() {
-            Ok(outcome) => {
+        match self.feed.poll() {
+            Ok(Some(outcome)) => {
                 self.stopped = true;
                 Some(outcome)
             }
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) if self.stopped => None,
-            Err(TryRecvError::Disconnected) => {
+            Ok(None) => None,
+            Err(dispatch::Disconnected) if self.stopped => None,
+            Err(dispatch::Disconnected) => {
                 self.stopped = true;
                 Some(StationOutcome::Failed(StationError::WorkerStopped))
             }
@@ -456,9 +446,9 @@ mod tests {
 
     #[test]
     fn a_completed_feed_does_not_report_a_stopped_worker() {
-        let (sender, results) = mpsc::channel();
+        let (queued, sender) = dispatch::Feed::<StationOutcome>::test_pair();
         let mut feed = StationFeed {
-            results,
+            feed: queued,
             stopped: false,
         };
         assert!(

@@ -21,12 +21,12 @@
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Instant, SystemTimeError};
 
 use serde_json::Value;
 
 use crate::acquire::Acquire;
+use crate::dispatch;
 use crate::engine::Served;
 use crate::provider::FetchError;
 use crate::sources;
@@ -390,63 +390,47 @@ pub enum HydroEvent {
     },
 }
 
-/// Fetches discharge off the UI thread.
+/// Fetches discharge on the shared job queue.
 pub struct HydroFeed {
-    requests: Sender<HydroRequest>,
-    events: Receiver<HydroEvent>,
+    feed: dispatch::Feed<HydroEvent>,
     generation: u64,
     stopped: bool,
 }
 
 impl HydroFeed {
     pub fn new(acquire: Acquire) -> Self {
-        let (requests, request_receiver) = mpsc::channel::<HydroRequest>();
-        let (event_sender, events) = mpsc::channel::<HydroEvent>();
-        std::thread::spawn(move || {
-            while let Ok(request) = request_receiver.recv() {
-                let outcome = fetch(
-                    &acquire,
-                    request.latitude,
-                    request.longitude,
-                    request.ensemble,
-                );
-                let event = match outcome {
-                    Ok(record) => HydroEvent::Ready {
-                        generation: request.generation,
-                        record,
-                    },
-                    Err(error) => HydroEvent::Failed {
-                        generation: request.generation,
-                        error,
-                    },
-                };
-                if event_sender.send(event).is_err() {
-                    return;
-                }
-            }
-        });
         Self {
-            requests,
-            events,
+            feed: dispatch::Feed::new(acquire),
             generation: 0,
             stopped: false,
         }
     }
 
-    pub fn request(&mut self, request: HydroRequest) -> Result<(), HydroError> {
+    pub fn request(&mut self, request: &HydroRequest) -> Result<(), HydroError> {
         self.generation = request.generation;
-        if self.requests.send(request).is_err() {
-            self.stopped = true;
-            return Err(HydroError::WorkerStopped);
-        }
-        Ok(())
+        let generation = request.generation;
+        let latitude = request.latitude;
+        let longitude = request.longitude;
+        let ensemble = request.ensemble;
+        self.feed
+            .request(move |acquire| {
+                let outcome = fetch(acquire, latitude, longitude, ensemble);
+                match outcome {
+                    Ok(record) => HydroEvent::Ready { generation, record },
+                    Err(error) => HydroEvent::Failed { generation, error },
+                }
+            })
+            .map_err(|_| {
+                self.stopped = true;
+                HydroError::WorkerStopped
+            })
     }
 
     pub fn poll(&mut self) -> Option<HydroEvent> {
-        match self.events.try_recv() {
-            Ok(event) => Some(event),
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => {
+        match self.feed.poll() {
+            Ok(Some(event)) => Some(event),
+            Ok(None) => None,
+            Err(dispatch::Disconnected) => {
                 if self.stopped {
                     return None;
                 }
@@ -530,7 +514,7 @@ impl HydroView {
             longitude,
             ensemble,
         };
-        if let Err(error) = self.feed.request(request) {
+        if let Err(error) = self.feed.request(&request) {
             let _transient = error.is_transient();
             self.state = HydroState::Failed { error, last: None };
         }

@@ -29,12 +29,12 @@
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::Instant;
 
 use serde_json::Value;
 
 use crate::acquire::Acquire;
+use crate::dispatch;
 use crate::engine::Served;
 use crate::provider::FetchError;
 use crate::sources;
@@ -331,9 +331,13 @@ pub fn fetch(acquire: &Acquire, now_ms: u64) -> Result<Served<StormList>, Cyclon
             ],
         )
         .map_err(|source| CycloneError::Provider { source })?;
-    let document = fetched
-        .json()
-        .map_err(|source| CycloneError::Provider { source })?;
+    let document = if fetched.body.is_empty() {
+        serde_json::json!({ "features": [] })
+    } else {
+        fetched
+            .json()
+            .map_err(|source| CycloneError::Provider { source })?
+    };
     let value = parse(&document)?;
     Ok(Served::new(value, fetched.provenance, fetched.cache))
 }
@@ -362,57 +366,42 @@ pub enum CycloneEvent {
     },
 }
 
-/// Fetches storms off the UI thread.
+/// Fetches storms on the shared job queue.
 pub struct CycloneFeed {
-    requests: Sender<CycloneRequest>,
-    events: Receiver<CycloneEvent>,
+    feed: dispatch::Feed<CycloneEvent>,
     generation: u64,
     stopped: bool,
 }
 
 impl CycloneFeed {
     pub fn new(acquire: Acquire) -> Self {
-        let (requests, request_receiver) = mpsc::channel::<CycloneRequest>();
-        let (event_sender, events) = mpsc::channel::<CycloneEvent>();
-        std::thread::spawn(move || {
-            while let Ok(request) = request_receiver.recv() {
-                let event = match fetch(&acquire, request.now_ms) {
-                    Ok(list) => CycloneEvent::Ready {
-                        generation: request.generation,
-                        list,
-                    },
-                    Err(error) => CycloneEvent::Failed {
-                        generation: request.generation,
-                        error,
-                    },
-                };
-                if event_sender.send(event).is_err() {
-                    return;
-                }
-            }
-        });
         Self {
-            requests,
-            events,
+            feed: dispatch::Feed::new(acquire),
             generation: 0,
             stopped: false,
         }
     }
 
-    pub fn request(&mut self, request: CycloneRequest) -> Result<(), CycloneError> {
+    pub fn request(&mut self, request: &CycloneRequest) -> Result<(), CycloneError> {
         self.generation = request.generation;
-        if self.requests.send(request).is_err() {
-            self.stopped = true;
-            return Err(CycloneError::WorkerStopped);
-        }
-        Ok(())
+        let generation = request.generation;
+        let now_ms = request.now_ms;
+        self.feed
+            .request(move |acquire| match fetch(acquire, now_ms) {
+                Ok(list) => CycloneEvent::Ready { generation, list },
+                Err(error) => CycloneEvent::Failed { generation, error },
+            })
+            .map_err(|_| {
+                self.stopped = true;
+                CycloneError::WorkerStopped
+            })
     }
 
     pub fn poll(&mut self) -> Option<CycloneEvent> {
-        match self.events.try_recv() {
-            Ok(event) => Some(event),
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => {
+        match self.feed.poll() {
+            Ok(Some(event)) => Some(event),
+            Ok(None) => None,
+            Err(dispatch::Disconnected) => {
                 if self.stopped {
                     return None;
                 }
@@ -488,7 +477,7 @@ impl CycloneView {
             generation: self.generation,
             now_ms,
         };
-        if let Err(error) = self.feed.request(request) {
+        if let Err(error) = self.feed.request(&request) {
             self.state = CycloneState::Failed { error, last: None };
         }
     }

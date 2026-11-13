@@ -22,12 +22,12 @@
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::Instant;
 
 use serde_json::Value;
 
 use crate::acquire::Acquire;
+use crate::dispatch;
 use crate::engine::Served;
 use crate::provider::FetchError;
 use crate::sources;
@@ -314,7 +314,7 @@ pub fn fetch(
         )
         .map_err(|source| ObservationError::Provider { source })?;
     let document = fetched
-        .json()
+        .json_or_empty_collection()
         .map_err(|source| ObservationError::Provider { source })?;
     let value = parse(&document)?;
     Ok(Served::new(value, fetched.provenance, fetched.cache))
@@ -344,57 +344,42 @@ pub enum ObservationEvent {
     },
 }
 
-/// Fetches observations off the UI thread.
+/// Fetches observations on the shared job queue.
 pub struct ObservationFeed {
-    requests: Sender<ObservationRequest>,
-    events: Receiver<ObservationEvent>,
+    feed: dispatch::Feed<ObservationEvent>,
     generation: u64,
     stopped: bool,
 }
 
 impl ObservationFeed {
     pub fn new(acquire: Acquire) -> Self {
-        let (requests, request_receiver) = mpsc::channel::<ObservationRequest>();
-        let (event_sender, events) = mpsc::channel::<ObservationEvent>();
-        std::thread::spawn(move || {
-            while let Ok(request) = request_receiver.recv() {
-                let event = match fetch(&acquire, request.bounds) {
-                    Ok(set) => ObservationEvent::Ready {
-                        generation: request.generation,
-                        set,
-                    },
-                    Err(error) => ObservationEvent::Failed {
-                        generation: request.generation,
-                        error,
-                    },
-                };
-                if event_sender.send(event).is_err() {
-                    return;
-                }
-            }
-        });
         Self {
-            requests,
-            events,
+            feed: dispatch::Feed::new(acquire),
             generation: 0,
             stopped: false,
         }
     }
 
-    pub fn request(&mut self, request: ObservationRequest) -> Result<(), ObservationError> {
+    pub fn request(&mut self, request: &ObservationRequest) -> Result<(), ObservationError> {
         self.generation = request.generation;
-        if self.requests.send(request).is_err() {
-            self.stopped = true;
-            return Err(ObservationError::WorkerStopped);
-        }
-        Ok(())
+        let generation = request.generation;
+        let bounds = request.bounds;
+        self.feed
+            .request(move |acquire| match fetch(acquire, bounds) {
+                Ok(set) => ObservationEvent::Ready { generation, set },
+                Err(error) => ObservationEvent::Failed { generation, error },
+            })
+            .map_err(|_| {
+                self.stopped = true;
+                ObservationError::WorkerStopped
+            })
     }
 
     pub fn poll(&mut self) -> Option<ObservationEvent> {
-        match self.events.try_recv() {
-            Ok(event) => Some(event),
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => {
+        match self.feed.poll() {
+            Ok(Some(event)) => Some(event),
+            Ok(None) => None,
+            Err(dispatch::Disconnected) => {
                 if self.stopped {
                     return None;
                 }
@@ -477,7 +462,7 @@ impl ObservationView {
             generation: self.generation,
             bounds,
         };
-        if let Err(error) = self.feed.request(request) {
+        if let Err(error) = self.feed.request(&request) {
             self.state = ObservationState::Failed { error, last: None };
         }
     }

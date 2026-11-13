@@ -23,12 +23,12 @@
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Instant, SystemTimeError};
 
 use serde_json::Value;
 
 use crate::acquire::Acquire;
+use crate::dispatch;
 use crate::engine::Served;
 use crate::provider::FetchError;
 use crate::sources;
@@ -425,58 +425,46 @@ pub enum ClimateEvent {
     },
 }
 
-/// Fetches the reanalysis off the UI thread.
+/// Fetches the reanalysis on the shared job queue.
 pub struct ClimateFeed {
-    requests: Sender<ClimateRequest>,
-    events: Receiver<ClimateEvent>,
+    feed: dispatch::Feed<ClimateEvent>,
     generation: u64,
     stopped: bool,
 }
 
 impl ClimateFeed {
     pub fn new(acquire: Acquire) -> Self {
-        let (requests, request_receiver) = mpsc::channel::<ClimateRequest>();
-        let (event_sender, events) = mpsc::channel::<ClimateEvent>();
-        std::thread::spawn(move || {
-            while let Ok(request) = request_receiver.recv() {
-                let outcome = fetch(&acquire, request.latitude, request.longitude);
-                let event = match outcome {
-                    Ok(record) => ClimateEvent::Ready {
-                        generation: request.generation,
-                        record,
-                    },
-                    Err(error) => ClimateEvent::Failed {
-                        generation: request.generation,
-                        error,
-                    },
-                };
-                if event_sender.send(event).is_err() {
-                    return;
-                }
-            }
-        });
         Self {
-            requests,
-            events,
+            feed: dispatch::Feed::new(acquire),
             generation: 0,
             stopped: false,
         }
     }
 
-    pub fn request(&mut self, request: ClimateRequest) -> Result<(), ClimateError> {
+    pub fn request(&mut self, request: &ClimateRequest) -> Result<(), ClimateError> {
         self.generation = request.generation;
-        if self.requests.send(request).is_err() {
-            self.stopped = true;
-            return Err(ClimateError::WorkerStopped);
-        }
-        Ok(())
+        let generation = request.generation;
+        let latitude = request.latitude;
+        let longitude = request.longitude;
+        self.feed
+            .request(move |acquire| {
+                let outcome = fetch(acquire, latitude, longitude);
+                match outcome {
+                    Ok(record) => ClimateEvent::Ready { generation, record },
+                    Err(error) => ClimateEvent::Failed { generation, error },
+                }
+            })
+            .map_err(|_| {
+                self.stopped = true;
+                ClimateError::WorkerStopped
+            })
     }
 
     pub fn poll(&mut self) -> Option<ClimateEvent> {
-        match self.events.try_recv() {
-            Ok(event) => Some(event),
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => {
+        match self.feed.poll() {
+            Ok(Some(event)) => Some(event),
+            Ok(None) => None,
+            Err(dispatch::Disconnected) => {
                 if self.stopped {
                     return None;
                 }
@@ -554,7 +542,7 @@ impl ClimateView {
             latitude,
             longitude,
         };
-        if let Err(error) = self.feed.request(request) {
+        if let Err(error) = self.feed.request(&request) {
             self.state = ClimateState::Failed { error, last: None };
         }
     }

@@ -26,12 +26,12 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::Instant;
 
 use serde_json::{Map, Value};
 
 use crate::acquire::Acquire;
+use crate::dispatch;
 use crate::engine::Served;
 use crate::provider::FetchError;
 use crate::sources;
@@ -437,57 +437,41 @@ pub enum VolcanoEvent {
     },
 }
 
-/// Fetches the volcano report off the UI thread.
+/// Fetches the volcano report on the shared job queue.
 pub struct VolcanoFeed {
-    requests: Sender<VolcanoRequest>,
-    events: Receiver<VolcanoEvent>,
+    feed: dispatch::Feed<VolcanoEvent>,
     generation: u64,
     stopped: bool,
 }
 
 impl VolcanoFeed {
     pub fn new(acquire: Acquire) -> Self {
-        let (requests, request_receiver) = mpsc::channel::<VolcanoRequest>();
-        let (event_sender, events) = mpsc::channel::<VolcanoEvent>();
-        std::thread::spawn(move || {
-            while let Ok(request) = request_receiver.recv() {
-                let event = match fetch(&acquire) {
-                    Ok(report) => VolcanoEvent::Ready {
-                        generation: request.generation,
-                        report,
-                    },
-                    Err(error) => VolcanoEvent::Failed {
-                        generation: request.generation,
-                        error,
-                    },
-                };
-                if event_sender.send(event).is_err() {
-                    return;
-                }
-            }
-        });
         Self {
-            requests,
-            events,
+            feed: dispatch::Feed::new(acquire),
             generation: 0,
             stopped: false,
         }
     }
 
-    pub fn request(&mut self, request: VolcanoRequest) -> Result<(), VolcanoError> {
+    pub fn request(&mut self, request: &VolcanoRequest) -> Result<(), VolcanoError> {
         self.generation = request.generation;
-        if self.requests.send(request).is_err() {
-            self.stopped = true;
-            return Err(VolcanoError::WorkerStopped);
-        }
-        Ok(())
+        let generation = request.generation;
+        self.feed
+            .request(move |acquire| match fetch(acquire) {
+                Ok(report) => VolcanoEvent::Ready { generation, report },
+                Err(error) => VolcanoEvent::Failed { generation, error },
+            })
+            .map_err(|_| {
+                self.stopped = true;
+                VolcanoError::WorkerStopped
+            })
     }
 
     pub fn poll(&mut self) -> Option<VolcanoEvent> {
-        match self.events.try_recv() {
-            Ok(event) => Some(event),
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => {
+        match self.feed.poll() {
+            Ok(Some(event)) => Some(event),
+            Ok(None) => None,
+            Err(dispatch::Disconnected) => {
                 if self.stopped {
                     return None;
                 }
@@ -563,7 +547,7 @@ impl VolcanoView {
         let request = VolcanoRequest {
             generation: self.generation,
         };
-        if let Err(error) = self.feed.request(request) {
+        if let Err(error) = self.feed.request(&request) {
             self.state = VolcanoState::Failed { error, last: None };
         }
     }

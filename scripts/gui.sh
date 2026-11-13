@@ -210,6 +210,12 @@ drag() {
 
 case "$scenario" in
     radar) ;;
+    registry)
+        "$tool_xwdtopnm" "$framebuffer" | "$tool_pnmtopng" > "$output/registry-before.png"
+        click 330 28
+        click 370 28
+        sleep "${OXRAD_GUI_REGISTRY_SETTLE:-100}"
+        ;;
     map) click 240 28 ;;
     measure)
         click 240 28
@@ -412,6 +418,22 @@ colours="$("$tool_pngtopnm" "$png" 2>/dev/null |
     sort -u | wc -l)"
 if [[ -z "$colours" ]] || ((colours < 16)); then
     fail "the captured frame has $colours distinct colours, which is not a rendered interface"
+fi
+
+if [[ "$scenario" == "registry" ]]; then
+    registry_sample() {
+        "$tool_pngtopnm" "$1" 2>/dev/null |
+            "$tool_pamcut" -left 0 -top 56 -width 320 -height 700 2>/dev/null |
+            "$scale_pnmscale" -xsize 160 -ysize 350 2>/dev/null |
+            "$scale_pnmtoplainpnm" 2>/dev/null |
+            awk 'NR <= 3 { next } { printf "%s %s %s\n", $1, $2, $3 }'
+    }
+    changed="$(diff <(registry_sample "$output/registry-before.png") <(registry_sample "$png") |
+        grep -c '^[<>]' || true)"
+    if [[ -z "$changed" ]] || ((changed < 500)); then
+        fail "the registry workspace changed $changed rail samples; it never opened"
+    fi
+    printf 'gui: registry workspace redrew %s rail samples\n' "$changed"
 fi
 
 if [[ "$scenario" == "measure" ]]; then

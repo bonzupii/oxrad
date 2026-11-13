@@ -98,7 +98,7 @@ pub enum Coverage {
 }
 
 impl Coverage {
-    fn label(self) -> String {
+    pub(crate) fn label(self) -> String {
         match self {
             Self::Global => String::from("Global"),
             Self::Countries(codes) => codes.join(", "),
@@ -1536,6 +1536,12 @@ pub fn openfreemap_attribution_url() -> &'static str {
 /// Looks up a source by its registry identifier.
 pub fn find(id: &str) -> Option<&'static Source> {
     SOURCES.iter().find(|source| source.id.as_str() == id)
+}
+
+/// Every source whose licence, credit, cache permission and live verification
+/// admit it to the product.
+pub fn admitted() -> impl Iterator<Item = &'static Source> {
+    SOURCES.iter().filter(|source| source.admits().is_ok())
 }
 
 fn endpoint_list(source: &Source) -> String {
