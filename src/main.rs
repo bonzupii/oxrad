@@ -98,7 +98,7 @@ use stations::SiteId;
 
 const USAGE: &str = "\
 Usage: oxrad [--site IDENTIFIER] [--profile PATH] [--set key=value]...
-             [--print-config] [--sources]
+             [--print-config | --prune-cache | --sources]
 
 Runs the radar viewer. The last selected site is restored from the
 configuration file; with no saved site the picker opens.
@@ -107,17 +107,36 @@ configuration file; with no saved site the picker opens.
   --profile PATH      Read this profile instead of ~/.oxrad/config.toml
   --set key=value     Override one setting for this run; repeatable
   --print-config      Print the effective configuration and exit
+  --prune-cache       Enforce the configured cache budget and exit
   --sources           Print the open-source inventory and exit
   -h, --help          Show this message";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Action {
+    #[default]
+    Run,
+    PrintConfig,
+    PruneCache,
+    PrintSources,
+    Help,
+}
 
 #[derive(Default)]
 struct Invocation {
     initial: Option<SiteId>,
     profile: Option<PathBuf>,
     selection: Vec<String>,
-    print_config: bool,
-    print_sources: bool,
-    help: bool,
+    action: Action,
+}
+
+fn choose(action: &mut Action, chosen: Action) -> Result<(), String> {
+    if *action != Action::Run {
+        return Err(String::from(
+            "only one of --print-config, --prune-cache, --sources and --help may be given.",
+        ));
+    }
+    *action = chosen;
+    Ok(())
 }
 
 fn parse_arguments() -> Result<Invocation, String> {
@@ -145,13 +164,40 @@ fn parse_arguments() -> Result<Invocation, String> {
                     .ok_or_else(|| String::from("--set needs a setting such as units=imperial."))?;
                 invocation.selection.push(value);
             }
-            "--print-config" => invocation.print_config = true,
-            "--sources" => invocation.print_sources = true,
-            "--help" | "-h" => invocation.help = true,
+            "--print-config" => choose(&mut invocation.action, Action::PrintConfig)?,
+            "--prune-cache" => choose(&mut invocation.action, Action::PruneCache)?,
+            "--sources" => choose(&mut invocation.action, Action::PrintSources)?,
+            "--help" | "-h" => choose(&mut invocation.action, Action::Help)?,
             unexpected => return Err(format!("Unexpected argument {unexpected}.")),
         }
     }
     Ok(invocation)
+}
+
+fn prune_cache(policy: config::CachePolicy) -> ExitCode {
+    let store = match cache::Store::default_location() {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match store.prune(policy) {
+        Ok(pruned) => {
+            println!("cache {}", store.root().display());
+            println!(
+                "budget {} MiB, {} entries",
+                pruned.max_bytes / (1024 * 1024),
+                pruned.max_entries
+            );
+            println!("removed {}", pruned.removed);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn print_inventory() -> ExitCode {
@@ -175,12 +221,13 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if invocation.help {
-        println!("{USAGE}");
-        return ExitCode::SUCCESS;
-    }
-    if invocation.print_sources {
-        return print_inventory();
+    match invocation.action {
+        Action::Help => {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        Action::PrintSources => return print_inventory(),
+        Action::Run | Action::PrintConfig | Action::PruneCache => {}
     }
     let selection = match config::selection_text(&invocation.selection) {
         Ok(text) => text,
@@ -189,8 +236,9 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let layered =
-        invocation.print_config || invocation.profile.is_some() || !invocation.selection.is_empty();
+    let layered = invocation.action != Action::Run
+        || invocation.profile.is_some()
+        || !invocation.selection.is_empty();
     let mut resolved = None;
     if layered {
         let effective = match config::load_effective(invocation.profile.as_deref(), &selection) {
@@ -200,8 +248,8 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        if invocation.print_config {
-            match effective.render() {
+        match invocation.action {
+            Action::PrintConfig => match effective.render() {
                 Ok(report) => {
                     print!("{report}");
                     return ExitCode::SUCCESS;
@@ -210,7 +258,9 @@ fn main() -> ExitCode {
                     eprintln!("The configuration report could not be rendered: {error}");
                     return ExitCode::FAILURE;
                 }
-            }
+            },
+            Action::PruneCache => return prune_cache(effective.config.cache),
+            Action::Run | Action::PrintSources | Action::Help => {}
         }
         resolved = Some(effective.config);
     }

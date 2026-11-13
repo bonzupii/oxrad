@@ -20,9 +20,9 @@ States: not started, in progress, verified, blocked.
 | 10 | Cross-workspace time, location, provenance, provider controls | not started | | Each subsystem tracks its own timestamps |
 | 11 | GUI and scientific validation | blocked | `scripts/gui.sh` present; `.tools/root` absent, so no display, no window capture | Provision the harness under `.tools`, pinned |
 | 12 | Documentation, including removal of environment-specific workflow | not started | `docs/HEADLESS.md` still carries the Xvfb procedure and an install instruction | Move it to the `headless-gui-testing` skill; make `AGENTS.md` instrument-neutral |
-| 13 | Apply the configured cache budget in the store | not started | `CachePolicy` is validated and printed, but `cache.rs` still prunes to its own constants | Pass the policy into `Store::prune` |
-| 14 | Draw every displayed credit from the enabled registry set | not started | The report derives credits; the map still draws the OpenFreeMap credit from the style document and no layer shows its source credit beside the data | Add a credit bar fed by `Config::providers` |
-| 15 | Gate fetches by the enabled provider set | not started | A provider can be disabled in configuration, but no fetcher consults the set yet | Consult `Config::providers` before a request starts |
+| 13 | Apply the configured cache budget in the store | verified | Pass 4: `Store::prune` takes the policy from the effective configuration, returns the byte and entry limits it enforced, and the private `MAX_CACHE_*` constants are gone; `oxrad --prune-cache` prints the enforced budget and what it removed | none |
+| 14 | Draw every displayed credit from the enabled registry set | in progress | Pass 4: the basemap credit now comes from `sources::OPENFREEMAP.credit` instead of a literal, and the report derives every credit from the enabled set; no layer yet shows its source credit beside its data, and the basemap credit is not conditioned on the source being enabled | Feed a credit bar from the enabled set |
+| 15 | Gate fetches by the enabled provider set | not started | A provider can be disabled in configuration, but no fetcher consults the set yet. Gating at the request path means passing the enabled set into 24 provider modules and the three HTTP boundaries | Thread the enabled set to `provider`, `network` and `basemap_tiles` |
 
 ## Acceptance criteria
 
@@ -45,8 +45,8 @@ States: not started, in progress, verified, blocked.
 | A15 | Every scientific domain has a complete data-to-visualization workflow | not started | |
 | A16 | Weather radio streams actual online audio | not started | |
 | A17 | Sunrise and sunset integrated with linked attribution and nullable events | not started | |
-| A18 | Provider attribution and licensing systematic and visible | in progress | 25 sources carry licence and credit; 17 admit; the RainViewer and Sunrise-Sunset credits are read from the registry; basemap credit still comes from the OpenFreeMap style document; 15 admitted sources show no credit in the interface yet | Draw every credit from the registry and display it beside its layer |
-| A19 | Persistent caches survive restarts and expose their state | not started | |
+| A18 | Provider attribution and licensing systematic and visible | in progress | 25 sources carry licence and credit; 17 admit; RainViewer, Sunrise-Sunset and OpenFreeMap credits are read from the registry; the report derives credits from the enabled set; 14 admitted sources show no credit in the interface yet | Display each credit beside its layer |
+| A19 | Persistent caches survive restarts and expose their state | in progress | Bodies and metadata persist with integrity checking; `oxrad --prune-cache` exposes the directory, the configured budget and the number removed; no window has shown the cache state | Surface cache state in the interface |
 | A20 | Network behavior provider-aware and robust | not started | |
 | A21 | Subsystems own state and lifecycle; root is not a god object | not started | `app.rs` is 4681 lines |
 | A22 | Scientific calculations and transformations have meaningful automated tests | not started | 467 tests recorded in `docs/TESTING.md`; coverage unverified |
@@ -88,6 +88,16 @@ States: not started, in progress, verified, blocked.
 - Gates: `cargo fmt --all` clean, `cargo clippy -- -D warnings` exit 0, `cargo test --all-targets` 479 passed and 0 failed, `cargo build --release --locked` exit 0.
 - Not done and recorded as gaps: the configured cache budget is printed but `cache.rs` still prunes to its own constants; the enabled provider set is not yet consulted before a fetch; no layer displays its registry credit beside its data; number formatting is locale-neutral rather than localised; no window was opened, so no GUI behaviour was observed.
 
+### Pass 4
+
+- Decision: the cache budget travels as an argument to `Store::prune` rather than living in the store as a field. Reason: three call sites construct the store, only the global radar worker prunes, and a field would either need a default or duplicate the configured value.
+- Decision: `prune` returns `Pruned`, carrying the byte and entry limits it enforced beside the count it removed. Reason: a report of the budget that is not the value used for eviction could disagree with behaviour, and the return value makes disagreement impossible.
+- Decision: `MAX_CACHE_BYTES` and `MAX_CACHE_ENTRIES` are deleted rather than demoted. Reason: two sources for one budget is the defect, and a named constant invites a future caller to reach for it.
+- Decision: the basemap credit is read from `sources::OPENFREEMAP.credit` in `draw_attribution`, replacing the module literal. Reason: the registry is the only place a licence and its required credit are recorded together.
+- Observed with 17 synthetic 1 MiB cache bodies under a temporary HOME: `oxrad --set cache_max_mb=8 --prune-cache` printed `budget 8 MiB, 256 entries` and `removed 9`; the same cache under `--set cache_max_mb=4096` printed `budget 4096 MiB, 256 entries` and `removed 0`. The budget printed is the budget used for eviction.
+- Gates: `cargo fmt --all -- --check` exit 0, `cargo clippy -- -D warnings` exit 0, `cargo test --all-targets` 480 passed and 0 failed, `cargo build --release --locked` exit 0.
+- Not done, and the reason is scope rather than uncertainty: acquisition is still not gated by the enabled provider set. The three HTTP boundaries and 24 provider modules do not receive the set, so disabling a provider changes the model and the refusal at parse time but does not yet stop a fetch. Attribution is registry-derived but not yet shown per layer. No window was opened; the environment still has no display or provisioned harness.
+
 ## Known gate gaps
 
 | Gap | Detail | Next action |
@@ -95,5 +105,5 @@ States: not started, in progress, verified, blocked.
 | Test targets are not linted | `cargo clippy --all-targets` fails on 280 assertion-in-`Result` errors that the documented gate never reaches | Align `STYLE.md` with one test convention, then lint test targets |
 | GUI evidence absent | No display and no `.tools/root`, so no window can be opened or captured | Provision the harness under `.tools` with pinned versions |
 | Basemap credit outside the registry | `walkers` supplies the OpenFreeMap attribution from the style document, so it bypasses `src/sources.rs` | Read the credit from the registry in `draw_attribution` |
-| Cache budget not enforced | `Config::cache` is validated and printed, but `Store::prune` still uses module constants | Give `Store` the policy at construction |
-| Providers not gating fetches | A disabled provider stays listed as enabled in the model but its fetcher does not check | Consult the set before a request starts |
+| Providers not gating fetches | A disabled provider is absent from the effective set but its fetcher does not consult the set, so a request can still start | Thread the set through the three HTTP boundaries and 24 provider modules |
+| Layer credits not displayed | Registry credit is correct and printed, but only the basemap and RainViewer draw a credit in the interface | Add a credit bar fed by the enabled set |

@@ -195,7 +195,7 @@ impl CachePolicy {
         max_entries: 256,
     };
 
-    fn from_mib(mib: u64) -> Result<Self, CachePolicyError> {
+    pub fn from_mib(mib: u64) -> Result<Self, CachePolicyError> {
         if !(MIN_CACHE_MIB..=MAX_CACHE_MIB).contains(&mib) {
             return Err(CachePolicyError::Size { mib });
         }
@@ -213,6 +213,10 @@ impl CachePolicy {
             max_bytes: self.max_bytes,
             max_entries: entries,
         })
+    }
+
+    pub const fn max_bytes(self) -> u64 {
+        self.max_bytes
     }
 
     pub const fn max_entries(self) -> usize {

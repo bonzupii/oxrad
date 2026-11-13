@@ -356,6 +356,7 @@ impl OxradApp {
             },
             |config| (config, true, None::<String>),
         );
+        let cache_policy = config.cache;
         let (restored_site, restored_place) = (
             initial.or_else(|| config.site.clone()),
             config.place.clone(),
@@ -393,7 +394,7 @@ impl OxradApp {
             basemap: Basemap::new(map_style),
             map: MapWorkspace::new(),
             radar: RadarWorkspace::new(),
-            global_feed: GlobalRadarFeed::new(),
+            global_feed: GlobalRadarFeed::new(cache_policy),
             global_generation: 0,
             global_frames: Vec::new(),
             global_index: 0,

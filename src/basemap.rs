@@ -454,7 +454,10 @@ impl Basemap {
         } else {
             ""
         };
-        let attribution = format!("{CREDIT}{status}{tile_status}");
+        let attribution = format!(
+            "{}{status}{tile_status}",
+            crate::sources::OPENFREEMAP.credit
+        );
         let galley =
             ui.painter()
                 .layout_no_wrap(attribution, FontId::proportional(10.0), Color32::WHITE);

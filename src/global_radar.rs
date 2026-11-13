@@ -236,7 +236,7 @@ pub struct GlobalRadarFeed {
 }
 
 impl GlobalRadarFeed {
-    pub fn new() -> Self {
+    pub fn new(budget: crate::config::CachePolicy) -> Self {
         let (requests, request_receiver) = mpsc::channel::<RadarRequest>();
         let (event_sender, events) = mpsc::channel::<GlobalEvent>();
         std::thread::spawn(move || {
@@ -252,6 +252,7 @@ impl GlobalRadarFeed {
                 cache,
                 cache_error,
                 cache_notice_sent: false,
+                budget,
             }
             .run();
         });
@@ -321,6 +322,7 @@ struct Worker {
     cache: Option<Store>,
     cache_error: Option<String>,
     cache_notice_sent: bool,
+    budget: crate::config::CachePolicy,
 }
 
 impl Worker {
@@ -416,7 +418,10 @@ impl Worker {
                 return Err(GlobalRadarError::WorkerStopped);
             }
         }
-        let prune_error = self.cache.as_ref().and_then(|cache| cache.prune().err());
+        let prune_error = self
+            .cache
+            .as_ref()
+            .and_then(|cache| cache.prune(self.budget).err());
         if let Some(error) = prune_error {
             self.cache_notice(error.to_string(), request.generation)?;
         }

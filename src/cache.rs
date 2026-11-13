@@ -29,13 +29,20 @@ use std::time::{SystemTime, SystemTimeError};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::config::CachePolicy;
 use crate::error::PathError;
 use crate::paths;
 
 const SCHEMA_VERSION: u64 = 1;
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
-const MAX_CACHE_BYTES: u64 = 128 * 1024 * 1024;
-const MAX_CACHE_ENTRIES: usize = 256;
+
+/// What one prune removed and the budget it enforced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pruned {
+    pub removed: usize,
+    pub max_entries: usize,
+    pub max_bytes: u64,
+}
 
 #[derive(Debug)]
 pub enum CacheError {
@@ -159,6 +166,11 @@ impl Store {
     /// Uses an explicit cache namespace directory.
     pub const fn at(root: PathBuf) -> Self {
         Self { root }
+    }
+
+    /// The directory this store holds bodies and metadata in.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     fn digest(key: &str) -> String {
@@ -355,20 +367,30 @@ impl Store {
         Ok(())
     }
 
-    /// Enforces the default entry and byte limits.
+    /// Enforces the configured entry and byte budget.
+    ///
+    /// The budget travels in from the effective configuration; the store holds
+    /// no limit of its own, so the printed budget and the enforced budget are
+    /// the same value.
     ///
     /// # Errors
     ///
     /// Returns a typed cache error when the directory cannot be inspected or
     /// an entry cannot be removed.
-    pub fn prune(&self) -> Result<usize, CacheError> {
-        self.prune_to(MAX_CACHE_ENTRIES, MAX_CACHE_BYTES)
+    pub fn prune(&self, policy: CachePolicy) -> Result<Pruned, CacheError> {
+        self.prune_to(policy.max_entries(), policy.max_bytes())
     }
 
-    fn prune_to(&self, max_entries: usize, max_bytes: u64) -> Result<usize, CacheError> {
+    fn prune_to(&self, max_entries: usize, max_bytes: u64) -> Result<Pruned, CacheError> {
         let directory = match fs::read_dir(&self.root) {
             Ok(directory) => directory,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(0),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Ok(Pruned {
+                    removed: 0,
+                    max_entries,
+                    max_bytes,
+                });
+            }
             Err(source) => {
                 return Err(CacheError::Read {
                     path: self.root.display().to_string(),
@@ -434,7 +456,11 @@ impl Store {
             count = count.saturating_sub(1);
             removed = removed.saturating_add(1);
         }
-        Ok(removed)
+        Ok(Pruned {
+            removed,
+            max_entries,
+            max_bytes,
+        })
     }
 }
 
@@ -518,14 +544,46 @@ mod tests {
     }
 
     #[test]
+    fn pruning_honours_a_configured_byte_budget() -> Result<(), TestError> {
+        let root = directory("budget")?;
+        let store = Store::at(root.clone());
+        let body = vec![7_u8; 1024 * 1024];
+        for index in 0..17 {
+            store.store(&format!("body-{index}"), &body)?;
+        }
+        let Ok(small) = CachePolicy::from_mib(8) else {
+            return Err("8 MiB must be an admissible budget".into());
+        };
+        let pruned = store.prune(small)?;
+        assert_eq!(pruned.max_bytes, 8 * 1024 * 1024);
+        assert_eq!(pruned.max_entries, 256);
+        assert_eq!(pruned.removed, 9, "17 MiB must fall to the 8 MiB budget");
+        assert_eq!(
+            store.prune(small)?.removed,
+            0,
+            "a second prune has nothing to do"
+        );
+        let Ok(large) = CachePolicy::from_mib(4096) else {
+            return Err("4096 MiB must be an admissible budget".into());
+        };
+        assert_eq!(
+            store.prune(large)?.removed,
+            0,
+            "a large budget evicts nothing"
+        );
+        cleanup(&root)?;
+        Ok(())
+    }
+
+    #[test]
     fn pruning_removes_oldest_entries_first() -> Result<(), TestError> {
         let root = directory("prune")?;
         let store = Store::at(root.clone());
         store.store_at("old", b"old", 1)?;
         store.store_at("middle", b"middle", 2)?;
         store.store_at("new", b"new", 3)?;
-        let removed = store.prune_to(2, 1024)?;
-        assert_eq!(removed, 1);
+        let pruned = store.prune_to(2, 1024)?;
+        assert_eq!(pruned.removed, 1);
         assert!(store.load("old")?.is_none());
         assert!(store.load("middle")?.is_some());
         assert!(store.load("new")?.is_some());
