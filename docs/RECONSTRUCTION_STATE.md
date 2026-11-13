@@ -9,7 +9,7 @@ States: not started, in progress, verified, blocked.
 | # | Work item | State | Evidence | Next action |
 |---|---|---|---|---|
 | 1 | Remove bundled datasets and prohibited assets | verified | Pass 1: no tracked file carries a dataset extension; no `include_bytes!` or `include_str!`; no `assets/`, `fixtures/`, or `data/` directory; no `build.rs` and no `include`/`exclude` keys in `Cargo.toml`; `src/basemap.rs` acquires OpenFreeMap tiles at runtime | none |
-| 2 | Configuration, profiles, provider registry, cache, attribution foundations | not started | | Audit `config.rs`, `cache.rs`, `provider.rs` against sections 1.2, 3, 17, 18 |
+| 2 | Configuration, profiles, provider registry, cache, attribution foundations | in progress | Pass 2: `src/sources.rs` records 25 sources with coverage, licence, credit, cadence, cache permission and verification level; 17 pass the admission test, 8 are rejected until their terms are verified; `oxrad --sources` renders `docs/SOURCES.md`; RainViewer and Sunrise-Sunset credits now come from the registry. Configuration profiles, the settings surface and the provider manager are not built | Add profiles and a settings surface that reads this registry |
 | 3 | OSM-derived basemap acquisition, styling, multi-scale cartography, persistent tile cache | in progress | `src/basemap.rs` and `src/basemap_tiles.rs` fetch and cache at runtime; multi-scale cartography and eviction unverified | Audit label density, zoom hierarchy, cache budget |
 | 4 | Design system, shell, navigation, icons, themes, accessibility, layer manager | not started | | Audit `theme.rs`, `app.rs`, `layer_catalog.rs` |
 | 5 | Separate Map and Radar workspaces | not started | | Map and Radar share `app.rs` presentation state |
@@ -42,7 +42,7 @@ States: not started, in progress, verified, blocked.
 | A15 | Every scientific domain has a complete data-to-visualization workflow | not started | |
 | A16 | Weather radio streams actual online audio | not started | |
 | A17 | Sunrise and sunset integrated with linked attribution and nullable events | not started | |
-| A18 | Provider attribution and licensing systematic and visible | not started | |
+| A18 | Provider attribution and licensing systematic and visible | in progress | 25 sources carry licence and credit; 17 admit; the RainViewer and Sunrise-Sunset credits are read from the registry; basemap credit still comes from the OpenFreeMap style document; 15 admitted sources show no credit in the interface yet | Draw every credit from the registry and display it beside its layer |
 | A19 | Persistent caches survive restarts and expose their state | not started | |
 | A20 | Network behavior provider-aware and robust | not started | |
 | A21 | Subsystems own state and lifecycle; root is not a god object | not started | `app.rs` is 4681 lines |
@@ -50,7 +50,7 @@ States: not started, in progress, verified, blocked.
 | A23 | Error paths, malformed data, missing metadata handled deliberately and visibly | not started | |
 | A24 | GUI workflows run and visually inspected | blocked | no display; `.tools/root` absent |
 | A25 | Settings and acquired data persist across restarts | not started | |
-| A26 | Documentation reflects actual behavior, no stale AI document as authority | not started | |
+| A26 | Documentation reflects actual behavior, no stale AI document as authority | in progress | `docs/SOURCES.md` is generated from the registry and a test fails when it drifts; `docs/DATA_SOURCES.md` is marked a lead list; the remaining AI documents are unreconciled | Replace or delete each remaining document |
 | A27 | Implementation committed and pushed to the managed development branch | verified | `238b1fb` and `849e2d3` pushed to `freebuff/9adade3717017f6ce0f6c608` |
 
 ## Pass log
@@ -64,9 +64,20 @@ States: not started, in progress, verified, blocked.
 - Release build: `cargo build --release --locked` green in 120s, binary at `target/release/oxrad`.
 - Committed `238b1fb` and `849e2d3` and pushed to `freebuff/9adade3717017f6ce0f6c608`. The `dev` branch was not modified.
 
+### Pass 2
+
+- Built the source registry as the first foundation because every domain draws endpoints, coverage, credit and cache policy from it. `src/sources.rs` holds 25 providers as constants: id, name, domain, coverage, home, endpoint, format, licence, credit line, refresh cadence, cache permission and verification level. No provider is selected by string at a call site.
+- Admission is structural, not documented. `admits` rejects a non-HTTPS endpoint, a credential marker in the URL, a missing licence, a missing credit line, empty coverage and an unstated cache permission. Tests prove each rejection and prove that every admitting source has reached at least `parsed`.
+- 17 of 25 sources admit. The 8 that do not are German, Canadian, Australian, European and global candidates whose terms are unverified; their licence is `None`, so they cannot reach the interface by accident. Canada and Norway were probed: `api.weather.gc.ca/collections` and `api.met.no` both answered 200 `application/json` to one identified request on 2026-11-13.
+- Quiet failure found in the old attribution: the RainViewer credit and the Sunrise-Sunset link were constants in their modules, so a provider change could not be seen from one place. Both now read the registry entry.
+- `oxrad --sources` renders the inventory, `docs/SOURCES.md` is that output, and a test compares the checked-in file against the render, so the documentation cannot drift from the code the way the AI documents did.
+- Gates: `cargo fmt --all` clean, `cargo clippy -- -D warnings` exit 0, `cargo test --all-targets` 477 passed and 0 failed, `cargo build --release --locked` exit 0, `cargo check --all-targets` exit 0.
+- Not done: configuration profiles, the settings surface and the provider manager. Work item 2 stays in progress.
+
 ## Known gate gaps
 
 | Gap | Detail | Next action |
 |---|---|---|
 | Test targets are not linted | `cargo clippy --all-targets` fails on 280 assertion-in-`Result` errors that the documented gate never reaches | Align `STYLE.md` with one test convention, then lint test targets |
 | GUI evidence absent | No display and no `.tools/root`, so no window can be opened or captured | Provision the harness under `.tools` with pinned versions |
+| Basemap credit outside the registry | `walkers` supplies the OpenFreeMap attribution from the style document, so it bypasses `src/sources.rs` | Read the credit from the registry in `draw_attribution` |

@@ -1,5 +1,8 @@
 # Data sources
 
+> Admitted sources are recorded in `docs/SOURCES.md`, generated from `src/sources.rs`. This file remains a research lead list; where the two disagree, the generated inventory is the record.
+
+
 ## Status vocabulary
 
 | Status | Meaning |

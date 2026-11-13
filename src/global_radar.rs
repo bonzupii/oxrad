@@ -42,8 +42,8 @@ const MAX_VIEW_TILES: usize = 8;
 const MANIFEST_LIFETIME: Duration = Duration::from_secs(90);
 const EARTH_KM_PER_DEGREE: f64 = 111.32;
 
-/// Attribution required by the RainViewer public API terms.
-pub const ATTRIBUTION: &str = "Weather data by RainViewer";
+/// Attribution required by the RainViewer public API terms, from the registry.
+pub const ATTRIBUTION: &str = crate::sources::RAINVIEWER.credit;
 
 /// The colour scheme requested for the global composite.
 pub const PALETTE: &str = "Universal Blue";

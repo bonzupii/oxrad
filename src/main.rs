@@ -74,6 +74,7 @@ mod snow;
 mod snow_layer;
 mod sounding;
 mod sounding_layer;
+mod sources;
 mod spaceweather;
 mod spaceweather_layer;
 mod stations;
@@ -95,12 +96,13 @@ use app::OxradApp;
 use stations::SiteId;
 
 const USAGE: &str = "\
-Usage: oxrad [--site IDENTIFIER]
+Usage: oxrad [--site IDENTIFIER] [--sources]
 
 Runs the radar viewer. The last selected site is restored from the
 configuration file; with no saved site the picker opens.
 
   --site IDENTIFIER   Start with this site instead of the saved one
+  --sources           Print the open-source inventory and exit
   -h, --help          Show this message";
 
 fn main() -> ExitCode {
@@ -118,6 +120,16 @@ fn main() -> ExitCode {
                 },
                 None => {
                     eprintln!("--site needs an identifier such as KTWX.\n\n{USAGE}");
+                    return ExitCode::FAILURE;
+                }
+            },
+            "--sources" => match sources::inventory_markdown() {
+                Ok(inventory) => {
+                    print!("{inventory}");
+                    return ExitCode::SUCCESS;
+                }
+                Err(error) => {
+                    eprintln!("The source inventory could not be rendered: {error}");
                     return ExitCode::FAILURE;
                 }
             },

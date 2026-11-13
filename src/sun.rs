@@ -26,8 +26,7 @@ use crate::retry;
 use crate::theme;
 use crate::time;
 
-const BASE: &str = "https://api.sunrise-sunset.org/v2";
-const CREDIT: &str = "https://sunrise-sunset.org";
+const BASE: &str = crate::sources::SUNRISE_SUNSET.endpoint;
 
 #[derive(Debug)]
 struct SunRecord {
@@ -164,7 +163,10 @@ impl SunView {
                 .size(theme::TYPE_LABEL)
                 .weak(),
         );
-        ui.hyperlink_to("Sun data by Sunrise-Sunset.org", CREDIT);
+        ui.hyperlink_to(
+            crate::sources::SUNRISE_SUNSET.credit,
+            crate::sources::SUNRISE_SUNSET.home,
+        );
         let waiting = self.retry_at.is_some_and(|at| Instant::now() < at);
         if ui
             .add_enabled(
